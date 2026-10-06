@@ -63,6 +63,7 @@ from .config import (
     load_config,
     normalize_validated_address,
     ntfy_disclosure_status,
+    printable_display_name,
     remove_sender,
     remove_senders,
     update_settings,
@@ -5553,9 +5554,10 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
     def remove() -> dict[str, object]:
         config = load_config(_config_path(request))
         try:
-            owner = _runtime(request).store.vendor_for_address(normalize_validated_address(email))
+            address = normalize_validated_address(email)
         except ValueError:
-            owner = None
+            address = None  # remove_sender reports the invalid address below
+        owner = _runtime(request).store.vendor_for_address(address) if address else None
         if owner is not None:
             raise ApiError(
                 "conflict",
@@ -5590,6 +5592,10 @@ def _vendor_name(payload: dict[str, object]) -> str:
     name = value.strip()
     if len(name.encode("utf-8")) > MAX_VENDOR_NAME_BYTES:
         raise ApiError("invalid_request", "display_name must be at most 200 UTF-8 bytes")
+    if not printable_display_name(name):
+        raise ApiError(
+            "invalid_request", "display_name must not contain line breaks or invisible characters"
+        )
     return name
 
 

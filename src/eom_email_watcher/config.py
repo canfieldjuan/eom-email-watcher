@@ -303,6 +303,15 @@ def admission_sender_display_name(value: str | None) -> str | None:
     return encoded[:MAX_SENDER_NAME_BYTES].decode("utf-8", errors="ignore")
 
 
+def printable_display_name(value: str) -> bool:
+    """The watchlist's sender-name rule: no line breaks or non-printable characters.
+
+    Vendor names use it too, because a vendor's name becomes its addresses'
+    watched-sender name.
+    """
+    return not any(character in "\r\n" or not character.isprintable() for character in value)
+
+
 def _sender(
     email_value: str,
     name_value: str | None,
@@ -320,9 +329,7 @@ def _sender(
             exact_sender_selector_id(email)
         except ValueError as exc:
             raise InvalidSenderError(str(exc)) from exc
-    if name_value is not None and any(
-        character in "\r\n" or not character.isprintable() for character in name_value
-    ):
+    if name_value is not None and not printable_display_name(name_value):
         raise InvalidSenderError("sender name must not contain control characters")
     name = name_value.strip() if name_value and name_value.strip() else None
     if (

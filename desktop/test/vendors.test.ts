@@ -88,3 +88,12 @@ test("confirmations say whether addresses stay watched", async () => {
   assert.match(deleteVendorConfirmText("Acme", 1, false), /Its address stays/);
   assert.match(deleteVendorConfirmText("Acme", 2, true), /stop watching its 2 addresses/);
 });
+
+test("vendor names refuse the characters the watchlist refuses in sender names", async () => {
+  const { vendorNameError } = await vendors();
+  for (const name of ["Acme Corp", "Acme\tCorp", "Soft­Hyphen", "Line\nBreak", "Zero‍Join"]) {
+    assert.match(vendorNameError(name), /invisible characters/, JSON.stringify(name));
+  }
+  assert.equal(vendorNameError("Café Ñandú 株式会社"), null);
+  assert.equal(vendorNameError("  Acme Supply  "), null);
+});

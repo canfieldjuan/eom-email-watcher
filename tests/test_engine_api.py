@@ -8741,3 +8741,32 @@ def test_vendor_address_add_to_a_missing_vendor_writes_nothing(
 
     assert response["error"]["code"] == "not_found"
     assert config_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("name", ["Acme Corp", "Acme\tCorp", "Soft­Hyphen", "Line\nBreak"])
+def test_vendor_names_follow_the_watchlist_name_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # The vendor name becomes the watched sender's name, so it shares that rule.
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    created = _call(config_path, "vendors.create", {"display_name": name})
+    assert created["error"]["code"] == "invalid_request"
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    renamed = _call(
+        config_path, "vendors.rename", {"vendor_id": acme["vendor_id"], "display_name": name}
+    )
+    assert renamed["error"]["code"] == "invalid_request"
+
+
+def test_a_printable_unicode_vendor_name_can_watch_its_addresses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    vendor = _call(config_path, "vendors.create", {"display_name": "Café Ñandú 株式会社"})
+    added = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": vendor["data"]["item"]["vendor_id"], "address": "billing@cafe.example"},
+    )
+    assert added["data"]["item"]["addresses"] == [
+        {"address": "billing@cafe.example", "watched": True}
+    ]

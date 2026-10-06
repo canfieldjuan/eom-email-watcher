@@ -6738,3 +6738,39 @@ def test_component_queries_use_key_led_indexes(
     with store.connection() as db:
         plan = " ".join(str(row[-1]) for row in db.execute(f"EXPLAIN QUERY PLAN {statement}"))
     assert index in plan, plan
+
+
+def test_an_oversized_provider_thread_id_still_keys_its_thread(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    long_thread = "t" * 600
+    for index in (1, 2):
+        store.add_message(
+            message_id=f"gmail-long-{index}", provider="gmail", account_id="g-account",
+            provider_message_id=f"g-{index}", thread_id=long_thread, sender="a@b.com",
+            sender_name=None, subject="S", received_at="2026-08-29T12:00:00+00:00",
+        )
+    keys = _thread_keys(store)
+    assert keys["gmail-long-1"] == keys["gmail-long-2"]
+    assert len(keys["gmail-long-1"].encode()) <= 512
+
+
+def test_schema_28_upgrade_keys_an_oversized_provider_thread_id(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for index in (1, 2):
+        store.add_message(
+            message_id=f"gmail-old-{index}", provider="gmail", account_id="g-account",
+            provider_message_id=f"g-{index}", thread_id="short", sender="a@b.com",
+            sender_name=None, subject="S", received_at="2026-08-29T12:00:00+00:00",
+        )
+    _reset_to_schema_28(store)
+    with store.connection() as db:
+        db.execute("UPDATE messages SET thread_id = ?", ("t" * 600,))
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    keys = _thread_keys(migrated)
+    assert keys["gmail-old-1"] == keys["gmail-old-2"]
+    assert len(keys["gmail-old-1"].encode()) <= 512

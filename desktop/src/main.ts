@@ -4739,6 +4739,14 @@ function setVendorsStatus(message: string, kind: "success" | "error"): void {
   vendorsStatus.dataset.kind = kind;
 }
 
+// One busy check for every vendor action, before any prompt, so a confirmed
+// action is never dropped silently while another update runs.
+function vendorsBusy(): boolean {
+  if (!operationInFlight) return false;
+  setVendorsStatus("Another update is still running. Try again when it finishes.", "error");
+  return true;
+}
+
 function vendorFailure(error: unknown): void {
   const code = errorCode(error);
   // A lapsed entitlement re-renders through the Connect status owner.
@@ -4858,6 +4866,8 @@ function renderVendors(): void {
     card.append(footer);
     vendorList.append(card);
   }
+  // A Connect status change can re-render mid-operation; keep the new controls busy.
+  if (operationInFlight) setBusy(true);
 }
 
 async function loadVendors(message = "Vendors are up to date."): Promise<void> {
@@ -4877,7 +4887,7 @@ async function vendorOperation(
   operation: () => Promise<string>,
   changesWatchlist: boolean,
 ): Promise<void> {
-  if (!beginOperation()) return;
+  if (vendorsBusy() || !beginOperation()) return;
   vendorsStatus.textContent = pending;
   let message: string | null = null;
   try {
@@ -4892,6 +4902,7 @@ async function vendorOperation(
 }
 
 async function renameVendor(vendorId: string, current: string): Promise<void> {
+  if (vendorsBusy()) return;
   const raw = window.prompt("Rename vendor", current);
   if (raw === null) return;
   const problem = vendorNameError(raw);
@@ -4928,7 +4939,9 @@ async function removeVendorAddress(
   address: string,
   unwatch: boolean,
 ): Promise<void> {
-  if (!window.confirm(removeAddressConfirmText(vendorName, address, unwatch))) return;
+  if (vendorsBusy() || !window.confirm(removeAddressConfirmText(vendorName, address, unwatch))) {
+    return;
+  }
   await vendorOperation(`Removing ${address}…`, async () => {
     const vendor = await invoke<Vendor>("vendors_address_remove", { vendorId, address, unwatch });
     return `${address} was removed from ${vendor.display_name}.`;
@@ -4941,7 +4954,12 @@ async function deleteVendor(
   addressCount: number,
   unwatchAddresses: boolean,
 ): Promise<void> {
-  if (!window.confirm(deleteVendorConfirmText(vendorName, addressCount, unwatchAddresses))) return;
+  if (
+    vendorsBusy()
+    || !window.confirm(deleteVendorConfirmText(vendorName, addressCount, unwatchAddresses))
+  ) {
+    return;
+  }
   await vendorOperation(`Deleting ${vendorName}…`, async () => {
     await invoke("vendors_delete", { vendorId, unwatchAddresses });
     return `${vendorName} was deleted.`;

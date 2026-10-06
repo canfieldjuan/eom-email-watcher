@@ -14,6 +14,10 @@ export interface Vendor {
 
 export const VENDORS_LOCKED_NOTICE = "Connect required to update";
 export const MAX_VENDOR_NAME_BYTES = 200;
+// Mirrors the engine's printable_display_name (Python str.isprintable): Unicode
+// "Other" and "Separator" characters are refused, except the ASCII space. The
+// engine stays the authority; this only explains the refusal before a request.
+const NON_PRINTABLE = /(?! )[\p{C}\p{Z}]/u;
 
 export interface VendorAddressView {
   address: string;
@@ -66,6 +70,9 @@ export function vendorNameError(name: string): string | null {
   if (trimmed === "") return "Vendor name is required.";
   if (new TextEncoder().encode(trimmed).length > MAX_VENDOR_NAME_BYTES) {
     return `Vendor name must be at most ${MAX_VENDOR_NAME_BYTES} UTF-8 bytes.`;
+  }
+  if (NON_PRINTABLE.test(trimmed)) {
+    return "Vendor name must not contain line breaks or invisible characters.";
   }
   return null;
 }

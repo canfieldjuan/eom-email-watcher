@@ -1896,3 +1896,33 @@ def test_in_reply_to_keeps_every_parent_id() -> None:
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
     assert gateway.metadata(message_id()).reply_ids == ("parent-one@x", "parent-two@x")
+
+
+class ReplyFirstImap(ReplyHeaderImap):
+    """A server may return the reply-header item before the main one."""
+
+    def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+        status, response = super().uid(command, *args)
+        if command != "FETCH" or "IN-REPLY-TO" not in (str(args[-1]) if args else ""):
+            return status, response
+        (main_prefix, main), (_reply_prefix, reply), closing = response
+        uid = str(args[0])
+        first = (
+            f"{uid} (UID {uid} INTERNALDATE \"04-Sep-2026 10:16:00 -0500\" "
+            "BODY[HEADER.FIELDS (IN-REPLY-TO REFERENCES)]<0> {1}"
+        ).encode()
+        second = b" BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0> {1}"
+        return status, [(first, reply), (second, main), closing]
+
+
+def test_metadata_reads_uid_and_internaldate_whichever_item_comes_first() -> None:
+    reply_headers = b"In-Reply-To: <parent@x>\r\n\r\n"
+    in_order = ImapGateway(
+        credentials(), lambda _credentials, _context: ReplyHeaderImap(reply_headers)
+    ).metadata(message_id())
+    reversed_order = ImapGateway(
+        credentials(), lambda _credentials, _context: ReplyFirstImap(reply_headers)
+    ).metadata(message_id())
+
+    assert reversed_order == in_order
+    assert reversed_order.reply_ids == ("parent@x",)

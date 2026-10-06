@@ -515,8 +515,13 @@ def _literal(response: list[Any] | None) -> tuple[bytes, bytes]:
 
 
 def _header_literals(response: list[Any] | None) -> tuple[bytes, bytes, bytes | None]:
-    """Split a metadata FETCH into (metadata, main headers, reply headers or None)."""
-    main: tuple[bytes, bytes] | None = None
+    """Split a metadata FETCH into (metadata, main headers, reply headers or None).
+
+    UID and INTERNALDATE precede the first literal, whichever header item the
+    server returns first, so the metadata is always that first prefix.
+    """
+    metadata: bytes | None = None
+    main: bytes | None = None
     reply: bytes | None = None
     for item in response or []:
         if not (isinstance(item, tuple) and len(item) == 2):
@@ -524,13 +529,15 @@ def _header_literals(response: list[Any] | None) -> tuple[bytes, bytes, bytes | 
         prefix, payload = item
         if not (isinstance(prefix, bytes) and isinstance(payload, bytes)):
             continue
+        if metadata is None:
+            metadata = prefix
         if b"IN-REPLY-TO" in prefix.upper():
             reply = payload
         elif main is None:
-            main = (prefix, payload)
-    if main is None:
+            main = payload
+    if metadata is None or main is None:
         raise MailboxMessageUnavailable("The mail server message is no longer available")
-    return main[0], main[1], reply
+    return metadata, main, reply
 
 
 def _reply_ids(payload: bytes | None) -> tuple[str, ...]:

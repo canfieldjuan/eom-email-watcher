@@ -240,8 +240,9 @@ Vendor operations implement [D-vendor](THREAD_VIEW_CONTRACT.md#d-vendor-vendors-
 and [D-ops](THREAD_VIEW_CONTRACT.md#d-ops-operation-classes-and-gating) of the thread-view
 contract, which owns their rules: operation classes, the watchlist link, removal effects, and the
 order of the two stores. Mechanically, `vendor_id` is a canonical UUIDv4 string, `display_name` is
-trimmed, non-empty, and at most 200 UTF-8 bytes, and addresses get the same validation and selector
-bound as `watchlist.add`. A vendor item is `{vendor_id, display_name, addresses}`, with each address
+trimmed, non-empty, at most 200 UTF-8 bytes, and free of line breaks and invisible characters (the
+watchlist's sender-name rule, since it becomes its addresses' watched-sender name), and addresses
+get the same validation and selector bound as `watchlist.add`. A vendor item is `{vendor_id, display_name, addresses}`, with each address
 as `{address, watched}`; vendors are ordered by display name, and addresses by when they were
 added. `vendors.delete` returns `{deleted, vendor_id, addresses}`. While the entitlement is
 inactive, `vendors.create`, `vendors.rename`, and `vendors.addresses.add` return

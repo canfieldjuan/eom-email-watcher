@@ -3276,6 +3276,23 @@ END;
 """
 
 
+MAX_THREAD_KEY_BYTES = 512
+
+
+def _provider_thread_key(thread_id: str | None) -> str:
+    """Gmail threadId or Microsoft conversationId as the thread key (contract D-identity).
+
+    An id over the key bound is hashed, so every message of that thread still
+    shares one key; a message without one forms its own thread.
+    """
+    if not thread_id:
+        return str(uuid.uuid4())
+    encoded = thread_id.encode("utf-8")
+    if len(encoded) <= MAX_THREAD_KEY_BYTES:
+        return thread_id
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _require_vendor(db: sqlite3.Connection, vendor_id: str) -> None:
     if db.execute("SELECT 1 FROM vendors WHERE vendor_id = ?", (vendor_id,)).fetchone() is None:
         raise KeyError(vendor_id)
@@ -3285,19 +3302,17 @@ def _migrate_thread_identity(db: sqlite3.Connection) -> None:
     """Add schema-29 thread keys and vendor records; key retained rows once."""
     columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
     for column, definition in {
-        "thread_key": "TEXT CHECK (thread_key IS NULL OR length(CAST(thread_key AS BLOB)) <= 512)",
+        "thread_key": (
+            "TEXT CHECK (thread_key IS NULL OR "
+            f"length(CAST(thread_key AS BLOB)) <= {MAX_THREAD_KEY_BYTES})"
+        ),
         "rfc_message_id": "TEXT CHECK (rfc_message_id IS NULL OR length(rfc_message_id) <= 998)",
     }.items():
         if column not in columns:
             db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
     _execute_transactional_script(db, THREAD_IDENTITY_SCHEMA)
-    # Every retained row gets a key (contract D-identity). Gmail threadId and
-    # Microsoft conversationId already are keys.
-    db.execute(
-        """UPDATE messages SET thread_key = thread_id
-        WHERE thread_key IS NULL AND thread_id IS NOT NULL
-          AND provider IN ('gmail', 'microsoft365')"""
-    )
+    # Every retained row gets a key (contract D-identity), through the same
+    # functions as capture.
     # IMAP stored the raw Message-ID header as thread_id. Each row goes through
     # the same parser and keying functions as capture. A row without a valid id,
     # or a legacy row stored without an identity whose mailbox was never proven
@@ -3320,7 +3335,7 @@ def _migrate_thread_identity(db: sqlite3.Connection) -> None:
         if provider != "imap":
             db.execute(
                 "UPDATE messages SET thread_key = ? WHERE message_id = ?",
-                (str(uuid.uuid4()), row["message_id"]),
+                (_provider_thread_key(row["thread_id"]), row["message_id"]),
             )
             continue
         identity = row["mailbox_identity_key"] or proven.get((provider, account_id))
@@ -8081,7 +8096,7 @@ class Store:
             )
             thread_key, merged = _imap_thread_key(db, scope=scope, ids=thread_ids)
         else:
-            thread_key = thread_id if thread_id else str(uuid.uuid4())
+            thread_key = _provider_thread_key(thread_id)
         placeholders = ", ".join("?" for _ in suppression_keys)
         cursor = db.execute(
             f"""INSERT OR IGNORE INTO messages(
