@@ -69,7 +69,7 @@ Ownership lane: thread-view-m1
    - surrounding whitespace and one pair of angle brackets are trimmed, and case is kept;
    - the result must be `left@right`, both sides non-empty, at most 998 characters, with no whitespace, control characters, or angle brackets. Anything else, such as `not-an-id`, is dropped and never registered;
    - `In-Reply-To` and `References` each keep at most 64 ids in header order, which for `References` is oldest first. `In-Reply-To` may name several parents, and all of them join the id set.
-8. `MessageMetadata` (`mailbox.py`) gains `rfc_message_id` and `reply_ids` (the `In-Reply-To` id, then the `References` ids, deduplicated). Gmail and Microsoft leave them empty in M1.
+8. `MessageMetadata` (`mailbox.py`) gains `rfc_message_id` and `reply_ids` (the `In-Reply-To` ids, then the `References` ids, deduplicated). Gmail and Microsoft leave them empty in M1.
 
 **Thread keys at capture.** Inside the capture transaction (`BEGIN IMMEDIATE`):
 9. Gmail stores `threadId`, and Microsoft stores `conversationId`. A message without one gets a fresh UUIDv4 key.
