@@ -316,7 +316,7 @@ Each named plan must include these, with fail-first tests.
 - **M2:**
   - Gmail discovery and thread sync page `messages.list` with durable page tokens, bounded to the admitted labels and dates; `threads.get` is never called, since it returns a thread's every message.
   - Every Gmail message gets a bounded `format=metadata` fetch before its scope check, and the body is fetched only after that check.
-  - Microsoft discovery pages each folder by `receivedDateTime` and matches recipients locally, never using `$search`.
+  - Microsoft discovery reads each admitted folder's delta and applies the dates and the recipient match locally, never using `$search`.
   - IMAP sync searches `HEADER Message-ID`, `In-Reply-To`, and `References` until the component stops growing.
   - IMAP messages retained from before M1 never had their reply headers fetched; M1 lists them. Sync fetches those headers for a listed message whose mailbox identity is known and merges through D-identity. A message whose source is gone, or whose identity is unknown, leaves the list and keeps its own component.
   - Rows stored before locations exist that are one message under [D-identity](#d-identity-message-identity-direction-and-thread-keys), retained or from M1, are coalesced into one message with all their locations.
