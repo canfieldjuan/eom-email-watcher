@@ -78,7 +78,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
    - Deletion works on the logical message as one unit: `delete_message` and `clear_messages` remove the canonical row, every row pointing to it through `logical_of`, and record a suppression for each recorded source identity, so no copy is recaptured after a cursor recovery.
    - `messages.capture_timezone`, the configured zone at capture. With `received_at`, it is C/D-body's date context, recorded here because a body can arrive in a later check (step 22). Retained rows keep it NULL: their context is unavailable, which C/D-claims already defines (dates without context are rejected).
    - Migration:
-     - every retained row gets an `inbox` location;
+     - every retained row gets an `inbox` location with no `recorded_at`: the pre-M2 poller admitted from the Inbox only, so the folder is assumed, not observed. The first fetch of the message (step 6, or discovery in step 16) records the folders it observes and stamps the assumed row, so a Gmail message that carried `INBOX` and `SENT` all along gets both, and its recipients;
      - retained rows sharing a logical identity (C/D-identity) are coalesced: the canonical-smallest row is the logical message, the others point to it through `logical_of`, and their locations move to it;
      - no row is deleted, so per-row summaries, attachments, and automation runs survive (the M2 required item).
 6. **A second location** of a captured logical identity is recorded on the logical message, inside the capture transaction (C/D-identity). It is not a new row, and it gets no admission or analysis.
@@ -104,7 +104,8 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
      - the purge;
      - `_apply_imap_component`, which also clears the survivor's watermark (C/D-reconcile);
      - every vendor mutation;
-     - `register_mail_account` and `update_mail_account_identity`.
+     - `register_mail_account` and `update_mail_account_identity`;
+     - `reconcile_mailbox_identity`, which assigns a proven identity to pending legacy rows (`db.py:5542-5547`), so those rows join the caches (step 8) in that transaction.
    - A test enumerates the input tables, and fails if a writer of one does not reach `_recompute_derived`. That makes C/D-derived's "by any path" checkable.
 10. **Capture kinds (C/D-capture).**
     - `match_mailbox_admission` (`service.py:154-200`) becomes the single owner of the capture decision.
@@ -118,7 +119,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
       - `sent_to_vendor`: `vendor-recipient:<address>`;
       - `thread_follow`: `thread:<sha256 of the thread key>`, since a thread key can itself be 512 bytes.
 
-      The display name is the vendor's. Provenance stays immutable.
+      The display name is the vendor's. Provenance stays immutable. The vendor address validator accepts an address only when every kind's selector id fits that bound, which the same owner computes from its longest prefix, so an address a vendor operation accepts never fails at capture.
 11. **Widening the closed set.**
     - `admission_kind` gains `vendor_address`, `vendor_domain`, `sent_to_vendor`, and `thread_follow`.
     - SQLite cannot change a CHECK in place, so `messages` is rebuilt by SQLite's documented procedure (create, copy, drop, rename, then recreate its indexes and triggers). Earlier migrations rebuilt `automation_fires` this way (`db.py:3484-3506`).
@@ -136,7 +137,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 ### M2.3 — The reconcile pass
 
 13. **Storage (schema 32):**
-    - `coverage_generation(provider, account_id, mailbox_identity_key, generation, entitlement_active, retention_days, sent_folder)`, C/D-reconcile's counter and the last observed entitlement state, retention, and resolved Sent folder (its scope and, for IMAP, its folder key). One function, `_bump_coverage_generation`, increments it, and every input change calls it in its own transaction: each vendor mutation; `register_mail_account` and `update_mail_account_identity`, which change a verified identity; the check, when the entitlement state, `retention_days`, or resolved Sent folder it observes differs from the recorded ones (so an edited `config.toml` or `imap_sent_folder` counts, as does `SPECIAL-USE` resolving to another folder or Sent becoming available, and `settings.update` needs no bump of its own); a cursor expiry or recovery; and (M4) an extractor version change;
+    - `coverage_generation(provider, account_id, mailbox_identity_key, generation, entitlement_active, retention_days, sent_folder)`, C/D-reconcile's counter and the last observed entitlement state, retention, and resolved Sent folder (its scope and, for IMAP, its folder key). One function, `_bump_coverage_generation`, increments it, and every input change calls it in its own transaction: each vendor mutation, for every configured account's row (vendor records are global, and an inactive account must find its coverage stale when it returns); `register_mail_account` and `update_mail_account_identity`, which change a verified identity; the check, when the entitlement state, `retention_days`, or resolved Sent folder it observes differs from the recorded ones (so an edited `config.toml` or `imap_sent_folder` counts, as does `SPECIAL-USE` resolving to another folder or Sent becoming available, and `settings.update` needs no bump of its own); a cursor expiry or recovery; and (M4) an extractor version change;
     - `reconcile_coverage(provider, account_id, mailbox_identity_key, generation, recorded_at)`, the reconciled generation;
     - `reconcile_progress(...)`, which holds the two values frozen when the pass started, the generation and the start time, plus the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields. Every bound a pass query uses derives from the frozen start (step 16), so nothing about a resumed query can move with the clock or the configuration. Progress belongs to the generation it froze: when the current generation differs, the check discards it and starts a fresh pass, so a page token is never reused against a changed query.
 
@@ -147,17 +148,18 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 15. **Budget.** The pass runs after polling, in `_check_active`, under the production check lock (`engine_api.py:390-391`).
     - Each check gets 30 seconds and at most 200 provider calls, the bounds `_run_gmail_recovery` uses (`service.py:1669-1846`).
     - A unit that errors backs off `min(15, 2**n)` minutes (`service.py:1505-1506`) while polling continues.
-    - A continuation token the provider rejects (a Gmail `messages.list` page token expires while a pass is paused) is not retried: the pass drops that folder's saved page state and restarts the query from the frozen bounds (step 16), as Gmail recovery resets `page_token` (`db.py:6422-6425`). Ids already captured are skipped by `has_seen_message`, so the restart costs fetches for new mail only.
+    - A definitive not-found completes a unit instead of retrying it: a candidate that vanished between its listing and its metadata fetch is skipped, and a stored message whose copy is gone records what step 22 records for it.
+    - A continuation token the provider rejects (a Gmail `messages.list` page token expires while a pass is paused) is not retried: the pass drops that folder's saved page state and restarts the query from the frozen bounds (step 16), as Gmail recovery resets `page_token` (`db.py:6422-6425`). Ids already fetched are skipped (step 16), so the restart costs fetches for new mail only.
     - At each budget check the pass re-evaluates the entitlement; when the gated class is no longer allowed, it stops there, keeping its progress.
-16. **Stage (a), discovery.** Each candidate gets a bounded metadata fetch, then the scope check, then C/D-capture. Bodies are never fetched in this stage.
+16. **Stage (a), discovery.** Each candidate that is not stored, or is stored with an assumed location (step 5), gets a bounded metadata fetch, then the scope check, then C/D-capture (for a stored one, step 6's location and recipient recording). Bodies are never fetched in this stage.
     - Every query bound derives from the frozen start time (step 13): the upper bound is the start, the lower bound `<cutoff>` is `start - retention_days`, and for IMAP the highest UID of each folder at the start is held with the progress. Every provider query the pass makes, in stage (a) or (b), applies both bounds to every page, including a resumed one, so no result set can move while the pass spans checks. Mail after the bound reaches polling, or the next pass.
     - **Gmail:** `messages.list` with `q = (in:inbox OR in:sent) after:<cutoff> before:<start> (from:a OR to:a OR cc:a ...)` over vendor addresses in batches, with durable page tokens.
-    - **Microsoft:** pages each of `inbox` and `sentitems` with `$filter=receivedDateTime ge <cutoff> and receivedDateTime lt <start>` and `$select` of the step-1 fields, and matches recipients locally. It never uses `$search`.
+    - **Microsoft:** a delta round per folder, `mailFolders/{inbox|sentitems}/messages/delta?$filter=receivedDateTime ge <cutoff>` with `$select` of the step-1 fields, as polling already issues (`_delta_url`). The upper bound and the recipient match apply to each returned item locally, and `@removed` entries are ignored. Delta page links are the durable page tokens: they stay valid when a message is removed or moved between checks, which a `$skip` listing does not, since its offsets shift over the shortened collection. It never uses `$search` or `$skip`.
     - **IMAP:** `UID SEARCH UID 1:<highest> SINCE <date> OR FROM a OR TO a CC a`, per folder, in bounded batches. IMAP's `OR` takes exactly two keys, so the keys nest; a test checks the exact command.
 17. **Stage (b), thread sync.** Each followed thread syncs from its watermark, or from the cutoff when it has none.
-    - **Gmail:** `threads.get(format=metadata)`. The provider thread id is read from the thread's messages (`messages.thread_id`, the native id as the provider gave it), never from the thread key, which `_provider_thread_key` may have hashed (`db.py:3282-3293`) or M1 may have minted. A thread whose messages all lack a native id has no provider thread; it is synced through its own messages only, and never sent to the provider. Microsoft's `conversationId` lookup reads the same column.
-    - **Microsoft:** each of `inbox` and `sentitems` is paged with `$filter=conversationId eq '<id>' and receivedDateTime ge <since> and receivedDateTime lt <start>`, as discovery pages them (step 16), so no message outside the admitted folders is fetched (C/D-scope); the folder is the location.
-    - **IMAP:** `UID SEARCH UID 1:<highest>` in `INBOX` and Sent for `HEADER Message-ID`, `HEADER In-Reply-To`, and `HEADER References` over the component's ids, repeated until the component stops growing. Before that, it drains `imap_reply_header_gaps`:
+    - **Gmail:** one `messages.list` per pass, `q = (in:inbox OR in:sent) after:<oldest watermark, or the cutoff> before:<start>`, with durable page tokens; it returns ids and `threadId`s only. An id whose `threadId` is a followed thread's native id gets the metadata fetch, and nothing else is fetched, so no archived, trashed, or out-of-retention message is ever retrieved (C/D-scope), which `threads.get` could not promise: it returns a thread's every message. The provider thread id is read from the thread's messages (`messages.thread_id`, the native id as the provider gave it), never from the thread key, which `_provider_thread_key` may have hashed (`db.py:3282-3293`) or M1 may have minted. A thread whose messages all lack a native id has no provider thread; it is synced through its own messages only, and never sent to the provider. Microsoft's `conversationId` lookup reads the same column.
+    - **Microsoft:** one delta round per folder from the oldest followed watermark, or the cutoff, exactly as step 16 issues it; an item whose `conversationId` is a followed thread's native id is a candidate, the rest are skipped locally, and the folder is the location. No per-thread listing, so no `$skip` offsets and no message outside the admitted folders (C/D-scope).
+    - **IMAP:** `UID SEARCH UID 1:<highest> SINCE <since date>` in `INBOX` and Sent for `HEADER Message-ID`, `HEADER In-Reply-To`, and `HEADER References` over the component's ids, repeated until the component stops growing. `SINCE` is day-granular, so the bound rounds down to the day of the watermark or cutoff. Before that, it drains `imap_reply_header_gaps`:
       - a listed row whose mailbox identity is known gets its reply headers fetched and merged through `_apply_imap_component`;
       - a row whose source is gone, or whose identity is unknown, leaves the list.
     - A thread's watermark advances to the pass's frozen start time, never past the bound its queries applied.
@@ -167,22 +169,23 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 ### M2.4 — Bodies and the followed-thread purge
 
 20. **Storage (schema 33):**
-    - `message_bodies(message_id, text, stored_chars, source_chars, fetched_at)`. A delete trigger ties it to its message. The date context lives on the message (step 5).
+    - `message_bodies(message_id, text, stored_chars, source_chars, fetched_at)`. The date context lives on the message (step 5).
     - `message_body_unavailable(message_id, reason)`, where `reason` is `source_gone` or `outside_folders`.
+    - Both are tied to their message by step 5's delete trigger, extended to them, so `delete_message`, `clear_messages`, and the purge need nothing of their own, and no marker outlives its message to be inherited by a recapture.
     - `maintenance_state(key PRIMARY KEY, value, updated_at)`, which holds the `checkpoint_pending` flag of step 23 across restarts.
     - The migration deletes every `reconcile_coverage` row, so each account is stale (step 14) and stage (c) fetches bodies for its already-followed messages.
 21. **The storage normalizer** is a new `stored_body_text` in `mime.py`, beside today's normalizer, which stays unchanged for analysis (C/D-body).
     - Quote containers become `>`-prefixed lines:
       - `<blockquote>`;
       - Gmail's `div.gmail_quote`;
-      - Outlook's reply header block, `div#divRplyFwdMsg` and everything after it.
+      - Outlook's reply header block, `div#divRplyFwdMsg`, alone. Outlook puts no container around the message it introduces, and prefixing everything after the header would also prefix text an author wrote below it. The header lines mark where quoting begins; separating the quoted message from text written after it is segmentation, which C/D-claims assigns to the M4 plan (its Outlook-header case).
     - The storage cap is `MAX_STORED_BODY_CHARS = 200_000`, above `body_char_limit`'s maximum of 100,000 (`config.py:464-469`).
 22. **Fetch, in stage (c) only, for followed-thread messages without a body.** Each provider gets a new gateway method, `stored_body`:
     - Gmail: `format=full`;
     - Microsoft: HTML, without `prefer_text`, so quote containers survive;
     - IMAP: the existing BODYSTRUCTURE path.
 
-    A logical message may have several recorded locations (step 5). Stage (c) tries each in-scope location in canonical order: right before each body request, a bounded metadata fetch rechecks that copy's folder, because a pass can span checks and a copy can leave scope in between. A copy outside the admitted folders is skipped; one that is gone is skipped. Only when every location is skipped does the message record `outside_folders` if any copy still exists, else `source_gone` (C/D-body). Other errors back off (step 15).
+    A logical message may have several recorded locations (step 5). Stage (c) tries each in-scope location in canonical order. The body response itself says where the copy is, in the same snapshot as the text: Gmail's `format=full` returns `labelIds`, Microsoft's `$select` adds `parentFolderId`, and an IMAP UID fetch is bound to the folder selected for it. A body whose snapshot is outside the admitted folders is discarded unstored and that copy is skipped, so no separate check can be overtaken between calls; a copy that is gone is skipped. Only when every location is skipped does the message record `outside_folders` if any copy still exists, else `source_gone` (C/D-body). Other errors back off (step 15).
 23. **Purge.**
     - `purge_with_outcome` (`db.py:12273`) keeps its predicate and its place at the start of the check (`service.py:1905`) for messages outside followed threads. A followed thread purges as one unit when its newest logical message is older than the cutoff and the account's coverage is current (C/D-scope, decision D1), so a thread whose newer replies are still unfetched survives a lapse. That purge runs after the check's polling, so a reply that was waiting on the provider cursor is captured, and counted as the newest message, before the decision. Duplicate rows (`logical_of`) go with their logical message.
     - `Store.connection` sets `PRAGMA secure_delete = ON`.
@@ -268,6 +271,16 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 - **Sent folder change.** A changed `imap_sent_folder`, or Sent becoming available, makes coverage stale and clears watermarks, so the newly admitted folder is discovered and synced.
 - **Rejected page token.** A saved Gmail page token the provider rejects restarts that query from the frozen bounds, and the pass completes.
 - **Reappearance.** A message whose every location was recorded and that left both folders is fetched again when polling reports it in one; an IMAP copy arriving for a `source_gone` message supplies its body.
+- **Assumed locations.** A retained Gmail message that carried `INBOX` and `SENT` before the upgrade is fetched once by discovery, records both folders and its recipients, and is attributed outbound.
+- **Removal mid-pass.** A Microsoft message deleted between two checks of a pass shifts no neighbour out of discovery; the delta page resumes without a gap.
+- **Thread sync scope.** A Gmail thread's archived message and a Microsoft conversation's Deleted Items message are never fetched during sync; an IMAP thread search carries its `SINCE` bound.
+- **Vanished candidate.** A candidate deleted between listing and fetch completes its unit, and the pass records coverage.
+- **Markers go with the message.** Deleting, clearing, or purging a message in `source_gone` or `outside_folders` leaves no marker, and a recapture starts with no body state.
+- **Inactive account.** Adding a vendor address bumps every account's generation; a reactivated account is stale.
+- **Identity assignment.** Rows that `reconcile_mailbox_identity` assigns an identity get attribution and follow rows in that transaction.
+- **Bottom-posted Outlook reply.** Text written below `div#divRplyFwdMsg` is stored unprefixed.
+- **Body snapshot.** A body whose response shows the copy outside the admitted folders is not stored.
+- **Selector bound.** A vendor address the vendor operation accepts always yields a storable selector id.
 - **Unfollow drops the watermark**, so a refollowed thread is stale and resyncs.
 - **Raised retention clears every watermark,** and the IMAP search command nests its `OR` keys exactly.
 - **Discovery.**
