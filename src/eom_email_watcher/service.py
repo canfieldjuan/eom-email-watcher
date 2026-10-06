@@ -2309,6 +2309,7 @@ class Watcher:
             provider_message_id=provider_message_id,
             locations=observed & folders,
             scope_complete=_scope_complete(folders),
+            headers_observed=False,
             now=checked_at,
         )
 

@@ -8662,12 +8662,16 @@ class Store:
         to: tuple[str, ...] = (),
         cc: tuple[str, ...] = (),
         scope_complete: bool = True,
+        headers_observed: bool = True,
         now: datetime | None = None,
     ) -> int:
         """Record an observation of a stored source identity's folders; new rows.
 
         The folders may be empty (the message is in none of the folders in scope);
         the observation still stamps or clears the source's rows (_record_locations).
+        A stamp means folders and headers were both observed (plan step 5): a
+        retained row, whose headers were never fetched, is stamped only by an
+        observation that fetched them, never by a change record's folders alone.
         Recipients that came with the observation fill a row that has none.
         """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
@@ -8681,6 +8685,14 @@ class Store:
             ).fetchone()
             if row is None:
                 return 0
+            retained = (
+                db.execute(
+                    "SELECT capture_timezone IS NULL FROM messages WHERE message_id = ?",
+                    (str(row["logical_id"]),),
+                ).fetchone()[0]
+                == 1
+            )
+            complete = scope_complete and (headers_observed or not retained)
             recorded = _record_locations(
                 db,
                 message_id=str(row["logical_id"]),
@@ -8689,7 +8701,7 @@ class Store:
                 mailbox_identity_key=mailbox_identity_key,
                 provider_message_id=provider_message_id,
                 locations=locations,
-                recorded_at=stamp if scope_complete else None,
+                recorded_at=stamp if complete else None,
             )
             _record_recipients(db, message_id=str(row["logical_id"]), to=to, cc=cc)
             return recorded

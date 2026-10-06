@@ -7518,3 +7518,30 @@ def test_an_incomplete_observation_clears_the_stamp_and_may_name_no_folder(
     observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
     store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at)
     assert stamps() == [observed_at.isoformat()]
+
+
+def test_a_change_record_never_stamps_a_retained_row(tmp_path: Path) -> None:
+    store, root, _duplicate = _coalesced_pair(tmp_path)
+    scope = _source_scope(store, root)
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                """SELECT recorded_at FROM message_locations
+                WHERE provider_message_id = ? ORDER BY location""",
+                (scope["provider_message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    # A star on the retained row names its folders, but its headers were never fetched.
+    store.record_message_location(
+        **scope, locations=frozenset({"inbox", "sent"}), headers_observed=False, now=observed_at
+    )
+    assert store.message_locations(root) == ["inbox", "sent"]
+    assert stamps() == [None, None]
+    # The fetch that brings its headers completes the observation.
+    store.record_message_location(
+        **scope, locations=frozenset({"inbox", "sent"}), to=("a@v.com",), now=observed_at
+    )
+    assert stamps() == [observed_at.isoformat(), observed_at.isoformat()]
