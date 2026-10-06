@@ -104,6 +104,7 @@ def folder_scope_key(folders: frozenset[str]) -> str:
     return "+".join(sorted(folders))
 
 
+FULL_FOLDER_SCOPE = "inbox+sent"  # folder_scope_key of every admitted folder
 MESSAGE_LOCATIONS = frozenset({INBOX_LOCATION, SENT_LOCATION})
 # An account's Sent scope (contract D-scope), as health reports it.
 SENT_SCOPE_AVAILABLE = "available"

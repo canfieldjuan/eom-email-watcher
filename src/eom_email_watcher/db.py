@@ -38,6 +38,7 @@ from .config import (
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
+    FULL_FOLDER_SCOPE,
     INBOX_LOCATION,
     MESSAGE_LOCATIONS,
     SENT_SCOPE_NOT_POLLED,
@@ -2064,7 +2065,7 @@ class GmailRecoveryState:
     updated_at: str
     # The folder scope the saved page belongs to (mailbox.folder_scope_key); a page
     # token is never reused against a query of another scope.
-    query_scope: str = "inbox+sent"
+    query_scope: str = FULL_FOLDER_SCOPE
 
 
 def _mail_account(row: sqlite3.Row) -> MailAccount:
@@ -3433,7 +3434,7 @@ def _ensure_sent_capture_tables(db: sqlite3.Connection) -> None:
         # Pages saved before schema 30 were read under both folders.
         db.execute(
             "ALTER TABLE gmail_recovery_state ADD COLUMN query_scope TEXT NOT NULL"
-            " DEFAULT 'inbox+sent'"
+            f" DEFAULT '{FULL_FOLDER_SCOPE}'"
         )
     _execute_transactional_script(db, SENT_CAPTURE_SCHEMA)
 
@@ -6471,7 +6472,7 @@ class Store:
         replacement_history_cursor: str,
         *,
         retention_cutoff: datetime | None = None,
-        query_scope: str = "inbox+sent",
+        query_scope: str = FULL_FOLDER_SCOPE,
         now: datetime | None = None,
     ) -> GmailRecoveryState:
         _require_mailbox_identity_key(mailbox_identity_key)

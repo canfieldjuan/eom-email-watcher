@@ -1084,7 +1084,8 @@ class GmailGateway:
 
     def search_since(self, addresses: frozenset[str], since: datetime) -> list[str]:
         sender_terms = " ".join(f"from:{address}" for address in sorted(addresses))
-        query = f"in:inbox {{{sender_terms}}} after:{int(since.timestamp())}"
+        folders = recovery_folder_query(self.query_folders)
+        query = f"{folders} {{{sender_terms}}} after:{int(since.timestamp())}"
         ids: list[str] = []
         page_token: str | None = None
         while True:
