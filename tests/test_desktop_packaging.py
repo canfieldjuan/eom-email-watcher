@@ -130,7 +130,7 @@ def test_packaged_smoke_uses_owner_private_config_parent(
             }
         },
         "connect.entitlement.status": {
-            "data": {"state": "authority_unavailable", "active": False}
+            "data": {"state": "authority_unavailable", "active": False, "automations_active": False}
         },
         "watcher.check": {"data": {"active": False}},
     }
@@ -288,7 +288,7 @@ def test_packaged_smoke_accepts_all_expected_mail_providers(
                     },
                 }
             },
-            {"data": {"state": "missing", "active": False}},
+            {"data": {"state": "missing", "active": False, "automations_active": False}},
             {"data": {"active": False}},
         ]
     )

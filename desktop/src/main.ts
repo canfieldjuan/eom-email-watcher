@@ -271,6 +271,7 @@ type ConnectEntitlementState =
 interface ConnectEntitlementStatus {
   state: ConnectEntitlementState;
   active: boolean;
+  automations_active: boolean;
 }
 
 interface MailProviderStatus {
@@ -821,7 +822,7 @@ const settingsView = requiredElement<HTMLElement>("#settings-view");
 const expiryLedgerStatus = requiredElement<HTMLParagraphElement>("#expiry-ledger-status");
 const expiryLedgerTableWrap = requiredElement<HTMLDivElement>("#expiry-ledger-table-wrap");
 const expiryLedgerRows = requiredElement<HTMLTableSectionElement>("#expiry-ledger-rows");
-const coiSetup = mountCoiSetup(requiredElement<HTMLElement>("#coi-setup"), invoke, errorMessage);
+const coiSetup = mountCoiSetup(requiredElement<HTMLElement>("#coi-setup"), invoke, errorMessage, openConnectHealth);
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const inboxSenderNavigation = requiredElement<HTMLElement>("#inbox-sender-nav");
@@ -1993,11 +1994,7 @@ function renderInbox(items: InboxItem[]): void {
         const viewConnect = document.createElement("button");
         viewConnect.type = "button";
         viewConnect.textContent = "View Connect";
-        viewConnect.addEventListener("click", () => {
-          showView("health");
-          connectHealth.scrollIntoView({ block: "center" });
-          if (!connectActivate.hidden) connectActivate.focus();
-        });
+        viewConnect.addEventListener("click", openConnectHealth);
         actions.append(locked, viewConnect);
       }
 
@@ -3650,6 +3647,13 @@ async function loadMailAccounts(): Promise<boolean> {
   }
 }
 
+function openConnectHealth(): void {
+  showView("health");
+  void Promise.all([loadHealth(), refreshConnectStatus()]);
+  connectHealth.scrollIntoView({ block: "center" });
+  if (!connectActivate.hidden) connectActivate.focus();
+}
+
 function renderConnectStatus(status: ConnectEntitlementStatus): void {
   connectActivate.disabled = connectInstalling;
   connectActivate.hidden = status.state === "authority_unavailable";
@@ -3675,7 +3679,11 @@ function renderConnectStatus(status: ConnectEntitlementStatus): void {
   };
   const [title, detail] = content[status.state];
   setHealthValue(connectHealth, status.active, title);
-  connectDetail.textContent = detail;
+  connectDetail.textContent = detail + (status.active
+    ? (status.automations_active
+      ? " Automations are included."
+      : " Automations are not included in this license, so rules can't be created or turned on.")
+    : "");
 }
 
 function applyConnectStatus(status: ConnectEntitlementStatus, forceCapabilityRefresh = false): void {
@@ -4680,10 +4688,7 @@ expiryLedgerTab.addEventListener("click", () => {
   void loadExpiryLedger();
   void coiSetup.refresh();
 });
-healthTab.addEventListener("click", () => {
-  showView("health");
-  void Promise.all([loadHealth(), refreshConnectStatus()]);
-});
+healthTab.addEventListener("click", openConnectHealth);
 settingsTab.addEventListener("click", () => {
   showView("settings");
   if (configurationReady) {

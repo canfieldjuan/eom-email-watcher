@@ -7737,10 +7737,120 @@ def _automation_definition() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("operation,editing", [
+    ("put", False), ("put", True), ("put_watched", False), ("set_enabled", True),
+])
+def test_rule_entitlement_blocks_writes_before_lock_and_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, editing: bool,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    definition = _automation_definition()
+    definition["conditions"].insert(
+        0, {"field": "sender", "op": "equals", "value": "a@example.com"}
+    )
+    created = runtime.store.put_automation_rule(definition)
+    paused = runtime.store.set_automation_rule_enabled(created.summary.rule_id, 1, False)
+    identity = {"rule_id": paused.summary.rule_id, "expected_version": paused.summary.version}
+    definition["name"] = "Changed rule"
+    payload = {"enabled": True} if operation == "set_enabled" else {"definition": definition}
+    if editing:
+        payload.update(identity)
+    before = runtime.store.automation_rules_snapshot()
+    calls = []
+    original = engine_api._with_automation_rule_mutation
+
+    def mutation(*args):
+        calls.append("lock/runtime")
+        return original(*args)
+
+    monkeypatch.setattr(engine_api, "_with_automation_rule_mutation", mutation)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    result = engine_api._response(request(config_path, f"automation.rules.{operation}", payload))
+    assert result.get("error") == {
+        "code": "automation_entitlement_required",
+        "message": "Automation rules require an active Automations entitlement",
+    }
+    assert calls == []
+    assert runtime.store.automation_rules_snapshot() == before
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    allowed = engine_api._response(request(config_path, f"automation.rules.{operation}", payload))
+    assert allowed["ok"], allowed
+    assert runtime.store.automation_rules_snapshot()[0] == before[0] + 1
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    summary = allowed["data"]["rule"]["summary"]
+    identity = {"rule_id": summary["rule_id"], "expected_version": summary["version"]}
+    for read, read_payload in [("list", {}), ("get", {"rule_id": summary["rule_id"]}),
+                               ("prepare", {"definition": definition})]:
+        assert engine_api._response(request(
+            config_path, f"automation.rules.{read}", read_payload,
+        ))["ok"]
+    disabled = engine_api._response(request(
+        config_path, "automation.rules.set_enabled", {**identity, "enabled": False},
+    ))
+    assert disabled["ok"], disabled
+    identity["expected_version"] = disabled["data"]["rule"]["summary"]["version"]
+    assert engine_api._response(request(config_path, "automation.rules.delete", identity))["ok"]
+
+
+def test_rule_entitlement_preserves_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    monkeypatch.setattr(
+        engine_api, "_runtime", lambda *_: pytest.fail("validation reached runtime"),
+    )
+    identity = {"rule_id": "11111111-1111-4111-8111-111111111111", "expected_version": 1}
+    for operation in ("put", "put_watched"):
+        for payload, code in [({}, "invalid_request"), ({"definition": {}}, "invalid_rule")]:
+            result = engine_api._response(request(
+                Path("missing"), f"automation.rules.{operation}", payload,
+            ))
+            assert result["error"]["code"] == code
+        for version in (0, "", False, 2**63):
+            result = engine_api._response(request(
+                Path("missing"), f"automation.rules.{operation}",
+                {**identity, "expected_version": version, "definition": _automation_definition()},
+            ))
+            assert result["error"]["code"] == "invalid_request"
+    for enabled in (0, "", None, 2):
+        result = engine_api._response(request(Path("missing"), "automation.rules.set_enabled", {
+            **identity, "enabled": enabled,
+        }))
+        assert result["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("operation", ["status", "install"])
+def test_rule_entitlement_status_and_install(
+    monkeypatch: pytest.MonkeyPatch, active: bool, operation: str,
+) -> None:
+    public = {"state": "active", "active": True}
+    status = SimpleNamespace(public_dict=lambda: public.copy())
+    monkeypatch.setattr(engine_api.entitlement, "connect_entitlement_status", lambda: status)
+    monkeypatch.setattr(engine_api.entitlement, "install_connect_entitlement", lambda _: status)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: active)
+    payload = {"source_path": "/license.json"} if operation == "install" else {}
+    result = engine_api._response(request(
+        Path("missing"), f"connect.entitlement.{operation}", payload,
+    ))
+    assert result["data"] == {**public, "automations_active": active}
+
+
+def test_rule_entitlement_requires_both_features(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    for active in (False, True):
+        monkeypatch.setattr(engine_api.entitlement, "feature_entitlements_active",
+                            lambda *features, active=active: calls.append(features) or active)
+        assert engine_api._automation_entitlement_active() is active
+    assert calls == [(engine_api.entitlement.CONNECT_FEATURE_ID,
+                      engine_api.entitlement.AUTOMATIONS_FEATURE_ID)] * 2
+
+
 def test_automation_rule_operations_expose_one_cas_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
@@ -7817,7 +7927,9 @@ def test_automation_rule_operations_expose_one_cas_lifecycle(
 def test_automation_rule_mutation_rejects_non_strict_versions(
     tmp_path: Path,
     expected_version: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     response = engine_api._response(
@@ -7837,6 +7949,7 @@ def test_automation_rule_lock_contention_is_retryable_mailbox_busy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
@@ -7865,6 +7978,7 @@ def test_automation_rule_mutation_rejects_unsupported_lock_before_runtime_access
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: False)
@@ -7889,6 +8003,7 @@ def test_automation_rule_put_rejects_oversized_canonical_bytes_before_runtime_ac
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     definition = _automation_definition()
@@ -7915,6 +8030,7 @@ def test_account_scoped_rule_create_rejects_limit_before_mailbox_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
@@ -7950,6 +8066,7 @@ def test_account_scoped_rule_distinguishes_unknown_and_transient_identity_failur
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
@@ -7992,6 +8109,7 @@ def test_account_scoped_rule_edit_rejects_before_mailbox_reconciliation(
     edit_state: str,
     expected_code: str,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
@@ -8052,6 +8170,7 @@ def test_account_scoped_rule_verification_and_commit_share_operation_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
@@ -8155,6 +8274,7 @@ def _desktop_rule_put_operation() -> str:
 def test_desktop_watched_save_uses_current_sender_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editing: bool, remove_sender: bool
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
@@ -8203,8 +8323,9 @@ def test_desktop_watched_save_uses_current_sender_admission(
     ],
 )
 def test_watched_save_rejects_missing_mixed_or_inactive_sender_without_changing_generic_put(
-    tmp_path: Path, sender_conditions: list[dict[str, str]]
+    tmp_path: Path, sender_conditions: list[dict[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     definition = _automation_definition()
@@ -8223,6 +8344,7 @@ def test_watched_save_rejects_missing_mixed_or_inactive_sender_without_changing_
 def test_watched_save_membership_and_commit_share_watchlist_mutation_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     held = False

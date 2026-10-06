@@ -1,6 +1,6 @@
 import type { ConnectCapabilities, ConnectCapability } from "./connectTypes";
 import {
-  CoiRequestGate, coiDefinition, editableCoiFields, isCoiProvider, providerKey,
+  CoiRequestGate, coiControlState, coiDefinition, editableCoiFields, isCoiProvider, providerKey,
   type CoiFields, type RuleDetail, type RuleList, type RuleResult,
 } from "./coiRules";
 
@@ -9,7 +9,7 @@ interface Account { provider: string; account_id: string; address: string | null
 interface Sender { email: string; name: string | null; admission_active: boolean }
 const mailboxKey = (account: { provider: string; account_id: string }) => JSON.stringify([account.provider, account.account_id]);
 
-export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (error: unknown) => string): { refresh: () => Promise<void> } {
+export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (error: unknown) => string, onViewConnect?: () => void): { refresh: () => Promise<void> } {
   root.innerHTML = `
     <details class="coi-setup" open>
       <summary>COI rules</summary>
@@ -20,6 +20,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
         <button type="button" data-action="new">New rule</button>
       </div>
       <p data-field="status" role="status" aria-live="polite">Open Expiry Ledger to load setup.</p>
+      <p data-field="locked" hidden><span class="capability-locked">Automations locked</span> <button type="button" data-action="view-connect">View Connect</button></p>
       <form>
         <fieldset disabled>
           <div class="coi-rule-fields">
@@ -51,6 +52,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
   const confirm = get<HTMLInputElement>('[data-field="confirm"]');
   const preview = get<HTMLParagraphElement>('[data-field="preview"]');
   const status = get<HTMLParagraphElement>('[data-field="status"]');
+  const locked = get<HTMLParagraphElement>('[data-field="locked"]');
   const fieldset = get<HTMLFieldSetElement>('fieldset');
   const save = get<HTMLButtonElement>('[data-action="save"]');
   const toggle = get<HTMLButtonElement>('[data-action="toggle"]');
@@ -62,6 +64,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
   let capabilities: ConnectCapability[] = [];
   let current: RuleDetail | null = null;
   let loaded = false;
+  let automationsActive: boolean | null = null;
   let editable = true;
   let diagnostic: string | null = null;
 
@@ -97,7 +100,10 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     newButton.disabled = gate.busy || !loaded || gate.needsRefresh;
     refreshButton.disabled = gate.busy;
     const choice = selected();
-    save.disabled = !choice || !editable || gate.needsRefresh;
+    const controls = coiControlState(automationsActive === true, current?.summary ?? null);
+    save.disabled = !controls.saveEnabled || !choice || !editable || gate.needsRefresh;
+    toggle.disabled = !controls.toggleEnabled;
+    locked.hidden = automationsActive !== false;
     toggle.hidden = current === null || !editable;
     toggle.textContent = current?.summary.enabled ? "Pause rule" : "Resume rule";
     save.textContent = current ? "Save changes" : "Save enabled rule";
@@ -129,12 +135,14 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     renderState();
   }
   async function loadSources(ruleId: string): Promise<void> {
-    const [a, s, catalog, rules] = await Promise.all([
+    const [a, s, catalog, rules, entitlement] = await Promise.all([
       invoke<{ accounts: Account[] }>("mail_accounts_list"),
       invoke<Sender[]>("watchlist_list"),
       invoke<ConnectCapabilities>("connect_catalog"),
       invoke<RuleList>("automation_rules_list"),
+      invoke<{ automations_active: boolean }>("connect_entitlement_status"),
     ]);
+    automationsActive = entitlement.automations_active;
     accounts = a.accounts; senders = s; capabilities = catalog.items.filter(isCoiProvider); diagnostic = catalog.diagnostic?.code ?? null;
     choices(mailbox, "Select mailbox");
     for (const item of accounts) option(mailbox, mailboxKey(item), `${item.address ?? item.display_name}${item.connected ? "" : " (disconnected)"}`, !item.connected);
@@ -171,7 +179,12 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     }, true);
     renderState();
     try { await request; message("Saved rule reloaded from the engine."); }
-    catch (error) { message(`${errorMessage(error)} Refresh saved rules before continuing; the last change may already have been saved.`, true); }
+    catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "automation_entitlement_required") {
+        await refresh();
+        message(errorMessage(error), true);
+      } else message(`${errorMessage(error)} Refresh saved rules before continuing; the last change may already have been saved.`, true);
+    }
     renderState();
   }
   saved.addEventListener("change", () => {
@@ -180,11 +193,12 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
   });
   newButton.addEventListener("click", () => { if (!gate.busy && !gate.needsRefresh) { reset(); message("Configure a new COI rule."); } });
   refreshButton.addEventListener("click", () => void refresh());
+  get<HTMLButtonElement>('[data-action="view-connect"]').addEventListener("click", () => onViewConnect?.());
   get<HTMLFormElement>("form").addEventListener("input", renderState);
   get<HTMLFormElement>("form").addEventListener("submit", (event) => {
     event.preventDefault();
     const choice = selected();
-    if (!choice || !editable || !loaded) return;
+    if (!choice || !editable || !loaded || automationsActive !== true) return;
     const editing = current;
     void mutate(async () => {
       // Recheck live selection before preparing; dispatch still owns final admission.
@@ -198,7 +212,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     });
   });
   toggle.addEventListener("click", () => {
-    if (!current || !editable || !loaded) return;
+    if (!current || !editable || !loaded || (automationsActive !== true && !current.summary.enabled)) return;
     const rule = current.summary;
     void mutate(() => invoke<RuleResult>("automation_rules_set_enabled", {
       ruleId: rule.rule_id, expectedVersion: rule.version, enabled: !rule.enabled,

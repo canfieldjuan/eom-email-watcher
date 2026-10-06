@@ -1437,9 +1437,13 @@ def _health(request: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _connect_entitlement_response(status) -> dict[str, object]:
+    return {**status.public_dict(), "automations_active": _automation_entitlement_active()}
+
+
 def _connect_entitlement_status(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
-    return entitlement.connect_entitlement_status().public_dict()
+    return _connect_entitlement_response(entitlement.connect_entitlement_status())
 
 
 def _connect_entitlement_install(request: dict[str, object]) -> dict[str, object]:
@@ -1454,7 +1458,7 @@ def _connect_entitlement_install(request: dict[str, object]) -> dict[str, object
         status = entitlement.install_connect_entitlement(Path(value))
     except entitlement.EntitlementInstallError as exc:
         raise ApiError(exc.code, str(exc)) from exc
-    return status.public_dict()
+    return _connect_entitlement_response(status)
 
 
 def _calendar_account(
@@ -1486,6 +1490,14 @@ def _automation_entitlement_active() -> bool:
         entitlement.CONNECT_FEATURE_ID,
         entitlement.AUTOMATIONS_FEATURE_ID,
     )
+
+
+def _require_automation_entitlement() -> None:
+    if not _automation_entitlement_active():
+        raise ApiError(
+            "automation_entitlement_required",
+            "Automation rules require an active Automations entitlement",
+        )
 
 
 def _require_calendar_entitlement() -> None:
@@ -2386,6 +2398,7 @@ def _automation_rules_put(
         canonical_rule_definition(definition)
     except RuleValidationError as exc:
         raise ApiError("invalid_rule", exc.reason) from exc
+    _require_automation_entitlement()
 
     def put(runtime: Runtime) -> dict[str, object]:
         try:
@@ -2461,6 +2474,8 @@ def _automation_rules_set_enabled(request: dict[str, object]) -> dict[str, objec
     enabled = payload["enabled"]
     if type(enabled) is not bool:
         raise ApiError("invalid_request", "enabled must be a boolean")
+    if enabled:
+        _require_automation_entitlement()
 
     def set_enabled(runtime: Runtime) -> dict[str, object]:
         try:
