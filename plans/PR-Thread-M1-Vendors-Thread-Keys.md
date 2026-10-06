@@ -56,10 +56,7 @@ Ownership lane: thread-view-m1
    - `thread_key_aliases(survivor_key)`.
 5. Migration of retained rows. Every row gets a key:
    - Gmail and Microsoft rows get `thread_key = thread_id`, which already holds `threadId` or `conversationId`; a row without one gets a fresh UUIDv4.
-   - For IMAP, `thread_id` holds the raw `Message-ID` header. Each row, in `message_id` order, goes through the step-7 parser that new metadata uses:
-     - a valid id that is already registered joins that component, so retained rows sharing an id share one component;
-     - a valid new id gets a fresh UUIDv4 component, and the id is registered and stored as `rfc_message_id`;
-     - a missing or malformed id gets a fresh component of its own, with nothing registered.
+   - For IMAP, `thread_id` holds the raw `Message-ID` header. Each row, in `message_id` order, goes through the step-7 parser and stores the result as `rfc_message_id` (NULL when missing or malformed). It is then keyed by the same functions as capture (steps 10-11), with that id as its whole id set. So rows sharing an id share one component, and a row without a valid id forms its own.
    - A legacy row stored without a mailbox identity registers under the account's `legacy_identity_key` when `legacy_identity_status` is `continuity_proven`, the condition capture already uses to treat legacy rows as the current mailbox (`db.py:7823-7825`). Otherwise its mailbox is unknown, and it forms its own component with nothing registered.
    - Every retained IMAP row is listed in `imap_reply_header_gaps`.
 
@@ -91,17 +88,17 @@ Ownership lane: thread-view-m1
     - `vendors.addresses.remove` (with optional `unwatch`) and `vendors.delete` (with optional `unwatch_addresses`) (removal).
 14. Gated operations call `connect.require_connect_entitlement()`. When it is inactive they return `connect_entitlement_required` and write nothing.
 15. Vendor mutations run inside the existing watchlist mutation lock (`_with_watchlist_mutation`, `engine_api.py:5490`). That covers:
-    - the watchlist link of D-ops (`add_sender` for an address not yet watched);
+    - the watchlist link of D-ops, in the order of step 19;
     - the new `conflict` guard in `_watchlist_remove`, which applies when the address belongs to a vendor.
 16. `vendors.list` reports `watched` per address, read from the config watchlist.
 17. `vendors.addresses.add` returns `conflict`, before any write, for an address equal to any `mail_accounts.address`.
     - That covers both of D-vendor's verified identities, because `reconcile_mailbox_session_identity` (`service.py:1208-1210`) refuses a session whose authenticated address differs from the stored one.
     - An account connected after its address became a vendor address is excluded by `vendor_of` under D-vendor (amendment C). M1 evaluates no `vendor_of`: attribution, capture, and following start in M2.
 18. `vendors.addresses.remove` records the `(vendor, address)` dismissal in the same transaction as the removal.
-19. The order of D-ops's two stores:
-    - `vendors.addresses.add`: `add_sender` when not watched, then the vendor insert;
-    - `vendors.addresses.remove` with `unwatch`, and `vendors.delete` with `unwatch_addresses`: membership is checked, then a new `config.remove_senders` removes the requested addresses in one config write, then the database transaction.
-    - `remove_senders` skips addresses that are already unwatched, so a retry after an interruption completes. `remove_sender` is its single-address case and keeps `not_found` for `watchlist.remove`.
+19. Every vendor operation runs in one order under the lock, which is how D-ops's two stores stay recoverable:
+    1. All deterministic checks come first: the payload, the vendor's existence, an address's membership for a removal, and the conflicts of D-vendor and step 17. A request that fails one writes nothing, in either store.
+    2. Then the watchlist write, when the operation changes it: `add_sender` for an address not yet watched, or a new `config.remove_senders` for the addresses to unwatch, in one config write. `remove_senders` skips addresses already unwatched, so a retry after an interruption completes. `remove_sender` is its single-address case and keeps `not_found` for `watchlist.remove`.
+    3. Last, the database transaction.
 
 **Desktop.**
 20. A Vendors tab next to Watchlist. It shows controls by D-ops class, through the existing locked-Connect presentation (`desktop/src/connectAvailability.ts`). Text renders with `textContent`.
@@ -132,7 +129,7 @@ Ownership lane: thread-view-m1
 
 **Vendors:**
 - create, rename, and delete;
-- `vendors.addresses.add` in five cases: new (it becomes watched), already watched (unchanged), on another vendor (`conflict`, nothing written), a mailbox account's address (`conflict`, nothing written), and invalid;
+- `vendors.addresses.add` in six cases: new (it becomes watched), already watched (unchanged), on another vendor (`conflict`, nothing written), a mailbox account's address (`conflict`, nothing written), a vendor that does not exist (`not_found`, nothing written), and invalid;
 - remove, with and without `unwatch`, records a dismissal;
 - `vendors.delete` with and without `unwatch_addresses`, and its dismissals go with it;
 - a delete with `unwatch_addresses`, and a remove with `unwatch`, each interrupted after the watchlist write, leave the vendor showing `watched: false`, and a retry completes it;
@@ -159,7 +156,7 @@ Ownership lane: thread-view-m1
 **Migration:**
 - a v28 database gains the keys as specified, with every row keyed;
 - a reply whose `In-Reply-To` is `<root@example.com>` joins the retained row stored with that raw header;
-- two retained rows with one id share a component, and the upgrade completes;
+- two retained rows with one id share a component, both store the normalized id, and the upgrade completes;
 - retained rows with no id, or a malformed one, each get their own key;
 - legacy rows without a mailbox identity upgrade: under a proven identity they thread with new mail, and otherwise they stay alone;
 - every retained IMAP row is listed in `imap_reply_header_gaps`, and deleting it removes its row;
