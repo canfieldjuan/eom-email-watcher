@@ -8770,3 +8770,19 @@ def test_a_printable_unicode_vendor_name_can_watch_its_addresses(
     assert added["data"]["item"]["addresses"] == [
         {"address": "billing@cafe.example", "watched": True}
     ]
+
+
+def test_a_missing_vendor_is_reported_before_address_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    missing = "00000000-0000-4000-8000-000000000000"
+    response = _call(
+        config_path, "vendors.addresses.add", {"vendor_id": missing, "address": "billing@acme.com"}
+    )
+    assert response["error"]["code"] == "not_found"

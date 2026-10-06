@@ -105,3 +105,18 @@ export function deleteVendorConfirmText(
     ? `Delete ${vendorName} and stop watching ${addresses}?`
     : `Delete ${vendorName}? ${addressCount === 1 ? "Its address stays" : "Its addresses stay"} on your watchlist.`;
 }
+
+// Only the latest of overlapping requests may commit its result, so an older
+// vendor list that finishes last cannot overwrite a fresher one.
+export function latestRequestFence() {
+  let current = 0;
+  return {
+    begin(): number {
+      current += 1;
+      return current;
+    },
+    isLatest(request: number): boolean {
+      return request === current;
+    },
+  };
+}

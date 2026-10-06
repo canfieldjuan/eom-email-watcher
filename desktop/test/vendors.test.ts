@@ -97,3 +97,13 @@ test("vendor names refuse the characters the watchlist refuses in sender names",
   assert.equal(vendorNameError("Café Ñandú 株式会社"), null);
   assert.equal(vendorNameError("  Acme Supply  "), null);
 });
+
+test("only the latest of overlapping vendor list requests commits", async () => {
+  const { latestRequestFence } = await vendors();
+  const fence = latestRequestFence();
+  const tabOpened = fence.begin();
+  const afterMutation = fence.begin();
+  // The mutation's reload finishes first, then the stale tab-open request.
+  assert.equal(fence.isLatest(afterMutation), true);
+  assert.equal(fence.isLatest(tabOpened), false);
+});

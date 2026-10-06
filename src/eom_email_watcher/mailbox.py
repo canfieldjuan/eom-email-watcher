@@ -17,8 +17,6 @@ DEFAULT_MAIL_ACCOUNT_ID = "gmail-default"
 MAX_MESSAGE_ID_CHARS = 998
 MAX_IDS_PER_REPLY_HEADER = 64
 _BRACKETED_ID_RE = re.compile(r"<([^<>\s]+)>")
-# RFC 5322 msg-id without its brackets: left@right, no whitespace, controls, or brackets.
-_MESSAGE_ID_RE = re.compile(r"[^\s<>\x00-\x1f\x7f]+@[^\s<>\x00-\x1f\x7f]+")
 
 
 class MailboxError(RuntimeError):
@@ -81,7 +79,19 @@ def normalize_message_id(value: object) -> str | None:
     text = value.strip()
     if text.startswith("<") and text.endswith(">"):
         text = text[1:-1].strip()
-    if len(text) > MAX_MESSAGE_ID_CHARS or _MESSAGE_ID_RE.fullmatch(text) is None:
+    # left@right with exactly one "@", both sides non-empty, and only printable,
+    # non-space characters other than angle brackets. Rare RFC forms with an "@"
+    # inside a quoted local part or a domain literal are dropped, which is safe:
+    # an id that is dropped just joins no component.
+    left, at, right = text.partition("@")
+    if (
+        len(text) > MAX_MESSAGE_ID_CHARS
+        or not at
+        or not left
+        or not right
+        or "@" in right
+        or any(not c.isprintable() or c.isspace() or c in "<>" for c in text)
+    ):
         return None
     return text
 

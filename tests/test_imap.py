@@ -44,6 +44,7 @@ from eom_email_watcher.mailbox import (
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
     StaleMailboxCursor,
+    normalize_message_id,
 )
 
 RAW_MESSAGE = b"""From: Sender Name <WATCHED@Example.com>\r
@@ -1926,3 +1927,14 @@ def test_metadata_reads_uid_and_internaldate_whichever_item_comes_first() -> Non
 
     assert reversed_order == in_order
     assert reversed_order.reply_ids == ("parent@x",)
+
+
+@pytest.mark.parametrize(
+    "value", ["<a@@b>", "<a@b@c>", "<a\u0080b@c>", "<a@b​>", "<@b>", "<a@>"]
+)
+def test_message_ids_need_exactly_one_at_and_printable_characters(value: str) -> None:
+    assert normalize_message_id(value) is None
+
+
+def test_a_well_formed_message_id_survives_normalization() -> None:
+    assert normalize_message_id(" <Part.1.ABC@mail.example.com> ") == "Part.1.ABC@mail.example.com"

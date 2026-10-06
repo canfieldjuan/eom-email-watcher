@@ -5698,6 +5698,8 @@ def _vendors_addresses_add(request: dict[str, object]) -> dict[str, object]:
 
     def add() -> dict[str, object]:
         store = _runtime(request).store
+        # Plan step 19: the vendor's existence, then the address conflicts.
+        vendor = _vendor_or_not_found(store, vendor_id)
         if address in _mailbox_addresses(store):
             raise ApiError("conflict", f"{address} is this mailbox's own address")
         owner = store.vendor_for_address(address)
@@ -5705,7 +5707,6 @@ def _vendors_addresses_add(request: dict[str, object]) -> dict[str, object]:
             raise ApiError(
                 "conflict", f"{address} already belongs to vendor {owner['display_name']}"
             )
-        vendor = _vendor_or_not_found(store, vendor_id)
         if address not in load_config(_config_path(request)).allowlist:
             try:
                 add_sender(_config_path(request), address, str(vendor["display_name"]))

@@ -22,6 +22,7 @@ import { inboxBodyTruncation } from "./inboxBodyTruncation";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import {
   deleteVendorConfirmText,
+  latestRequestFence,
   removeAddressConfirmText,
   vendorErrorText,
   vendorNameError,
@@ -967,6 +968,7 @@ const calendarConsentStatus = requiredElement<HTMLParagraphElement>("#calendar-c
 const calendarConsentList = requiredElement<HTMLElement>("#calendar-consent-list");
 let watchedSenders: WatchedSender[] = [];
 let vendorRecords: Vendor[] = [];
+const vendorListFence = latestRequestFence();
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
@@ -4871,12 +4873,15 @@ function renderVendors(): void {
 }
 
 async function loadVendors(message = "Vendors are up to date."): Promise<void> {
+  const request = vendorListFence.begin();
   try {
-    vendorRecords = await invoke<Vendor[]>("vendors_list");
+    const vendors = await invoke<Vendor[]>("vendors_list");
+    if (!vendorListFence.isLatest(request)) return;
+    vendorRecords = vendors;
     renderVendors();
     setVendorsStatus(message, "success");
   } catch (error) {
-    vendorFailure(error);
+    if (vendorListFence.isLatest(request)) vendorFailure(error);
   }
 }
 
