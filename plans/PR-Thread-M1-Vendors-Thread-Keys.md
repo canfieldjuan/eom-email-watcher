@@ -68,7 +68,7 @@ Ownership lane: thread-view-m1
 7. One parser owns ids (`mailbox.normalize_message_id`), used at capture and by the migration:
    - surrounding whitespace and one pair of angle brackets are trimmed, and case is kept;
    - the result must be `left@right`, both sides non-empty, at most 998 characters, with no whitespace, control characters, or angle brackets. Anything else, such as `not-an-id`, is dropped and never registered;
-   - `In-Reply-To` keeps its first id, and `References` keeps at most 64 ids, oldest first.
+   - `In-Reply-To` and `References` each keep at most 64 ids in header order, which for `References` is oldest first. `In-Reply-To` may name several parents, and all of them join the id set.
 8. `MessageMetadata` (`mailbox.py`) gains `rfc_message_id` and `reply_ids` (the `In-Reply-To` id, then the `References` ids, deduplicated). Gmail and Microsoft leave them empty in M1.
 
 **Thread keys at capture.** Inside the capture transaction (`BEGIN IMMEDIATE`):
@@ -145,6 +145,7 @@ Ownership lane: thread-view-m1
 - a merge keeps the key of the component holding the smallest member, including when no member has a `Message-ID`;
 - a bridging message merges atomically and records an alias, and a second merge re-points the first alias;
 - 65 `References` ids keep 64; a 999-character id, `not-an-id`, `@host`, and `left@` are dropped;
+- an `In-Reply-To` naming two parents in different components merges them;
 - an oversized reply-header item is ignored, and the message is still admitted;
 - today's `imap_headers_too_large` rejection is unchanged.
 
