@@ -3406,16 +3406,18 @@ def _effective_cutoff_sql(alias: str) -> str:
     ), ?))"""
 
 
-def _expired_logical_messages_sql(
+def _logical_messages_past_cutoff_sql(
     cutoff_epoch: float, stamp_epoch: float
 ) -> tuple[str, tuple[float, ...]]:
-    """The logical messages that have left retention (contract D-scope, D-identity).
+    """The logical messages whose received time is past the cutoff (contract D-scope).
 
-    The one retention rule: the purge deletes exactly these, and the analysis
-    queues and Connect treat every other stored message as retained, so a message
-    is processed exactly while it is kept. A logical message is retained while any
-    of its copies is: a row by its received time (a future-dated row by its
-    discovery time), or a copy recorded only as a location by its own received time.
+    A logical message's received time is its newest copy's (contract D-identity):
+    a row by its received time (a future-dated row by its discovery time), or a
+    copy recorded only as a location by its own received time. An account under
+    Gmail recovery keeps the recovery's frozen cutoff when it is earlier. Fetching,
+    analysis, and Connect act only on messages not named here. The purge deletes
+    them today; a purge that keeps more (a followed thread, contract D-scope)
+    decides that separately and must not widen what is fetched.
     """
     row_expired = f"""aware_iso_epoch(received_at) IS NULL
         OR (
@@ -13131,10 +13133,9 @@ class Store:
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         stamp_epoch = (stamp - epoch).total_seconds()
         cutoff_epoch = (cutoff - epoch).total_seconds()
-        # A logical message is purged as one unit (contract D-identity), once
-        # every copy has left retention under the one rule the queues and Connect
-        # also read.
-        expired_units, expiry_parameters = _expired_logical_messages_sql(
+        # A logical message is purged as one unit (contract D-identity), once its
+        # received time, its newest copy's, is past the cutoff.
+        expired_units, expiry_parameters = _logical_messages_past_cutoff_sql(
             cutoff_epoch, stamp_epoch
         )
         with self.connection() as db:
@@ -13200,20 +13201,21 @@ class Store:
     def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
         return self.purge_with_outcome(retention_days, now=now).messages
 
-    def retained_logical_messages(
+    def logical_messages_within_cutoff(
         self, message_ids: Iterable[str], *, cutoff: datetime, now: datetime
     ) -> frozenset[str]:
-        """The given stored messages whose logical message is within retention.
+        """The given stored messages whose logical message is within the cutoff.
 
-        Reads the purge's rule (_expired_logical_messages_sql), so a message is
-        analyzed, delivered, or acted on through Connect exactly while the purge
-        keeps it, a newer copy of it included (contract D-scope, D-identity).
+        A logical message's received time is its newest copy's (contract D-scope,
+        D-identity), so a message kept within it by a newer copy is analyzed,
+        delivered, and served to Connect. This is what may be fetched, not what is
+        kept: the purge's own decision can keep more.
         """
         ids = tuple(dict.fromkeys(message_ids))
         if not ids:
             return frozenset()
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
-        expired_sql, parameters = _expired_logical_messages_sql(
+        expired_sql, parameters = _logical_messages_past_cutoff_sql(
             (cutoff.astimezone(UTC) - epoch).total_seconds(),
             (now.astimezone(UTC) - epoch).total_seconds(),
         )

@@ -2814,9 +2814,9 @@ def _attachment_download_matches(provider: str, byte_size: int, content: bytes) 
 def _retained_connect_message_source(runtime: Runtime, message_id: str) -> MessageSource:
     source = _configured_message_source(runtime, message_id)
     observed_at = datetime.now(UTC)
-    # The purge's retention rule (contract D-scope, D-identity): Connect acts on a
-    # message exactly while the purge keeps it, a newer copy of it included.
-    if message_id not in runtime.store.retained_logical_messages(
+    # Connect fetches only a message within the cutoff, judged by its newest copy
+    # (contract D-scope, D-identity).
+    if message_id not in runtime.store.logical_messages_within_cutoff(
         (message_id,),
         cutoff=observed_at - timedelta(days=runtime.config.retention_days),
         now=observed_at,

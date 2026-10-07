@@ -1221,14 +1221,15 @@ def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | Non
         return None
 
 
-def _copy_received_in_retention(
+def _copy_received_within_cutoff(
     metadata: MessageMetadata, *, checked_at: datetime, retention_cutoff: datetime
 ) -> datetime | None:
     """A fetched copy's received time if it may be captured (contract D-scope).
 
     The one copy-level rule every capture path applies: the time parses, is clamped
-    to the check, and is at or after the cutoff. None otherwise. A stored logical
-    message's retention is the store's rule (Store.retained_logical_messages).
+    to the check, and is at or after the cutoff. None otherwise. A copy not yet
+    captured is judged by its own time; a stored logical message by its newest
+    copy's (Store.logical_messages_within_cutoff).
     """
     received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
     if received_at is None or received_at < retention_cutoff:
@@ -1761,7 +1762,7 @@ class Watcher:
                 admitted_at=checked_at,
                 folders=folders,
             )
-            received_at = _copy_received_in_retention(
+            received_at = _copy_received_within_cutoff(
                 metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
             )
             if admission is None or received_at is None:
@@ -1971,7 +1972,7 @@ class Watcher:
                 admitted_at=checked_at,
                 folders=folders,
             )
-            received_at = _copy_received_in_retention(
+            received_at = _copy_received_within_cutoff(
                 metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
             )
             if admission is None or received_at is None:
@@ -2380,7 +2381,7 @@ class Watcher:
             )
             if admission is None:
                 continue
-            received_at = _copy_received_in_retention(
+            received_at = _copy_received_within_cutoff(
                 metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
             )
             if received_at is None:
@@ -2666,13 +2667,13 @@ class Watcher:
             for intent in self.store.notification_intents(kind="automation_review"):
                 self._deliver_automation_review(intent, dry_run)
         delivery = self.store.pending_delivery()
-        retained = self.store.retained_logical_messages(
+        within = self.store.logical_messages_within_cutoff(
             (message.message_id for message in delivery),
             cutoff=retention_cutoff,
             now=retention_observed_at,
         )
         for message in delivery:
-            if message.message_id not in retained:
+            if message.message_id not in within:
                 continue
             if deliver_notifications:
                 fallback += self._deliver_analysis(
@@ -2690,15 +2691,15 @@ class Watcher:
             provider=self.mailbox.provider,
             account_id=self.mailbox.account_id,
         )
-        retained = self.store.retained_logical_messages(
+        within = self.store.logical_messages_within_cutoff(
             (message.message_id for message in stored),
             cutoff=retention_cutoff,
             now=retention_observed_at,
         )
-        # The store judges stored messages by the purge's rule; a preview (extra)
+        # The store judges a stored message by its newest copy; a preview (extra)
         # is not stored, and this check admitted it under the same cutoff.
         for message in [
-            *(message for message in stored if message.message_id in retained),
+            *(message for message in stored if message.message_id in within),
             *(extra or []),
         ]:
             try:
