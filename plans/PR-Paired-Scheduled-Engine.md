@@ -237,3 +237,41 @@ bundled modules match source. Substituted manager metadata, development authorit
 public DB/config and monthly dry-run remain explicit limitations. Earlier proof
 versions retained separately; exact-head review/CI, merge and installed normal
 native busy recovery remain NOT DONE.
+
+
+## Accepted consolidation: database acquisition, execution phases and proof manager
+
+ACCEPTED by the operator on 2026-10-07: "I accept the plan", referring to
+PR217 root note6047252859. Record this acceptance before implementation.
+The public round4 reproduction gives15 expected failures: twelve unchecked
+auxiliary-command cases, two real retained-bundle replaced-inode migrations
+(schema28 to30, including waiting for stdin), and packaged Connect admission
+failure. Origins: bcf90be's partial ExecStart/startup-path policy and eeb0b5d's
+manager requirement with only one proof updated.
+
+Required surface: deployment.py owns the canonical effective execution-phase
+and process-identity policy. Check all six auxiliary command arrays and both
+MainPID/ControlPID as typed manager metadata; only the canonical paired
+ExecStart is admitted. Empty auxiliary arrays are valid; missing/malformed
+arrays and active incompatible control processes are refused. The executing
+process /proc/self/exe must match the installed binary at database acquisition,
+including after stdin wait; recheck identity after manager inspection. Route
+Store.connection through that owner before sqlite3.connect. An early
+entrypoint check may use the same owner to fail fast, but cannot authorize a
+later database open. Preserve read-only protocol/directory/version probes and
+compatible paired workers. No manager-admission cache authorizes later opens.
+
+One script-only proof-support owner supplies the typed explicit empty-manager
+fixture to both smoke_packaged_engine.py and connect-packaged-deb-proof.py.
+This fixture is not a production bypass. Reuse the existing packaged upgrade,
+CLI/overlap and Connect proof lane; commit minimal public regressions for all
+execution phases, both readers, typed control PID, both entrypoints and
+replacement before/after startup. Keep independent fixture expectations.
+
+Non-scope: DB schema/version/migration logic, model.py, prompts, model/host
+policy, dependencies, installed normal config/services, DocSum files and merge
+holds. Freeze source and actual rebuilt bundle; prove negatives leave public
+DB unchanged and positives retain migration/CLI/overlap. Run affected tests,
+Ruff/format/bash/diff checks and existing packaged smoke/Connect entrypoint.
+CI owns duplicated broad suites. One consolidation push after cold diff and
+source/bundle equality. Exact-head CI/review/normal deployment remain pending.
