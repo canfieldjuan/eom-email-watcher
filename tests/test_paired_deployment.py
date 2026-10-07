@@ -22,6 +22,17 @@ def units(tmp_path: Path, names: tuple[str, ...]) -> tuple[Path, Path, Path]:
     return binary, alias, unit_directory
 
 
+def _mock_service_reader(monkeypatch, reader):
+    """Service-focused fixtures explicitly have no loaded timers."""
+
+    def read(unit, name):
+        if unit in deployment.SCHEDULED_JOBS:
+            return {"LoadState": "not-found", "ActiveState": "inactive"}[name]
+        return reader(unit, name)
+
+    monkeypatch.setattr(deployment, "_service_property", read)
+
+
 def test_only_explicit_manager_not_found_is_unconfigured(tmp_path: Path, monkeypatch) -> None:
     calls = []
 
@@ -29,12 +40,16 @@ def test_only_explicit_manager_not_found_is_unconfigured(tmp_path: Path, monkeyp
         calls.append((unit, name))
         if name == "LoadState":
             return "not-found"
+        if name == "ActiveState":
+            return "inactive"
         assert name == "MainPID"
         return 0
 
     monkeypatch.setattr(deployment, "_service_property", read)
     deployment.verify_scheduled_readers(tmp_path / "engine")
     assert calls == [
+        (unit, name) for unit in deployment.SCHEDULED_JOBS for name in ("LoadState", "ActiveState")
+    ] + [
         (unit, name) for unit in deployment.SCHEDULED_COMMANDS for name in ("LoadState", "MainPID")
     ]
 
@@ -67,7 +82,7 @@ def test_mixed_scheduled_readers_block_before_request_or_migration(
                 ignore = True
         return [[executable, argv, ignore, 0, 0, 0, 0, 0, 0, 0]]
 
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     from eom_email_watcher import engine_api
 
     monkeypatch.setattr(engine_api, "main", lambda: pytest.fail("API/migration reached"))
@@ -105,7 +120,7 @@ def test_paired_services_reach_api_owner(tmp_path: Path, monkeypatch):
             ]
         ]
 
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     from eom_email_watcher import engine_api
 
     called = []
@@ -122,7 +137,7 @@ def test_paired_services_reach_api_owner(tmp_path: Path, monkeypatch):
 @pytest.mark.parametrize("metadata", [None, [], [None], [["path"]], [[], []]])
 def test_invalid_service_metadata_is_not_admitted(tmp_path: Path, monkeypatch, metadata):
     binary, _alias, directory = units(tmp_path, ("eom-email-watcher.service",))
-    monkeypatch.setattr(deployment, "_service_property", lambda *args: metadata)
+    _mock_service_reader(monkeypatch, lambda *args: metadata)
     with pytest.raises(deployment.DeploymentError):
         deployment.verify_scheduled_readers(binary)
 
@@ -138,7 +153,7 @@ def test_invalid_active_worker_metadata_is_not_defaulted(tmp_path: Path, monkeyp
             return pid if (directory / unit).exists() else 0
         return [[str(alias), [str(alias), "check"], False, 0, 0, 0, 0, 0, 0, 0]]
 
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     with pytest.raises(deployment.DeploymentError):
         deployment.verify_scheduled_readers(binary)
 
@@ -216,7 +231,7 @@ def test_public_schema_28_partial_update_is_rejected_before_migration(tmp_path, 
         path = str(alias) if paired else str(tmp_path / "legacy-cli")
         return [[path, [path, "check"], False, 0, 0, 0, 0, 0, 0, 0]]
 
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     monkeypatch.setattr(sys, "argv", [str(binary)])
     monkeypatch.setattr(sys, "executable", str(binary))
     monkeypatch.setattr(sys, "frozen", True, raising=False)
@@ -256,9 +271,8 @@ def test_cli_cannot_migrate_with_an_incompatible_scheduled_reader(tmp_path, monk
     from eom_email_watcher import cli
 
     binary, _alias, directory = units(tmp_path, ("eom-email-watcher.service",))
-    monkeypatch.setattr(
-        deployment,
-        "_service_property",
+    _mock_service_reader(
+        monkeypatch,
         lambda unit, name: (
             "loaded"
             if name == "LoadState"
@@ -302,7 +316,7 @@ def test_running_reader_identity_controls_admission(tmp_path, monkeypatch, pid, 
             return pid if (directory / unit).exists() else 0
         return [[str(alias), [str(alias), "check"], False, 0, 0, 0, 0, 0, 0, 0]]
 
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     original = deployment._same_executable
     monkeypatch.setattr(
         deployment,
@@ -324,9 +338,8 @@ def test_invalid_xdg_config_cannot_hide_scheduled_readers(tmp_path, monkeypatch,
 
     (tmp_path / ".config").mkdir()
     binary, _alias, _directory = units(tmp_path / ".config", ("eom-email-watcher.service",))
-    monkeypatch.setattr(
-        deployment,
-        "_service_property",
+    _mock_service_reader(
+        monkeypatch,
         lambda unit, name: (
             "loaded"
             if name == "LoadState"
@@ -421,7 +434,7 @@ def test_paired_active_worker_does_not_drop_overlapping_job(tmp_path, monkeypatc
 
     active_pid = os.getpid()
     called = []
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     monkeypatch.setattr(cli, "main", lambda args: called.append(args))
     monkeypatch.setattr(sys, "argv", [str(binary), "--cli", "send-hours"])
     monkeypatch.setattr(sys, "executable", str(binary))
@@ -448,7 +461,7 @@ def test_loaded_legacy_reader_cannot_hide_by_removing_unit_file(tmp_path, monkey
         legacy = str(tmp_path / "legacy-reader")
         return [[legacy, [legacy, deployment.SCHEDULED_COMMANDS[unit]], False, 0, 0, 0, 0, 0, 0, 0]]
 
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     monkeypatch.setattr(
         engine_api,
         "main",
@@ -509,9 +522,8 @@ def test_manager_failure_is_not_unconfigured(monkeypatch, failure):
 
 @pytest.mark.parametrize("pid", [1, False, "0", None, -1])
 def test_not_found_cannot_hide_active_or_invalid_pid(tmp_path, monkeypatch, pid):
-    monkeypatch.setattr(
-        deployment,
-        "_service_property",
+    _mock_service_reader(
+        monkeypatch,
         lambda unit, name: "not-found" if name == "LoadState" else pid,
     )
     with pytest.raises(deployment.DeploymentError):
@@ -530,7 +542,7 @@ def test_worker_exit_race_requires_confirmed_zero_pid(tmp_path, monkeypatch, fin
             return next(pids) if unit == "eom-email-watcher.service" else 0
         return [[str(alias), [str(alias), "check"], False, 0, 0, 0, 0, 0, 0, 0]]
 
-    monkeypatch.setattr(deployment, "_service_property", read)
+    _mock_service_reader(monkeypatch, read)
     if type(final_pid) is int and final_pid == 0:
         deployment.verify_scheduled_readers(binary)
     else:
@@ -565,7 +577,7 @@ def test_overwritten_running_inode_is_incompatible(tmp_path, monkeypatch):
                 return worker.pid
             return [[str(alias), [str(alias), "check"], False, 0, 0, 0, 0, 0, 0, 0]]
 
-        monkeypatch.setattr(deployment, "_service_property", read)
+        _mock_service_reader(monkeypatch, read)
         assert alias.samefile(binary)
         assert not Path(f"/proc/{worker.pid}/exe").samefile(binary)
         with pytest.raises(deployment.DeploymentError, match="incompatible scheduled worker"):
@@ -573,3 +585,189 @@ def test_overwritten_running_inode_is_incompatible(tmp_path, monkeypatch):
     finally:
         worker.terminate()
         worker.wait(timeout=5)
+
+
+@pytest.mark.parametrize("timer", ["eom-email-watcher.timer", "eom-monthly-hours.timer"])
+def test_redirected_loaded_timer_blocks_migration(tmp_path, monkeypatch, timer):
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"public paired binary")
+    alias = tmp_path / "eom-mail-watch"
+    alias.symlink_to(binary)
+    calls = []
+
+    def read(unit, name):
+        calls.append((unit, name))
+        if name == "LoadState":
+            return "loaded"
+        if name == "Unit":
+            return (
+                "legacy-redirected-reader.service"
+                if unit == timer
+                else unit.replace(".timer", ".service")
+            )
+        if name == "MainPID":
+            return 0
+        if unit == "legacy-redirected-reader.service":
+            return [["/missing-old-cli", ["/missing-old-cli", "check"], False, 0, 0, 0, 0, 0, 0, 0]]
+        return [
+            [
+                str(alias),
+                [str(alias), deployment.SCHEDULED_COMMANDS[unit]],
+                False,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        ]
+
+    monkeypatch.setattr(deployment, "_service_property", read)
+    with pytest.raises(deployment.DeploymentError):
+        deployment.verify_scheduled_readers(binary)
+
+
+def _loaded_timer_graph(alias, overrides=None):
+    overrides = overrides or {}
+
+    def read(unit, name):
+        if name == "LoadState":
+            return "loaded"
+        if name == "Unit":
+            return overrides.get(unit, deployment.SCHEDULED_JOBS[unit][0])
+        if name == "MainPID":
+            return 0
+        return [
+            [
+                str(alias),
+                [str(alias), deployment.SCHEDULED_COMMANDS[unit]],
+                False,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        ]
+
+    return read
+
+
+def test_canonical_loaded_timers_and_services_are_admitted(tmp_path, monkeypatch):
+    binary, alias, _directory = units(tmp_path, ())
+    calls = []
+    read = _loaded_timer_graph(alias)
+
+    def record(unit, name):
+        calls.append((unit, name))
+        return read(unit, name)
+
+    monkeypatch.setattr(deployment, "_service_property", record)
+    deployment.verify_scheduled_readers(binary)
+    assert [unit for unit, name in calls if name == "Unit"] == list(deployment.SCHEDULED_JOBS)
+    assert [unit for unit, name in calls if name == "ExecStart"] == list(
+        deployment.SCHEDULED_COMMANDS
+    )
+
+
+@pytest.mark.parametrize("timer", ["eom-email-watcher.timer", "eom-monthly-hours.timer"])
+@pytest.mark.parametrize(
+    "target", [None, False, 0, "", "legacy.service", ["eom-email-watcher.service"]]
+)
+def test_malformed_or_redirected_timer_target_is_not_defaulted(
+    tmp_path, monkeypatch, timer, target
+):
+    binary, alias, _directory = units(tmp_path, ())
+    monkeypatch.setattr(
+        deployment, "_service_property", _loaded_timer_graph(alias, {timer: target})
+    )
+    with pytest.raises(deployment.DeploymentError, match="timer must target"):
+        deployment.verify_scheduled_readers(binary)
+
+
+@pytest.mark.parametrize(
+    "active", ["inactive", "active", "activating", "deactivating", "", None, False, 0]
+)
+def test_missing_timer_requires_explicit_inactive_state(tmp_path, monkeypatch, active):
+    def read(unit, name):
+        if name == "LoadState":
+            return "not-found"
+        if name == "ActiveState":
+            return active
+        assert name == "MainPID"
+        return 0
+
+    monkeypatch.setattr(deployment, "_service_property", read)
+    if active == "inactive":
+        deployment.verify_scheduled_readers(tmp_path / "engine")
+    else:
+        with pytest.raises(deployment.DeploymentError):
+            deployment.verify_scheduled_readers(tmp_path / "engine")
+
+
+@pytest.mark.parametrize("mode", ["api", "cli"])
+@pytest.mark.parametrize("timer", ["eom-email-watcher.timer", "eom-monthly-hours.timer"])
+def test_redirected_timer_blocks_both_database_dispatches(tmp_path, monkeypatch, mode, timer):
+    from eom_email_watcher import cli, engine_api
+
+    binary, alias, _directory = units(tmp_path, ())
+    called = []
+    monkeypatch.setattr(
+        deployment,
+        "_service_property",
+        _loaded_timer_graph(alias, {timer: "legacy-redirected-reader.service"}),
+    )
+    monkeypatch.setattr(engine_api, "main", lambda: called.append("api"))
+    monkeypatch.setattr(cli, "main", lambda args: called.append("cli"))
+    argv = [str(binary)] + (["--cli", "recent"] if mode == "cli" else [])
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sys, "executable", str(binary))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(SystemExit) as rejected:
+        deployment.main()
+    assert rejected.value.code == 2
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    "name,interface,data",
+    [
+        ("Unit", "org.freedesktop.systemd1.Timer", "eom-email-watcher.service"),
+        ("ActiveState", "org.freedesktop.systemd1.Unit", "inactive"),
+    ],
+)
+def test_timer_property_reads_correct_typed_interface(monkeypatch, name, interface, data):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"type": "s", "data": data}))
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert deployment._service_property("eom-email-watcher.timer", name) == data
+    assert calls[0][-2:] == [interface, name]
+
+
+@pytest.mark.parametrize("name", ["Unit", "ActiveState"])
+def test_timer_property_rejects_non_string_dbus_type(monkeypatch, name):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, '{"type":"u","data":0}'),
+    )
+    with pytest.raises(deployment.DeploymentError):
+        deployment._service_property("eom-email-watcher.timer", name)
+
+
+def test_systemd_base_declarations_match_canonical_deployment_jobs():
+    root = Path(__file__).resolve().parents[1]
+    for timer, (service, verb) in deployment.SCHEDULED_JOBS.items():
+        timer_lines = (root / "systemd" / timer).read_text().splitlines()
+        service_lines = (root / "systemd" / service).read_text().splitlines()
+        assert "Unit=" + service in timer_lines
+        assert "ExecStart=%h/.local/bin/eom-mail-watch " + verb in service_lines

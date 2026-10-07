@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 
 PAIRED_CLI_PROTOCOL = "eom-mail-engine-paired-cli-v1"
-SCHEDULED_COMMANDS = {
-    "eom-email-watcher.service": "check",
-    "eom-monthly-hours.service": "send-hours",
+SCHEDULED_JOBS = {
+    "eom-email-watcher.timer": ("eom-email-watcher.service", "check"),
+    "eom-monthly-hours.timer": ("eom-monthly-hours.service", "send-hours"),
 }
+SCHEDULED_COMMANDS = {service: command for service, command in SCHEDULED_JOBS.values()}
 
 
 class DeploymentError(RuntimeError):
@@ -45,6 +46,13 @@ def _service_property(unit: str, name: str) -> object:
         if result.returncode != 0 or result.stdout.strip() not in {"loaded", "not-found"}:
             raise DeploymentError("Cannot verify the configured scheduled reader")
         return result.stdout.strip()
+    if name == "Unit":
+        interface, expected_type = "org.freedesktop.systemd1.Timer", "s"
+    elif name == "ActiveState":
+        interface, expected_type = "org.freedesktop.systemd1.Unit", "s"
+    else:
+        interface = "org.freedesktop.systemd1.Service"
+        expected_type = "u" if name == "MainPID" else "a(sasbttttuii)"
     # systemd DBus escaping: these fixed unit names contain only letters and '-.'.
     escaped = unit.replace("-", "_2d").replace(".", "_2e")
     try:
@@ -56,7 +64,7 @@ def _service_property(unit: str, name: str) -> object:
                 "get-property",
                 "org.freedesktop.systemd1",
                 "/org/freedesktop/systemd1/unit/" + escaped,
-                "org.freedesktop.systemd1.Service",
+                interface,
                 name,
             ],
             capture_output=True,
@@ -71,7 +79,6 @@ def _service_property(unit: str, name: str) -> object:
         raise DeploymentError("Cannot verify the configured scheduled reader") from exc
     if not isinstance(value, dict) or set(value) != {"type", "data"}:
         raise DeploymentError("Invalid scheduled reader metadata")
-    expected_type = "u" if name == "MainPID" else "a(sasbttttuii)"
     if value["type"] != expected_type:
         raise DeploymentError("Invalid scheduled reader metadata")
     return value["data"]
@@ -97,6 +104,17 @@ def verify_scheduled_readers(
     binary: Path,
 ) -> None:
     """Bind manager configuration and running readers to this packaged owner."""
+    for timer, (expected_service, _command) in SCHEDULED_JOBS.items():
+        state = _service_property(timer, "LoadState")
+        if state == "not-found" and _service_property(timer, "ActiveState") == "inactive":
+            continue
+        if state != "loaded":
+            raise DeploymentError("Cannot verify the configured scheduled timer")
+        if _service_property(timer, "Unit") != expected_service:
+            raise DeploymentError(
+                "Scheduled timer must target its paired service; "
+                "remove redirected timer overrides before updating"
+            )
     for unit, command in SCHEDULED_COMMANDS.items():
         load_state = _service_property(unit, "LoadState")
         pid = _service_main_pid(unit)
@@ -132,8 +150,7 @@ def verify_scheduled_readers(
             and _service_main_pid(unit) != 0
         ):
             raise DeploymentError(
-                "An incompatible scheduled worker is still active; "
-                "let it finish before updating"
+                "An incompatible scheduled worker is still active; let it finish before updating"
             )
 
 

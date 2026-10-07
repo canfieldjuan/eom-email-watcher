@@ -223,3 +223,17 @@ engine is an ELF executable (observed retained qualified bundle). Source wrapper
 are not a packaged artifact. Custom redirected timer targets are rejected rather
 than silently rewritten; normal canonical timer definitions remain supported.
 Merge and normal deployment wait for new exact-head CI/review.
+
+
+Accepted consolidation verification: the committed minimal three-case probe fails
+before the fix and passes after. Adjacent 195 passed, one Windows-only skip; Ruff,
+bash syntax and diff checks pass. Only formatter and documentation edits followed
+that suite; behavior is unchanged. Rebuilt v4 packaged smoke passes. Both effective
+timer redirects reject API/CLI with schema28 and DB digest unchanged, even after
+actual shell reinstall retains persistent drop-ins. Source shim is never executed;
+actual native bundle selected. Existing partial/removed-loaded-reader/old-worker
+refusals, migration30/CLI read and actual paired overlap continue passing. Four
+bundled modules match source. Substituted manager metadata, development authority,
+public DB/config and monthly dry-run remain explicit limitations. Earlier proof
+versions retained separately; exact-head review/CI, merge and installed normal
+native busy recovery remain NOT DONE.

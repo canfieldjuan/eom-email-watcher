@@ -14,14 +14,24 @@ release_keyring_input=""
 release_keyring_stage=""
 # An installed desktop owns both readers. Never install a separate snapshot beside it.
 packaged_engine=""
-# A prior uv snapshot also exports an API console script. It is not a desktop
-# bundle. Skip that known source owner, then find the installed desktop on PATH.
+# Bundles are native ELF executables. Console shims are scripts regardless of
+# which source environment exported them. Never execute a shim to identify it.
 while IFS= read -r candidate; do
-  if [[ "$candidate" -ef "$tool_dir/eom-email-watcher/bin/eom-mail-engine" ]]; then
-    continue
-  fi
-  packaged_engine="$candidate"
-  break
+  artifact_magic="$(od -An -N4 -tx1 "$candidate")"
+  artifact_magic="${artifact_magic//[[:space:]]/}"
+  case "$artifact_magic" in
+    7f454c46)
+      packaged_engine="$candidate"
+      break
+      ;;
+    2321*)
+      continue
+      ;;
+    *)
+      echo "Unrecognized engine artifact; rebuild it before installing services." >&2
+      exit 2
+      ;;
+  esac
 done < <(type -aP eom-mail-engine || true)
 if [[ -n "$packaged_engine" ]]; then
   if [[ -n "$release_keyring_source" ]]; then

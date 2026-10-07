@@ -333,12 +333,13 @@ LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json 
 The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
 not bodies, OAuth tokens, or model prompts. It requests the local LM Studio service so existing
 loopback installs retain automatic startup, but that optional service cannot block a gateway-backed
-watcher when LM Studio is absent or fails. On a desktop installation the installer verifies
-the bundled engine's CLI dispatch and
-points `~/.local/bin/eom-mail-watch` at that same executable. Both timers and the desktop
+watcher when LM Studio is absent or fails. On a desktop installation the installer qualifies
+the native bundle and its CLI dispatch. Source console shims are skipped regardless of
+which environment put them on PATH. The installer points `~/.local/bin/eom-mail-watch` at that same executable. Both timers and the desktop
 therefore use the same database modules after updates. The bundled startup owner checks
-the manager's loaded scheduled commands and running executable identities before handling
-a request. Legacy/mixed readers and incompatible active workers block database migration;
+the manager's effective timer targets, loaded scheduled commands and running executable
+identities before handling a request. Redirected timer targets must be corrected before
+updating. Legacy/mixed readers and incompatible active workers block database migration;
 compatible paired timers can overlap using the existing operation locks and dedupe.
 Let an incompatible running worker finish, then
 rerun the installer after upgrading the bundle. Service execution does not require a source

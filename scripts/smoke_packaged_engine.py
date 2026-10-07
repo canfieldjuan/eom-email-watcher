@@ -193,7 +193,16 @@ def smoke_packaged_engine(
                 ("busctl", '{"type":"u","data":0}'),
             ):
                 tool = manager / name
-                tool.write_text("#!/bin/sh\nprintf '%s\\n' '" + output + "'\n")
+                script = "#!/bin/sh\n"
+                if name == "busctl":
+                    script += "for property; do :; done\n"
+                    script += 'if [ "$property" = ActiveState ]; then\n'
+                    script += 'printf \'%s\\n\' \'{"type":"s","data":"inactive"}\'\n'
+                    script += "else\n"
+                script += "printf '%s\\n' '" + output + "'\n"
+                if name == "busctl":
+                    script += "fi\n"
+                tool.write_text(script)
                 tool.chmod(0o700)
             environment["PATH"] = str(manager) + os.pathsep + environment.get("PATH", "")
 

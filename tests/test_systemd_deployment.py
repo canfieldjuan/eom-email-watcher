@@ -348,6 +348,32 @@ def _write_private(path: Path, content: bytes) -> Path:
     return path
 
 
+def _write_native_engine(path: Path, body: str) -> None:
+    """An ELF launcher fixture; actual frozen bundle is qualified separately."""
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("native installer fixture needs a C compiler")
+    script = path.with_suffix(".sh")
+    script.write_text(body)
+    source = (
+        "#include <unistd.h>\n#include <stdlib.h>\n"
+        "int main(int argc, char **argv) {\n"
+        "char **args = calloc(argc + 2, sizeof(char *));\n"
+        'args[0] = "/bin/sh"; args[1] = ' + json.dumps(str(script)) + ";\n"
+        "for (int i = 1; i < argc; ++i) args[i + 1] = argv[i];\n"
+        "execv(args[0], args); return 127; }\n"
+    )
+    result = subprocess.run(
+        [compiler, "-x", "c", "-o", str(path), "-"],
+        input=source,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes()[:4] == b"\x7fELF"
+
+
 def _run_installer(
     tmp_path: Path,
     home: Path,
@@ -356,6 +382,8 @@ def _run_installer(
     config_home: str | None = None,
     source_engine: Path | None = None,
     data_home: str | None = None,
+    source_first: bool = True,
+    artifact: bytes | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -365,10 +393,15 @@ def _run_installer(
         tool.chmod(0o755)
     if engine_body is not None:
         engine = fake_bin / "eom-mail-engine"
-        engine.write_text(engine_body)
-        engine.chmod(0o755)
+        _write_native_engine(engine, engine_body)
+    if artifact is not None:
+        engine = fake_bin / "eom-mail-engine"
+        engine.write_bytes(artifact)
+        engine.chmod(0o700)
+    source_bin = tmp_path / "source-path"
     if source_engine is not None:
-        (fake_bin / "eom-mail-engine").symlink_to(source_engine)
+        source_bin.mkdir()
+        (source_bin / "eom-mail-engine").symlink_to(source_engine)
     # Source-only fixture: do not discover an unrelated installed desktop on the host.
     for name in (
         "bash",
@@ -382,6 +415,7 @@ def _run_installer(
         "ln",
         "readlink",
         "rmdir",
+        "od",
     ):
         target = shutil.which(name)
         assert target is not None
@@ -395,6 +429,9 @@ def _run_installer(
         "INSTALLER_TEST_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "INSTALLER_TEST_UV_LOG": str(tmp_path / "uv.log"),
     }
+    if source_engine is not None:
+        directories = [source_bin, fake_bin] if source_first else [fake_bin, source_bin]
+        environment["PATH"] = os.pathsep.join(str(directory) for directory in directories)
     if data_home is not None:
         environment["XDG_DATA_HOME"] = data_home
     if config_home is not None:
@@ -651,3 +688,72 @@ def test_source_reinstall_recognizes_canonical_xdg_data_engine(tmp_path, spellin
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "uv.log").exists()
     assert (home / ".config/systemd/user/eom-monthly-hours.service").is_file()
+
+
+@posix_installer
+def test_source_environment_shim_is_not_a_packaged_engine(tmp_path):
+    source = tmp_path / "source-environment/bin/eom-mail-engine"
+    source.parent.mkdir(parents=True)
+    checkout = ROOT
+    source.write_text(
+        "#!"
+        + sys.executable
+        + "\nimport sys\nsys.path.insert(0,"
+        + repr(str(checkout / "src"))
+        + ")\n"
+        + "from eom_email_watcher.engine_api import main\nmain()\n"
+    )
+    source.chmod(0o700)
+    result = _run_installer(tmp_path, tmp_path / "home", source_engine=source)
+    assert result.returncode == 0, "source-environment shim aborted installer: " + result.stderr
+    assert (tmp_path / "uv.log").exists()
+
+
+@posix_installer
+@pytest.mark.parametrize("source_first", [True, False])
+def test_source_shims_and_native_bundle_discovery_orders(tmp_path, source_first):
+    from eom_email_watcher.deployment import PAIRED_CLI_PROTOCOL
+
+    source = tmp_path / "arbitrary runner environment/bin/eom-mail-engine"
+    source.parent.mkdir(parents=True)
+    marker = tmp_path / "source-executed"
+    source.write_text("#!/bin/sh\nprintf invoked > " + json.dumps(str(marker)) + "\nexit 2\n")
+    source.chmod(0o700)
+    body = (
+        '#!/bin/sh\ncase "$1" in\n'
+        f'--paired-cli-version) printf "%s\\n" "{PAIRED_CLI_PROTOCOL}" ;;\n'
+        '--service-unit-directory) printf "%s\\n" "$HOME/.config/systemd/user" ;;\n'
+        '--cli) test "$2" = --version ;;\n*) exit 2 ;;\nesac\n'
+    )
+    home = tmp_path / "home"
+    result = _run_installer(
+        tmp_path, home, engine_body=body, source_engine=source, source_first=source_first
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), "source shim was executed for artifact classification"
+    assert not (tmp_path / "uv.log").exists()
+    assert (home / ".local/bin/eom-mail-watch").samefile(tmp_path / "fake-bin/eom-mail-engine")
+
+
+@posix_installer
+@pytest.mark.parametrize("artifact", [b"", b"unknown executable", b"\x7fELFnot-a-valid-bundle"])
+def test_unrecognized_or_invalid_native_artifacts_fail_before_publication(tmp_path, artifact):
+    home = tmp_path / "home"
+    result = _run_installer(tmp_path, home, artifact=artifact)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not (tmp_path / "uv.log").exists()
+    assert not (tmp_path / "systemctl.log").exists()
+    assert not (home / ".config/systemd/user").exists()
+
+
+@posix_installer
+def test_source_shim_with_no_native_bundle_is_never_executed(tmp_path):
+    source = tmp_path / "arbitrary-venv/bin/eom-mail-engine"
+    source.parent.mkdir(parents=True)
+    marker = tmp_path / "source-executed"
+    source.write_text("#!/bin/sh\nprintf invoked > " + json.dumps(str(marker)) + "\nexit 2\n")
+    source.chmod(0o700)
+    result = _run_installer(tmp_path, tmp_path / "home", source_engine=source)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert (tmp_path / "uv.log").exists()
