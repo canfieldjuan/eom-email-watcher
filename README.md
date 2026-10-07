@@ -336,10 +336,12 @@ loopback installs retain automatic startup, but that optional service cannot blo
 watcher when LM Studio is absent or fails. On a desktop installation the installer qualifies
 the native bundle and its CLI dispatch. Source console shims are skipped regardless of
 which environment put them on PATH. The installer points `~/.local/bin/eom-mail-watch` at that same executable. Both timers and the desktop
-therefore use the same database modules after updates. The bundled startup owner checks
-the manager's effective timer targets, loaded scheduled commands and running executable
-identities before handling a request. Redirected timer targets must be corrected before
-updating. Legacy/mixed readers and incompatible active workers block database migration;
+therefore use the same database modules after updates. At startup and before every SQLite
+connection, the bundled admission owner binds the executing process to the installed engine
+and checks the manager's effective timer targets, main/control processes and service commands.
+Auxiliary execution phases must be empty. Redirected timer targets and auxiliary command
+overrides must be corrected before updating. Legacy/mixed readers and incompatible active
+workers block database migration;
 compatible paired timers can overlap using the existing operation locks and dedupe.
 Let an incompatible running worker finish, then
 rerun the installer after upgrading the bundle. Service execution does not require a source

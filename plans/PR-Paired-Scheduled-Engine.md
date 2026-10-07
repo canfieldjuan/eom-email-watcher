@@ -24,8 +24,9 @@ The prior source-only local alignment did not remove this release defect.
 - Installed service CLI is an alias of the bundled engine, never another snapshot.
 - Installer verifies the packaged dispatch before changing scheduled units/alias;
   an installed incompatible desktop engine fails closed instead of falling back.
-- The bundled API entrypoint checks configured watcher/monthly service commands
-  and running executable identities before request handling, hence before any Store migration.
+- The shared admission owner checks configured watcher/monthly service commands
+  and executing/main/control process identities before each Store connection.
+  Both entrypoints call it early for fast refusal; startup cannot authorize a later open.
   This is a last defense consuming installed command identity; it does not
   catch schema errors downstream or relax the DB reader.
 - Remove checkout-dependent service working directories. Preserve timer cadence,
@@ -36,8 +37,9 @@ The prior source-only local alignment did not remove this release defect.
 
 1. Both existing entrypoints share one packaged executable; source-only machines
    retain the locked uv installation when no desktop engine exists.
-2. Bundled API startup refuses legacy/mixed readers and incompatible active workers
-   before reading input. No service is silently cancelled or config migrated.
+2. Bundled startup and each database acquisition refuse legacy/mixed readers,
+   auxiliary command phases, replaced executing engines and incompatible active workers.
+   Input wait does not cache admission. No service is silently cancelled or config migrated.
 3. Scheduled services no longer require a development checkout as their cwd.
 4. Candidate source uses merged schema30, whereas installed source is schema28;
    inventory lists every upstream difference. Pairing is proven on a public
@@ -275,3 +277,31 @@ DB unchanged and positives retain migration/CLI/overlap. Run affected tests,
 Ruff/format/bash/diff checks and existing packaged smoke/Connect entrypoint.
 CI owns duplicated broad suites. One consolidation push after cold diff and
 source/bundle equality. Exact-head CI/review/normal deployment remain pending.
+
+
+Consolidation verification: tracked fail-first regressions rejected no auxiliary
+commands, did not bind the executing process at Store.connection, and could not
+query an isolated Connect manager. The retained native bundle additionally
+migrated after replacement during admission and stdin wait. Corrected supported
+Connect operation reproduces the old manager failure before the fix; the original
+probe used an unsupported operation name, corrected in evidence rather than
+production. All retained round4 cases now pass (15 passed), adjacent tests pass
+262 with one Windows-only skip; Ruff, bash syntax and diff checks pass.
+
+Rebuilt development bundle passes existing smoke. Public schema28 fixture stays
+unchanged for every auxiliary phase on both services through API and CLI, both
+replacement barriers, legacy/redirected readers and incompatible workers.
+Compatible migration30, CLI reading and active paired overlap still work.
+The existing Connect proof environment and engine_request reach the supported
+entitlement status operation with expected development authority state. Four
+compiled modules equal candidate source. No release-provider interoperability,
+normal installation or native inference is claimed by the substituted proof.
+
+Cold diff: deployment.py owns all execution phases and process identities;
+db.py adds only the owner call before SQLite connect. One script-only manager
+fixture replaces smoke's duplicate and serves existing Connect isolation.
+Deployment/Connect regressions cover mixed, malformed, falsy, compatible and
+replacement cases. README and this canonical contract describe database
+acquisition. There is no schema, model, runtime, dependency or normal-profile diff.
+Gap audit: implementation and local packaged proof complete; exact-head CI/review,
+merge and later normal compatible installation/native busy recovery remain pending.

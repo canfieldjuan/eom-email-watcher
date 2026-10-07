@@ -28,9 +28,35 @@ def _mock_service_reader(monkeypatch, reader):
     def read(unit, name):
         if unit in deployment.SCHEDULED_JOBS:
             return {"LoadState": "not-found", "ActiveState": "inactive"}[name]
+        if name == "ControlPID":
+            return 0
+        if name in {
+            "ExecCondition",
+            "ExecStartPre",
+            "ExecStartPost",
+            "ExecReload",
+            "ExecStop",
+            "ExecStopPost",
+        }:
+            return []
         return reader(unit, name)
 
     monkeypatch.setattr(deployment, "_service_property", read)
+
+
+def _fixture_current_process(monkeypatch, binary):
+    """Service fixtures bind a synthetic process to their explicit public inode.
+
+    Kernel replacement is independently exercised by the real packaged proof.
+    """
+    original = deployment._same_executable
+    monkeypatch.setattr(
+        deployment,
+        "_same_executable",
+        lambda value, current: (
+            binary.samefile(current) if value == "/proc/self/exe" else original(value, current)
+        ),
+    )
 
 
 def test_only_explicit_manager_not_found_is_unconfigured(tmp_path: Path, monkeypatch) -> None:
@@ -42,7 +68,7 @@ def test_only_explicit_manager_not_found_is_unconfigured(tmp_path: Path, monkeyp
             return "not-found"
         if name == "ActiveState":
             return "inactive"
-        assert name == "MainPID"
+        assert name in {"MainPID", "ControlPID"}
         return 0
 
     monkeypatch.setattr(deployment, "_service_property", read)
@@ -50,7 +76,9 @@ def test_only_explicit_manager_not_found_is_unconfigured(tmp_path: Path, monkeyp
     assert calls == [
         (unit, name) for unit in deployment.SCHEDULED_JOBS for name in ("LoadState", "ActiveState")
     ] + [
-        (unit, name) for unit in deployment.SCHEDULED_COMMANDS for name in ("LoadState", "MainPID")
+        (unit, name)
+        for unit in deployment.SCHEDULED_COMMANDS
+        for name in ("LoadState", "MainPID", "ControlPID")
     ]
 
 
@@ -88,6 +116,7 @@ def test_mixed_scheduled_readers_block_before_request_or_migration(
     monkeypatch.setattr(engine_api, "main", lambda: pytest.fail("API/migration reached"))
     monkeypatch.setattr(sys, "argv", [str(binary)])
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(directory.parent.parent))
@@ -127,6 +156,7 @@ def test_paired_services_reach_api_owner(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(engine_api, "main", lambda: called.append("api"))
     monkeypatch.setattr(sys, "argv", [str(binary)])
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(directory.parent.parent))
@@ -234,6 +264,7 @@ def test_public_schema_28_partial_update_is_rejected_before_migration(tmp_path, 
     _mock_service_reader(monkeypatch, read)
     monkeypatch.setattr(sys, "argv", [str(binary)])
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     request = json.dumps(
@@ -297,6 +328,7 @@ def test_cli_cannot_migrate_with_an_incompatible_scheduled_reader(tmp_path, monk
     monkeypatch.setattr(cli, "main", lambda *args: pytest.fail("CLI/migration reached"))
     monkeypatch.setattr(sys, "argv", [str(binary), "--cli", "recent"])
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(directory.parent.parent))
@@ -368,6 +400,7 @@ def test_invalid_xdg_config_cannot_hide_scheduled_readers(tmp_path, monkeypatch,
     monkeypatch.setenv("XDG_CONFIG_HOME", xdg)
     monkeypatch.setattr(sys, "argv", [str(binary)])
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     with pytest.raises(SystemExit) as rejected:
@@ -438,6 +471,7 @@ def test_paired_active_worker_does_not_drop_overlapping_job(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "main", lambda args: called.append(args))
     monkeypatch.setattr(sys, "argv", [str(binary), "--cli", "send-hours"])
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(directory.parent.parent))
@@ -469,6 +503,7 @@ def test_loaded_legacy_reader_cannot_hide_by_removing_unit_file(tmp_path, monkey
     )
     monkeypatch.setattr(sys, "argv", [str(binary)])
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(directory.parent.parent))
@@ -637,8 +672,17 @@ def _loaded_timer_graph(alias, overrides=None):
             return "loaded"
         if name == "Unit":
             return overrides.get(unit, deployment.SCHEDULED_JOBS[unit][0])
-        if name == "MainPID":
+        if name in {"MainPID", "ControlPID"}:
             return 0
+        if name in {
+            "ExecCondition",
+            "ExecStartPre",
+            "ExecStartPost",
+            "ExecReload",
+            "ExecStop",
+            "ExecStopPost",
+        }:
+            return []
         return [
             [
                 str(alias),
@@ -698,7 +742,7 @@ def test_missing_timer_requires_explicit_inactive_state(tmp_path, monkeypatch, a
             return "not-found"
         if name == "ActiveState":
             return active
-        assert name == "MainPID"
+        assert name in {"MainPID", "ControlPID"}
         return 0
 
     monkeypatch.setattr(deployment, "_service_property", read)
@@ -726,6 +770,7 @@ def test_redirected_timer_blocks_both_database_dispatches(tmp_path, monkeypatch,
     argv = [str(binary)] + (["--cli", "recent"] if mode == "cli" else [])
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(sys, "executable", str(binary))
+    _fixture_current_process(monkeypatch, binary)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     with pytest.raises(SystemExit) as rejected:
@@ -771,3 +816,231 @@ def test_systemd_base_declarations_match_canonical_deployment_jobs():
         service_lines = (root / "systemd" / service).read_text().splitlines()
         assert "Unit=" + service in timer_lines
         assert "ExecStart=%h/.local/bin/eom-mail-watch " + verb in service_lines
+
+
+@pytest.mark.parametrize("unit", tuple(deployment.SCHEDULED_COMMANDS))
+@pytest.mark.parametrize(
+    "property_name",
+    (
+        "ExecCondition",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecReload",
+        "ExecStop",
+        "ExecStopPost",
+    ),
+)
+def test_auxiliary_execution_phase_cannot_admit_legacy_reader(
+    tmp_path, monkeypatch, unit, property_name
+):
+    binary, alias, _directory = units(tmp_path, ())
+    calls = []
+
+    def read(name, prop):
+        calls.append((name, prop))
+        if prop == "LoadState":
+            return "loaded"
+        if prop == "Unit":
+            return name.replace(".timer", ".service")
+        if prop in {"MainPID", "ControlPID"}:
+            return 0
+        if prop == "ExecStart":
+            return [
+                [
+                    str(alias),
+                    [str(alias), deployment.SCHEDULED_COMMANDS[name]],
+                    False,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]
+            ]
+        if name == unit and prop == property_name:
+            return [
+                [
+                    "/public/legacy-reader",
+                    ["/public/legacy-reader", "check"],
+                    False,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]
+            ]
+        return []
+
+    monkeypatch.setattr(deployment, "_service_property", read)
+    with pytest.raises(deployment.DeploymentError):
+        deployment.verify_scheduled_readers(binary)
+    assert (unit, property_name) in calls
+
+
+def test_database_open_rejects_replaced_executing_identity(tmp_path, monkeypatch):
+    from eom_email_watcher.db import Store
+
+    # The installed target is a distinct inode from this executing interpreter.
+    binary = tmp_path / "eom-mail-engine"
+    binary.write_bytes(b"public replacement identity")
+    database = tmp_path / "must-not-open.sqlite3"
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "executable", str(binary))
+    with pytest.raises(deployment.DeploymentError), Store(database).connection():
+        pass
+    assert not database.exists()
+
+
+@pytest.mark.parametrize(
+    "property_name",
+    (
+        "ExecCondition",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecReload",
+        "ExecStop",
+        "ExecStopPost",
+    ),
+)
+@pytest.mark.parametrize("value", [None, False, 0, "", {}, [None]])
+def test_auxiliary_metadata_is_not_defaulted(tmp_path, monkeypatch, property_name, value):
+    binary, alias, _directory = units(tmp_path, ())
+    read = _loaded_timer_graph(alias)
+    monkeypatch.setattr(
+        deployment,
+        "_service_property",
+        lambda unit, name: value if name == property_name else read(unit, name),
+    )
+    with pytest.raises(deployment.DeploymentError, match="auxiliary"):
+        deployment.verify_scheduled_readers(binary)
+
+
+@pytest.mark.parametrize("pid", [None, False, "0", -1])
+def test_control_pid_is_not_defaulted(tmp_path, monkeypatch, pid):
+    binary, alias, _directory = units(tmp_path, ())
+    read = _loaded_timer_graph(alias)
+    monkeypatch.setattr(
+        deployment,
+        "_service_property",
+        lambda unit, name: pid if name == "ControlPID" else read(unit, name),
+    )
+    with pytest.raises(deployment.DeploymentError, match="Invalid"):
+        deployment.verify_scheduled_readers(binary)
+
+
+@pytest.mark.parametrize("compatible,exited", [(True, False), (False, False), (False, True)])
+def test_active_control_process_uses_same_identity_owner(tmp_path, monkeypatch, compatible, exited):
+    binary, alias, _directory = units(tmp_path, ())
+    read = _loaded_timer_graph(alias)
+    reads = []
+
+    def control(unit, name):
+        if name == "ControlPID":
+            reads.append(unit)
+            return 0 if exited and reads.count(unit) > 1 else 123
+        return read(unit, name)
+
+    monkeypatch.setattr(deployment, "_service_property", control)
+    original = deployment._same_executable
+    monkeypatch.setattr(
+        deployment,
+        "_same_executable",
+        lambda value, target: compatible if value == "/proc/123/exe" else original(value, target),
+    )
+    if compatible or exited:
+        deployment.verify_scheduled_readers(binary)
+    else:
+        with pytest.raises(deployment.DeploymentError, match="still active"):
+            deployment.verify_scheduled_readers(binary)
+
+
+def test_engine_replacement_during_manager_inspection_blocks_database_open(tmp_path, monkeypatch):
+    import os
+
+    from eom_email_watcher.db import Store
+
+    binary, alias, _directory = units(tmp_path, ())
+    running = tmp_path / "executing-inode"
+    os.link(binary, running)
+    read = _loaded_timer_graph(alias)
+    replaced = False
+
+    def metadata(unit, name):
+        nonlocal replaced
+        result = read(unit, name)
+        if unit == "eom-monthly-hours.service" and name == "ExecStart" and not replaced:
+            replacement = tmp_path / "new-engine"
+            replacement.write_bytes(b"new public inode")
+            replacement.replace(binary)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(deployment, "_service_property", metadata)
+    original = deployment._same_executable
+    monkeypatch.setattr(
+        deployment,
+        "_same_executable",
+        lambda value, target: (
+            running.samefile(target) if value == "/proc/self/exe" else original(value, target)
+        ),
+    )
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "executable", str(binary))
+    database = tmp_path / "must-not-open.sqlite3"
+    with (
+        pytest.raises(deployment.DeploymentError, match="running engine was replaced"),
+        Store(database).connection(),
+    ):
+        pass
+    assert replaced and not database.exists()
+
+
+def test_database_connection_checks_unchanged_process_and_each_later_open(tmp_path, monkeypatch):
+    from eom_email_watcher.db import Store
+
+    binary, alias, _directory = units(tmp_path, ())
+    read = _loaded_timer_graph(alias)
+    calls = []
+
+    def metadata(unit, name):
+        calls.append((unit, name))
+        return read(unit, name)
+
+    monkeypatch.setattr(deployment, "_service_property", metadata)
+    compatible = True
+    original = deployment._same_executable
+    monkeypatch.setattr(
+        deployment,
+        "_same_executable",
+        lambda value, target: compatible if value == "/proc/self/exe" else original(value, target),
+    )
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "executable", str(binary))
+    database = tmp_path / "public.sqlite3"
+    store = Store(database)
+    with store.connection() as connection:
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+    assert ("eom-monthly-hours.service", "ExecStopPost") in calls
+    compatible = False
+    with pytest.raises(deployment.DeploymentError), store.connection():
+        pass
+
+
+@pytest.mark.parametrize(
+    "name,kind,data", [("ControlPID", "u", 0), ("ExecStopPost", "a(sasbttttuii)", [])]
+)
+def test_extended_service_properties_use_typed_metadata(monkeypatch, name, kind, data):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps({"type": kind, "data": data})),
+    )
+    assert deployment._service_property("eom-email-watcher.service", name) == data

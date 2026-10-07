@@ -11,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from packaged_proof_environment import with_empty_user_manager
+
 PROTOCOL_VERSION = 1
 ENGINE_TIMEOUT_SECONDS = 90
 EXPECTED_ENTITLEMENT_STATES = ("authority_unavailable", "missing")
@@ -183,28 +185,7 @@ def smoke_packaged_engine(
             environment[key] = str(private_root)
         environment["XDG_STATE_HOME"] = str(state_home.resolve())
         if sys.platform == "linux":
-            # This proof owns a private HOME, not the host's user manager. Model
-            # an explicit empty manager; real configured/active cases have their
-            # own paired-deployment regression and packaged upgrade proof.
-            manager = temporary / "empty-manager-fixture"
-            manager.mkdir(mode=0o700)
-            for name, output in (
-                ("systemctl", "not-found"),
-                ("busctl", '{"type":"u","data":0}'),
-            ):
-                tool = manager / name
-                script = "#!/bin/sh\n"
-                if name == "busctl":
-                    script += "for property; do :; done\n"
-                    script += 'if [ "$property" = ActiveState ]; then\n'
-                    script += 'printf \'%s\\n\' \'{"type":"s","data":"inactive"}\'\n'
-                    script += "else\n"
-                script += "printf '%s\\n' '" + output + "'\n"
-                if name == "busctl":
-                    script += "fi\n"
-                tool.write_text(script)
-                tool.chmod(0o700)
-            environment["PATH"] = str(manager) + os.pathsep + environment.get("PATH", "")
+            environment = with_empty_user_manager(temporary, environment)
 
         initialized = _request(
             isolated_binary,

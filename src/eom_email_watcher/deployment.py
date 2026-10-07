@@ -12,6 +12,14 @@ SCHEDULED_JOBS = {
     "eom-monthly-hours.timer": ("eom-monthly-hours.service", "send-hours"),
 }
 SCHEDULED_COMMANDS = {service: command for service, command in SCHEDULED_JOBS.values()}
+AUXILIARY_EXECUTION_PROPERTIES = (
+    "ExecCondition",
+    "ExecStartPre",
+    "ExecStartPost",
+    "ExecReload",
+    "ExecStop",
+    "ExecStopPost",
+)
 
 
 class DeploymentError(RuntimeError):
@@ -52,7 +60,7 @@ def _service_property(unit: str, name: str) -> object:
         interface, expected_type = "org.freedesktop.systemd1.Unit", "s"
     else:
         interface = "org.freedesktop.systemd1.Service"
-        expected_type = "u" if name == "MainPID" else "a(sasbttttuii)"
+        expected_type = "u" if name in {"MainPID", "ControlPID"} else "a(sasbttttuii)"
     # systemd DBus escaping: these fixed unit names contain only letters and '-.'.
     escaped = unit.replace("-", "_2d").replace(".", "_2e")
     try:
@@ -93,8 +101,8 @@ def _same_executable(value: object, binary: Path) -> bool:
         return False
 
 
-def _service_main_pid(unit: str) -> int:
-    pid = _service_property(unit, "MainPID")
+def _service_pid(unit: str, name: str) -> int:
+    pid = _service_property(unit, name)
     if type(pid) is not int or pid < 0:
         raise DeploymentError("Invalid scheduled reader metadata")
     return pid
@@ -117,11 +125,18 @@ def verify_scheduled_readers(
             )
     for unit, command in SCHEDULED_COMMANDS.items():
         load_state = _service_property(unit, "LoadState")
-        pid = _service_main_pid(unit)
-        if load_state == "not-found" and pid == 0:
+        pid = _service_pid(unit, "MainPID")
+        control_pid = _service_pid(unit, "ControlPID")
+        if load_state == "not-found" and pid == 0 and control_pid == 0:
             continue
         if load_state != "loaded":
             raise DeploymentError("Cannot verify the configured scheduled reader")
+        for name in AUXILIARY_EXECUTION_PROPERTIES:
+            if _service_property(unit, name) != []:
+                raise DeploymentError(
+                    "Scheduled intake must not have auxiliary execution commands; "
+                    "remove service command overrides before updating"
+                )
         entries = _service_property(unit, "ExecStart")
         if not isinstance(entries, list) or len(entries) != 1:
             raise DeploymentError("Scheduled intake must use the paired desktop engine")
@@ -142,16 +157,31 @@ def verify_scheduled_readers(
                 "Scheduled intake must use the paired desktop engine; "
                 "rerun install-user-services.sh"
             )
-        # ExecStart may name an updated binary while the old inode still runs.
-        # Admit an observed worker exit only after a typed zero MainPID report.
-        if (
-            pid
-            and not _same_executable(f"/proc/{pid}/exe", binary)
-            and _service_main_pid(unit) != 0
-        ):
-            raise DeploymentError(
-                "An incompatible scheduled worker is still active; let it finish before updating"
-            )
+        # Configured commands may have changed while their old processes run.
+        # Admit an observed exit only after the manager reports a typed zero PID.
+        for name, active_pid in (("MainPID", pid), ("ControlPID", control_pid)):
+            if (
+                active_pid
+                and not _same_executable(f"/proc/{active_pid}/exe", binary)
+                and _service_pid(unit, name) != 0
+            ):
+                raise DeploymentError(
+                    "An incompatible scheduled worker is still active; "
+                    "let it finish before updating"
+                )
+
+
+def verify_database_admission() -> None:
+    """Check the packaged process and effective readers at every database open."""
+    if not getattr(sys, "frozen", False) or sys.platform != "linux":
+        return
+    binary = Path(sys.executable)
+    if not _same_executable("/proc/self/exe", binary):
+        raise DeploymentError("The running engine was replaced; restart it before database access")
+    verify_scheduled_readers(binary)
+    # Manager inspection may overlap an atomic package replacement.
+    if not _same_executable("/proc/self/exe", binary):
+        raise DeploymentError("The running engine was replaced; restart it before database access")
 
 
 def _dispatch_entrypoint() -> None:
@@ -168,8 +198,8 @@ def _dispatch_entrypoint() -> None:
     cli_mode = args[:1] == ["--cli"] or alias
     cli_args = args[1:] if args[:1] == ["--cli"] else args
     readonly_version = cli_mode and cli_args == ["--version"]
-    if getattr(sys, "frozen", False) and sys.platform == "linux" and not readonly_version:
-        verify_scheduled_readers(Path(sys.executable))
+    if not readonly_version:
+        verify_database_admission()
     if cli_mode:
         cli.main(cli_args)
     else:

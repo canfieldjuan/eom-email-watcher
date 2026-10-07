@@ -123,3 +123,72 @@ def test_proof_check_gate_and_timeout_parser_fail_closed() -> None:
     for value in ("0", "-1", "1.5", "not-a-number"):
         with pytest.raises(argparse.ArgumentTypeError):
             positive_seconds(value)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
+def test_existing_connect_environment_supplies_typed_empty_manager(tmp_path):
+    import json
+    import subprocess
+
+    prepare_private_directories(tmp_path)
+    environment = isolated_environment(tmp_path)
+    state = subprocess.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "eom-email-watcher.service",
+            "--property=LoadState",
+            "--value",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert state.returncode == 0 and state.stdout.strip() == "not-found"
+    for name, expected in (
+        ("ActiveState", {"type": "s", "data": "inactive"}),
+        ("MainPID", {"type": "u", "data": 0}),
+        ("ControlPID", {"type": "u", "data": 0}),
+    ):
+        value = subprocess.run(
+            [
+                "busctl",
+                "--user",
+                "--json=short",
+                "get-property",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1/unit/eom_2demail_2dwatcher_2eservice",
+                "org.freedesktop.systemd1.Unit"
+                if name == "ActiveState"
+                else "org.freedesktop.systemd1.Service",
+                name,
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        assert value.returncode == 0 and json.loads(value.stdout) == expected
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
+def test_shared_manager_fixture_is_explicit_and_rejects_unknown_queries(tmp_path):
+    import subprocess
+
+    from packaged_proof_environment import with_empty_user_manager
+
+    original = {"PATH": "/usr/bin"}
+    environment = with_empty_user_manager(tmp_path, original)
+    assert original == {"PATH": "/usr/bin"}
+    command = [
+        "busctl",
+        "--user",
+        "--json=short",
+        "get-property",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1/unit/public",
+        "org.freedesktop.systemd1.Service",
+        "Unknown",
+    ]
+    result = subprocess.run(command, env=environment, capture_output=True)
+    assert result.returncode == 2 and result.stdout == b""

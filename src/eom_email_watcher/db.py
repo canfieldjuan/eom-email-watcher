@@ -35,6 +35,7 @@ from .config import (
     exact_sender_selector_id,
     normalize_validated_address,
 )
+from .deployment import verify_database_admission
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -5230,6 +5231,7 @@ class Store:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
+        verify_database_admission()
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA recursive_triggers = ON")
         connection.row_factory = sqlite3.Row
