@@ -172,3 +172,54 @@ and simultaneous bundled API plus monthly dry-run. The four deployment/API/CLI/D
 compiled modules match the candidate source; no native settings changed. Prior
 v1/v2 artifacts remain retained. Normal deployment and exact-head CI/review are
 NOT DONE, with the substitutions and tested versions recorded in durable evidence.
+
+
+## Accepted consolidation: artifact kind and effective timer graph
+
+Operator directed "address the blockers" after root note6046531049. This accepts
+Rule21's third-round consolidation before a further fix. Both findings originate
+in my bcf90be implementation, confirmed by git log -L and the retained exact-head
+public reproduction: source shim aborts; both redirected timers are admitted.
+
+Root cause: install-user-services.sh:20-23 guesses bundle ownership from a single
+excluded uv path; deployment.py:10-13 guesses scheduled readers from base service
+names. Expected provenance/address is not authoritative deployed identity.
+
+Required change surface:
+- The installer qualifies Linux native ELF artifacts before paired-protocol probes.
+  Shebang console shims are source artifacts regardless of virtualenv, uv, runner,
+  path order, symlink or directory spelling. Skip them to find an actual native
+  bundle, or retain source-only mode when none exists. Unrecognized executable
+  kinds and incompatible discovered native bundles fail closed before publication.
+  Remove known-uv-path exclusion rather than adding source-path cases.
+- One canonical deployment timer/service/verb mapping derives service readers.
+  Before either DB dispatch, inspect loaded timers' effective Unit strings and
+  reject redirects/malformed/unknown targets. Explicit not-found timers are absent
+  only with confirmed inactive state. Both canonical services still use existing
+  loaded-command and running-inode verification. No arbitrary target graph crawl.
+- Update existing public manager smoke fixture for timer properties; keep it
+  explicitly substituted. Upgrade proof reuses the retained public schema28 oracle
+  and actual bundled overlap, adding redirected timer rejection before DB change.
+- Commit the public minimal source-shim and both timer reproductions; sibling
+  tests cover arbitrary source dirs, source/native PATH order, malformed native
+  candidates, old/valid native protocol, missing/loaded timer state, malformed and
+  redirected Unit, inactive/active not-found timers. Canonical systemd declarations
+  must agree with the single mapping. Native installer fixtures represent artifact
+  kind using a minimal compiled launcher; full bundle proof remains authoritative.
+
+Explicit non-scope: no model/runtime/prompt/schema, timer cadence/sandbox, normal
+profile/config/DB, confirmation, downstream schema catch or legacy reader relaxation.
+No source console entrypoint rewrite. Linux native qualification is installation
+scope; packaged Windows startup still has no systemd checks.
+
+Verification plan: retained fail-before3cases on eeb0b5d; commit those regressions
+and show pass after. Run targeted/adjacent packaging/deployment tests, Ruff, bash
+syntax and diff checks; rebuild; preserve prior evidence separately, prove bundle
+compiled-source equality and public upgrade/redirect/overlap. One consolidation
+push, then exact-head independent review/CI after the standing waiting gate.
+
+Assumptions/blockers: source console shims are scripts; supported Linux packaged
+engine is an ELF executable (observed retained qualified bundle). Source wrappers
+are not a packaged artifact. Custom redirected timer targets are rejected rather
+than silently rewritten; normal canonical timer definitions remain supported.
+Merge and normal deployment wait for new exact-head CI/review.
