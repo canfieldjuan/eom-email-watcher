@@ -305,3 +305,34 @@ replacement cases. README and this canonical contract describe database
 acquisition. There is no schema, model, runtime, dependency or normal-profile diff.
 Gap audit: implementation and local packaged proof complete; exact-head CI/review,
 merge and later normal compatible installation/native busy recovery remain pending.
+
+
+## CI correction: isolated script-test import context
+
+Exact published cc7d308 Windows packaging fails collecting test_desktop_packaging:
+smoke_packaged_engine imports the shared proof helper without scripts on sys.path.
+I introduced the import at cc7d308: scripts/smoke_packaged_engine.py:14. Runtime
+script execution supplies that directory automatically; spec/runpy test loaders
+need the same context. Adjacent Linux verification was masked by other test
+modules mutating sys.path during collection. This is my verification omission.
+
+Required surface: one test import-context owner in conftest supplies the scripts
+directory before collection. Remove duplicated path mutation from all script-test
+readers, including the temporary COI insertion. Add clean-process isolated
+collection probes for each reader, and run the failed packaging file alone before
+an adjacent gate. No production/proof helper/model/bundle/module change. This
+correction changes test bootstrap, not database admission or thinking policy.
+Fail-first must report ModuleNotFoundError: packaged_proof_environment in isolated
+desktop packaging collection; afterward all isolated readers collect successfully.
+Reuse committed runtime/frozen proof evidence because production source is unchanged;
+record the no-relevant-diff comparison and defer duplicated broad suites to CI.
+
+
+CI correction proven: the clean-process desktop collection regression failed
+with the exact Windows ModuleNotFoundError, then passed after one conftest owner
+replaced five per-reader sys.path mutations. All six isolated collection probes
+and affected proof/packaging tests pass:167 passed, one Windows-only skip.
+Ruff and new/bootstrap format checks pass. Cold diff is test bootstrap/readers,
+regression and this contract only. No production/proof/bundle/dependency diff
+against cc7d308; reuse its native/module equality receipts for that unchanged
+source. Windows execution itself remains CI-owned and pending after publication.

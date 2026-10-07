@@ -12,7 +12,6 @@ from eom_email_watcher.config import load_config
 from eom_email_watcher.db import Store
 
 SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
 PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-packaged-deb-proof.py"))
 
 PackagedConnectProofError = PROOF_SCRIPT["PackagedConnectProofError"]

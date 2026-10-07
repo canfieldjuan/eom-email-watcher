@@ -12,18 +12,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import coi_evidence
 import pytest
 
 spec = importlib.util.spec_from_file_location(
     "coi_local_proof", Path(__file__).resolve().parents[1] / "scripts" / "coi_local_proof.py"
 )
 proof = importlib.util.module_from_spec(spec)
-sys.path.insert(0, str(Path(spec.origin).parent))
-try:
-    spec.loader.exec_module(proof)
-    import coi_evidence
-finally:
-    sys.path.pop(0)
+spec.loader.exec_module(proof)
 
 
 def complete_checks():
