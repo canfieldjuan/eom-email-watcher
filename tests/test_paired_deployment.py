@@ -283,3 +283,57 @@ def test_only_own_scheduled_worker_is_admitted(tmp_path, monkeypatch, pid, allow
     else:
         with pytest.raises(deployment.DeploymentError, match="still active"):
             deployment.verify_scheduled_readers(binary, directory, frozenset({123}))
+
+
+@pytest.mark.parametrize("xdg", ["", "relative-config"])
+def test_invalid_xdg_config_cannot_hide_scheduled_readers(tmp_path, monkeypatch, xdg):
+    from eom_email_watcher import engine_api
+
+    (tmp_path / ".config").mkdir()
+    binary, _alias, _directory = units(tmp_path / ".config", ("eom-email-watcher.service",))
+    monkeypatch.setattr(
+        deployment,
+        "_service_property",
+        lambda *args: [
+            ["/missing-legacy-cli", ["/missing-legacy-cli", "check"], False, 0, 0, 0, 0, 0, 0, 0]
+        ],
+    )
+    monkeypatch.setattr(
+        engine_api, "main", lambda: pytest.fail("API/migration reached through XDG")
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", xdg)
+    monkeypatch.setattr(sys, "argv", [str(binary)])
+    monkeypatch.setattr(sys, "executable", str(binary))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(SystemExit) as rejected:
+        deployment.main()
+    assert rejected.value.code == 2
+
+
+@pytest.mark.parametrize("xdg", [None, "", "relative"])
+def test_unit_directory_default_is_shared_and_absolute(tmp_path, monkeypatch, xdg):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if xdg is None:
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    else:
+        monkeypatch.setenv("XDG_CONFIG_HOME", xdg)
+    assert deployment.service_unit_directory() == tmp_path / ".config/systemd/user"
+
+
+def test_unit_directory_preserves_absolute_custom_path_with_spaces(tmp_path, monkeypatch):
+    custom = tmp_path / "custom config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(custom))
+    assert deployment.service_unit_directory() == custom / "systemd/user"
+
+
+def test_unit_directory_metadata_is_read_only_and_uses_owner(tmp_path, monkeypatch, capsys):
+    from eom_email_watcher import engine_api
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+    monkeypatch.setattr(sys, "argv", ["engine", "--service-unit-directory"])
+    monkeypatch.setattr(engine_api, "main", lambda: pytest.fail("API reached"))
+    deployment.main()
+    assert capsys.readouterr().out.strip() == str(tmp_path / ".config/systemd/user")

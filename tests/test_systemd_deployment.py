@@ -353,6 +353,7 @@ def _run_installer(
     home: Path,
     keyring_source: Path | None = None,
     engine_body: str | None = None,
+    config_home: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -390,6 +391,8 @@ def _run_installer(
         "INSTALLER_TEST_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "INSTALLER_TEST_UV_LOG": str(tmp_path / "uv.log"),
     }
+    if config_home is not None:
+        environment["XDG_CONFIG_HOME"] = config_home
     if keyring_source is not None:
         environment["LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE"] = str(keyring_source)
     return subprocess.run(
@@ -566,6 +569,7 @@ def test_installer_pairs_both_services_without_installing_another_snapshot(tmp_p
         engine_body=(
             '#!/bin/sh\ncase "$1" in\n'
             f'--paired-cli-version) printf "%s\\n" "{PAIRED_CLI_PROTOCOL}" ;;\n'
+            '--service-unit-directory) printf "%s\\n" "$HOME/.config/systemd/user" ;;\n'
             '--cli) test "$2" = --version ;;\n*) exit 2 ;;\nesac\n'
         ),
     )
@@ -579,3 +583,18 @@ def test_installer_pairs_both_services_without_installing_another_snapshot(tmp_p
             in (home / ".config/systemd/user" / unit).read_text()
         )
     assert "Paired scheduled intake" in result.stdout
+
+
+@posix_installer
+@pytest.mark.parametrize("setting", ["", "relative", "custom"])
+def test_source_installer_consumes_runtime_unit_directory(tmp_path, monkeypatch, setting):
+    from eom_email_watcher.deployment import service_unit_directory
+    home = tmp_path / "home"
+    value = str(tmp_path / "custom config") if setting == "custom" else setting
+    result = _run_installer(tmp_path, home, config_home=value)
+    assert result.returncode == 0, result.stderr
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", value)
+    directory = service_unit_directory()
+    assert (directory / "eom-email-watcher.service").is_file()
+    assert (directory / "eom-monthly-hours.service").is_file()

@@ -81,7 +81,7 @@ Source implementation complete; normal profile remains untouched.
 | install-user-services.sh:15 | verifies and atomically pairs alias; preserves source-only authority path | incompatible installer fail-first, paired/source-only tests |
 | systemd watcher/monthly units | removes checkout-dependent cwd | systemd/state/sandbox tests |
 | smoke_packaged_engine.py:132 | existing build smoke reads API-owned DB via bundled CLI | packaged-engine-smoke: ok |
-| deployment/systemd/packaging tests | negative, mixed and valid boundary/migration regressions | 117 passed, 1 skipped |
+| deployment/systemd/packaging tests | negative, mixed and valid boundary/migration regressions | 127 passed, 1 skipped |
 | README two-hour timer | canonical paired/source-only install directions | cold diff audit |
 
 Gap audit: NOT DONE. Exact-head review/CI and normal compatible deployment/native
@@ -113,3 +113,10 @@ module through its installed interpreter. Remove the shell's independently
 constructed unit directory and the startup expression. Read-only directory
 metadata does not open a DB. Probe unset/empty/relative/custom absolute paths,
 including spaces, and prove installer output equals runtime selection.
+
+Directory correction proven: two fail-first XDG bypasses now reject; both installer
+modes use the one service_unit_directory owner. 127 passed, 1 Windows-only skip,
+Ruff/diff/bash checks clean. Rebuilt v2 executable passes the existing packaged
+smoke and public schema28 proof; empty/relative/custom absolute XDG values resolve
+correctly, and the real shell installer consumes the binary's directory result.
+Old evidence retained; v2 upgrade evidence is separate. Normal profile untouched.

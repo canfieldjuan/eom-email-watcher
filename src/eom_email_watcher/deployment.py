@@ -17,6 +17,19 @@ class DeploymentError(RuntimeError):
     pass
 
 
+def service_unit_directory() -> Path:
+    """One XDG resolver for installation and both packaged entrypoints."""
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    root = (
+        Path(configured)
+        if configured and Path(configured).is_absolute()
+        else Path.home() / ".config"
+    )
+    if not root.is_absolute() or "\n" in str(root) or "\r" in str(root):
+        raise DeploymentError("Scheduled unit directory must be one absolute path")
+    return root / "systemd/user"
+
+
 def _service_property(unit: str, name: str) -> object:
     # systemd DBus escaping: these fixed unit names contain only letters and '-.'.
     escaped = unit.replace("-", "_2d").replace(".", "_2e")
@@ -97,32 +110,34 @@ def verify_scheduled_readers(
             )
 
 
-def main() -> None:
+def _dispatch_entrypoint() -> None:
     from . import cli, engine_api
 
     args = sys.argv[1:]
     if args == ["--paired-cli-version"]:
         print(PAIRED_CLI_PROTOCOL)
         return
+    if args == ["--service-unit-directory"]:
+        print(service_unit_directory())
+        return
     alias = Path(sys.argv[0]).name in {"eom-mail-watch", "eom-mail-watch.exe"}
     cli_mode = args[:1] == ["--cli"] or alias
     cli_args = args[1:] if args[:1] == ["--cli"] else args
     readonly_version = cli_mode and cli_args == ["--version"]
     if getattr(sys, "frozen", False) and sys.platform == "linux" and not readonly_version:
-        unit_directory = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
         # PyInstaller's parent bootloader is the systemd MainPID. Its application
         # child is this process. Other active workers must finish before migration.
         own_worker_pids = frozenset({os.getpid(), os.getppid()}) if cli_mode else frozenset()
-        try:
-            verify_scheduled_readers(
-                Path(sys.executable),
-                unit_directory / "systemd/user",
-                own_worker_pids,
-            )
-        except DeploymentError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            raise SystemExit(2) from exc
+        verify_scheduled_readers(Path(sys.executable), service_unit_directory(), own_worker_pids)
     if cli_mode:
         cli.main(cli_args)
     else:
         engine_api.main()
+
+
+def main() -> None:
+    try:
+        _dispatch_entrypoint()
+    except DeploymentError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+unit_dir=""
 tool_bin_dir="$HOME/.local/bin"
 tool_dir="${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools"
 release_keyring_source="${LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE:-}"
@@ -40,6 +40,7 @@ if [[ -n "$packaged_engine" ]]; then
   packaged_engine="$(readlink -f "$packaged_engine")"
   test -x "$packaged_engine"
   "$packaged_engine" --cli --version >/dev/null
+  unit_dir="$("$packaged_engine" --service-unit-directory)"
   mkdir -p "$unit_dir" "$tool_bin_dir"
   alias_stage="$(mktemp -d "$tool_bin_dir/.paired-cli.XXXXXX")"
   cleanup_alias() { rm -f "$alias_stage/eom-mail-watch"; rmdir "$alias_stage"; }
@@ -61,7 +62,7 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$unit_dir" "$tool_bin_dir" "$tool_dir"
+mkdir -p "$tool_bin_dir" "$tool_dir"
 uv export --project "$repo_dir" --locked --no-dev --no-emit-project --format requirements.txt \
   --output-file "$constraints_file" >/dev/null
 UV_TOOL_BIN_DIR="$tool_bin_dir" UV_TOOL_DIR="$tool_dir" \
@@ -72,6 +73,10 @@ test -x "$tool_bin_dir/eom-mail-watch"
 # installer from creating or syncing an environment inside the source checkout.
 snapshot_python="$tool_dir/eom-email-watcher/bin/python"
 test -x "$snapshot_python"
+unit_dir="$(
+  PYTHONPATH="$repo_dir/src" "$snapshot_python" -c \
+    'from eom_email_watcher.deployment import service_unit_directory; print(service_unit_directory())'
+)"
 
 validate_release_keyring() {
   PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$1" "$snapshot_python" -c \
@@ -117,6 +122,7 @@ fi
 
 fi
 
+mkdir -p "$unit_dir"
 install -m 0644 "$repo_dir/systemd/eom-email-watcher.service" "$unit_dir/"
 install -m 0644 "$repo_dir/systemd/eom-email-watcher.timer" "$unit_dir/"
 install -m 0644 "$repo_dir/systemd/eom-email-lmstudio.service" "$unit_dir/"
