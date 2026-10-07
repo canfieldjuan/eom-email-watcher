@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
@@ -13,6 +13,8 @@ from typing import Literal, Protocol
 from connect_automate.entitlement import (
     AUTOMATIONS_FEATURE_ID,
     CONNECT_FEATURE_ID,
+    EntitlementDecision,
+    connect_entitlement_decision,
     feature_entitlements_active,
 )
 
@@ -46,9 +48,16 @@ from .gmail import (
     GmailLabelCatalogUnavailable,
     GmailRecoveryPageInvalid,
     GmailRecoveryPageTokenInvalid,
+    locations_from_labels,
 )
 from .imap import IMAP_PROVIDER, ImapGateway, imap_cursor_epoch
 from .mailbox import (
+    INBOX_LOCATION,
+    MESSAGE_LOCATIONS,
+    SENT_LOCATION,
+    SENT_SCOPE_AVAILABLE,
+    SENT_SCOPE_NOT_POLLED,
+    FolderObservation,
     MailboxAccountUnavailable,
     MailboxChanges,
     MailboxError,
@@ -56,11 +65,15 @@ from .mailbox import (
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
     MailboxSession,
+    MessageContent,
+    MessageMetadata,
     StaleMailboxCursor,
     default_mailbox_session,
+    folder_scope_key,
     mailbox_polling_session,
     mailbox_session_address,
     mailbox_session_identity_key,
+    read_through_sources,
     scoped_message_id,
 )
 from .microsoft365 import (
@@ -151,6 +164,54 @@ class RecoveryLabelGrant:
     selected_display_name: str
 
 
+def _recovery_since(last_success: str, retention_cutoff: datetime) -> datetime:
+    """Where a stale cursor's recovery starts: shortly before the last success, within retention."""
+    since = datetime.fromisoformat(last_success).astimezone(UTC) - timedelta(minutes=5)
+    return max(since, retention_cutoff)
+
+
+def _folders_in_scope(gated_allowed: bool) -> frozenset[str]:
+    """Contract D-ops: Sent is in scope only while the gated class is allowed."""
+    return MESSAGE_LOCATIONS if gated_allowed else frozenset({INBOX_LOCATION})
+
+
+def _scope_gateway(gateway: object, folders: frozenset[str]) -> None:
+    """Tell a gateway the folders in scope, so its own queries never read a gated one."""
+    scoper = getattr(gateway, "scope_folders", None)
+    if callable(scoper):
+        scoper(folders)
+
+
+def _content_from_sources(
+    gateway: MailboxGateway, provider_message_ids: Sequence[str], body_char_limit: int
+) -> tuple[str, MessageContent]:
+    return read_through_sources(
+        provider_message_ids, lambda source: gateway.content(source, body_char_limit)
+    )
+
+
+def _scope_complete(folders: frozenset[str]) -> bool:
+    """Whether every admitted folder is in scope, so an observation is complete (plan step 5)."""
+    return folders == MESSAGE_LOCATIONS
+
+
+def _admitted_locations(
+    metadata: object, labels: frozenset[str], folders: frozenset[str] = MESSAGE_LOCATIONS
+) -> frozenset[str]:
+    """Contract D-scope: the admitted folders a message is in, among those in scope.
+
+    Providers that record locations say which. Gmail metadata without them names
+    its folders through labels, with the mapping gmail.parse_metadata owns. The
+    one answer decides admission and is what every insert stores, so a message
+    is never admitted from a folder other than the one recorded for it, and a
+    Sent-only message is admitted only while Sent is in scope (_folders_in_scope).
+    """
+    locations = getattr(metadata, "locations", None)
+    if not (isinstance(locations, frozenset) and locations):
+        locations = locations_from_labels(labels)
+    return locations & folders
+
+
 def match_mailbox_admission(
     *,
     metadata: object,
@@ -160,11 +221,12 @@ def match_mailbox_admission(
     exact_senders: Mapping[str, str | None],
     label_selectors: Iterable[GmailLabelSelectorLike],
     admitted_at: datetime,
+    folders: frozenset[str] = MESSAGE_LOCATIONS,
 ) -> AdmissionDecision | None:
     """Return the one deterministic admission grant for mailbox metadata."""
     labels = getattr(metadata, "labels", None)
     sender = getattr(metadata, "sender", None)
-    if not isinstance(labels, frozenset) or "INBOX" not in labels:
+    if not isinstance(labels, frozenset) or not _admitted_locations(metadata, labels, folders):
         return None
     admitted_at_text = admitted_at.astimezone(UTC).isoformat()
     if isinstance(sender, str) and sender in exact_senders:
@@ -1159,6 +1221,21 @@ def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | Non
         return None
 
 
+def _copy_received_in_retention(
+    metadata: MessageMetadata, *, checked_at: datetime, retention_cutoff: datetime
+) -> datetime | None:
+    """A fetched copy's received time if it may be captured (contract D-scope).
+
+    The one copy-level rule every capture path applies: the time parses, is clamped
+    to the check, and is at or after the cutoff. None otherwise. A stored logical
+    message's retention is the store's rule (Store.retained_logical_messages).
+    """
+    received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
+    if received_at is None or received_at < retention_cutoff:
+        return None
+    return received_at
+
+
 def _deliver_automation_review_intent(
     config: Config,
     store: Store,
@@ -1358,6 +1435,60 @@ class Watcher:
             result["recovery_next_retry_at"] = state.next_retry_at
         return result
 
+    def _settle_sent(
+        self,
+        *,
+        folders: frozenset[str],
+        mailbox_identity_key: str | None,
+        dry_run: bool,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Decide Sent once per check, before any Inbox work (contract D-scope, D-ops).
+
+        Every path a check completes by runs this first, so the scope Health reports
+        is never a previous check's. The first time Sent is available it also records
+        the folder's current position: taken before the Inbox poll, so mail sent while
+        the Inbox is polled is after it and reaches this check's Sent poll. Returns
+        the scope, or None when Sent could not be read: a Sent error never stops the
+        Inbox check, and the scope stays as last recorded. A dry run records nothing.
+        """
+        provider = self.mailbox.provider
+        account_id = self.mailbox.account_id
+        checked_at = now or datetime.now(UTC)
+        if SENT_LOCATION not in folders:
+            scope = SENT_SCOPE_NOT_POLLED
+        elif provider == "gmail":
+            # Gmail's one mailbox-wide history carries SENT events: no Sent cursor.
+            scope = SENT_SCOPE_AVAILABLE
+        else:
+            scope_reader = getattr(self.gateway, "sent_scope", None)
+            if not callable(scope_reader):
+                return None
+            try:
+                scope = scope_reader()
+            except MailboxError as exc:
+                logger.warning("Sent folder could not be read; the Inbox goes on: %s", exc)
+                return None
+        if dry_run:
+            return scope
+        self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
+        if scope != SENT_SCOPE_AVAILABLE or provider == "gmail" or mailbox_identity_key is None:
+            return scope
+        folder_scope = {
+            "provider": provider,
+            "account_id": account_id,
+            "mailbox_identity_key": mailbox_identity_key,
+            "folder": SENT_LOCATION,
+        }
+        if self.store.folder_state(**folder_scope) is None:
+            try:
+                self.store.set_folder_state(
+                    self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
+                )
+            except MailboxError as exc:
+                logger.warning("Sent folder position unread; the next check retries: %s", exc)
+        return scope
+
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
     ) -> dict[str, int | bool | str]:
@@ -1388,6 +1519,7 @@ class Watcher:
             and not gmail_watch_configured
             and not pending_current_identity
         ):
+            self._settle_sent(folders=frozenset(), mailbox_identity_key=None, dry_run=dry_run)
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
         with mailbox_polling_session(self.gateway):
             mailbox_identity_key = reconcile_mailbox_session_identity(
@@ -1428,6 +1560,10 @@ class Watcher:
                 and not label_selectors
                 and recovery_state is None
             ):
+                # Nothing is polled on this path, Sent included.
+                self._settle_sent(
+                    folders=frozenset(), mailbox_identity_key=None, dry_run=dry_run
+                )
                 pending_current_identity = self.store.has_current_pending_mailbox_work(
                     self.mailbox.provider,
                     self.mailbox.account_id,
@@ -1561,20 +1697,24 @@ class Watcher:
         mailbox_identity_key: str,
         checked_at: datetime,
         deliver_notifications: bool,
+        folders: frozenset[str],
     ) -> dict[str, int | bool | str]:
         """Preview the frozen recovery window without changing durable progress."""
         deadline = time.monotonic() + 30.0
         if not self._retry_due(state.next_retry_at, checked_at):
             return self.recovery_backoff_result(state)
-        if state.page_loaded:
+        same_scope = state.query_scope == folder_scope_key(folders)
+        if state.page_loaded and same_scope:
             message_ids = state.current_page_ids[state.next_index :]
         else:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 message_ids = ()
             else:
+                # A page saved under another folder scope is not previewed; the
+                # window is read afresh under this one, without saving anything.
                 message_ids, _next_page_token = self.gateway.recovery_page(
-                    state.page_token,
+                    state.page_token if same_scope else None,
                     state.recovery_after_exclusive_epoch,
                     state.recovery_before_exclusive_epoch,
                     200,
@@ -1619,38 +1759,36 @@ class Watcher:
                 exact_senders=current_senders,
                 label_selectors=current_selectors,
                 admitted_at=checked_at,
+                folders=folders,
             )
-            received_at = _received_at_or_none(
-                metadata.received_at,
-                observed_at=checked_at,
+            received_at = _copy_received_in_retention(
+                metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
             )
-            if admission is None or received_at is None or received_at < retention_cutoff:
+            if admission is None or received_at is None:
                 continue
-            dry_run_messages.append(
-                PendingMessage(
-                    message_id=scoped_message_id(
+            self._preview_candidate(
+                metadata,
+                {
+                    "message_id": scoped_message_id(
                         "gmail",
                         self.mailbox.account_id,
                         metadata.message_id,
                         mailbox_identity_key,
                     ),
-                    provider="gmail",
-                    account_id=self.mailbox.account_id,
-                    provider_message_id=metadata.message_id,
-                    thread_id=metadata.thread_id,
-                    sender=metadata.sender,
-                    sender_name=(
+                    "provider": "gmail",
+                    "account_id": self.mailbox.account_id,
+                    "provider_message_id": metadata.message_id,
+                    "thread_id": metadata.thread_id,
+                    "sender": metadata.sender,
+                    "sender_name": (
                         metadata.sender_name or self.sender_names.get(metadata.sender)
                     ),
-                    subject=metadata.subject,
-                    received_at=received_at.isoformat(),
-                    attempts=0,
-                    fallback_notified_at=None,
-                    analysis_request_id=None,
-                    analysis_context_at=None,
-                    analysis_body_char_limit=None,
-                    mailbox_identity_key=mailbox_identity_key,
-                )
+                    "subject": metadata.subject,
+                    "received_at": received_at.isoformat(),
+                    "mailbox_identity_key": mailbox_identity_key,
+                },
+                mailbox_identity_key,
+                dry_run_messages,
             )
 
         return self._finish_active_result(
@@ -1671,10 +1809,20 @@ class Watcher:
         *,
         mailbox_identity_key: str,
         checked_at: datetime,
+        folders: frozenset[str],
     ) -> tuple[int, bool]:
         state = self.store.gmail_recovery_state(self.mailbox.account_id)
         if state is None:
             raise RuntimeError("Gmail recovery state was not initialized")
+        if state.query_scope != folder_scope_key(folders):
+            # The saved page belongs to another folder scope: restart paging under
+            # this one (contract D-ops); captured ids are skipped as seen.
+            state = self.store.restart_gmail_recovery_page(
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                folder_scope_key(folders),
+                now=checked_at,
+            )
         retention_cutoff = self._recovery_retention_cutoff(state)
         if not self._retry_due(state.next_retry_at, checked_at):
             return 0, False
@@ -1758,6 +1906,19 @@ class Watcher:
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             ):
+                # The lost interval may have moved it, and the search does not say
+                # where it is now: an incomplete observation clears its stamp, so
+                # discovery observes it again once this recovery makes coverage stale.
+                self.store.record_message_location(
+                    provider=self.mailbox.provider,
+                    account_id=self.mailbox.account_id,
+                    mailbox_identity_key=mailbox_identity_key,
+                    provider_message_id=provider_message_id,
+                    locations=frozenset(),
+                    scope_complete=False,
+                    headers_observed=False,
+                    now=checked_at,
+                )
                 self.store.finish_gmail_recovery_candidate(
                     self.mailbox.account_id,
                     mailbox_identity_key,
@@ -1808,9 +1969,12 @@ class Watcher:
                 exact_senders=current_senders,
                 label_selectors=current_selectors,
                 admitted_at=checked_at,
+                folders=folders,
             )
-            received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
-            if admission is None or received_at is None or received_at < retention_cutoff:
+            received_at = _copy_received_in_retention(
+                metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
+            )
+            if admission is None or received_at is None:
                 self.store.finish_gmail_recovery_candidate(
                     self.mailbox.account_id,
                     mailbox_identity_key,
@@ -1836,6 +2000,13 @@ class Watcher:
                         ),
                         subject=metadata.subject,
                         received_at=received_at.isoformat(),
+                        rfc_message_id=metadata.rfc_message_id,
+                        reply_ids=metadata.reply_ids,
+                        to=metadata.to,
+                        cc=metadata.cc,
+                        locations=_admitted_locations(metadata, metadata.labels, folders),
+                        capture_timezone=self.config.timezone,
+                        scope_complete=_scope_complete(folders),
                     ),
                     admission=admission.provenance(),
                     metadata_label_ids=metadata.labels,
@@ -1902,6 +2073,16 @@ class Watcher:
     ) -> dict[str, int | bool | str]:
         checked_at = datetime.now(UTC)
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
+        gated_allowed = self._gated_class_allowed()
+        folders = _folders_in_scope(gated_allowed)
+        _scope_gateway(self.gateway, folders)
+        sent_scope = self._settle_sent(
+            folders=folders,
+            mailbox_identity_key=mailbox_identity_key,
+            dry_run=dry_run,
+            now=checked_at,
+        )
+        self._preview_identities: set[tuple[str, str, str, str]] = set()
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
         state = self.store.state(
             provider=self.mailbox.provider,
@@ -1922,6 +2103,7 @@ class Watcher:
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=checked_at,
+                    folders=folders,
                 )
                 pending_recovery = (
                     None
@@ -1951,6 +2133,7 @@ class Watcher:
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=checked_at,
                     deliver_notifications=deliver_notifications,
+                    folders=folders,
                 )
         try:
             changes = self.gateway.changes_since(cursor)
@@ -1973,8 +2156,13 @@ class Watcher:
                     "Stale recovery is blocked by unresolved legacy mailbox identity markers"
                 ) from exc
             recovered = True
-            since = datetime.fromisoformat(last_success).astimezone(UTC) - timedelta(minutes=5)
-            since = max(since, retention_cutoff)
+            since = _recovery_since(last_success, retention_cutoff)
+            if not dry_run:
+                # A gap in polling: folder changes may have gone unobserved, so every
+                # observation of the account is incomplete until discovery looks.
+                self.store.clear_location_stamps(
+                    self.mailbox.provider, self.mailbox.account_id, mailbox_identity_key
+                )
             if self.mailbox.provider == "gmail" and dry_run:
                 replacement_cursor = self.gateway.initial_cursor()
                 if not replacement_cursor.isdigit():
@@ -2037,11 +2225,13 @@ class Watcher:
                     before_epoch,
                     replacement_cursor,
                     retention_cutoff=retention_cutoff,
+                    query_scope=folder_scope_key(folders),
                     now=sampled_at,
                 )
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=sampled_at,
+                    folders=folders,
                 )
                 pending_recovery = (
                     None
@@ -2066,15 +2256,99 @@ class Watcher:
             else:
                 changes = self.gateway.recover_since(self.config.allowlist, since)
 
-        added = 0
         dry_run_messages: list[PendingMessage] = []
-        for provider_message_id in changes.message_ids:
+        added = self._capture_ids(
+            changes.message_ids,
+            mailbox_identity_key=mailbox_identity_key,
+            label_selectors=label_selectors,
+            checked_at=checked_at,
+            retention_cutoff=retention_cutoff,
+            folders=folders,
+            known_locations=changes.locations,
+            dry_run=dry_run,
+            dry_run_messages=dry_run_messages,
+        )
+
+        if not dry_run:
+            self.store.set_state(
+                changes.cursor,
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+        added += self._poll_sent_folder(
+            mailbox_identity_key=mailbox_identity_key,
+            label_selectors=label_selectors,
+            checked_at=checked_at,
+            retention_cutoff=retention_cutoff,
+            folders=folders,
+            sent_scope=sent_scope,
+            dry_run=dry_run,
+            dry_run_messages=dry_run_messages,
+        )
+        return self._finish_active_result(
+            added=added,
+            purged=purged,
+            recovered=recovered,
+            dry_run=dry_run,
+            deliver_notifications=deliver_notifications,
+            checked_at=checked_at,
+            retention_cutoff=retention_cutoff,
+            mailbox_identity_key=mailbox_identity_key,
+            dry_run_messages=dry_run_messages,
+            recovery_incomplete=recovery_incomplete,
+            recovery_reason=recovery_reason,
+        )
+
+    @staticmethod
+    def _gated_class_allowed() -> bool:
+        """Contract D-ops: Sent polling (and later gated capture) need the paid entitlement."""
+        return connect_entitlement_decision() is EntitlementDecision.ACTIVE
+
+    def _capture_ids(
+        self,
+        message_ids: Iterable[str],
+        *,
+        mailbox_identity_key: str,
+        label_selectors: tuple[GmailLabelSelectorLike, ...],
+        checked_at: datetime,
+        retention_cutoff: datetime,
+        folders: frozenset[str],
+        known_locations: Mapping[str, FolderObservation],
+        dry_run: bool,
+        dry_run_messages: list[PendingMessage],
+    ) -> int:
+        """Admit and capture one folder's changed messages; return how many were added.
+
+        An id that arrives with a folder observation but outside the batch (a Gmail
+        continuation replays its prefix) is handled like any other: known or new.
+        """
+        added = 0
+        batch = set(message_ids)
+        candidates = (*message_ids, *(i for i in known_locations if i not in batch))
+        for provider_message_id in candidates:
             if self.store.has_seen_message(
                 provider_message_id,
                 provider=self.mailbox.provider,
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             ):
+                # Gmail and Microsoft ids span folders, so a known id comes back
+                # when its labels or folder change; IMAP copies have folder-tokened ids.
+                hint = known_locations.get(provider_message_id)
+                if self.mailbox.provider != IMAP_PROVIDER and not dry_run and hint is not None:
+                    self._record_known_message_location(
+                        provider_message_id,
+                        mailbox_identity_key=mailbox_identity_key,
+                        checked_at=checked_at,
+                        folders=folders,
+                        observed=hint,
+                    )
+                continue
+            hint = known_locations.get(provider_message_id)
+            if hint is not None and hint.complete and not (hint.locations & folders):
+                # The record says the message is in no folder in scope: nothing is
+                # fetched from the gated scope (contract D-ops); the cursor advances.
                 continue
             try:
                 metadata = self.gateway.metadata(provider_message_id)
@@ -2102,11 +2376,14 @@ class Watcher:
                 exact_senders=self.admission_sender_names,
                 label_selectors=label_selectors,
                 admitted_at=checked_at,
+                folders=folders,
             )
             if admission is None:
                 continue
-            received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
-            if received_at is None or received_at < retention_cutoff:
+            received_at = _copy_received_in_retention(
+                metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
+            )
+            if received_at is None:
                 logger.info(
                     "Skipping message %s outside the configured retention window",
                     provider_message_id,
@@ -2130,45 +2407,156 @@ class Watcher:
                 "mailbox_identity_key": mailbox_identity_key,
             }
             if dry_run:
-                dry_run_messages.append(
-                    PendingMessage(
-                        **values,
-                        attempts=0,
-                        fallback_notified_at=None,
-                        analysis_request_id=None,
-                        analysis_context_at=None,
-                        analysis_body_char_limit=None,
-                    )
-                )
-                added += 1
+                if self._preview_candidate(
+                    metadata, values, mailbox_identity_key, dry_run_messages
+                ):
+                    added += 1
             elif self.store.add_message(
                 **values,
                 admission=admission.provenance(),
                 rfc_message_id=metadata.rfc_message_id,
                 reply_ids=metadata.reply_ids,
+                to=metadata.to,
+                cc=metadata.cc,
+                locations=_admitted_locations(metadata, metadata.labels, folders),
+                capture_timezone=self.config.timezone,
+                scope_complete=_scope_complete(folders),
             ):
                 added += 1
+        return added
 
-        if not dry_run:
-            self.store.set_state(
-                changes.cursor,
-                provider=self.mailbox.provider,
-                account_id=self.mailbox.account_id,
-                mailbox_identity_key=mailbox_identity_key,
+    def _preview_candidate(
+        self,
+        metadata: MessageMetadata,
+        values: dict[str, object],
+        mailbox_identity_key: str,
+        dry_run_messages: list[PendingMessage],
+    ) -> bool:
+        """Append an admitted candidate to a dry run as capture would store it.
+
+        A second copy of a stored or already previewed logical identity is a
+        location, not a message (contract D-identity), in a preview too; the one
+        rule serves polling and recovery previews alike.
+        """
+        if metadata.rfc_message_id is not None:
+            identity = (
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                metadata.rfc_message_id,
             )
-        return self._finish_active_result(
-            added=added,
-            purged=purged,
-            recovered=recovered,
-            dry_run=dry_run,
-            deliver_notifications=deliver_notifications,
-            checked_at=checked_at,
-            retention_cutoff=retention_cutoff,
-            mailbox_identity_key=mailbox_identity_key,
-            dry_run_messages=dry_run_messages,
-            recovery_incomplete=recovery_incomplete,
-            recovery_reason=recovery_reason,
+            if identity in self._preview_identities or (
+                self.store.logical_message_id(*identity, other_than=metadata.message_id)
+                is not None
+            ):
+                return False
+            self._preview_identities.add(identity)
+        dry_run_messages.append(
+            PendingMessage(
+                **values,
+                attempts=0,
+                fallback_notified_at=None,
+                analysis_request_id=None,
+                analysis_context_at=None,
+                analysis_body_char_limit=None,
+            )
         )
+        return True
+
+    def _record_known_message_location(
+        self,
+        provider_message_id: str,
+        *,
+        mailbox_identity_key: str,
+        checked_at: datetime,
+        folders: frozenset[str],
+        observed: FolderObservation,
+    ) -> None:
+        """A known id came back through polling with its folders (contract D-identity).
+
+        The change record says which folders the message is in, so nothing is fetched
+        (plan step 6). A record that is not a whole folder set and names no admitted
+        folder in scope (a star, a read) says nothing about folders and changes
+        nothing. Otherwise the folders in scope are recorded; the observation is
+        complete, and stamps the source's rows, only when the record carried the
+        whole set and every admitted folder was in scope (plan step 5), and clears
+        their stamp otherwise, so the message is observed again by discovery.
+        """
+        if not observed.complete and not (observed.locations & folders):
+            return
+        self.store.record_message_location(
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
+            mailbox_identity_key=mailbox_identity_key,
+            provider_message_id=provider_message_id,
+            locations=observed.locations & folders,
+            scope_complete=_scope_complete(folders) and observed.complete,
+            headers_observed=False,
+            now=checked_at,
+        )
+
+    def _poll_sent_folder(
+        self,
+        *,
+        mailbox_identity_key: str,
+        label_selectors: tuple[GmailLabelSelectorLike, ...],
+        checked_at: datetime,
+        retention_cutoff: datetime,
+        folders: frozenset[str],
+        sent_scope: str | None,
+        dry_run: bool,
+        dry_run_messages: list[PendingMessage],
+    ) -> int:
+        """Poll the Sent folder this check's _settle_sent found available (D-scope).
+
+        Gmail's one mailbox-wide cursor already carries SENT events, so only the other
+        providers keep a Sent cursor of their own. A dry run previews Sent as it
+        previews the Inbox: it reads, and moves no cursor.
+        """
+        if sent_scope != SENT_SCOPE_AVAILABLE or self.mailbox.provider == "gmail":
+            return 0
+        provider = self.mailbox.provider
+        account_id = self.mailbox.account_id
+        folder_scope = {
+            "provider": provider,
+            "account_id": account_id,
+            "mailbox_identity_key": mailbox_identity_key,
+            "folder": SENT_LOCATION,
+        }
+        state = self.store.folder_state(**folder_scope)
+        if state is None:
+            # No position yet: a dry run records none, and _settle_sent retries one
+            # it could not read on the next check.
+            return 0
+        # A Sent folder error never stops the Inbox check; the next check retries.
+        try:
+            try:
+                changes = self.gateway.sent_changes_since(state[0])
+            except StaleMailboxCursor as exc:
+                # Like the Inbox: recover the interval since the last success first.
+                logger.warning("Sent folder cursor expired (%s); recovering the gap", exc)
+                if not dry_run:
+                    self.store.clear_location_stamps(provider, account_id, mailbox_identity_key)
+                changes = self.gateway.sent_recover_since(
+                    _recovery_since(state[1], retention_cutoff)
+                )
+            added = self._capture_ids(
+                changes.message_ids,
+                mailbox_identity_key=mailbox_identity_key,
+                label_selectors=label_selectors,
+                checked_at=checked_at,
+                retention_cutoff=retention_cutoff,
+                folders=folders,
+                known_locations=changes.locations,
+                dry_run=dry_run,
+                dry_run_messages=dry_run_messages,
+            )
+            if not dry_run:
+                self.store.set_folder_state(changes.cursor, at=checked_at, **folder_scope)
+            return added
+        except MailboxError as exc:
+            logger.warning("Sent folder poll failed; the Inbox check is unaffected: %s", exc)
+            return 0
 
     def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender
@@ -2277,11 +2665,14 @@ class Watcher:
                 fallback += self._send_fallback(intent, dry_run)
             for intent in self.store.notification_intents(kind="automation_review"):
                 self._deliver_automation_review(intent, dry_run)
-        for message in self.store.pending_delivery():
-            received_at = _received_at_or_none(
-                message.received_at, observed_at=retention_observed_at
-            )
-            if received_at is None or received_at < retention_cutoff:
+        delivery = self.store.pending_delivery()
+        retained = self.store.retained_logical_messages(
+            (message.message_id for message in delivery),
+            cutoff=retention_cutoff,
+            now=retention_observed_at,
+        )
+        for message in delivery:
+            if message.message_id not in retained:
                 continue
             if deliver_notifications:
                 fallback += self._deliver_analysis(
@@ -2295,18 +2686,21 @@ class Watcher:
                 )
             elif not self.config.notifications_enabled and not dry_run:
                 self.store.mark_delivery_complete(message.message_id, notified=False)
+        stored = self.store.pending(
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
+        )
+        retained = self.store.retained_logical_messages(
+            (message.message_id for message in stored),
+            cutoff=retention_cutoff,
+            now=retention_observed_at,
+        )
+        # The store judges stored messages by the purge's rule; a preview (extra)
+        # is not stored, and this check admitted it under the same cutoff.
         for message in [
-            *self.store.pending(
-                provider=self.mailbox.provider,
-                account_id=self.mailbox.account_id,
-            ),
+            *(message for message in stored if message.message_id in retained),
             *(extra or []),
         ]:
-            received_at = _received_at_or_none(
-                message.received_at, observed_at=retention_observed_at
-            )
-            if received_at is None or received_at < retention_cutoff:
-                continue
             try:
                 if (
                     message.mailbox_identity_key is None
@@ -2335,9 +2729,25 @@ class Watcher:
                     request_id = request.request_id
                     body_char_limit = request.body_char_limit
                     current_local_time = datetime.fromisoformat(request.context_at)
-                content = self.gateway.content(message.provider_message_id, body_char_limit)
+                # A stored message is read through any of its copies; a dry-run
+                # message is not stored and has only the id polling saw.
+                source_ids = (
+                    (message.provider_message_id,)
+                    if dry_run
+                    else tuple(
+                        s.provider_message_id
+                        for s in self.store.message_sources(message.message_id)
+                    )
+                )
+                served_by, content = _content_from_sources(
+                    self.gateway, source_ids, body_char_limit
+                )
                 if not dry_run:
-                    self.store.replace_attachments(message.message_id, content.attachments)
+                    self.store.replace_attachments(
+                        message.message_id,
+                        content.attachments,
+                        source_provider_message_id=served_by,
+                    )
                 analysis = self.model.analyze(
                     sender=message.sender,
                     subject=message.subject,

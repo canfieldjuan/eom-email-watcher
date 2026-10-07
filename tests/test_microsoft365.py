@@ -11,6 +11,7 @@ import pytest
 
 from eom_email_watcher import microsoft365
 from eom_email_watcher.mailbox import (
+    FolderObservation,
     MailboxMessageUnavailable,
     StaleMailboxCursor,
 )
@@ -504,11 +505,18 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         path = request.url.path
-        if "/mailFolders/inbox/messages/" in path:
+        if path.endswith("/mailFolders/inbox"):
+            return httpx.Response(200, json={"id": "inbox-folder-id"})
+        if path.endswith("/mailFolders/sentitems"):
+            return httpx.Response(200, json={"id": "sent-folder-id"})
+        if path.endswith("/messages/message-1") and str(
+            request.url.params.get("$select", "")
+        ).startswith("id,"):
             return httpx.Response(
                 200,
                 json={
                     "id": "message-1",
+                    "parentFolderId": "inbox-folder-id",
                     "conversationId": "conversation-1",
                     "from": {
                         "emailAddress": {
@@ -689,3 +697,180 @@ def test_message_content_reports_pre_cut_length(limit: int, expected_body: str) 
 @pytest.mark.parametrize("body", [None, {}, {"content": 7}, "text"])
 def test_unusable_message_body_counts_zero(body: object) -> None:
     assert microsoft365._message_body_text(body, 100) == ("", 0)
+
+
+# Thread view M2.1: Sent Items delta, folder-agnostic metadata, locations.
+
+
+def _folders_and_messages(request: httpx.Request) -> httpx.Response | None:
+    path = request.url.path
+    if path.endswith("/mailFolders/inbox"):
+        return httpx.Response(200, json={"id": "inbox-folder-id"})
+    if path.endswith("/mailFolders/sentitems"):
+        return httpx.Response(200, json={"id": "sent-folder-id"})
+    if "/mailFolders/sentitems/messages/delta" in path:
+        return httpx.Response(
+            200,
+            json={
+                "value": [{"id": "sent-1"}],
+                "@odata.deltaLink": (
+                    f"{GRAPH_ROOT}/me/mailFolders/sentitems/messages/delta?$deltatoken=sent-next"
+                ),
+            },
+        )
+    documents = {
+        "sent-1": {
+            "id": "sent-1",
+            "parentFolderId": "sent-folder-id",
+            "conversationId": "conversation-9",
+            "internetMessageId": "<s1@owner.example>",
+            "from": {"emailAddress": {"address": "OWNER@Example.com", "name": "Owner"}},
+            "toRecipients": [
+                {"emailAddress": {"address": "Billing@Vendor.com"}},
+                {"emailAddress": {"address": "sales@vendor.com"}},
+            ],
+            "ccRecipients": [{"emailAddress": {"address": "cc@other.com"}}],
+            "subject": "Re: Quote",
+            "receivedDateTime": "2026-09-02T12:00:00Z",
+        },
+        "archived-1": {
+            "id": "archived-1",
+            "parentFolderId": "archive-folder-id",
+            "conversationId": "conversation-9",
+            "from": {"emailAddress": {"address": "v@vendor.com"}},
+            "subject": "Old",
+            "receivedDateTime": "2026-09-01T12:00:00Z",
+        },
+    }
+    for message_id, document in documents.items():
+        if path.endswith(f"/messages/{message_id}"):
+            return httpx.Response(200, json=document)
+    return None
+
+
+def test_sent_items_has_its_own_delta_and_metadata_records_locations() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = _folders_and_messages(request)
+        assert response is not None, request.url
+        return response
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+
+    assert gateway.sent_scope() == "available"
+    changes = gateway.sent_changes_since(gateway.sent_initial_cursor())
+    assert changes.message_ids == ("sent-1",)
+    # The delta is per folder, so the record names the message's folder.
+    assert changes.locations == {"sent-1": FolderObservation(frozenset({"sent"}), complete=True)}
+    assert "/mailFolders/sentitems/messages/delta" in changes.cursor
+    delta_requests = [r for r in requests if "/messages/delta" in r.url.path]
+    assert len(delta_requests) == 1 and "sentitems" in delta_requests[0].url.path
+
+    sent = gateway.metadata("sent-1")
+    assert sent.locations == frozenset({"sent"})
+    assert sent.labels == frozenset()
+    assert sent.to == ("billing@vendor.com", "sales@vendor.com")
+    assert sent.cc == ("cc@other.com",)
+    assert sent.rfc_message_id == "s1@owner.example"
+    assert sent.sender == "owner@example.com"
+    # Read through the folder whose delta listed it, so a message that moved since
+    # answers not found instead of being read from another folder.
+    metadata_request = next(r for r in requests if r.url.path.endswith("/messages/sent-1"))
+    assert "/mailFolders/sentitems/messages/sent-1" in metadata_request.url.path
+
+    archived = gateway.metadata("archived-1")
+    assert archived.locations == frozenset()
+    assert archived.labels == frozenset()
+
+    # The well-known folder ids are resolved once per gateway.
+    assert sum(1 for r in requests if r.url.path.endswith("/mailFolders/inbox")) == 1
+
+
+def test_inbox_metadata_never_looks_up_sent_items() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path.endswith("/mailFolders/sentitems"):
+            return httpx.Response(503, json={"error": {"code": "ServiceUnavailable"}})
+        if path.endswith("/mailFolders/inbox"):
+            return httpx.Response(200, json={"id": "inbox-folder-id"})
+        if path.endswith("/messages/inbox-1"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "inbox-1",
+                    "parentFolderId": "inbox-folder-id",
+                    "conversationId": "conversation-1",
+                    "from": {"emailAddress": {"address": "trusted@example.com"}},
+                    "subject": "Invoice",
+                    "receivedDateTime": "2026-09-02T12:00:00Z",
+                },
+            )
+        raise AssertionError(request.url)
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+
+    # An Inbox message resolves its location without touching the Sent scope, so a
+    # Sent Items failure cannot abort the Inbox check (contract D-ops).
+    assert gateway.metadata("inbox-1").locations == frozenset({"inbox"})
+    assert not any(r.url.path.endswith("/mailFolders/sentitems") for r in requests)
+    # A read with no delta origin is an Inbox read: a moved message answers not found.
+    assert any(r.url.path.endswith("/mailFolders/inbox/messages/inbox-1") for r in requests)
+
+    # The Sent poll sees the failure as the mailbox error it contains.
+    with pytest.raises(Microsoft365Error):
+        gateway.sent_scope()
+
+
+def test_folder_resolution_never_reads_sent_items_while_it_is_out_of_scope() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = _folders_and_messages(request)
+        assert response is not None, request.url
+        return response
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+    gateway.scope_folders(frozenset({"inbox"}))
+
+    # A message outside the Inbox is not compared with Sent Items while Sent is gated:
+    # no request reads the paid scope, and the message gets no location.
+    assert gateway.metadata("archived-1").locations == frozenset()
+    assert not any(r.url.path.endswith("/mailFolders/sentitems") for r in requests)
+
+
+def test_sent_scope_is_unavailable_without_a_sent_items_folder() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/mailFolders/sentitems"):
+            return httpx.Response(404, json={"error": {"code": "ErrorItemNotFound"}})
+        response = _folders_and_messages(request)
+        assert response is not None, request.url
+        return response
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+
+    assert gateway.sent_scope() == "unavailable"
+
+
+def test_sent_recovery_restarts_the_sent_items_delta_from_since() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = _folders_and_messages(request)
+        assert response is not None, request.url
+        return response
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+
+    changes = gateway.sent_recover_since(datetime(2026, 9, 1, 12, 0, tzinfo=UTC))
+
+    assert changes.message_ids == ("sent-1",)
+    delta = next(r for r in requests if "/messages/delta" in r.url.path)
+    assert "sentitems" in delta.url.path
+    assert "receivedDateTime ge 2026-09-01T12:00:00Z" in str(delta.url.params.get("$filter"))

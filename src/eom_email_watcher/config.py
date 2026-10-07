@@ -27,6 +27,8 @@ from filelock import FileLock
 from tomlkit import aot, document, dumps, inline_table, parse, table
 from tomlkit.items import AoT, Array
 
+from .text import utf8_size, within_utf8_bytes
+
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
 DEFAULT_POLL_INTERVAL_MINUTES = 120
 DEFAULT_RETENTION_DAYS = 180
@@ -262,7 +264,7 @@ def normalize_validated_address(value: str) -> str:
 
 def exact_sender_selector_id(value: str) -> str:
     selector_id = f"{EXACT_SENDER_SELECTOR_PREFIX}{normalize_validated_address(value)}"
-    if len(selector_id.encode("utf-8")) > MAX_ADMISSION_SELECTOR_BYTES:
+    if not within_utf8_bytes(selector_id, MAX_ADMISSION_SELECTOR_BYTES):
         raise ValueError(
             "sender email creates an admission selector over 512 UTF-8 bytes"
         )
@@ -295,7 +297,7 @@ def _valid_network_host(host: str) -> bool:
 
 
 def admission_sender_display_name(value: str | None) -> str | None:
-    if value is None:
+    if value is None or utf8_size(value) is None:
         return None
     encoded = value.encode("utf-8")
     if len(encoded) <= MAX_SENDER_NAME_BYTES:
@@ -335,7 +337,7 @@ def _sender(
     if (
         enforce_name_limit
         and name is not None
-        and len(name.encode("utf-8")) > MAX_SENDER_NAME_BYTES
+        and not within_utf8_bytes(name, MAX_SENDER_NAME_BYTES)
     ):
         raise InvalidSenderError(
             f"sender name must be at most {MAX_SENDER_NAME_BYTES} UTF-8 bytes"

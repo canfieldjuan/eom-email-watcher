@@ -12,13 +12,14 @@ from urllib3.response import HTTPResponse
 
 from eom_email_watcher import gmail as gmail_module
 from eom_email_watcher.gmail import (
+    GMAIL_METADATA_HEADERS,
     GmailAuthorizationRejected,
     GmailError,
     GmailGateway,
     parse_metadata,
     resolve_gmail_credentials_file,
 )
-from eom_email_watcher.mailbox import MailboxMessageInvalid
+from eom_email_watcher.mailbox import FolderObservation, MailboxMessageInvalid
 
 
 def test_gmail_operation_timeout_reaches_authorized_transport() -> None:
@@ -163,7 +164,7 @@ def test_parse_metadata_rejects_malformed_label_ids(label_ids: object) -> None:
 
 def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> None:
     gateway = GmailGateway(None)
-    gateway.history_message_ids = lambda cursor: (["m1", "m2"], "next-cursor")
+    gateway._history_changes = lambda cursor: (["m1", "m2"], "next-cursor", {})
     gateway.search_since = lambda addresses, since: ["recovered"]
     gateway.profile_history_id = lambda: "recovery-cursor"
     gateway.full_payload = lambda message_id: {
@@ -288,6 +289,23 @@ def test_gmail_history_v2_resumes_more_than_200_unique_ids_without_skip_or_dupli
     ]
 
 
+def test_gmail_history_carries_later_hints_for_replayed_prefix_ids() -> None:
+    response = history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1)
+    history = response["history"]
+    assert isinstance(history, list)
+    # After the batch boundary, the first message of the prefix gains SENT.
+    history.append({"labelsAdded": [{"message": {"id": "message-0"}, "labelIds": ["SENT"]}]})
+    gateway = GmailGateway(FakeHistoryService(response))
+
+    first = gateway.changes_since("12345")
+    second = gateway.changes_since(first.cursor)
+
+    assert "message-0" in first.message_ids
+    assert second.message_ids == (f"message-{gmail_module.MAX_INCREMENTAL_MESSAGE_IDS}",)
+    # The later event travels as an observation outside the second batch.
+    assert second.locations["message-0"] == FolderObservation(frozenset({"sent"}), complete=False)
+
+
 def test_gmail_history_deduplicates_before_enforcing_limit() -> None:
     response = history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS)
     history = response["history"]
@@ -360,6 +378,40 @@ def test_gmail_history_deduplicates_message_and_label_added_in_canonical_order()
 
     assert message_ids == ["delivered", "overlap", "labeled-later"]
     assert cursor == "99999"
+
+
+def test_gmail_history_changes_carry_each_record_s_admitted_folders() -> None:
+    response = {
+        "historyId": "99999",
+        "history": [
+            {
+                "messagesAdded": [
+                    {"message": {"id": "delivered", "labelIds": ["INBOX", "UNREAD"]}},
+                ],
+                "labelsAdded": [
+                    # The addition says what was added; the nested message, when it
+                    # carries labelIds, says the whole set.
+                    {"message": {"id": "starred"}, "labelIds": ["STARRED"]},
+                    {"message": {"id": "sent-copy"}, "labelIds": ["SENT"]},
+                    {
+                        "message": {"id": "whole", "labelIds": ["SENT", "INBOX"]},
+                        "labelIds": ["SENT"],
+                    },
+                    {"message": {"id": "unknown"}},
+                ],
+            }
+        ],
+    }
+
+    changes = GmailGateway(FakeHistoryService(response)).changes_since("12345")
+
+    assert changes.message_ids == ("delivered", "starred", "sent-copy", "whole", "unknown")
+    assert changes.locations == {
+        "delivered": FolderObservation(frozenset({"inbox"}), complete=True),
+        "starred": FolderObservation(frozenset(), complete=False),
+        "sent-copy": FolderObservation(frozenset({"sent"}), complete=False),
+        "whole": FolderObservation(frozenset({"inbox", "sent"}), complete=True),
+    }
 
 
 def test_gmail_history_v2_rejects_changed_prefix_digest_and_legacy_v1_token_as_stale() -> None:
@@ -446,6 +498,19 @@ class FakeRecoveryService:
         return self._users
 
 
+def test_gmail_recovery_query_follows_the_folders_in_scope() -> None:
+    service = FakeRecoveryService({"messages": [{"id": "only"}]})
+    gateway = GmailGateway(service)
+    gateway.scope_folders(frozenset({"inbox"}))
+
+    gateway.recovery_page(None, 100, 200)
+
+    assert service.messages.calls[0]["q"] == "in:inbox after:100 before:200"
+    assert gmail_module.recovery_folder_query(frozenset({"inbox", "sent"})) == (
+        "(in:inbox OR in:sent)"
+    )
+
+
 def test_gmail_recovery_page_is_one_broad_inbox_window_query_without_rule_filters() -> None:
     service = FakeRecoveryService(
         {"messages": [{"id": "second"}, {"id": "first"}], "nextPageToken": "next"}
@@ -458,7 +523,7 @@ def test_gmail_recovery_page_is_one_broad_inbox_window_query_without_rule_filter
     assert service.messages.calls == [
         {
             "userId": "me",
-            "q": "in:inbox after:100 before:200",
+            "q": "(in:inbox OR in:sent) after:100 before:200",
             "pageToken": "current",
             "maxResults": 200,
         }
@@ -1730,3 +1795,50 @@ def test_profile_rejects_incomplete_identity(response: dict[str, str]) -> None:
 
     with pytest.raises(GmailError, match="profile response"):
         gateway.profile()
+
+
+# Thread view M2.1: recipients, RFC ids, and locations (contract D-attribution, D-identity).
+
+
+def test_parse_metadata_reads_recipients_rfc_ids_and_locations() -> None:
+    parsed = parse_metadata(
+        {
+            "id": "m1",
+            "threadId": "t1",
+            "internalDate": "1784383200000",
+            "labelIds": ["INBOX", "SENT", "UNREAD"],
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "Person <TRUSTED@Example.com>"},
+                    {"name": "To", "value": "A <A@Vendor.com>, b@vendor.com"},
+                    {"name": "Cc", "value": "c@other.com"},
+                    {"name": "Subject", "value": "Quote"},
+                    {"name": "Message-ID", "value": "<m1@vendor.com>"},
+                    {"name": "In-Reply-To", "value": "<p@vendor.com>"},
+                    {"name": "References", "value": "<r@vendor.com> <p@vendor.com>"},
+                ]
+            },
+        }
+    )
+    assert parsed.to == ("a@vendor.com", "b@vendor.com")
+    assert parsed.cc == ("c@other.com",)
+    assert parsed.rfc_message_id == "m1@vendor.com"
+    assert parsed.reply_ids == ("p@vendor.com", "r@vendor.com")
+    assert parsed.locations == frozenset({"inbox", "sent"})
+
+
+def test_parse_metadata_without_admitted_labels_has_no_location() -> None:
+    parsed = parse_metadata(
+        {
+            "id": "m2",
+            "threadId": "t2",
+            "labelIds": ["IMPORTANT"],
+            "payload": {"headers": [{"name": "From", "value": "a@b.com"}]},
+        }
+    )
+    assert parsed.locations == frozenset()
+    assert parsed.to == ()
+
+
+def test_metadata_fetch_requests_the_thread_headers() -> None:
+    assert set(GMAIL_METADATA_HEADERS) >= {"To", "Cc", "Message-ID", "In-Reply-To", "References"}

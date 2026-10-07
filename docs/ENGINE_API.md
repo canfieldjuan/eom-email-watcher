@@ -59,7 +59,7 @@ envelope without changing its protocol number.
 | `config.admission.snapshot` | `{}` | Return safe settings, the current admission token, and the first-run receipt when present |
 | `config.admission.compare` | `token` from a snapshot | Return `{"current":true}` only when that token still matches the safely reopened config |
 | `health.get` | `{}` | Database, generic mail-account catalog, legacy Gmail status, local-model health, notification mode, watchlist count, last check |
-| `mail.accounts.list` | `{}` | Available mail providers and retained local accounts, without credential values or paths |
+| `mail.accounts.list` | `{}` | Available mail providers and retained local accounts, each with its Sent scope, without credential values or paths |
 | `mail.accounts.connect` | `provider`; IMAP also requires `connection` | Run that provider's account flow and safely register or reuse the resulting mailbox identity |
 | `mail.accounts.reconnect` | `provider`, `account_id`; IMAP also requires `connection` | Reauthorize exactly one retained account without changing its identity or mailbox cursor |
 | `mail.accounts.disconnect` | `provider`, `account_id` | Remove that account's local read token while retaining local history and mailbox state |
@@ -254,6 +254,16 @@ vendor, or an address the vendor does not have. `watchlist.remove` of a vendor a
 Schema v29 also gives every stored message a thread key under
 [D-identity](THREAD_VIEW_CONTRACT.md#d-identity-message-identity-direction-and-thread-keys). No
 operation returns it before the thread view.
+
+Schema v30 (thread view M2.1) records, for every captured message, its To and Cc recipients in
+header order and the admitted folders it is in ([D-scope](THREAD_VIEW_CONTRACT.md#d-scope-in-scope-messages-and-retention):
+`inbox`, `sent`), plus the configured time zone at capture. A second copy of an already-captured
+message (the same `Message-ID` in the same mailbox) is recorded as a location of the first, never as a
+second row. The Sent folder is polled only while the Connect entitlement is active, with a cursor of
+its own per folder. Each account item of `mail.accounts.list` and `health.get` carries `sent_scope`:
+`available`, `unavailable` (an IMAP server with no `\Sent` folder and no configured `sent_folder`,
+shown as "Sent mail unavailable"), or `not_polled`. IMAP `connection` payloads accept an optional
+`sent_folder` name. Nothing reads locations or recipients before the thread view.
 
 `settings.get` reports the configured inference endpoint and model under `local_model` without
 exposing token values or paths. Its `editable` flag is true only for the exact-loopback backend.

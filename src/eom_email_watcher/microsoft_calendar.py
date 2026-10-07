@@ -39,6 +39,7 @@ from .microsoft365 import (
 from .microsoft365 import (
     SCOPES as MAIL_READ_SCOPES,
 )
+from .text import utf8_size, within_utf8_bytes
 
 CALENDAR_READ_PROFILE = "read"
 CALENDAR_READ_SCOPES = ("Calendars.Read",)
@@ -795,11 +796,11 @@ def _calendar_write_request(
     transaction_id = _calendar_transaction_id(transaction_id)
     candidate = CalendarProposalCandidate(start=start, end=end, timezone=timezone)
     parsed_start, parsed_end, _zone = _proposal_candidate_interval(candidate)
-    try:
-        subject_bytes = subject.encode("utf-8")
-    except (AttributeError, UnicodeEncodeError) as exc:
-        raise ValueError("calendar event subject is invalid") from exc
-    if not subject or len(subject_bytes) > MAX_CALENDAR_SUBJECT_BYTES:
+    if (
+        not isinstance(subject, str)
+        or not subject
+        or not within_utf8_bytes(subject, MAX_CALENDAR_SUBJECT_BYTES)
+    ):
         raise ValueError("calendar event subject is invalid")
     if len(attendees) > MAX_CALENDAR_PROPOSAL_ATTENDEES:
         raise ValueError("calendar event has too many attendees")
@@ -1048,7 +1049,7 @@ def _calendar_delta_url(window_start: str, window_end: str) -> str:
 
 
 def _safe_calendar_continuation(url: object, token_name: str) -> str:
-    if not isinstance(url, str) or not url or len(url.encode("utf-8")) > MAX_GRAPH_URL_LENGTH:
+    if not isinstance(url, str) or not url or not within_utf8_bytes(url, MAX_GRAPH_URL_LENGTH):
         raise Microsoft365Error("Microsoft Graph returned an invalid calendar cursor")
     try:
         parsed = urlsplit(url)
@@ -1077,7 +1078,7 @@ def _safe_calendar_view_continuation(
     window_start: str,
     window_end: str,
 ) -> str:
-    if not isinstance(url, str) or not url or len(url.encode("utf-8")) > MAX_GRAPH_URL_LENGTH:
+    if not isinstance(url, str) or not url or not within_utf8_bytes(url, MAX_GRAPH_URL_LENGTH):
         raise Microsoft365Error("Microsoft Graph returned an invalid reconciliation cursor")
     try:
         parsed = urlsplit(url)
@@ -1220,11 +1221,10 @@ def _bounded_graph_text(
 ) -> str:
     if not isinstance(value, str) or (not value and not allow_empty):
         raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}") from exc
-    if len(encoded) > byte_limit:
+    size = utf8_size(value)
+    if size is None:
+        raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")
+    if size > byte_limit:
         raise Microsoft365Error(f"Microsoft Graph returned an oversized calendar {name}")
     if any(unicodedata.category(character) in {"Cc", "Cs"} for character in value):
         raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")

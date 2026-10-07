@@ -8,11 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from connect_automate.entitlement import EntitlementDecision
 
 from eom_email_watcher import db as db_module
 from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
-from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, Store
+from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, MessageSource, Store
 from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
     GmailLabelCatalogInvalid,
@@ -21,12 +22,15 @@ from eom_email_watcher.gmail import (
     MessageMetadata,
     MessageUnavailable,
     StaleHistoryCursor,
+    locations_from_labels,
 )
-from eom_email_watcher.imap import ImapGateway
+from eom_email_watcher.imap import ImapError, ImapGateway
 from eom_email_watcher.mailbox import (
+    FolderObservation,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
+    MailboxMessageUnavailable,
     MailboxSession,
     MessageContent,
     StaleMailboxCursor,
@@ -1214,6 +1218,7 @@ def test_dry_run_previews_open_recovery_without_mutating_it(tmp_path: Path) -> N
         frozen_after,
         frozen_before,
         "200",
+        query_scope="inbox",
     )
     store.remove_gmail_label_selector(
         "gmail-default",
@@ -1260,6 +1265,444 @@ def test_dry_run_previews_open_recovery_without_mutating_it(tmp_path: Path) -> N
     assert gateway.recovery_args == (None, frozen_after, frozen_before, 200)
     assert store.gmail_recovery_state("gmail-default") == before
     assert store.state()[0] == "100"
+
+
+def test_dry_run_recovery_preview_keeps_sent_only_candidates_out_of_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+    frozen_after = 1_779_000_000
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        revision,
+        (),
+        (selector,),
+        frozen_after,
+        frozen_after + 3_600,
+        "200",
+        query_scope="inbox",
+    )
+
+    class SentOnlyRecoveryGmail(FreshGmail):
+        labels = frozenset({"SENT", "Label_123"})
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return ("allowed",), None
+
+        def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+            return replace(
+                super().metadata(message_id),
+                labels=self.labels,
+                locations=locations_from_labels(self.labels),
+                received_at=datetime(2026, 10, 1, 12, tzinfo=UTC).isoformat(),
+            )
+
+    # The autouse conftest fixture reports no entitlement: Sent is out of scope.
+    inactive = Watcher(cfg, store, SentOnlyRecoveryGmail(), FakeModel()).check(dry_run=True)
+    assert inactive["recovery_pending"] is True
+    assert inactive["discovered"] == 0
+
+    _active_entitlement(monkeypatch)
+    active = Watcher(cfg, store, SentOnlyRecoveryGmail(), FakeModel()).check(dry_run=True)
+    assert active["recovery_pending"] is True
+    assert active["discovered"] == 1
+
+
+def test_recovery_marks_a_known_candidate_for_a_fresh_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"INBOX"}))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    item = store.recent(1)[0]
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ?",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    # The history cursor is lost; the recovery search lists the known message among
+    # its candidates. Recovery fetches nothing for it, but the lost interval may have
+    # moved it, so its observation is no longer complete.
+    class RecoveringGmail(LabelledGmail):
+        def history_message_ids(self, cursor: str):
+            raise StaleHistoryCursor()
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return ("allowed",), None
+
+    recovering = RecoveringGmail(frozenset({"INBOX"}))
+    calls = recovering.metadata_calls
+    Watcher(cfg, store, recovering, FakeModel()).check()
+    assert recovering.metadata_calls == calls
+    assert stamps() == [None]
+    assert len(store.recent(5)) == 1
+
+
+def test_a_recovery_restarts_its_page_when_the_folder_scope_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+    frozen_after = 1_779_000_000
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        revision,
+        (),
+        (selector,),
+        frozen_after,
+        frozen_after + 3_600,
+        "200",
+        query_scope="inbox+sent",
+    )
+    store.store_gmail_recovery_page("gmail-default", TEST_MAILBOX_IDENTITY_KEY, [], "page-2")
+
+    class PagedGmail(FreshGmail):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tokens: list[str | None] = []
+            self.query_folders: frozenset[str] | None = None
+
+        def scope_folders(self, folders: frozenset[str]) -> None:
+            self.query_folders = folders
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            self.tokens.append(page_token)
+            return (), None
+
+    # The conftest reports no entitlement: the saved page belongs to the other
+    # scope, so paging restarts under the Inbox-only query instead of reusing it.
+    gateway = PagedGmail()
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    assert gateway.tokens == [None]
+    assert gateway.query_folders == frozenset({"inbox"})
+    state = store.gmail_recovery_state("gmail-default")
+    assert state is None or state.query_scope == "inbox"
+
+
+def test_content_is_read_through_any_source_of_a_logical_message() -> None:
+    class Copies:
+        def content(self, provider_message_id: str, body_char_limit: int) -> MessageContent:
+            if provider_message_id == "imap:mailbox:44:1":
+                raise MailboxMessageUnavailable("expunged")
+            return MessageContent(f"body of {provider_message_id}", (), (), 4)
+
+    sources = tuple(
+        MessageSource(
+            message_id="m", provider="imap", account_id="a", provider_message_id=pid,
+            received_at="2026-09-01T00:00:00+00:00", discovered_at="2026-09-01T00:00:00+00:00",
+            mailbox_identity_key="k" * 64,
+        )
+        for pid in ("imap:mailbox:44:1", "imap:sent:77:3")
+    )
+
+    ids = tuple(s.provider_message_id for s in sources)
+    served_by, content = service_module._content_from_sources(Copies(), ids, 100)
+    assert served_by == "imap:sent:77:3"
+    assert content.body == "body of imap:sent:77:3"
+    with pytest.raises(MailboxMessageUnavailable):
+        service_module._content_from_sources(Copies(), ids[:1], 100)
+
+
+def test_a_lost_history_cursor_marks_every_observation_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, LabelledGmail(frozenset({"INBOX"})), FakeModel()).check()
+    item = store.recent(1)[0]
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ?",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    class LostCursor(LabelledGmail):
+        def history_message_ids(self, cursor: str):
+            raise StaleHistoryCursor()
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return (), None
+
+    # The gap may have moved messages unobserved: every stamp is cleared, so the
+    # next discovery pass looks at them again; the recovery itself lists nothing.
+    Watcher(cfg, store, LostCursor(frozenset({"INBOX"})), FakeModel()).check()
+    assert stamps() == [None]
+
+
+def test_a_recovery_preview_previews_a_logical_message_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+    frozen_after = 1_779_000_000
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        revision,
+        (),
+        (selector,),
+        frozen_after,
+        frozen_after + 3_600,
+        "200",
+        query_scope="inbox+sent",
+    )
+
+    class TwoCopiesRecovery(FreshGmail):
+        labels = frozenset({"INBOX", "Label_123"})
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return ("copy-a", "copy-b"), None
+
+        def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+            return replace(
+                super().metadata(message_id),
+                labels=self.labels,
+                locations=locations_from_labels(self.labels),
+                rfc_message_id="same@x",
+                received_at=datetime(2026, 10, 1, 12, tzinfo=UTC).isoformat(),
+            )
+
+    preview = Watcher(cfg, store, TwoCopiesRecovery(), FakeModel()).check(dry_run=True)
+    assert preview["recovery_pending"] is True
+    assert preview["discovered"] == 1
+
+
+def test_a_gmail_recovery_check_records_the_sent_scope_it_decided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+
+    def recover() -> None:
+        store.create_gmail_recovery_state(
+            "gmail-default",
+            TEST_MAILBOX_IDENTITY_KEY,
+            revision,
+            (),
+            (selector,),
+            1_779_000_000,
+            1_779_003_600,
+            "200",
+            query_scope="inbox",
+        )
+
+    class EmptyRecovery(FreshGmail):
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return (), None
+
+    # A check that spends itself on recovery still records this check's Sent scope:
+    # available once Connect is active, not polled once it lapses.
+    recover()
+    _active_entitlement(monkeypatch)
+    assert Watcher(cfg, store, EmptyRecovery(), FakeModel()).check()["active"] is True
+    assert store.sent_scope("gmail", "gmail-default") == "available"
+
+    recover()
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
+    )
+    assert Watcher(cfg, store, EmptyRecovery(), FakeModel()).check()["active"] is True
+    assert store.sent_scope("gmail", "gmail-default") == "not_polled"
+
+
+def test_a_message_kept_by_a_newer_copy_is_analyzed(tmp_path: Path) -> None:
+    cfg = replace(config(tmp_path), retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
+    for message_id, age, locations in (
+        ("old-inbox-copy", timedelta(days=2), frozenset({"inbox"})),
+        ("new-sent-copy", timedelta(hours=1), frozenset({"sent"})),
+    ):
+        store.add_message(
+            message_id=message_id,
+            provider_message_id=message_id,
+            thread_id=None,
+            sender="trusted@example.com",
+            sender_name="Trusted",
+            subject="Quote",
+            received_at=(datetime.now(UTC) - age).isoformat(),
+            rfc_message_id="same@x",
+            locations=locations,
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            admission=exact_sender_admission(),
+        )
+    gmail = FakeGmail()
+    gmail.history_message_ids = lambda cursor: ([], "200")
+    model = FakeModel()
+
+    result = Watcher(cfg, store, gmail, model).check()
+
+    # The canonical row is past retention, its Sent copy is not: the purge keeps the
+    # message, so it is analyzed rather than left pending until the copy expires.
+    assert result["purged"] == 0
+    assert result["summarized"] == 1
+    assert model.calls == 1
 
 
 def test_inert_persisted_label_selectors_return_stable_inactive_reason(
@@ -1492,6 +1935,7 @@ def test_due_recovery_retry_crash_preserves_degraded_backoff_state(
         Watcher(cfg, store, gateway, FakeModel())._run_gmail_recovery(
             mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
             checked_at=checked_at,
+            folders=frozenset({"inbox", "sent"}),
         )
 
     assert gateway.recovery_calls == 1
@@ -1545,6 +1989,7 @@ def test_open_recovery_retains_dedupe_until_page_token_restart_drains(
         "200",
         retention_cutoff=frozen_cutoff,
         now=checked_at,
+        query_scope="inbox",
     )
     store.store_gmail_recovery_page(
         "gmail-default",
@@ -1995,6 +2440,7 @@ def test_open_recovery_keeps_capture_retention_after_setting_shrinks(
         "200",
         retention_cutoff=frozen_cutoff,
         now=captured_at,
+        query_scope="inbox",
     )
     recovery = store.gmail_recovery_state("gmail-default")
     assert recovery is not None
@@ -5160,3 +5606,592 @@ def test_imap_capture_threads_a_reply_with_its_root(tmp_path: Path) -> None:
     assert rows[ids["root"]][1] == "root@vendor.example"
     assert rows[ids["reply"]][1] == "reply@vendor.example"
     assert rows[ids["root"]][0] == rows[ids["reply"]][0] is not None
+
+
+# Thread view M2.1: Sent capture and locations (contract D-scope, D-identity, D-ops).
+
+
+class LabelledGmail(FakeGmail):
+    """Gmail history naming one watched message, with the labels the test chooses."""
+
+    def __init__(self, labels: frozenset[str], *, added: frozenset[str] | None = None) -> None:
+        super().__init__()
+        self.labels = labels
+        # What the history record says: the labels an event added (Gmail history is a
+        # delta); the message's whole label set only when a test says so.
+        self.added = labels if added is None else added
+        self.whole = False
+        self.metadata_calls = 0
+
+    def history_message_ids(self, cursor: str):
+        return ["allowed"], "200"
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        # Like the real gateway: a record carries the labels an event added, and the
+        # whole set only when the nested message carries labelIds.
+        ids, newest = self.history_message_ids(cursor)
+        observed = FolderObservation(
+            locations_from_labels(self.labels if self.whole else self.added),
+            complete=self.whole,
+        )
+        return MailboxChanges(tuple(ids), newest, {i: observed for i in ids})
+
+    def _locations(self) -> frozenset[str]:
+        return locations_from_labels(self.labels)
+
+    def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+        self.metadata_calls += 1
+        return replace(
+            super().metadata(message_id),
+            labels=self.labels,
+            locations=self._locations(),
+            to=("billing@vendor.com",),
+        )
+
+
+def test_gmail_sent_only_message_from_a_watched_sender_is_captured_with_its_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+
+    result = Watcher(cfg, store, LabelledGmail(frozenset({"SENT"})), FakeModel()).check()
+
+    assert result["summarized"] == 1
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["sent"]
+    assert store.sent_scope("gmail", "gmail-default") == "available"
+    with store.connection() as db:
+        recipients = db.execute(
+            "SELECT field, position, address FROM message_recipients WHERE message_id = ?",
+            (item["message_id"],),
+        ).fetchall()
+        zone = db.execute(
+            "SELECT capture_timezone FROM messages WHERE message_id = ?", (item["message_id"],)
+        ).fetchone()[0]
+    assert [tuple(row) for row in recipients] == [("to", 0, "billing@vendor.com")]
+    assert zone == "America/Chicago"
+
+
+def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The autouse conftest fixture reports no entitlement (contract D-ops).
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"SENT"}))
+    gateway.whole = True
+
+    result = Watcher(cfg, store, gateway, FakeModel()).check()
+
+    # The record says the message is in no folder in scope: nothing is fetched from
+    # the gated scope, nothing is captured, and the shared history cursor advances.
+    assert gateway.metadata_calls == 0
+    assert result["summarized"] == 0
+    assert store.recent(5) == []
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == "200"
+    gateway.whole = False
+
+    # The same message in both folders is admitted from the Inbox only.
+    gateway.labels = frozenset({"INBOX", "SENT"})
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+
+    # A known id gaining SENT records nothing new while Sent is out of scope, and
+    # the change record is all polling reads: no metadata fetch.
+    gateway.added = frozenset({"SENT"})
+    calls = gateway.metadata_calls
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    assert gateway.metadata_calls == calls
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ? ORDER BY location",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    # Observed with Sent out of scope: the row is not stamped (plan step 5).
+    assert stamps() == [None]
+
+    # Connect returns: the SENT addition is in scope now, so polling records it,
+    # still without a fetch. The record does not say where else the message is,
+    # so the observation stays incomplete for discovery.
+    _active_entitlement(monkeypatch)
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    assert gateway.metadata_calls == calls
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert stamps() == [None, None]
+
+
+def test_a_folder_change_during_a_lapse_is_recorded_and_leaves_the_source_unstamped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"SENT"}))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["sent"]
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ? ORDER BY location",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    # Connect lapses, and the message also appears in the Inbox: the record names
+    # both folders, the one in scope is recorded, and the observation was incomplete,
+    # so the source's stamp is cleared for the next pass after reactivation.
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
+    )
+    gateway.labels = frozenset({"INBOX", "SENT"})
+    gateway.added = frozenset({"INBOX"})
+    calls = gateway.metadata_calls
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    assert gateway.metadata_calls == calls
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert stamps() == [None, None]
+    assert len(store.recent(5)) == 1
+
+
+def test_an_observation_for_an_id_outside_the_batch_is_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"INBOX"}))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+
+    class ReplayedPrefix(LabelledGmail):
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            # A continuation whose batch is empty, carrying a later event for a
+            # replayed id.
+            observed = FolderObservation(frozenset({"sent"}), complete=False)
+            return MailboxChanges((), "300", {"allowed": observed})
+
+    replayed = ReplayedPrefix(frozenset({"INBOX", "SENT"}))
+    calls = replayed.metadata_calls
+    Watcher(cfg, store, replayed, FakeModel()).check()
+    assert replayed.metadata_calls == calls
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == "300"
+
+
+def test_a_dry_run_previews_a_logical_message_once(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    # A dry run records no identity, so the account's is registered up front.
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 7, 18, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    class TwoCopies(FakeGmail):
+        def history_message_ids(self, cursor: str):
+            return ["copy-a", "copy-b"], "200"
+
+        def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+            return replace(
+                super().metadata("allowed"),
+                message_id=message_id,
+                rfc_message_id="same@x",
+            )
+
+    result = Watcher(cfg, store, TwoCopies(), FakeModel()).check(dry_run=True)
+
+    # Two copies of one logical identity preview as one message, as capture would
+    # store them (the second is a location, not a row).
+    assert result["discovered"] == 1
+
+
+def test_gmail_label_added_to_a_known_message_records_its_second_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"INBOX"}))
+    watcher = Watcher(cfg, store, gateway, FakeModel())
+    watcher.check()
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+    calls = gateway.metadata_calls
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ? ORDER BY location",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    # A star on the known message: the record adds no admitted folder, so it says
+    # nothing about folders and nothing changes, the stamp included.
+    gateway.added = frozenset({"STARRED"})
+    watcher.check()
+    assert gateway.metadata_calls == calls
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+    assert stamps() != [None]
+
+    # Gmail reports the same id again with SENT added: the folder is recorded with
+    # no fetch, and since the record does not say where else the message is, the
+    # observation is incomplete until discovery looks.
+    gateway.labels = frozenset({"INBOX", "SENT"})
+    gateway.added = frozenset({"SENT"})
+    watcher.check()
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert gateway.metadata_calls == calls
+    assert stamps() == [None, None]
+
+    # A record that carries the whole label set is a complete observation.
+    gateway.whole = True
+    watcher.check()
+    assert all(stamp is not None for stamp in stamps())
+
+    # A repeated event costs nothing either.
+    watcher.check()
+    assert gateway.metadata_calls == calls
+    assert len(store.recent(5)) == 1
+
+
+def _imap_sent_scaffold(tmp_path: Path) -> tuple[Config, Store, str, str, str, str]:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id = "imap-" + "e" * 32
+    store.register_mail_account(
+        "imap", account_id, display_name="IMAP", address="owner@example.com", active=True
+    )
+    credential_identity = "e" * 64
+    identity = hashlib.sha256(
+        f"imap-mailbox-v2\0{credential_identity}\0{44}".encode()
+    ).hexdigest()
+    store.reconcile_mailbox_identity(
+        "imap", account_id, identity, legacy_status="replacement", preserve_cursor=True
+    )
+    inbox_cursor = f"eom-imap-v2:{credential_identity}:44:7"
+    store.set_state(
+        inbox_cursor,
+        datetime.now(UTC) - timedelta(minutes=10),
+        provider="imap",
+        account_id=account_id,
+        mailbox_identity_key=identity,
+    )
+    return cfg, store, account_id, credential_identity, identity, inbox_cursor
+
+
+class SentPollingGateway(ImapGateway):
+    """An IMAP gateway whose Inbox is quiet and whose Sent folder the test controls."""
+
+    def __init__(
+        self,
+        credential_identity: str,
+        identity: str,
+        inbox_cursor: str,
+        *,
+        scope: str = "available",
+        sent_ids: tuple[str, ...] = (),
+        fail_sent: bool = False,
+        stale_once: bool = False,
+    ) -> None:
+        self.stale_once = stale_once
+        self.credential_identity = credential_identity
+        self.identity = identity
+        self.inbox_cursor = inbox_cursor
+        self.scope = scope
+        self.sent_ids = sent_ids
+        self.fail_sent = fail_sent
+        self.sent_cursor = f"eom-imap-v2:{credential_identity}:77:0"
+        self.sent_calls: list[object] = []
+
+    @contextmanager
+    def polling_session(self):
+        yield
+
+    def mailbox_epoch(self) -> tuple[str, int]:
+        return self.credential_identity, 44
+
+    def mailbox_identity_key(self) -> str:
+        return self.identity
+
+    def mailbox_address(self) -> str:
+        return "owner@example.com"
+
+    def initial_cursor(self) -> str:
+        return self.inbox_cursor
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        return MailboxChanges((), self.inbox_cursor)
+
+    def sent_scope(self) -> str:
+        self.sent_calls.append("scope")
+        return self.scope
+
+    def sent_initial_cursor(self) -> str:
+        self.sent_calls.append("initial")
+        return self.sent_cursor
+
+    def sent_changes_since(self, cursor: str) -> MailboxChanges:
+        self.sent_calls.append(("changes", cursor))
+        if self.fail_sent:
+            raise ImapError("imap_connection_failed", "Mail server connection failed; retry")
+        if self.stale_once:
+            self.stale_once = False
+            raise StaleMailboxCursor("The mail server Sent folder changed")
+        # The cursor moves only past mail that arrived after it.
+        if not self.sent_ids:
+            return MailboxChanges((), cursor)
+        return MailboxChanges(self.sent_ids, f"eom-imap-v2:{self.credential_identity}:77:3")
+
+    def sent_recover_since(self, since: datetime) -> MailboxChanges:
+        self.sent_calls.append(("recover", since))
+        return MailboxChanges(self.sent_ids, f"eom-imap-v2:{self.credential_identity}:77:3")
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        return MessageMetadata(
+            message_id,
+            "<sent@owner.example>",
+            "trusted@example.com",
+            "Trusted",
+            "Re: Quote",
+            datetime.now(UTC).isoformat(),
+            frozenset(),
+            rfc_message_id="sent@owner.example",
+            to=("billing@vendor.com",),
+            locations=frozenset({"sent"}),
+        )
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        return MessageContent("body", (), (), 4)
+
+
+def _active_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.ACTIVE
+    )
+
+
+def test_imap_sent_folder_is_polled_only_while_connect_is_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
+    gateway = SentPollingGateway(credential, identity, inbox_cursor)
+    scope = {
+        "provider": "imap",
+        "account_id": account_id,
+        "mailbox_identity_key": identity,
+        "folder": "sent",
+    }
+
+    def check() -> dict[str, object]:
+        session = MailboxSession("imap", account_id, gateway)
+        return Watcher(cfg, store, session, FakeModel()).check()
+
+    # Inactive (the conftest default): Sent is never consulted.
+    check()
+    assert gateway.sent_calls == []
+    assert store.folder_state(**scope) is None
+    assert store.sent_scope("imap", account_id) == "not_polled"
+
+    # The first active check records the folder's current position, like the Inbox at setup.
+    _active_entitlement(monkeypatch)
+    check()
+    assert store.sent_scope("imap", account_id) == "available"
+    assert store.folder_state(**scope)[0] == gateway.sent_cursor
+    assert store.recent(1) == []
+
+    # Mail sent after that position: the next active check captures it from Sent
+    # and advances only the Sent cursor.
+    gateway.sent_ids = (sent_id,)
+    result = check()
+    assert result["summarized"] == 1
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["sent"]
+    assert store.folder_state(**scope)[0].endswith(":77:3")
+    assert store.state(provider="imap", account_id=account_id)[0] == inbox_cursor
+
+    # An account with nothing to watch is not polled at all, Sent included.
+    quiet = MailboxSession("imap", account_id, gateway)
+    assert Watcher(replace(cfg, senders=()), store, quiet, FakeModel()).check()["active"] is False
+    assert store.sent_scope("imap", account_id) == "not_polled"
+    check()
+    assert store.sent_scope("imap", account_id) == "available"
+
+    # The entitlement lapses: Sent is out of scope again and Health says so.
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
+    )
+    sent_calls = len(gateway.sent_calls)
+    check()
+    assert len(gateway.sent_calls) == sent_calls
+    assert store.sent_scope("imap", account_id) == "not_polled"
+    assert store.folder_state(**scope)[0].endswith(":77:3")
+
+
+def test_a_dry_run_previews_sent_mail_without_moving_its_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
+    gateway = SentPollingGateway(credential, identity, inbox_cursor)
+    scope = {
+        "provider": "imap",
+        "account_id": account_id,
+        "mailbox_identity_key": identity,
+        "folder": "sent",
+    }
+
+    def check(*, dry_run: bool) -> dict[str, object]:
+        session = MailboxSession("imap", account_id, gateway)
+        return Watcher(cfg, store, session, FakeModel()).check(dry_run=dry_run)
+
+    check(dry_run=False)
+    assert store.folder_state(**scope)[0] == gateway.sent_cursor
+    gateway.sent_ids = (sent_id,)
+
+    # A dry run reads Sent like the Inbox: it reports the mail and changes nothing.
+    preview = check(dry_run=True)
+    assert preview["discovered"] == 1
+    assert store.recent(5) == []
+    assert store.folder_state(**scope)[0] == gateway.sent_cursor
+
+    result = check(dry_run=False)
+    assert result["summarized"] == 1
+    assert store.folder_state(**scope)[0].endswith(":77:3")
+
+
+def test_mail_sent_while_the_inbox_is_polled_follows_the_sent_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
+
+    class SlowInbox(SentPollingGateway):
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            # The owner sends a message while the Inbox poll runs.
+            self.sent_calls.append("inbox")
+            self.sent_ids = (sent_id,)
+            return super().changes_since(cursor)
+
+    gateway = SlowInbox(credential, identity, inbox_cursor)
+    _active_entitlement(monkeypatch)
+
+    result = Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()).check()
+
+    # The Sent position is taken before the Inbox poll, so the message is after it
+    # and this same check captures it.
+    assert gateway.sent_calls.index("initial") < gateway.sent_calls.index("inbox")
+    assert result["summarized"] == 1
+    assert store.message_locations(store.recent(1)[0]["message_id"]) == ["sent"]
+
+
+def test_imap_without_a_sent_folder_records_unavailable_and_polls_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    gateway = SentPollingGateway(credential, identity, inbox_cursor, scope="unavailable")
+    _active_entitlement(monkeypatch)
+
+    Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()).check()
+
+    assert store.sent_scope("imap", account_id) == "unavailable"
+    assert gateway.sent_calls == ["scope"]
+    assert (
+        store.folder_state(
+            provider="imap", account_id=account_id, mailbox_identity_key=identity, folder="sent"
+        )
+        is None
+    )
+
+
+def test_a_sent_folder_error_does_not_stop_the_inbox_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    gateway = SentPollingGateway(credential, identity, inbox_cursor, fail_sent=True)
+    _active_entitlement(monkeypatch)
+    session = MailboxSession("imap", account_id, gateway)
+    Watcher(cfg, store, session, FakeModel()).check()
+
+    result = Watcher(cfg, store, session, FakeModel()).check()
+
+    assert result["active"] is True
+    assert ("changes", gateway.sent_cursor) in gateway.sent_calls
+    assert (
+        store.folder_state(
+            provider="imap", account_id=account_id, mailbox_identity_key=identity, folder="sent"
+        )[0]
+        == gateway.sent_cursor
+    )
+    assert store.state(provider="imap", account_id=account_id)[0] == inbox_cursor
+
+
+def test_a_stale_sent_cursor_recovers_the_gap_before_moving_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
+    gateway = SentPollingGateway(credential, identity, inbox_cursor)
+    _active_entitlement(monkeypatch)
+    session = MailboxSession("imap", account_id, gateway)
+    Watcher(cfg, store, session, FakeModel()).check()
+    gateway.sent_ids = (sent_id,)
+    scope = {
+        "provider": "imap",
+        "account_id": account_id,
+        "mailbox_identity_key": identity,
+        "folder": "sent",
+    }
+    last_success = datetime.fromisoformat(store.folder_state(**scope)[1])
+
+    gateway.stale_once = True
+    result = Watcher(cfg, store, session, FakeModel()).check()
+
+    assert result["summarized"] == 1
+    recoveries = [call for call in gateway.sent_calls if call[0] == "recover"]
+    assert len(recoveries) == 1
+    since = recoveries[0][1]
+    assert last_success - timedelta(minutes=6) <= since <= last_success
+    assert store.folder_state(**scope)[0].endswith(":77:3")
+    assert store.message_locations(store.recent(1)[0]["message_id"]) == ["sent"]

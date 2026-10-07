@@ -72,6 +72,9 @@ class AttachmentDescriptor:
     byte_size: int
     position: int
     byte_size_known: bool = True
+    # The source identity whose content listed this attachment (contract D-identity):
+    # provider attachment ids belong to one copy, so its bytes are read from it.
+    source_provider_message_id: str | None = None
 
 
 def _decode(data: str) -> str:
