@@ -947,6 +947,36 @@ Prove fail-before/pass-after on the current source; retain first-attempt pause,
 confirmation, concurrency and ordinary certificate regressions. Extraction and
 the qualified native setup are unchanged, so reuse the recorded native parity.
 
+### Review correction: scheduler consumes eligibility (accepted 2026-10-07)
+
+My original commitded1f756 broadened paused-failure suppression using error codes
+instead of the shared eligibility rule. My follow-up239a6c67 fixed exhausted
+settlement but retained that duplicate SQL predicate. Nonretryable, unknown or
+effectful authority, and an admission deadline after provider acceptance, can
+therefore suppress a terminal automatic fire's wake-up incorrectly.
+
+Remove both the code-only SQL predicate and the separate exhausted pre-scan.
+The scheduler selects terminal linked candidates, then consumes the existing
+Store eligibility rule. An eligible paused first attempt sleeps pending renewed
+entitlement; an exhausted eligible failure wakes to manual review. An ineligible
+automatic terminal failure wakes to settle failed. Preserve the pre-existing
+interactive completion/entitlement policy. Do not copy the authority predicate
+into another SQL expression or add error-specific scheduler cases.
+
+Provider acceptance is distinct from document-model handoff. Keep resource-busy
+eligibility after accepted/processing: Invoice Processor enters processing
+before building its native runtime and can authoritatively refuse admission
+with no document handoff. A requested-only restriction would break the proved
+COI path. Admission deadlines still need requested because they lack that typed
+refusal authority. Add both accepted and processing boundary regressions.
+
+Fail-first scheduler matrix: paused automatic failures with nonretryable busy,
+unknown/effectful authority or post-admission deadline must be due after reopening
+the Store and settle failed without replacement or a spin. Preserve first-attempt
+eligible pause, exhausted settlement and interactive completion tests. Native
+model/prompt/schema/runtime and installations are unchanged; retained inventory
+and native parity remain bound to their original tested heads.
+
 **Status:** issue #117 complete. Durable storage, engine pump, Tauri host/UI
 behavior, and the exact-current Invoice Processor operational proof are
 implemented and recorded below.
