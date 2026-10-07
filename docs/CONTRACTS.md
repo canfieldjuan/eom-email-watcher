@@ -923,6 +923,30 @@ native COI harness; original real contention evidence remains retained.
 Implementation and installed recovery proof are pending, not established by
 this contract or the baseline parity receipt.
 
+### Review correction: exhausted retry settlement (accepted 2026-10-07)
+
+My implementation commitded1f756 put new-work entitlement authorization before
+the retry ceiling. A second eligible failed job can become entitlement_paused
+instead of manual_review. The scheduler's paused-failure exclusion, extended in
+that same commit, can then suppress settlement indefinitely.
+
+The existing settlement owner must settle an exhausted eligible failure before
+any entitlement or paused-state gate, from submitted or entitlement_paused. It
+creates no replacement work and uses the existing second-reason/manual_review
+transition. The scheduler must wake that same terminal decision even when the
+entitlement is inactive. Reuse the Store eligibility policy for this decision
+and the scheduler; do not duplicate its authority predicate in SQL. First
+eligible failures still pause without spinning and require current entitlement
+and fresh confirmation for replacement. Do not change interactive completion
+policy or generic fault handling.
+
+Regression: both resource_busy and admission_deadline, submitted and paused,
+automatic and confirm_each jobs, must settle attempt2 to manual_review with no
+third attempt and no entitlement check. A paused exhausted fire must be due.
+Prove fail-before/pass-after on the current source; retain first-attempt pause,
+confirmation, concurrency and ordinary certificate regressions. Extraction and
+the qualified native setup are unchanged, so reuse the recorded native parity.
+
 **Status:** issue #117 complete. Durable storage, engine pump, Tauri host/UI
 behavior, and the exact-current Invoice Processor operational proof are
 implemented and recorded below.
