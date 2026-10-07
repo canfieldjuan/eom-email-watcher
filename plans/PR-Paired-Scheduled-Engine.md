@@ -120,3 +120,41 @@ Ruff/diff/bash checks clean. Rebuilt v2 executable passes the existing packaged
 smoke and public schema28 proof; empty/relative/custom absolute XDG values resolve
 correctly, and the real shell installer consumes the binary's directory result.
 Old evidence retained; v2 upgrade evidence is separate. Normal profile untouched.
+
+
+## Contract revision: loaded reader and running executable are authoritative
+
+Exact-head review and four deliberate failures on 08f8de5 confirm defects in my
+initial bcf90be implementation: deployment.py:83 trusts disk presence instead of
+loaded manager state; deployment.py:107 equates any foreign active PID with an
+incompatible reader; install-user-services.sh:21 compares lexical and canonical
+paths. These are identity/authority errors at deployment admission, not database
+or model failures. This is own correction round two; consolidate the class once.
+
+Required surface: the one startup owner queries manager LoadState for every
+canonical service name, with only explicit not-found plus zero MainPID considered
+unconfigured. Loaded units remain checked when their files are removed, renamed,
+or placed elsewhere. Missing bus, malformed metadata, and other load states fail
+closed. ExecStart/argv must retain the paired binary and command identities.
+For active readers compare /proc/MainPID/exe to the current binary by file
+identity, including overwritten/deleted old executables. Compatible simultaneous
+watcher/monthly/API readers remain admitted; existing check/outbound operation
+locks and outbound dedupe continue owning their effects. Remove the own/parent
+PID exemption and blanket active refusal. A worker that exits during observation
+is admitted only after the manager reports zero MainPID, otherwise fail closed.
+
+The installer uses Bash -ef file identity to distinguish its uv console script,
+removing the asymmetric readlink/string comparison. Cover HOME and absolute
+XDG_DATA_HOME with symlink, dotdot, and spaces, plus source and desktop candidates.
+Update README to the canonical contract. Smoke uses an explicitly substituted
+empty manager on Linux, because its private HOME must not inspect normal-profile
+units; record the substitution, never present it as installed-systemd proof.
+
+Verification: four fail-first cases retained in review-class-fail-before.json;
+manager and process identity negative/positive/mixed boundaries, both dispatch
+paths and concurrent paired activations, explicit not-found, malformed/bus errors,
+old overwritten executable, worker exit race; isolated shell reinstallation and
+adjacent packaging tests. Rebuild and reuse the public schema28 packaged upgrade
+proof, with an isolated loaded-manager fixture and paired overlap. Native model
+harness, pins, prompts, authority, confirmation, service sandbox, cadence, schema
+and normal profile remain unchanged. Retain prior proof artifacts separately.
