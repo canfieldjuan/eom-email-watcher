@@ -322,8 +322,8 @@ systemctl --user status eom-email-watcher.timer
 journalctl --user -u eom-email-watcher.service --since today
 ```
 
-For a paid Connect-enabled service snapshot, supply the approved production public-key ring when
-installing:
+On a source-only installation, supply the approved production public-key ring for a
+paid Connect-enabled service snapshot:
 
 ```bash
 LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json \
@@ -333,13 +333,20 @@ LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json 
 The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
 not bodies, OAuth tokens, or model prompts. It requests the local LM Studio service so existing
 loopback installs retain automatic startup, but that optional service cannot block a gateway-backed
-watcher when LM Studio is absent or fails. The installer snapshots the current source revision and
-its locked production dependencies into an isolated `uv tool` environment, and both timers execute
-`~/.local/bin/eom-mail-watch`; changing the branch in a development checkout cannot silently
-downgrade the production watcher. Rerun the installer from the intended revision to update that
-service snapshot. Supplying the approved production Connect public-key ring installs a validated
-copy for the non-frozen service snapshot; without it, mailbox watching remains available while
-paid Connect and automation features fail closed as unavailable.
+watcher when LM Studio is absent or fails. On a desktop installation the installer verifies
+the bundled engine's CLI dispatch and
+points `~/.local/bin/eom-mail-watch` at that same executable. Both timers and the desktop
+therefore use the same database modules after updates. The bundled startup owner checks
+configured scheduled commands before handling a request and refuses a legacy/mixed reader
+or an active scheduled worker before database migration. Let a running worker finish, then
+rerun the installer after upgrading the bundle. Service execution does not require a source
+checkout. Timer cadence, ntfy delivery settings and per-attachment confirmation are retained.
+
+On a machine without an installed desktop, the installer retains the locked production
+`uv tool` snapshot. Supplying the approved production public-key ring installs the validated
+source-service authority. A desktop bundle embeds that authority at build time; do not pass
+`LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to the service installer in packaged mode.
+See [paired deployment contract](plans/PR-Paired-Scheduled-Engine.md).
 
 ## Model output and safety
 

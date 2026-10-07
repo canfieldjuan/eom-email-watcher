@@ -51,8 +51,8 @@ def test_systemd_services_use_stable_cli_snapshot() -> None:
     assert "/eom-email-watcher/.venv/" not in watcher
     assert "/eom-email-watcher/.venv/" not in monthly
     working_directory = "WorkingDirectory=%h/Desktop/01 - Effingham Office Maids/eom-email-watcher"
-    assert working_directory in watcher
-    assert working_directory in monthly
+    assert working_directory not in watcher
+    assert working_directory not in monthly
 
 
 def test_systemd_config_lock_resolves_inside_only_writable_state_path(
@@ -349,7 +349,10 @@ def _write_private(path: Path, content: bytes) -> Path:
 
 
 def _run_installer(
-    tmp_path: Path, home: Path, keyring_source: Path | None = None
+    tmp_path: Path,
+    home: Path,
+    keyring_source: Path | None = None,
+    engine_body: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -357,10 +360,31 @@ def _run_installer(
         tool = fake_bin / name
         tool.write_text(body)
         tool.chmod(0o755)
+    if engine_body is not None:
+        engine = fake_bin / "eom-mail-engine"
+        engine.write_text(engine_body)
+        engine.chmod(0o755)
+    # Source-only fixture: do not discover an unrelated installed desktop on the host.
+    for name in (
+        "bash",
+        "dirname",
+        "mktemp",
+        "rm",
+        "mkdir",
+        "install",
+        "mv",
+        "chmod",
+        "ln",
+        "readlink",
+        "rmdir",
+    ):
+        target = shutil.which(name)
+        assert target is not None
+        (fake_bin / name).symlink_to(target)
     home.mkdir(exist_ok=True)
     environment = {
         "HOME": str(home),
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "PATH": str(fake_bin),
         "TMPDIR": str(tmp_path),
         "INSTALLER_TEST_PYTHON": sys.executable,
         "INSTALLER_TEST_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
@@ -492,3 +516,66 @@ def test_installer_rejects_an_unapproved_explicit_authority(
     assert result.returncode != 0
     assert _runtime_authority(home, monkeypatch) is None
     assert not (tmp_path / "systemctl.log").exists()
+
+
+@posix_installer
+def test_packaged_entrypoint_dispatches_existing_cli_without_reading_api_input(
+    tmp_path: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "packaging/engine_entry.py"), "--cli", "--version"],
+        input="",
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=tmp_path,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    from eom_email_watcher import __version__
+
+    assert result.stdout.strip() == __version__
+
+
+@posix_installer
+def test_installer_rejects_incompatible_desktop_before_publishing_services(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    result = _run_installer(
+        tmp_path,
+        home,
+        engine_body='#!/bin/sh\nprintf "old-api-only-engine\\n"\nexit 2\n',
+    )
+    assert result.returncode != 0, "incompatible desktop admitted an independent CLI"
+    assert not (tmp_path / "uv.log").exists()
+    assert not (tmp_path / "systemctl.log").exists()
+    assert not (home / ".config/systemd/user/eom-email-watcher.service").exists()
+
+
+@posix_installer
+def test_installer_pairs_both_services_without_installing_another_snapshot(tmp_path: Path) -> None:
+    from eom_email_watcher.deployment import PAIRED_CLI_PROTOCOL
+
+    home = tmp_path / "home"
+    result = _run_installer(
+        tmp_path,
+        home,
+        engine_body=(
+            '#!/bin/sh\ncase "$1" in\n'
+            f'--paired-cli-version) printf "%s\\n" "{PAIRED_CLI_PROTOCOL}" ;;\n'
+            '--cli) test "$2" = --version ;;\n*) exit 2 ;;\nesac\n'
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    alias = home / ".local/bin/eom-mail-watch"
+    assert alias.samefile(tmp_path / "fake-bin/eom-mail-engine")
+    assert not (tmp_path / "uv.log").exists()
+    for unit in ("eom-email-watcher.service", "eom-monthly-hours.service"):
+        assert (
+            "ExecStart=%h/.local/bin/eom-mail-watch "
+            in (home / ".config/systemd/user" / unit).read_text()
+        )
+    assert "Paired scheduled intake" in result.stdout

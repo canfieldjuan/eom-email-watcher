@@ -72,7 +72,24 @@ artifacts. An active scheduled worker must finish before desktop migration.
 
 ## Implementation summary / cold diff / gap audit
 
-Pending. No code changed or normal profile touched at contract creation.
+Source implementation complete; normal profile remains untouched.
+
+| Owner | Actual change | Evidence |
+|---|---|---|
+| packaging/engine_entry.py:1 | delegates to shared deployment dispatcher | CLI fail-first and real packaged alias proof |
+| deployment.py:62,100 | validates configured readers and active worker before API/CLI dispatch | public schema28 digest unchanged on refusal; same binary migrates/reads |
+| install-user-services.sh:15 | verifies and atomically pairs alias; preserves source-only authority path | incompatible installer fail-first, paired/source-only tests |
+| systemd watcher/monthly units | removes checkout-dependent cwd | systemd/state/sandbox tests |
+| smoke_packaged_engine.py:132 | existing build smoke reads API-owned DB via bundled CLI | packaged-engine-smoke: ok |
+| deployment/systemd/packaging tests | negative, mixed and valid boundary/migration regressions | 117 passed, 1 skipped |
+| README two-hour timer | canonical paired/source-only install directions | cold diff audit |
+
+Gap audit: NOT DONE. Exact-head review/CI and normal compatible deployment/native
+busy recovery are pending. Development bundle proof has no embedded release
+mail-provider identities/authority, and systemd metadata is substituted. It is not
+an installed normal-profile or public release claim. Model/template/prompt/settings
+and existing native COI harness remain unchanged; retained native parity applies
+only to its recorded earlier heads.
 
 ## Contract revision: both entrypoints open the database
 

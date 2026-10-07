@@ -163,6 +163,7 @@ def test_packaged_smoke_uses_owner_private_config_parent(
         return responses[operation]
 
     monkeypatch.setattr(smoke_packaged_engine, "_request", request)
+    monkeypatch.setattr(smoke_packaged_engine, "_cli_read", lambda *args: None)
 
     smoke_packaged_engine.smoke_packaged_engine(binary, "authority_unavailable")
     assert operations == [
@@ -298,6 +299,7 @@ def test_packaged_smoke_accepts_all_expected_mail_providers(
         lambda *args, **kwargs: next(responses),
     )
 
+    monkeypatch.setattr(smoke_packaged_engine, "_cli_read", lambda *args: None)
     smoke_packaged_engine.smoke_packaged_engine(
         binary,
         "missing",
@@ -1229,3 +1231,26 @@ def test_release_candidate_workflow_is_private_main_only_and_fail_closed() -> No
 
     assert packaging_test < sidecar_build
     assert sidecar_build < cargo_format < cargo_clippy < cargo_test < linux_deb
+
+
+@pytest.mark.parametrize("code,output", [(2, "[]"), (0, "invalid"), (0, "{}"), (0, "[1]")])
+def test_packaged_cli_smoke_rejects_failed_or_wrong_reader(monkeypatch, tmp_path, code, output):
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, code, output)
+    )
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError):
+        smoke_packaged_engine._cli_read(tmp_path / "engine", tmp_path / "config", {})
+
+
+def test_packaged_cli_smoke_calls_same_binary_and_config(monkeypatch, tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "[]")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    binary, config = tmp_path / "engine", tmp_path / "config"
+    smoke_packaged_engine._cli_read(binary, config, {"isolated": "yes"})
+    assert calls[0][0] == [str(binary), "--cli", "--config", str(config), "recent", "--limit", "1"]
+    assert calls[0][1]["env"] == {"isolated": "yes"}

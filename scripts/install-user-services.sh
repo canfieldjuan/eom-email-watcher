@@ -12,6 +12,41 @@ legacy_release_keyring="$HOME/.local/share/eom-email-watcher/connect-entitlement
 release_keyring_target=""
 release_keyring_input=""
 release_keyring_stage=""
+# An installed desktop owns both readers. Never install a separate snapshot beside it.
+packaged_engine=""
+# A prior uv snapshot also exports an API console script. It is not a desktop
+# bundle. Skip that known source owner, then find the installed desktop on PATH.
+while IFS= read -r candidate; do
+  resolved="$(readlink -f "$candidate")"
+  if [[ "$resolved" == "$tool_dir/eom-email-watcher/bin/eom-mail-engine" ]]; then
+    continue
+  fi
+  packaged_engine="$candidate"
+  break
+done < <(type -aP eom-mail-engine || true)
+if [[ -n "$packaged_engine" ]]; then
+  if [[ -n "$release_keyring_source" ]]; then
+    echo "The packaged engine embeds its approved authority; supply it at build time." >&2
+    exit 2
+  fi
+  if ! paired_version="$("$packaged_engine" --paired-cli-version)"; then
+    echo "Installed desktop engine has no paired CLI; rebuild it before installing services." >&2
+    exit 2
+  fi
+  if [[ "$paired_version" != "eom-mail-engine-paired-cli-v1" ]]; then
+    echo "Installed desktop engine has no compatible paired CLI." >&2
+    exit 2
+  fi
+  packaged_engine="$(readlink -f "$packaged_engine")"
+  test -x "$packaged_engine"
+  "$packaged_engine" --cli --version >/dev/null
+  mkdir -p "$unit_dir" "$tool_bin_dir"
+  alias_stage="$(mktemp -d "$tool_bin_dir/.paired-cli.XXXXXX")"
+  cleanup_alias() { rm -f "$alias_stage/eom-mail-watch"; rmdir "$alias_stage"; }
+  trap cleanup_alias EXIT
+  ln -s "$packaged_engine" "$alias_stage/eom-mail-watch"
+  mv -Tf "$alias_stage/eom-mail-watch" "$tool_bin_dir/eom-mail-watch"
+else
 constraints_file="$(mktemp)"
 cleanup() {
   rm -f "$constraints_file"
@@ -80,6 +115,8 @@ if [[ -n "$release_keyring_input" ]]; then
   fi
 fi
 
+fi
+
 install -m 0644 "$repo_dir/systemd/eom-email-watcher.service" "$unit_dir/"
 install -m 0644 "$repo_dir/systemd/eom-email-watcher.timer" "$unit_dir/"
 install -m 0644 "$repo_dir/systemd/eom-email-lmstudio.service" "$unit_dir/"
@@ -91,6 +128,11 @@ systemctl --user enable eom-monthly-hours.timer
 
 echo "Installed and enabled eom-email-watcher.timer."
 echo "Installed and enabled eom-monthly-hours.timer."
+if [[ -n "$packaged_engine" ]]; then
+  echo "Paired scheduled intake with $packaged_engine."
+  echo "It will begin succeeding after: $tool_bin_dir/eom-mail-watch setup"
+  exit 0
+fi
 echo "Installed a stable eom-mail-watch snapshot at $tool_bin_dir/eom-mail-watch."
 if [[ -n "$release_keyring_target" && -f "$release_keyring_target" ]]; then
   echo "Installed the approved Connect release authority for the service snapshot."
