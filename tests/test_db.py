@@ -8012,7 +8012,7 @@ def test_retention_rule_boundaries(
         )
     observed_at = datetime(2026, 9, 9, 12, tzinfo=UTC)
 
-    retained = store.retained_logical_messages(
+    retained = store.logical_messages_within_cutoff(
         [message_id], cutoff=observed_at - timedelta(days=30), now=observed_at
     )
 
@@ -8021,7 +8021,7 @@ def test_retention_rule_boundaries(
     assert store.purge(30, now=observed_at) == (0 if expected else 1)
 
 
-def test_a_newer_copy_keeps_a_logical_message_retained_for_every_reader(
+def test_a_newer_copy_keeps_a_logical_message_within_the_cutoff_for_every_reader(
     tmp_path: Path,
 ) -> None:
     store = Store(tmp_path / "db.sqlite3")
@@ -8049,11 +8049,11 @@ def test_a_newer_copy_keeps_a_logical_message_retained_for_every_reader(
     cutoff = observed_at - timedelta(days=30)
 
     # The canonical row is old, its Sent copy is not: kept, and processed.
-    assert store.retained_logical_messages([root], cutoff=cutoff, now=observed_at) == {root}
+    assert store.logical_messages_within_cutoff([root], cutoff=cutoff, now=observed_at) == {root}
     assert store.purge(30, now=observed_at) == 0
     # Once the copy is old too, both readers agree it has left retention.
     later = datetime(2026, 10, 9, 12, tzinfo=UTC)
-    assert store.retained_logical_messages(
+    assert store.logical_messages_within_cutoff(
         [root], cutoff=later - timedelta(days=30), now=later
     ) == frozenset()
     assert store.purge(30, now=later) == 1
