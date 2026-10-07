@@ -7978,6 +7978,18 @@ class Store:
 
     def automation_fire_settlement_due(self) -> bool:
         with self.connection() as db:
+            exhausted = db.execute(
+                """SELECT fire_id FROM automation_fires
+                WHERE state IN ('submitted', 'entitlement_paused')
+                  AND current_attempt_no >= ? AND job_id IS NOT NULL""",
+                (AUTOMATION_FIRE_MAX_ATTEMPTS,),
+            ).fetchall()
+            if any(
+                _automation_failure_retry_kind(_automation_fire_retry_row(db, row["fire_id"]))
+                is not None
+                for row in exhausted
+            ):
+                return True
             row = db.execute(
                 f"""SELECT 1
                 FROM automation_fires AS fire

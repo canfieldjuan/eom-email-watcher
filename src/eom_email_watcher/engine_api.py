@@ -4809,6 +4809,16 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 reason="job_removed",
             )
             continue
+        retry_kind = runtime.store.automation_fire_retry_kind(fire.fire_id)
+        if retry_kind is not None and fire.current_attempt_no >= AUTOMATION_FIRE_MAX_ATTEMPTS:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason="second_" + retry_kind,
+            )
+            continue
         if (
             not runtime.store.connect_job_requires_automation_entitlement(fire.job_id)
             and not _automation_entitlement_active()
@@ -4847,7 +4857,6 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 expected_version=fire.state_version,
             )
             continue
-        retry_kind = runtime.store.automation_fire_retry_kind(fire.fire_id)
         if retry_kind is not None:
             if fire.state == "submitted" and not _automation_entitlement_active():
                 runtime.store.transition_automation_fire(
@@ -4865,19 +4874,10 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                     expected_version=fire.state_version,
                 )
                 continue
-            if fire.current_attempt_no < AUTOMATION_FIRE_MAX_ATTEMPTS:
-                runtime.store.retry_automation_fire_after_failure(
-                    fire_id=fire.fire_id,
-                    expected_version=fire.state_version,
-                )
-            else:
-                runtime.store.transition_automation_fire(
-                    fire_id=fire.fire_id,
-                    expected_state=fire.state,
-                    expected_version=fire.state_version,
-                    next_state="manual_review",
-                    reason="second_" + retry_kind,
-                )
+            runtime.store.retry_automation_fire_after_failure(
+                fire_id=fire.fire_id,
+                expected_version=fire.state_version,
+            )
             continue
         runtime.store.transition_automation_fire(
             fire_id=fire.fire_id,

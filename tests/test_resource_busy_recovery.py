@@ -253,3 +253,42 @@ def test_recovered_certificate_settles_once_on_the_same_attachment_after_restart
     assert reopened.list_certificate_expiry_ledger(today="2026-10-07", limit=100) == (
         runtime.store.list_certificate_expiry_ledger(today="2026-10-07", limit=100)
     )
+
+
+@pytest.mark.parametrize("code", ["PROVIDER_RESOURCE_BUSY", "connect_queue_deadline_exceeded"])
+@pytest.mark.parametrize("paused", [False, True], ids=["submitted", "paused"])
+@pytest.mark.parametrize("confirm_each", [False, True], ids=["automatic", "confirmed"])
+def test_exhausted_recovery_settles_without_entitlement(
+    tmp_path, monkeypatch, code, paused, confirm_each
+):
+    config, runtime, selected, fire, first = prepare(
+        tmp_path, monkeypatch, confirm_each=confirm_each
+    )
+    if confirm_each:
+        confirm(config, runtime, fire.fire_id)
+    fail(runtime, selected, first.dispatch_request_id, code=code)
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    if confirm_each:
+        confirm(config, runtime, fire.fire_id)
+    second = runtime.store.automation_fire_attempts(fire.fire_id)[1]
+    fail(runtime, selected, second.dispatch_request_id, code=code)
+    if paused:
+        current = runtime.store.automation_fire(fire.fire_id)
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=current.state,
+            expected_version=current.state_version,
+            next_state="entitlement_paused",
+            reason="entitlement_inactive",
+        )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    assert runtime.store.automation_fire_settlement_due(), "Exhausted terminal fire was not due"
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    stopped = runtime.store.automation_fire(fire.fire_id)
+    assert stopped.state == "manual_review"
+    assert stopped.reason == (
+        "second_resource_busy" if code == "PROVIDER_RESOURCE_BUSY" else "second_admission_deadline"
+    )
+    assert len(runtime.store.automation_fire_attempts(fire.fire_id)) == 2
+    assert not runtime.store.automation_fire_settlement_due()
