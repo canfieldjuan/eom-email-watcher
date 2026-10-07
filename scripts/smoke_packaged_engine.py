@@ -182,6 +182,20 @@ def smoke_packaged_engine(
         for key in ("APPDATA", "HOME", "LOCALAPPDATA", "USERPROFILE", "XDG_CONFIG_HOME"):
             environment[key] = str(private_root)
         environment["XDG_STATE_HOME"] = str(state_home.resolve())
+        if sys.platform == "linux":
+            # This proof owns a private HOME, not the host's user manager. Model
+            # an explicit empty manager; real configured/active cases have their
+            # own paired-deployment regression and packaged upgrade proof.
+            manager = temporary / "empty-manager-fixture"
+            manager.mkdir(mode=0o700)
+            for name, output in (
+                ("systemctl", "not-found"),
+                ("busctl", '{"type":"u","data":0}'),
+            ):
+                tool = manager / name
+                tool.write_text("#!/bin/sh\nprintf '%s\\n' '" + output + "'\n")
+                tool.chmod(0o700)
+            environment["PATH"] = str(manager) + os.pathsep + environment.get("PATH", "")
 
         initialized = _request(
             isolated_binary,

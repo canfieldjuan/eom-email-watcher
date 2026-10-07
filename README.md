@@ -337,8 +337,10 @@ watcher when LM Studio is absent or fails. On a desktop installation the install
 the bundled engine's CLI dispatch and
 points `~/.local/bin/eom-mail-watch` at that same executable. Both timers and the desktop
 therefore use the same database modules after updates. The bundled startup owner checks
-configured scheduled commands before handling a request and refuses a legacy/mixed reader
-or an active scheduled worker before database migration. Let a running worker finish, then
+the manager's loaded scheduled commands and running executable identities before handling
+a request. Legacy/mixed readers and incompatible active workers block database migration;
+compatible paired timers can overlap using the existing operation locks and dedupe.
+Let an incompatible running worker finish, then
 rerun the installer after upgrading the bundle. Service execution does not require a source
 checkout. Timer cadence, ntfy delivery settings and per-attachment confirmation are retained.
 

@@ -17,8 +17,7 @@ packaged_engine=""
 # A prior uv snapshot also exports an API console script. It is not a desktop
 # bundle. Skip that known source owner, then find the installed desktop on PATH.
 while IFS= read -r candidate; do
-  resolved="$(readlink -f "$candidate")"
-  if [[ "$resolved" == "$tool_dir/eom-email-watcher/bin/eom-mail-engine" ]]; then
+  if [[ "$candidate" -ef "$tool_dir/eom-email-watcher/bin/eom-mail-engine" ]]; then
     continue
   fi
   packaged_engine="$candidate"

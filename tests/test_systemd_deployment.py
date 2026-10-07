@@ -354,6 +354,8 @@ def _run_installer(
     keyring_source: Path | None = None,
     engine_body: str | None = None,
     config_home: str | None = None,
+    source_engine: Path | None = None,
+    data_home: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -365,6 +367,8 @@ def _run_installer(
         engine = fake_bin / "eom-mail-engine"
         engine.write_text(engine_body)
         engine.chmod(0o755)
+    if source_engine is not None:
+        (fake_bin / "eom-mail-engine").symlink_to(source_engine)
     # Source-only fixture: do not discover an unrelated installed desktop on the host.
     for name in (
         "bash",
@@ -391,6 +395,8 @@ def _run_installer(
         "INSTALLER_TEST_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "INSTALLER_TEST_UV_LOG": str(tmp_path / "uv.log"),
     }
+    if data_home is not None:
+        environment["XDG_DATA_HOME"] = data_home
     if config_home is not None:
         environment["XDG_CONFIG_HOME"] = config_home
     if keyring_source is not None:
@@ -589,6 +595,7 @@ def test_installer_pairs_both_services_without_installing_another_snapshot(tmp_p
 @pytest.mark.parametrize("setting", ["", "relative", "custom"])
 def test_source_installer_consumes_runtime_unit_directory(tmp_path, monkeypatch, setting):
     from eom_email_watcher.deployment import service_unit_directory
+
     home = tmp_path / "home"
     value = str(tmp_path / "custom config") if setting == "custom" else setting
     result = _run_installer(tmp_path, home, config_home=value)
@@ -598,3 +605,49 @@ def test_source_installer_consumes_runtime_unit_directory(tmp_path, monkeypatch,
     directory = service_unit_directory()
     assert (directory / "eom-email-watcher.service").is_file()
     assert (directory / "eom-monthly-hours.service").is_file()
+
+
+@posix_installer
+@pytest.mark.parametrize("spelling", ["symlink", "dotdot"])
+def test_source_reinstall_recognizes_canonical_uv_engine(tmp_path, spelling):
+    physical = tmp_path / "physical-home"
+    physical.mkdir()
+    if spelling == "symlink":
+        home = tmp_path / "home-alias"
+        home.symlink_to(physical, target_is_directory=True)
+    else:
+        (physical / "nested").mkdir()
+        home = physical / "nested/.."
+    source = physical / ".local/share/uv/tools/eom-email-watcher/bin/eom-mail-engine"
+    source.parent.mkdir(parents=True)
+    source.write_text('#!/bin/sh\nprintf "source API has no paired metadata\\n" >&2\nexit 2\n')
+    source.chmod(0o755)
+    result = _run_installer(tmp_path, home, source_engine=source)
+    assert result.returncode == 0, "source snapshot was mistaken for desktop: " + result.stderr
+    assert (tmp_path / "uv.log").exists()
+    assert (home / ".config/systemd/user/eom-monthly-hours.service").is_file()
+
+
+@posix_installer
+@pytest.mark.parametrize("spelling", ["symlink", "dotdot", "spaces"])
+def test_source_reinstall_recognizes_canonical_xdg_data_engine(tmp_path, spelling):
+    home = tmp_path / "home"
+    home.mkdir()
+    physical = tmp_path / "physical data"
+    physical.mkdir()
+    if spelling == "symlink":
+        data = tmp_path / "data-alias"
+        data.symlink_to(physical, target_is_directory=True)
+    elif spelling == "dotdot":
+        (physical / "nested").mkdir()
+        data = physical / "nested/.."
+    else:
+        data = physical
+    source = physical / "uv/tools/eom-email-watcher/bin/eom-mail-engine"
+    source.parent.mkdir(parents=True)
+    source.write_text("#!/bin/sh\nexit 2\n")
+    source.chmod(0o755)
+    result = _run_installer(tmp_path, home, source_engine=source, data_home=str(data))
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "uv.log").exists()
+    assert (home / ".config/systemd/user/eom-monthly-hours.service").is_file()

@@ -31,6 +31,20 @@ def service_unit_directory() -> Path:
 
 
 def _service_property(unit: str, name: str) -> object:
+    if name == "LoadState":
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show", unit, "--property=LoadState", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DeploymentError("Cannot verify the configured scheduled reader") from exc
+        if result.returncode != 0 or result.stdout.strip() not in {"loaded", "not-found"}:
+            raise DeploymentError("Cannot verify the configured scheduled reader")
+        return result.stdout.strip()
     # systemd DBus escaping: these fixed unit names contain only letters and '-.'.
     escaped = unit.replace("-", "_2d").replace(".", "_2e")
     try:
@@ -72,15 +86,24 @@ def _same_executable(value: object, binary: Path) -> bool:
         return False
 
 
+def _service_main_pid(unit: str) -> int:
+    pid = _service_property(unit, "MainPID")
+    if type(pid) is not int or pid < 0:
+        raise DeploymentError("Invalid scheduled reader metadata")
+    return pid
+
+
 def verify_scheduled_readers(
     binary: Path,
-    unit_directory: Path,
-    own_worker_pids: frozenset[int] = frozenset(),
 ) -> None:
-    """Before API request handling, bind configured timers to this packaged owner."""
+    """Bind manager configuration and running readers to this packaged owner."""
     for unit, command in SCHEDULED_COMMANDS.items():
-        if not (unit_directory / unit).exists() and not (unit_directory / (unit + ".d")).exists():
+        load_state = _service_property(unit, "LoadState")
+        pid = _service_main_pid(unit)
+        if load_state == "not-found" and pid == 0:
             continue
+        if load_state != "loaded":
+            raise DeploymentError("Cannot verify the configured scheduled reader")
         entries = _service_property(unit, "ExecStart")
         if not isinstance(entries, list) or len(entries) != 1:
             raise DeploymentError("Scheduled intake must use the paired desktop engine")
@@ -101,12 +124,16 @@ def verify_scheduled_readers(
                 "Scheduled intake must use the paired desktop engine; "
                 "rerun install-user-services.sh"
             )
-        pid = _service_property(unit, "MainPID")
-        if type(pid) is not int or pid < 0:
-            raise DeploymentError("Invalid scheduled reader metadata")
-        if pid and pid not in own_worker_pids:
+        # ExecStart may name an updated binary while the old inode still runs.
+        # Admit an observed worker exit only after a typed zero MainPID report.
+        if (
+            pid
+            and not _same_executable(f"/proc/{pid}/exe", binary)
+            and _service_main_pid(unit) != 0
+        ):
             raise DeploymentError(
-                "A scheduled worker is still active; let it finish before updating"
+                "An incompatible scheduled worker is still active; "
+                "let it finish before updating"
             )
 
 
@@ -125,10 +152,7 @@ def _dispatch_entrypoint() -> None:
     cli_args = args[1:] if args[:1] == ["--cli"] else args
     readonly_version = cli_mode and cli_args == ["--version"]
     if getattr(sys, "frozen", False) and sys.platform == "linux" and not readonly_version:
-        # PyInstaller's parent bootloader is the systemd MainPID. Its application
-        # child is this process. Other active workers must finish before migration.
-        own_worker_pids = frozenset({os.getpid(), os.getppid()}) if cli_mode else frozenset()
-        verify_scheduled_readers(Path(sys.executable), service_unit_directory(), own_worker_pids)
+        verify_scheduled_readers(Path(sys.executable))
     if cli_mode:
         cli.main(cli_args)
     else:

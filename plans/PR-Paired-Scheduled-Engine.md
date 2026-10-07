@@ -25,7 +25,7 @@ The prior source-only local alignment did not remove this release defect.
 - Installer verifies the packaged dispatch before changing scheduled units/alias;
   an installed incompatible desktop engine fails closed instead of falling back.
 - The bundled API entrypoint checks configured watcher/monthly service commands
-  and active workers before request handling, hence before any Store migration.
+  and running executable identities before request handling, hence before any Store migration.
   This is a last defense consuming installed command identity; it does not
   catch schema errors downstream or relax the DB reader.
 - Remove checkout-dependent service working directories. Preserve timer cadence,
@@ -36,7 +36,7 @@ The prior source-only local alignment did not remove this release defect.
 
 1. Both existing entrypoints share one packaged executable; source-only machines
    retain the locked uv installation when no desktop engine exists.
-2. Bundled API startup refuses legacy/mixed readers and active scheduled workers
+2. Bundled API startup refuses legacy/mixed readers and incompatible active workers
    before reading input. No service is silently cancelled or config migrated.
 3. Scheduled services no longer require a development checkout as their cwd.
 4. Candidate source uses merged schema30, whereas installed source is schema28;
@@ -54,7 +54,7 @@ No normal DB rollback, historical retry migration or independent CLI update.
 Linux user services installed by this project are the deployment scope; Windows
 has no such timer. Existing overrides must resolve to the paired executable.
 Normal installation and real busy proof require reviewed source and compatible
-artifacts. An active scheduled worker must finish before desktop migration.
+artifacts. An incompatible active worker must finish before desktop migration; paired readers may overlap.
 
 ## Verification plan
 
@@ -77,7 +77,7 @@ Source implementation complete; normal profile remains untouched.
 | Owner | Actual change | Evidence |
 |---|---|---|
 | packaging/engine_entry.py:1 | delegates to shared deployment dispatcher | CLI fail-first and real packaged alias proof |
-| deployment.py:62,100 | validates configured readers and active worker before API/CLI dispatch | public schema28 digest unchanged on refusal; same binary migrates/reads |
+| deployment.py:62,100 | validates loaded readers and active executable identity before API/CLI dispatch | public schema28 digest unchanged on refusal; same binary migrates/reads |
 | install-user-services.sh:15 | verifies and atomically pairs alias; preserves source-only authority path | incompatible installer fail-first, paired/source-only tests |
 | systemd watcher/monthly units | removes checkout-dependent cwd | systemd/state/sandbox tests |
 | smoke_packaged_engine.py:132 | existing build smoke reads API-owned DB via bundled CLI | packaged-engine-smoke: ok |
@@ -97,10 +97,11 @@ New evidence: CLI-first regression fails with `CLI/migration reached` because my
 unpublished deployment dispatcher returned to cli.main before the API-only check.
 The API check alone was incomplete. The same startup owner must check either
 entrypoint before handing off. Read-only protocol/version probes do not open a DB
-and remain available to the installer. Scheduled CLI checks can admit their own
-systemd MainPID (including the PyInstaller bootloader parent); other active workers
-still block migration. Test API-first and CLI-first partial updates, own-worker
-admission and another worker refusal. No downstream runtime catch is added.
+and remain available to the installer. The initial own/parent MainPID exception
+and blanket other-worker refusal are superseded by the loaded/running identity
+revision below. Both entrypoints now consume the same executable-identity owner;
+compatible readers may overlap, incompatible readers block migration. No
+downstream runtime catch is added.
 
 ## Contract revision: canonical scheduled-unit directory
 
@@ -108,7 +109,8 @@ Independent post-publication boundary probe on bcf90be deliberately reproduced t
 failures: empty/relative XDG_CONFIG_HOME reached API migration without inspecting
 normal scheduled readers. I introduced the runtime resolver mismatch; the shell
 used a different fallback. Fix at service_unit_directory in deployment.py. Both
-packaged installer and runtime consume it; source-only installer calls the same
+packaged installer and initial runtime consumed it; manager admission below now
+queries all canonical unit names independently of disk location. Source-only installer calls the same
 module through its installed interpreter. Remove the shell's independently
 constructed unit directory and the startup expression. Read-only directory
 metadata does not open a DB. Probe unset/empty/relative/custom absolute paths,
@@ -158,3 +160,15 @@ adjacent packaging tests. Rebuild and reuse the public schema28 packaged upgrade
 proof, with an isolated loaded-manager fixture and paired overlap. Native model
 harness, pins, prompts, authority, confirmation, service sandbox, cadence, schema
 and normal profile remain unchanged. Retain prior proof artifacts separately.
+
+
+Current correction verification: the four fail-first cases pass after the class
+fix. Adjacent tests passed 156 with one Windows-only skip; the equivalent nested
+condition cleanup then passed all 56 deployment tests. Ruff, bash syntax and diff
+checks are clean. Actual rebuilt v3 bundle passes the retained public schema28
+upgrade oracle, legacy loaded-unit refusal with on-disk files absent, unchanged DB
+on incompatible active-reader refusal, real installer pairing, migration/CLI read,
+and simultaneous bundled API plus monthly dry-run. The four deployment/API/CLI/DB
+compiled modules match the candidate source; no native settings changed. Prior
+v1/v2 artifacts remain retained. Normal deployment and exact-head CI/review are
+NOT DONE, with the substitutions and tested versions recorded in durable evidence.
