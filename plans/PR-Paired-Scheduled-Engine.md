@@ -101,3 +101,15 @@ and remain available to the installer. Scheduled CLI checks can admit their own
 systemd MainPID (including the PyInstaller bootloader parent); other active workers
 still block migration. Test API-first and CLI-first partial updates, own-worker
 admission and another worker refusal. No downstream runtime catch is added.
+
+## Contract revision: canonical scheduled-unit directory
+
+Independent post-publication boundary probe on bcf90be deliberately reproduced two
+failures: empty/relative XDG_CONFIG_HOME reached API migration without inspecting
+normal scheduled readers. I introduced the runtime resolver mismatch; the shell
+used a different fallback. Fix at service_unit_directory in deployment.py. Both
+packaged installer and runtime consume it; source-only installer calls the same
+module through its installed interpreter. Remove the shell's independently
+constructed unit directory and the startup expression. Read-only directory
+metadata does not open a DB. Probe unset/empty/relative/custom absolute paths,
+including spaces, and prove installer output equals runtime selection.
