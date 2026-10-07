@@ -5,11 +5,18 @@ from threading import Barrier
 
 import pytest
 from connect_automate import connect
+from test_certificate_expiry_ledger import (
+    CERTIFICATE_MEDIA_TYPE,
+    _certificate_pending_fires,
+    _record,
+    _result,
+)
 from test_connect_v2_engine_api import (
     active_connect_entitlement as active_connect_entitlement,
 )
 from test_connect_v2_engine_api import (
     api_request,
+    capability,
     install_automation_dispatch_fakes,
     seed_contract_fire,
     seeded_runtime,
@@ -188,7 +195,8 @@ def test_two_retry_transactions_create_only_one_replacement(tmp_path, monkeypatc
         barrier.wait(timeout=5)
         try:
             store.retry_automation_fire_after_failure(
-                fire_id=fire.fire_id, expected_version=current.state_version,
+                fire_id=fire.fire_id,
+                expected_version=current.state_version,
             )
             return "created"
         except (RuntimeError, KeyError):
@@ -198,3 +206,50 @@ def test_two_retry_transactions_create_only_one_replacement(tmp_path, monkeypatc
         results = list(pool.map(retry, stores))
     assert sorted(results) == ["created", "rejected"]
     assert len(runtime.store.automation_fire_attempts(fire.fire_id)) == 2
+
+
+def test_recovered_certificate_settles_once_on_the_same_attachment_after_restart(
+    tmp_path, monkeypatch
+):
+    _, runtime = seeded_runtime(tmp_path)
+    selected = capability(
+        app_id="invoice-processor",
+        app_version="0.1.0",
+        capability_id="certificate.extract",
+        produces=(CERTIFICATE_MEDIA_TYPE,),
+        parameters=(),
+    )
+    fire = _certificate_pending_fires(runtime.store)[0]
+    first = runtime.store.automation_fire_attempts(fire.fire_id)[0]
+    install_automation_dispatch_fakes(
+        monkeypatch, runtime, lambda **kwargs: connect.CapabilityCatalog((selected,))
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    fail(runtime, selected, first.dispatch_request_id)
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    second = runtime.store.automation_fire_attempts(fire.fire_id)[1]
+    runtime.store.transition_connect_job(
+        job_id=second.dispatch_request_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=_result(_record()),
+    )
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    completed = runtime.store.automation_fire(fire.fire_id)
+    assert completed.state == "completed"
+    assert completed.message_id == fire.message_id and completed.part_id == fire.part_id
+    assert completed.current_attempt_no == 2
+    assert runtime.store.connect_job(first.dispatch_request_id).status == "failed"
+    reopened = Store(runtime.store.path)
+    reopened.initialize()
+    with reopened.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
+    assert reopened.list_certificate_expiry_ledger(today="2026-10-07", limit=100) == (
+        runtime.store.list_certificate_expiry_ledger(today="2026-10-07", limit=100)
+    )
