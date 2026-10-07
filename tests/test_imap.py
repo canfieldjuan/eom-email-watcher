@@ -2292,6 +2292,16 @@ def test_a_failed_folder_listing_retries_instead_of_using_the_fallback() -> None
     assert '"Custom"' not in _selects(client)
 
 
+def test_a_failed_select_is_probed_again_on_the_next_check() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST, reject={"Sent Messages"})
+    gateway = _sent_gateway(client, credentials())
+
+    assert gateway.sent_scope() == "unavailable"
+    # The folder comes back: the next check resolves and selects it again.
+    client.reject = set()
+    assert gateway.sent_scope() == "available"
+
+
 def test_a_server_advertising_special_use_is_asked_for_it() -> None:
     client = SentFolderImap(list_lines=SENT_LIST)
     client.capabilities = ("IMAP4REV1", "SPECIAL-USE")

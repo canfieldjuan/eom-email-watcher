@@ -1477,7 +1477,8 @@ def test_content_is_read_through_any_source_of_a_logical_message() -> None:
     )
 
     ids = tuple(s.provider_message_id for s in sources)
-    content = service_module._content_from_sources(Copies(), ids, 100)
+    served_by, content = service_module._content_from_sources(Copies(), ids, 100)
+    assert served_by == "imap:sent:77:3"
     assert content.body == "body of imap:sent:77:3"
     with pytest.raises(MailboxMessageUnavailable):
         service_module._content_from_sources(Copies(), ids[:1], 100)
@@ -1523,6 +1524,75 @@ def test_a_lost_history_cursor_marks_every_observation_incomplete(
     # next discovery pass looks at them again; the recovery itself lists nothing.
     Watcher(cfg, store, LostCursor(frozenset({"INBOX"})), FakeModel()).check()
     assert stamps() == [None]
+
+
+def test_a_recovery_preview_previews_a_logical_message_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+    frozen_after = 1_779_000_000
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        revision,
+        (),
+        (selector,),
+        frozen_after,
+        frozen_after + 3_600,
+        "200",
+        query_scope="inbox+sent",
+    )
+
+    class TwoCopiesRecovery(FreshGmail):
+        labels = frozenset({"INBOX", "Label_123"})
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return ("copy-a", "copy-b"), None
+
+        def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+            return replace(
+                super().metadata(message_id),
+                labels=self.labels,
+                locations=locations_from_labels(self.labels),
+                rfc_message_id="same@x",
+                received_at=datetime(2026, 10, 1, 12, tzinfo=UTC).isoformat(),
+            )
+
+    preview = Watcher(cfg, store, TwoCopiesRecovery(), FakeModel()).check(dry_run=True)
+    assert preview["recovery_pending"] is True
+    assert preview["discovered"] == 1
 
 
 def test_inert_persisted_label_selectors_return_stable_inactive_reason(

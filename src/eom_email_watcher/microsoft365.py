@@ -717,15 +717,13 @@ class Microsoft365Gateway:
         query = urlencode({"$select": METADATA_SELECT})
         # Through the folder whose delta listed the id, so a message that moved since
         # answers not found instead of being read from a folder outside scope
-        # (contract D-scope); an id with no delta origin is read mailbox-wide and its
-        # folder decides the location.
-        origin = getattr(self, "_delta_folders", {}).get(message_id)
-        url = (
-            f"{GRAPH_ROOT}/me/mailFolders/{origin}/messages/{encoded_id}?{query}"
-            if origin is not None
-            else f"{GRAPH_ROOT}/me/messages/{encoded_id}?{query}"
+        # (contract D-scope). A read with no delta origin (automation re-reading a
+        # stored Inbox message) is an Inbox read, as it was before Sent capture.
+        origin = getattr(self, "_delta_folders", {}).get(message_id, INBOX_FOLDER)
+        response = self._request(
+            f"{GRAPH_ROOT}/me/mailFolders/{origin}/messages/{encoded_id}?{query}",
+            missing_is_message=True,
         )
-        response = self._request(url, missing_is_message=True)
         document = _response_document(response, "message metadata")
         response_id = _graph_id(document.get("id"), "message id")
         if response_id != message_id:

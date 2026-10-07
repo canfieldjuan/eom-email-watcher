@@ -3373,6 +3373,26 @@ def _logical_message_id(
     return str(row["message_id"]) if row is not None else None
 
 
+# A run whose source row duplicates another message (logical_of) is not work
+# (contract D-identity): the queues read logical rows, and so do the notifications.
+_RUN_OF_A_CHILD_ROW = """EXISTS (
+    SELECT 1 FROM messages AS child
+    WHERE child.logical_of IS NOT NULL
+      AND child.provider = r.provider AND child.account_id = r.account_id
+      AND (
+          (child.mailbox_identity_key IS NOT NULL
+           AND message_source_key(
+                 child.provider, child.account_id, child.provider_message_id,
+                 child.mailbox_identity_key
+               ) = r.source_message_key)
+          OR (child.mailbox_identity_key IS NULL
+              AND message_source_key(
+                    child.provider, child.account_id, child.provider_message_id
+                  ) = r.source_message_key)
+      )
+)"""
+
+
 def _requeue_if_skipped(db: sqlite3.Connection, message_id: str) -> None:
     """A message skipped because its only copy was gone is analyzed once a copy exists.
 
@@ -3484,6 +3504,11 @@ def _ensure_sent_capture_tables(db: sqlite3.Connection) -> None:
     }
     if "received_at" not in location_columns:
         db.execute("ALTER TABLE message_locations ADD COLUMN received_at TEXT")
+    attachment_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(message_attachments)").fetchall()
+    }
+    if "source_provider_message_id" not in attachment_columns:
+        db.execute("ALTER TABLE message_attachments ADD COLUMN source_provider_message_id TEXT")
 
 
 @dataclass(frozen=True)
@@ -3543,7 +3568,7 @@ def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | Non
     }
     located = db.execute(
         """SELECT m.provider, m.account_id, l.mailbox_identity_key, l.provider_message_id,
-            m.received_at
+            COALESCE(l.received_at, m.received_at) AS received_at
         FROM message_locations AS l JOIN messages AS m ON m.message_id = l.message_id
         WHERE l.message_id = ?""",
         (canonical,),
@@ -5302,6 +5327,7 @@ class Store:
                     media_type TEXT NOT NULL,
                     byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
                     position INTEGER NOT NULL CHECK (position >= 0),
+                    source_provider_message_id TEXT,
                     PRIMARY KEY (message_id, part_id),
                     UNIQUE (message_id, position)
                 );
@@ -9107,7 +9133,8 @@ class Store:
                 # Recorded locations are source identities too (contract D-identity).
                 located = db.execute(
                     f"""SELECT m.provider, m.account_id, l.mailbox_identity_key,
-                        l.provider_message_id, m.received_at
+                        l.provider_message_id,
+                        COALESCE(l.received_at, m.received_at) AS received_at
                     FROM message_locations AS l
                     JOIN messages AS m ON m.message_id = l.message_id
                     WHERE l.message_id IN ({row_placeholders})""",
@@ -9156,8 +9183,13 @@ class Store:
         return deleted
 
     def replace_attachments(
-        self, message_id: str, attachments: Iterable[AttachmentDescriptor]
+        self,
+        message_id: str,
+        attachments: Iterable[AttachmentDescriptor],
+        *,
+        source_provider_message_id: str | None = None,
     ) -> None:
+        """Store a message's attachment catalog, remembering the copy that listed it."""
         items = tuple(attachments)
         with self._source_cleanup_locks((message_id,)), self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -9170,8 +9202,9 @@ class Store:
             db.executemany(
                 """INSERT INTO message_attachments(
                         message_id, part_id, attachment_id, filename,
-                        media_type, byte_size, position, byte_size_known
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        media_type, byte_size, position, byte_size_known,
+                        source_provider_message_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         message_id,
@@ -9182,6 +9215,7 @@ class Store:
                         item.byte_size,
                         item.position,
                         int(item.byte_size_known),
+                        source_provider_message_id,
                     )
                     for item in items
                 ],
@@ -9191,7 +9225,7 @@ class Store:
         with self.connection() as db:
             row = db.execute(
                 """SELECT part_id, attachment_id, filename, media_type, byte_size, position,
-                    byte_size_known
+                    byte_size_known, source_provider_message_id
                 FROM message_attachments WHERE message_id = ? AND part_id = ?""",
                 (message_id, part_id),
             ).fetchone()
@@ -9205,6 +9239,7 @@ class Store:
             byte_size=int(row["byte_size"]),
             position=int(row["position"]),
             byte_size_known=bool(row["byte_size_known"]),
+            source_provider_message_id=row["source_provider_message_id"],
         )
 
     @staticmethod
@@ -12464,7 +12499,7 @@ class Store:
     ) -> list[NotificationIntent]:
         with self.connection() as db:
             rows = db.execute(
-                """SELECT subject_type, subject_id, revision, message_id, kind,
+                f"""SELECT subject_type, subject_id, revision, message_id, kind,
                     sender, sender_name, subject, analysis_at, priority, summary,
                     suggested_action, deadline_iso, last_error,
                     analysis_body_chars, analysis_body_source_chars
@@ -12525,6 +12560,7 @@ class Store:
                  )
                 WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
                   AND r.review_notified_at IS NULL
+                  AND NOT {_RUN_OF_A_CHILD_ROW}
                 ) AS intents
                 WHERE (? IS NULL OR kind = ?)
                 ORDER BY sort_at LIMIT ?""",
@@ -12535,15 +12571,16 @@ class Store:
     def notification_intent_count(self) -> int:
         with self.connection() as db:
             row = db.execute(
-                """SELECT
+                f"""SELECT
                     (SELECT COUNT(*) FROM logical_messages
                      WHERE (status = 'analyzed' AND notified_at IS NULL)
                         OR (status = 'pending' AND last_error IS NOT NULL
                             AND fallback_notified_at IS NULL))
                     +
-                    (SELECT COUNT(*) FROM automation_runs
-                     WHERE state IN ('ambiguous', 'manual_review', 'source_unavailable')
-                       AND review_notified_at IS NULL) AS count"""
+                    (SELECT COUNT(*) FROM automation_runs AS r
+                     WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
+                       AND r.review_notified_at IS NULL
+                       AND NOT {_RUN_OF_A_CHILD_ROW}) AS count"""
             ).fetchone()
         return int(row["count"])
 

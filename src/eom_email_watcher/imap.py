@@ -1725,15 +1725,13 @@ class ImapGateway:
     def sent_scope(self) -> str:
         """'available' only once the resolved folder has been selected (contract D-scope)."""
         with self._mailbox() as client:
-            folder = self._resolve_sent_folder(client)
-            if folder is None:
-                return SENT_SCOPE_UNAVAILABLE
             try:
-                self._ensure_selected(client, folder)
-            except ImapError:
-                self._sent_folder = None
-                return SENT_SCOPE_UNAVAILABLE
-            return SENT_SCOPE_AVAILABLE
+                self._require_sent_folder(client)
+            except ImapError as exc:
+                if exc.code == "imap_sent_unavailable":
+                    return SENT_SCOPE_UNAVAILABLE
+                raise
+        return SENT_SCOPE_AVAILABLE
 
     def _folder_cursor(self, folder_key: str | None, uid_validity: int, last_uid: int) -> str:
         if folder_key is None:
@@ -1872,7 +1870,6 @@ class ImapGateway:
     def sent_initial_cursor(self) -> str:
         with self._mailbox() as client:
             folder = self._require_sent_folder(client)
-            self._ensure_selected(client, folder)
             uid_validity, last_uid = self._snapshot(client)
         return _sent_cursor(self._mailbox_id, _folder_key(folder), uid_validity, last_uid)
 
@@ -1890,7 +1887,6 @@ class ImapGateway:
                 folder = self._require_sent_folder(client)
                 if saved_mailbox != self._mailbox_id or saved_folder_key != _folder_key(folder):
                     raise StaleMailboxCursor("The mail server Sent folder changed")
-                self._ensure_selected(client, folder)
                 return self._resume_recovery(
                     client,
                     folder_key=saved_folder_key,
@@ -1904,13 +1900,24 @@ class ImapGateway:
     def sent_recover_since(self, since: datetime) -> MailboxChanges:
         with self._mailbox() as client:
             folder = self._require_sent_folder(client)
-            self._ensure_selected(client, folder)
             return self._recover_folder(client, _folder_key(folder), since)
 
     def _require_sent_folder(self, client: imaplib.IMAP4) -> str:
+        """The selected Sent folder, else imap_sent_unavailable (contract D-scope).
+
+        One owner of "Sent is available": the resolved name is kept, a failure to
+        select it is not, so each call probes again and a folder that comes back
+        is used by the next check without remaking the gateway.
+        """
         folder = self._resolve_sent_folder(client)
         if folder is None:
             raise ImapError("imap_sent_unavailable", "Mail server has no Sent folder")
+        try:
+            self._ensure_selected(client, folder)
+        except ImapError as exc:
+            raise ImapError(
+                "imap_sent_unavailable", "Mail server Sent folder cannot be selected"
+            ) from exc
         return folder
 
     def _incremental_changes(self, cursor: str, *, sent: bool) -> MailboxChanges:

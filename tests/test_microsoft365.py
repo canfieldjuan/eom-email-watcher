@@ -509,7 +509,7 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
             return httpx.Response(200, json={"id": "inbox-folder-id"})
         if path.endswith("/mailFolders/sentitems"):
             return httpx.Response(200, json={"id": "sent-folder-id"})
-        if path.endswith("/me/messages/message-1") and str(
+        if path.endswith("/messages/message-1") and str(
             request.url.params.get("$select", "")
         ).startswith("id,"):
             return httpx.Response(
@@ -798,7 +798,7 @@ def test_inbox_metadata_never_looks_up_sent_items() -> None:
             return httpx.Response(503, json={"error": {"code": "ServiceUnavailable"}})
         if path.endswith("/mailFolders/inbox"):
             return httpx.Response(200, json={"id": "inbox-folder-id"})
-        if path.endswith("/me/messages/inbox-1"):
+        if path.endswith("/messages/inbox-1"):
             return httpx.Response(
                 200,
                 json={
@@ -818,6 +818,8 @@ def test_inbox_metadata_never_looks_up_sent_items() -> None:
     # Sent Items failure cannot abort the Inbox check (contract D-ops).
     assert gateway.metadata("inbox-1").locations == frozenset({"inbox"})
     assert not any(r.url.path.endswith("/mailFolders/sentitems") for r in requests)
+    # A read with no delta origin is an Inbox read: a moved message answers not found.
+    assert any(r.url.path.endswith("/mailFolders/inbox/messages/inbox-1") for r in requests)
 
     # The Sent poll sees the failure as the mailbox error it contains.
     with pytest.raises(Microsoft365Error):

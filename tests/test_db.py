@@ -7881,11 +7881,107 @@ def test_a_polling_gap_clears_the_account_s_observation_stamps(tmp_path: Path) -
         message_id="gmail-1", thread_id="t", sender="a@b.com", sender_name=None,
         subject="S", received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
     )
+    store.add_message(
+        message_id="other-1", provider="gmail", account_id="gmail-other", thread_id="t",
+        sender="a@b.com", sender_name=None, subject="S",
+        received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
+    )
+
+    def stamps() -> dict[str, str | None]:
+        with store.connection() as db:
+            return {
+                str(row["message_id"]): row["recorded_at"]
+                for row in db.execute("SELECT message_id, recorded_at FROM message_locations")
+            }
+
+    assert None not in stamps().values()
     with store.connection() as db:
         row = db.execute(
             "SELECT provider, account_id, mailbox_identity_key FROM messages"
+            " WHERE message_id = 'gmail-1'"
         ).fetchone()
-        assert db.execute("SELECT recorded_at FROM message_locations").fetchone()[0] is not None
     store.clear_location_stamps(row[0], row[1], row[2])
+    # The gap is one account's: its stamps clear, another account's stay.
+    assert stamps()["gmail-1"] is None
+    assert stamps()["other-1"] is not None
+
+
+def test_attachments_remember_the_copy_that_listed_them(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "same@x")
+    store.replace_attachments(
+        first,
+        [
+            AttachmentDescriptor(
+                part_id="2", attachment_id=None, filename="quote.pdf",
+                media_type="application/pdf", byte_size=10, position=0,
+            )
+        ],
+        source_provider_message_id="imap:sent:77:3",
+    )
+    assert store.attachment(first, "2").source_provider_message_id == "imap:sent:77:3"
+
+
+def test_a_deleted_location_copy_is_suppressed_for_its_own_retention(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "same@x")
     with store.connection() as db:
-        assert db.execute("SELECT recorded_at FROM message_locations").fetchone()[0] is None
+        db.execute(
+            "UPDATE messages SET received_at = '2026-01-01T12:00:00+00:00' WHERE message_id = ?",
+            (root,),
+        )
+    store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-09-01T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    )
+
+    assert store.delete_message(root, now=datetime(2026, 9, 10, tzinfo=UTC))
+    with store.connection() as db:
+        rows = db.execute(
+            "SELECT message_key, expires_at FROM suppressed_messages ORDER BY expires_at"
+        ).fetchall()
+    # The newer copy's suppression outlives the older canonical's: each copy is
+    # suppressed for its own retention horizon.
+    assert len(rows) == 2
+    assert rows[0]["expires_at"] < rows[1]["expires_at"]
+
+
+def test_review_notifications_skip_a_run_owned_by_a_child_row(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = admitted_scheduling_run(store, message_id="local-a", provider_message_id="m-a")
+    second = admitted_scheduling_run(store, message_id="local-b", provider_message_id="m-b")
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET rfc_message_id = 'same@x', thread_id = '<same@x>'"
+            " WHERE message_id IN ('local-a', 'local-b')"
+        )
+        db.execute(
+            "UPDATE automation_runs SET state = 'manual_review', review_notified_at = NULL"
+            " WHERE run_id IN (?, ?)",
+            (first.run_id, second.run_id),
+        )
+
+    def review_intents() -> int:
+        return sum(1 for i in store.notification_intents() if i.kind == "automation_review")
+
+    before = review_intents()
+    _reset_to_schema_29(store)
+    store.initialize()
+
+    # Both copies' runs wanted review; after coalescing only the canonical's does,
+    # and the count agrees with the list.
+    assert before == 2
+    assert review_intents() == 1
+    assert store.notification_intent_count() == len(store.notification_intents())

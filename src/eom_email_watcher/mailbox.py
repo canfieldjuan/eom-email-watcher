@@ -101,16 +101,18 @@ INBOX_LOCATION = "inbox"
 SENT_LOCATION = "sent"
 def read_through_sources[T](
     provider_message_ids: Sequence[str], read: Callable[[str], T]
-) -> T:
+) -> tuple[str, T]:
     """Read a logical message through any of its source identities (contract D-identity).
 
     A copy that is gone is not the message being gone: the next recorded source is
     tried, and only when every copy is unavailable does the message count as such.
+    Returns the source that served the read with the result, since what it lists
+    (an attachment id) belongs to that copy.
     """
     last: MailboxMessageUnavailable | None = None
     for provider_message_id in provider_message_ids:
         try:
-            return read(provider_message_id)
+            return provider_message_id, read(provider_message_id)
         except MailboxMessageUnavailable as exc:
             last = exc
     if last is None:

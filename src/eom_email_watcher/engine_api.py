@@ -130,7 +130,6 @@ from .mailbox import (
     MailboxSession,
     mailbox_polling_session,
     mailbox_session_identity_key,
-    read_through_sources,
 )
 from .microsoft365 import (
     MICROSOFT365_PROVIDER,
@@ -2858,6 +2857,8 @@ def _verified_mailbox_attachment_bytes(
     part_id: str,
     attachment_id: str | None,
     remaining_timeout: Callable[[], float] | None = None,
+    *,
+    source_provider_message_id: str | None = None,
 ) -> bytes:
     mailbox = load_mailbox_account(
         runtime.config,
@@ -2884,15 +2885,12 @@ def _verified_mailbox_attachment_bytes(
             )
         if remaining_timeout is not None:
             gateway.set_operation_timeout(remaining_timeout())
-        # Any copy of the logical message can serve the bytes (contract D-identity).
-        source_ids = tuple(
-            s.provider_message_id for s in runtime.store.message_sources(source.message_id)
-        ) or (source.provider_message_id,)
-        return read_through_sources(
-            source_ids,
-            lambda provider_message_id: gateway.attachment_bytes(
-                provider_message_id, part_id, attachment_id
-            ),
+        # The attachment id belongs to the copy whose content listed it (contract
+        # D-identity), so the bytes are read from that copy.
+        return gateway.attachment_bytes(
+            source_provider_message_id or source.provider_message_id,
+            part_id,
+            attachment_id,
         )
 
 
@@ -2916,6 +2914,7 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
         source,
         part_id,
         attachment.attachment_id,
+        source_provider_message_id=attachment.source_provider_message_id,
     )
     if not _attachment_download_matches(source.provider, attachment.byte_size, content):
         raise MailboxError("Mailbox attachment size did not match stored metadata")
@@ -4358,6 +4357,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     source,
                     claimed_job.part_id,
                     attachment.attachment_id,
+                    source_provider_message_id=attachment.source_provider_message_id,
                 )
 
             try:
@@ -4535,6 +4535,7 @@ def _generic_attachment_content(
         part_id,
         current_attachment.attachment_id,
         remaining_timeout,
+        source_provider_message_id=current_attachment.source_provider_message_id,
     )
 
 
@@ -5449,6 +5450,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         source,
         part_id,
         attachment.attachment_id,
+        source_provider_message_id=attachment.source_provider_message_id,
     )
     if not _attachment_download_matches(source.provider, attachment.byte_size, content):
         raise MailboxError("Mailbox attachment size did not match stored metadata")

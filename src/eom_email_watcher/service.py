@@ -66,6 +66,7 @@ from .mailbox import (
     MailboxMessageUnavailable,
     MailboxSession,
     MessageContent,
+    MessageMetadata,
     StaleMailboxCursor,
     default_mailbox_session,
     folder_scope_key,
@@ -183,7 +184,7 @@ def _scope_gateway(gateway: object, folders: frozenset[str]) -> None:
 
 def _content_from_sources(
     gateway: MailboxGateway, provider_message_ids: Sequence[str], body_char_limit: int
-) -> MessageContent:
+) -> tuple[str, MessageContent]:
     return read_through_sources(
         provider_message_ids, lambda source: gateway.content(source, body_char_limit)
     )
@@ -1701,31 +1702,29 @@ class Watcher:
             )
             if admission is None or received_at is None or received_at < retention_cutoff:
                 continue
-            dry_run_messages.append(
-                PendingMessage(
-                    message_id=scoped_message_id(
+            self._preview_candidate(
+                metadata,
+                {
+                    "message_id": scoped_message_id(
                         "gmail",
                         self.mailbox.account_id,
                         metadata.message_id,
                         mailbox_identity_key,
                     ),
-                    provider="gmail",
-                    account_id=self.mailbox.account_id,
-                    provider_message_id=metadata.message_id,
-                    thread_id=metadata.thread_id,
-                    sender=metadata.sender,
-                    sender_name=(
+                    "provider": "gmail",
+                    "account_id": self.mailbox.account_id,
+                    "provider_message_id": metadata.message_id,
+                    "thread_id": metadata.thread_id,
+                    "sender": metadata.sender,
+                    "sender_name": (
                         metadata.sender_name or self.sender_names.get(metadata.sender)
                     ),
-                    subject=metadata.subject,
-                    received_at=received_at.isoformat(),
-                    attempts=0,
-                    fallback_notified_at=None,
-                    analysis_request_id=None,
-                    analysis_context_at=None,
-                    analysis_body_char_limit=None,
-                    mailbox_identity_key=mailbox_identity_key,
-                )
+                    "subject": metadata.subject,
+                    "received_at": received_at.isoformat(),
+                    "mailbox_identity_key": mailbox_identity_key,
+                },
+                mailbox_identity_key,
+                dry_run_messages,
             )
 
         return self._finish_active_result(
@@ -2333,34 +2332,10 @@ class Watcher:
                 "mailbox_identity_key": mailbox_identity_key,
             }
             if dry_run:
-                # A second copy of a stored or already previewed logical identity is a
-                # location, not a message (contract D-identity), in a preview too.
-                if metadata.rfc_message_id is not None:
-                    identity = (
-                        self.mailbox.provider,
-                        self.mailbox.account_id,
-                        mailbox_identity_key,
-                        metadata.rfc_message_id,
-                    )
-                    if identity in self._preview_identities or (
-                        self.store.logical_message_id(
-                            *identity, other_than=metadata.message_id
-                        )
-                        is not None
-                    ):
-                        continue
-                    self._preview_identities.add(identity)
-                dry_run_messages.append(
-                    PendingMessage(
-                        **values,
-                        attempts=0,
-                        fallback_notified_at=None,
-                        analysis_request_id=None,
-                        analysis_context_at=None,
-                        analysis_body_char_limit=None,
-                    )
-                )
-                added += 1
+                if self._preview_candidate(
+                    metadata, values, mailbox_identity_key, dry_run_messages
+                ):
+                    added += 1
             elif self.store.add_message(
                 **values,
                 admission=admission.provenance(),
@@ -2374,6 +2349,44 @@ class Watcher:
             ):
                 added += 1
         return added
+
+    def _preview_candidate(
+        self,
+        metadata: MessageMetadata,
+        values: dict[str, object],
+        mailbox_identity_key: str,
+        dry_run_messages: list[PendingMessage],
+    ) -> bool:
+        """Append an admitted candidate to a dry run as capture would store it.
+
+        A second copy of a stored or already previewed logical identity is a
+        location, not a message (contract D-identity), in a preview too; the one
+        rule serves polling and recovery previews alike.
+        """
+        if metadata.rfc_message_id is not None:
+            identity = (
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                metadata.rfc_message_id,
+            )
+            if identity in self._preview_identities or (
+                self.store.logical_message_id(*identity, other_than=metadata.message_id)
+                is not None
+            ):
+                return False
+            self._preview_identities.add(identity)
+        dry_run_messages.append(
+            PendingMessage(
+                **values,
+                attempts=0,
+                fallback_notified_at=None,
+                analysis_request_id=None,
+                analysis_context_at=None,
+                analysis_body_char_limit=None,
+            )
+        )
+        return True
 
     def _record_known_message_location(
         self,
@@ -2665,9 +2678,15 @@ class Watcher:
                         for s in self.store.message_sources(message.message_id)
                     )
                 )
-                content = _content_from_sources(self.gateway, source_ids, body_char_limit)
+                served_by, content = _content_from_sources(
+                    self.gateway, source_ids, body_char_limit
+                )
                 if not dry_run:
-                    self.store.replace_attachments(message.message_id, content.attachments)
+                    self.store.replace_attachments(
+                        message.message_id,
+                        content.attachments,
+                        source_provider_message_id=served_by,
+                    )
                 analysis = self.model.analyze(
                     sender=message.sender,
                     subject=message.subject,
