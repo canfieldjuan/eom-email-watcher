@@ -2811,38 +2811,15 @@ def _attachment_download_matches(provider: str, byte_size: int, content: bytes) 
     return provider == IMAP_PROVIDER or len(content) == byte_size
 
 
-def _connect_source_is_retained(
-    source: MessageSource,
-    retention_days: int,
-    *,
-    observed_at: datetime,
-) -> bool:
-    try:
-        received_at = datetime.fromisoformat(source.received_at)
-        if received_at.tzinfo is None:
-            return False
-        received_at = received_at.astimezone(UTC)
-    except (OverflowError, ValueError):
-        return False
-    cutoff = observed_at - timedelta(days=retention_days)
-    if received_at <= observed_at:
-        return received_at >= cutoff
-    try:
-        discovered_at = datetime.fromisoformat(source.discovered_at)
-        if discovered_at.tzinfo is None:
-            return False
-        discovered_at = discovered_at.astimezone(UTC)
-    except (OverflowError, ValueError):
-        return False
-    return cutoff <= discovered_at <= observed_at
-
-
 def _retained_connect_message_source(runtime: Runtime, message_id: str) -> MessageSource:
     source = _configured_message_source(runtime, message_id)
-    if not _connect_source_is_retained(
-        source,
-        runtime.config.retention_days,
-        observed_at=datetime.now(UTC),
+    observed_at = datetime.now(UTC)
+    # The purge's retention rule (contract D-scope, D-identity): Connect acts on a
+    # message exactly while the purge keeps it, a newer copy of it included.
+    if message_id not in runtime.store.retained_logical_messages(
+        (message_id,),
+        cutoff=observed_at - timedelta(days=runtime.config.retention_days),
+        now=observed_at,
     ):
         raise ApiError(
             "connect_source_unavailable",

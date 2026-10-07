@@ -7985,3 +7985,75 @@ def test_review_notifications_skip_a_run_owned_by_a_child_row(tmp_path: Path) ->
     assert before == 2
     assert review_intents() == 1
     assert store.notification_intent_count() == len(store.notification_intents())
+
+
+@pytest.mark.parametrize(
+    ("received_at", "discovered_at", "expected"),
+    [
+        ("2026-08-10T11:59:59+00:00", "2026-09-01T12:00:00+00:00", False),
+        ("2026-08-10T12:00:00+00:00", "2026-09-01T12:00:00+00:00", True),
+        ("2026-09-10T12:00:01+00:00", "2026-09-01T12:00:00+00:00", True),
+        ("2026-09-10T12:00:01+00:00", "2026-08-10T11:59:59+00:00", False),
+        ("2026-09-10T12:00:01+00:00", "2026-09-10T12:00:00+00:00", False),
+        ("2026-09-01T12:00:00", "2026-09-01T12:00:00+00:00", False),
+        ("not-a-time", "2026-09-01T12:00:00+00:00", False),
+    ],
+)
+def test_retention_rule_boundaries(
+    tmp_path: Path, received_at: str, discovered_at: str, expected: bool
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    message_id = _imap_message(store, "1", None)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET received_at = ?, discovered_at = ? WHERE message_id = ?",
+            (received_at, discovered_at, message_id),
+        )
+    observed_at = datetime(2026, 9, 9, 12, tzinfo=UTC)
+
+    retained = store.retained_logical_messages(
+        [message_id], cutoff=observed_at - timedelta(days=30), now=observed_at
+    )
+
+    assert (message_id in retained) is expected
+    # The purge reads the same rule: it deletes exactly what is not retained.
+    assert store.purge(30, now=observed_at) == (0 if expected else 1)
+
+
+def test_a_newer_copy_keeps_a_logical_message_retained_for_every_reader(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "same@x")
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET received_at = '2026-01-01T12:00:00+00:00' WHERE message_id = ?",
+            (root,),
+        )
+    store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-09-01T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    )
+    observed_at = datetime(2026, 9, 9, 12, tzinfo=UTC)
+    cutoff = observed_at - timedelta(days=30)
+
+    # The canonical row is old, its Sent copy is not: kept, and processed.
+    assert store.retained_logical_messages([root], cutoff=cutoff, now=observed_at) == {root}
+    assert store.purge(30, now=observed_at) == 0
+    # Once the copy is old too, both readers agree it has left retention.
+    later = datetime(2026, 10, 9, 12, tzinfo=UTC)
+    assert store.retained_logical_messages(
+        [root], cutoff=later - timedelta(days=30), now=later
+    ) == frozenset()
+    assert store.purge(30, now=later) == 1

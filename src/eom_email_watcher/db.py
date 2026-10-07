@@ -3393,6 +3393,65 @@ _RUN_OF_A_CHILD_ROW = """EXISTS (
 )"""
 
 
+def _effective_cutoff_sql(alias: str) -> str:
+    """The cutoff for a copy under `alias`: an account under Gmail recovery keeps
+    the recovery's frozen cutoff when it is earlier. Takes two parameters, both the
+    cutoff epoch."""
+    return f"""MIN(?, COALESCE((
+        SELECT aware_iso_epoch(recovery.retention_cutoff)
+        FROM gmail_recovery_state AS recovery
+        WHERE recovery.provider = {alias}.provider
+          AND recovery.account_id = {alias}.account_id
+          AND recovery.mailbox_identity_key = {alias}.mailbox_identity_key
+    ), ?))"""
+
+
+def _expired_logical_messages_sql(
+    cutoff_epoch: float, stamp_epoch: float
+) -> tuple[str, tuple[float, ...]]:
+    """The logical messages that have left retention (contract D-scope, D-identity).
+
+    The one retention rule: the purge deletes exactly these, and the analysis
+    queues and Connect treat every other stored message as retained, so a message
+    is processed exactly while it is kept. A logical message is retained while any
+    of its copies is: a row by its received time (a future-dated row by its
+    discovery time), or a copy recorded only as a location by its own received time.
+    """
+    row_expired = f"""aware_iso_epoch(received_at) IS NULL
+        OR (
+            aware_iso_epoch(received_at) > ?
+            AND (
+                aware_iso_epoch(discovered_at) IS NULL
+                OR aware_iso_epoch(discovered_at) < ?
+                OR aware_iso_epoch(discovered_at) > ?
+            )
+        )
+        OR (
+            aware_iso_epoch(received_at) <= ?
+            AND aware_iso_epoch(received_at) < {_effective_cutoff_sql("messages")}
+        )"""
+    sql = f"""SELECT canonical FROM (
+            SELECT COALESCE(logical_of, message_id) AS canonical,
+                   MIN(CASE WHEN ({row_expired}) THEN 1 ELSE 0 END) AS all_expired
+            FROM messages GROUP BY canonical
+        ) WHERE all_expired = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM message_locations AS l
+              WHERE l.message_id = canonical AND l.received_at IS NOT NULL
+                AND aware_iso_epoch(l.received_at) >= {_effective_cutoff_sql("l")}
+          )"""
+    return sql, (
+        stamp_epoch,
+        cutoff_epoch,
+        stamp_epoch,
+        stamp_epoch,
+        cutoff_epoch,
+        cutoff_epoch,
+        cutoff_epoch,
+        cutoff_epoch,
+    )
+
+
 def _requeue_if_skipped(db: sqlite3.Connection, message_id: str) -> None:
     """A message skipped because its only copy was gone is analyzed once a copy exists.
 
@@ -13072,54 +13131,17 @@ class Store:
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         stamp_epoch = (stamp - epoch).total_seconds()
         cutoff_epoch = (cutoff - epoch).total_seconds()
-        effective_cutoff = """MIN(?, COALESCE((
-                           SELECT aware_iso_epoch(recovery.retention_cutoff)
-                           FROM gmail_recovery_state AS recovery
-                           WHERE recovery.provider = messages.provider
-                             AND recovery.account_id = messages.account_id
-                             AND recovery.mailbox_identity_key = messages.mailbox_identity_key
-                       ), ?))"""
-        expiry_predicate = f"""aware_iso_epoch(received_at) IS NULL
-                   OR (
-                       aware_iso_epoch(received_at) > ?
-                       AND (
-                           aware_iso_epoch(discovered_at) IS NULL
-                           OR aware_iso_epoch(discovered_at) < ?
-                           OR aware_iso_epoch(discovered_at) > ?
-                       )
-                   )
-                   OR (
-                       aware_iso_epoch(received_at) <= ?
-                       AND aware_iso_epoch(received_at) < {effective_cutoff}
-                   )"""
-        expiry_parameters = (
-            stamp_epoch,
-            cutoff_epoch,
-            stamp_epoch,
-            stamp_epoch,
-            cutoff_epoch,
-            cutoff_epoch,
+        # A logical message is purged as one unit (contract D-identity), once
+        # every copy has left retention under the one rule the queues and Connect
+        # also read.
+        expired_units, expiry_parameters = _expired_logical_messages_sql(
+            cutoff_epoch, stamp_epoch
         )
-        # A logical message is purged as one unit (contract D-identity): its
-        # canonical row and every row pointing to it go together, once every
-        # row has expired, so a later-dated copy keeps the shared locations.
-        # A copy captured as a location, not a row, carries its own receive time:
-        # while it is within retention the logical message stays.
-        expired_units = f"""SELECT canonical FROM (
-                SELECT COALESCE(logical_of, message_id) AS canonical,
-                       MIN(CASE WHEN ({expiry_predicate}) THEN 1 ELSE 0 END) AS all_expired
-                FROM messages GROUP BY canonical
-            ) WHERE all_expired = 1
-              AND NOT EXISTS (
-                  SELECT 1 FROM message_locations AS l
-                  WHERE l.message_id = canonical AND l.received_at IS NOT NULL
-                    AND aware_iso_epoch(l.received_at) >= ?
-              )"""
         with self.connection() as db:
             expired_ids = [
                 str(row["canonical"])
                 for row in db.execute(
-                    f"{expired_units} ORDER BY canonical", (*expiry_parameters, cutoff_epoch)
+                    f"{expired_units} ORDER BY canonical", expiry_parameters
                 ).fetchall()
             ]
         deleted = 0
@@ -13138,7 +13160,7 @@ class Store:
                     for row in db.execute(
                         f"""SELECT canonical FROM ({expired_units})
                             WHERE canonical IN ({placeholders})""",
-                        (*expiry_parameters, cutoff_epoch, *chunk),
+                        (*expiry_parameters, *chunk),
                     ).fetchall()
                 ]
                 current_rows = _unit_rows(db, current_expired)
@@ -13177,6 +13199,41 @@ class Store:
 
     def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
         return self.purge_with_outcome(retention_days, now=now).messages
+
+    def retained_logical_messages(
+        self, message_ids: Iterable[str], *, cutoff: datetime, now: datetime
+    ) -> frozenset[str]:
+        """The given stored messages whose logical message is within retention.
+
+        Reads the purge's rule (_expired_logical_messages_sql), so a message is
+        analyzed, delivered, or acted on through Connect exactly while the purge
+        keeps it, a newer copy of it included (contract D-scope, D-identity).
+        """
+        ids = tuple(dict.fromkeys(message_ids))
+        if not ids:
+            return frozenset()
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        expired_sql, parameters = _expired_logical_messages_sql(
+            (cutoff.astimezone(UTC) - epoch).total_seconds(),
+            (now.astimezone(UTC) - epoch).total_seconds(),
+        )
+        retained: set[str] = set()
+        with self.connection() as db:
+            for offset in range(0, len(ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+                chunk = ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in chunk)
+                retained.update(
+                    str(row["message_id"])
+                    for row in db.execute(
+                        f"""WITH expired(canonical) AS ({expired_sql})
+                        SELECT message_id FROM messages
+                        WHERE message_id IN ({placeholders})
+                          AND COALESCE(logical_of, message_id)
+                              NOT IN (SELECT canonical FROM expired)""",
+                        (*parameters, *chunk),
+                    ).fetchall()
+                )
+        return frozenset(retained)
 
     def outbound_status(self, dedupe_key: str) -> str | None:
         with self.connection() as db:

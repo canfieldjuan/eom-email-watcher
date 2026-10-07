@@ -1595,6 +1595,116 @@ def test_a_recovery_preview_previews_a_logical_message_once(
     assert preview["discovered"] == 1
 
 
+def test_a_gmail_recovery_check_records_the_sent_scope_it_decided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+
+    def recover() -> None:
+        store.create_gmail_recovery_state(
+            "gmail-default",
+            TEST_MAILBOX_IDENTITY_KEY,
+            revision,
+            (),
+            (selector,),
+            1_779_000_000,
+            1_779_003_600,
+            "200",
+            query_scope="inbox",
+        )
+
+    class EmptyRecovery(FreshGmail):
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return (), None
+
+    # A check that spends itself on recovery still records this check's Sent scope:
+    # available once Connect is active, not polled once it lapses.
+    recover()
+    _active_entitlement(monkeypatch)
+    assert Watcher(cfg, store, EmptyRecovery(), FakeModel()).check()["active"] is True
+    assert store.sent_scope("gmail", "gmail-default") == "available"
+
+    recover()
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
+    )
+    assert Watcher(cfg, store, EmptyRecovery(), FakeModel()).check()["active"] is True
+    assert store.sent_scope("gmail", "gmail-default") == "not_polled"
+
+
+def test_a_message_kept_by_a_newer_copy_is_analyzed(tmp_path: Path) -> None:
+    cfg = replace(config(tmp_path), retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
+    for message_id, age, locations in (
+        ("old-inbox-copy", timedelta(days=2), frozenset({"inbox"})),
+        ("new-sent-copy", timedelta(hours=1), frozenset({"sent"})),
+    ):
+        store.add_message(
+            message_id=message_id,
+            provider_message_id=message_id,
+            thread_id=None,
+            sender="trusted@example.com",
+            sender_name="Trusted",
+            subject="Quote",
+            received_at=(datetime.now(UTC) - age).isoformat(),
+            rfc_message_id="same@x",
+            locations=locations,
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            admission=exact_sender_admission(),
+        )
+    gmail = FakeGmail()
+    gmail.history_message_ids = lambda cursor: ([], "200")
+    model = FakeModel()
+
+    result = Watcher(cfg, store, gmail, model).check()
+
+    # The canonical row is past retention, its Sent copy is not: the purge keeps the
+    # message, so it is analyzed rather than left pending until the copy expires.
+    assert result["purged"] == 0
+    assert result["summarized"] == 1
+    assert model.calls == 1
+
+
 def test_inert_persisted_label_selectors_return_stable_inactive_reason(
     tmp_path: Path,
 ) -> None:
@@ -5867,6 +5977,9 @@ class SentPollingGateway(ImapGateway):
         if self.stale_once:
             self.stale_once = False
             raise StaleMailboxCursor("The mail server Sent folder changed")
+        # The cursor moves only past mail that arrived after it.
+        if not self.sent_ids:
+            return MailboxChanges((), cursor)
         return MailboxChanges(self.sent_ids, f"eom-imap-v2:{self.credential_identity}:77:3")
 
     def sent_recover_since(self, since: datetime) -> MailboxChanges:
@@ -5902,7 +6015,7 @@ def test_imap_sent_folder_is_polled_only_while_connect_is_active(
 ) -> None:
     cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
     sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
-    gateway = SentPollingGateway(credential, identity, inbox_cursor, sent_ids=(sent_id,))
+    gateway = SentPollingGateway(credential, identity, inbox_cursor)
     scope = {
         "provider": "imap",
         "account_id": account_id,
@@ -5927,7 +6040,9 @@ def test_imap_sent_folder_is_polled_only_while_connect_is_active(
     assert store.folder_state(**scope)[0] == gateway.sent_cursor
     assert store.recent(1) == []
 
-    # The next active check captures from Sent and advances only the Sent cursor.
+    # Mail sent after that position: the next active check captures it from Sent
+    # and advances only the Sent cursor.
+    gateway.sent_ids = (sent_id,)
     result = check()
     assert result["summarized"] == 1
     item = store.recent(1)[0]
@@ -5959,7 +6074,7 @@ def test_a_dry_run_previews_sent_mail_without_moving_its_cursor(
     _active_entitlement(monkeypatch)
     cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
     sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
-    gateway = SentPollingGateway(credential, identity, inbox_cursor, sent_ids=(sent_id,))
+    gateway = SentPollingGateway(credential, identity, inbox_cursor)
     scope = {
         "provider": "imap",
         "account_id": account_id,
@@ -5973,6 +6088,7 @@ def test_a_dry_run_previews_sent_mail_without_moving_its_cursor(
 
     check(dry_run=False)
     assert store.folder_state(**scope)[0] == gateway.sent_cursor
+    gateway.sent_ids = (sent_id,)
 
     # A dry run reads Sent like the Inbox: it reports the mail and changes nothing.
     preview = check(dry_run=True)
@@ -5983,6 +6099,31 @@ def test_a_dry_run_previews_sent_mail_without_moving_its_cursor(
     result = check(dry_run=False)
     assert result["summarized"] == 1
     assert store.folder_state(**scope)[0].endswith(":77:3")
+
+
+def test_mail_sent_while_the_inbox_is_polled_follows_the_sent_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
+
+    class SlowInbox(SentPollingGateway):
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            # The owner sends a message while the Inbox poll runs.
+            self.sent_calls.append("inbox")
+            self.sent_ids = (sent_id,)
+            return super().changes_since(cursor)
+
+    gateway = SlowInbox(credential, identity, inbox_cursor)
+    _active_entitlement(monkeypatch)
+
+    result = Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()).check()
+
+    # The Sent position is taken before the Inbox poll, so the message is after it
+    # and this same check captures it.
+    assert gateway.sent_calls.index("initial") < gateway.sent_calls.index("inbox")
+    assert result["summarized"] == 1
+    assert store.message_locations(store.recent(1)[0]["message_id"]) == ["sent"]
 
 
 def test_imap_without_a_sent_folder_records_unavailable_and_polls_nothing(
@@ -6031,10 +6172,11 @@ def test_a_stale_sent_cursor_recovers_the_gap_before_moving_on(
 ) -> None:
     cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
     sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
-    gateway = SentPollingGateway(credential, identity, inbox_cursor, sent_ids=(sent_id,))
+    gateway = SentPollingGateway(credential, identity, inbox_cursor)
     _active_entitlement(monkeypatch)
     session = MailboxSession("imap", account_id, gateway)
     Watcher(cfg, store, session, FakeModel()).check()
+    gateway.sent_ids = (sent_id,)
     scope = {
         "provider": "imap",
         "account_id": account_id,

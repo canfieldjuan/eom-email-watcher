@@ -1221,6 +1221,21 @@ def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | Non
         return None
 
 
+def _copy_received_in_retention(
+    metadata: MessageMetadata, *, checked_at: datetime, retention_cutoff: datetime
+) -> datetime | None:
+    """A fetched copy's received time if it may be captured (contract D-scope).
+
+    The one copy-level rule every capture path applies: the time parses, is clamped
+    to the check, and is at or after the cutoff. None otherwise. A stored logical
+    message's retention is the store's rule (Store.retained_logical_messages).
+    """
+    received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
+    if received_at is None or received_at < retention_cutoff:
+        return None
+    return received_at
+
+
 def _deliver_automation_review_intent(
     config: Config,
     store: Store,
@@ -1420,12 +1435,59 @@ class Watcher:
             result["recovery_next_retry_at"] = state.next_retry_at
         return result
 
-    def _note_not_polled(self, dry_run: bool) -> None:
-        """An inactive account polls nothing, Sent included (contract D-scope, D-ops)."""
-        if not dry_run:
-            self.store.set_sent_scope(
-                self.mailbox.provider, self.mailbox.account_id, SENT_SCOPE_NOT_POLLED
-            )
+    def _settle_sent(
+        self,
+        *,
+        folders: frozenset[str],
+        mailbox_identity_key: str | None,
+        dry_run: bool,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Decide Sent once per check, before any Inbox work (contract D-scope, D-ops).
+
+        Every path a check completes by runs this first, so the scope Health reports
+        is never a previous check's. The first time Sent is available it also records
+        the folder's current position: taken before the Inbox poll, so mail sent while
+        the Inbox is polled is after it and reaches this check's Sent poll. Returns
+        the scope, or None when Sent could not be read: a Sent error never stops the
+        Inbox check, and the scope stays as last recorded. A dry run records nothing.
+        """
+        provider = self.mailbox.provider
+        account_id = self.mailbox.account_id
+        checked_at = now or datetime.now(UTC)
+        if SENT_LOCATION not in folders:
+            scope = SENT_SCOPE_NOT_POLLED
+        elif provider == "gmail":
+            # Gmail's one mailbox-wide history carries SENT events: no Sent cursor.
+            scope = SENT_SCOPE_AVAILABLE
+        else:
+            scope_reader = getattr(self.gateway, "sent_scope", None)
+            if not callable(scope_reader):
+                return None
+            try:
+                scope = scope_reader()
+            except MailboxError as exc:
+                logger.warning("Sent folder could not be read; the Inbox goes on: %s", exc)
+                return None
+        if dry_run:
+            return scope
+        self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
+        if scope != SENT_SCOPE_AVAILABLE or provider == "gmail" or mailbox_identity_key is None:
+            return scope
+        folder_scope = {
+            "provider": provider,
+            "account_id": account_id,
+            "mailbox_identity_key": mailbox_identity_key,
+            "folder": SENT_LOCATION,
+        }
+        if self.store.folder_state(**folder_scope) is None:
+            try:
+                self.store.set_folder_state(
+                    self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
+                )
+            except MailboxError as exc:
+                logger.warning("Sent folder position unread; the next check retries: %s", exc)
+        return scope
 
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
@@ -1457,7 +1519,7 @@ class Watcher:
             and not gmail_watch_configured
             and not pending_current_identity
         ):
-            self._note_not_polled(dry_run)
+            self._settle_sent(folders=frozenset(), mailbox_identity_key=None, dry_run=dry_run)
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
         with mailbox_polling_session(self.gateway):
             mailbox_identity_key = reconcile_mailbox_session_identity(
@@ -1498,6 +1560,10 @@ class Watcher:
                 and not label_selectors
                 and recovery_state is None
             ):
+                # Nothing is polled on this path, Sent included.
+                self._settle_sent(
+                    folders=frozenset(), mailbox_identity_key=None, dry_run=dry_run
+                )
                 pending_current_identity = self.store.has_current_pending_mailbox_work(
                     self.mailbox.provider,
                     self.mailbox.account_id,
@@ -1524,7 +1590,6 @@ class Watcher:
                     if self.mailbox.provider == "gmail"
                     else ()
                 )
-                self._note_not_polled(dry_run)
                 return self.inactive_result(
                     self.config,
                     self.store,
@@ -1696,11 +1761,10 @@ class Watcher:
                 admitted_at=checked_at,
                 folders=folders,
             )
-            received_at = _received_at_or_none(
-                metadata.received_at,
-                observed_at=checked_at,
+            received_at = _copy_received_in_retention(
+                metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
             )
-            if admission is None or received_at is None or received_at < retention_cutoff:
+            if admission is None or received_at is None:
                 continue
             self._preview_candidate(
                 metadata,
@@ -1907,8 +1971,10 @@ class Watcher:
                 admitted_at=checked_at,
                 folders=folders,
             )
-            received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
-            if admission is None or received_at is None or received_at < retention_cutoff:
+            received_at = _copy_received_in_retention(
+                metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
+            )
+            if admission is None or received_at is None:
                 self.store.finish_gmail_recovery_candidate(
                     self.mailbox.account_id,
                     mailbox_identity_key,
@@ -2010,6 +2076,12 @@ class Watcher:
         gated_allowed = self._gated_class_allowed()
         folders = _folders_in_scope(gated_allowed)
         _scope_gateway(self.gateway, folders)
+        sent_scope = self._settle_sent(
+            folders=folders,
+            mailbox_identity_key=mailbox_identity_key,
+            dry_run=dry_run,
+            now=checked_at,
+        )
         self._preview_identities: set[tuple[str, str, str, str]] = set()
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
         state = self.store.state(
@@ -2210,6 +2282,7 @@ class Watcher:
             checked_at=checked_at,
             retention_cutoff=retention_cutoff,
             folders=folders,
+            sent_scope=sent_scope,
             dry_run=dry_run,
             dry_run_messages=dry_run_messages,
         )
@@ -2307,8 +2380,10 @@ class Watcher:
             )
             if admission is None:
                 continue
-            received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
-            if received_at is None or received_at < retention_cutoff:
+            received_at = _copy_received_in_retention(
+                metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
+            )
+            if received_at is None:
                 logger.info(
                     "Skipping message %s outside the configured retention window",
                     provider_message_id,
@@ -2428,53 +2503,33 @@ class Watcher:
         checked_at: datetime,
         retention_cutoff: datetime,
         folders: frozenset[str],
+        sent_scope: str | None,
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
     ) -> int:
-        """Poll the Sent folder (contract D-scope) while the gated class is allowed (D-ops).
+        """Poll the Sent folder this check's _settle_sent found available (D-scope).
 
         Gmail's one mailbox-wide cursor already carries SENT events, so only the other
         providers keep a Sent cursor of their own. A dry run previews Sent as it
-        previews the Inbox: it reads, and writes neither scope nor cursor.
+        previews the Inbox: it reads, and moves no cursor.
         """
+        if sent_scope != SENT_SCOPE_AVAILABLE or self.mailbox.provider == "gmail":
+            return 0
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
-        if SENT_LOCATION not in folders:
-            if not dry_run:
-                self.store.set_sent_scope(
-                    provider, account_id, SENT_SCOPE_NOT_POLLED, now=checked_at
-                )
-            return 0
-        if provider == "gmail":
-            if not dry_run:
-                self.store.set_sent_scope(
-                    provider, account_id, SENT_SCOPE_AVAILABLE, now=checked_at
-                )
+        folder_scope = {
+            "provider": provider,
+            "account_id": account_id,
+            "mailbox_identity_key": mailbox_identity_key,
+            "folder": SENT_LOCATION,
+        }
+        state = self.store.folder_state(**folder_scope)
+        if state is None:
+            # No position yet: a dry run records none, and _settle_sent retries one
+            # it could not read on the next check.
             return 0
         # A Sent folder error never stops the Inbox check; the next check retries.
         try:
-            scope_reader = getattr(self.gateway, "sent_scope", None)
-            if not callable(scope_reader):
-                return 0
-            scope = scope_reader()
-            if not dry_run:
-                self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
-            if scope != SENT_SCOPE_AVAILABLE:
-                return 0
-            folder_scope = {
-                "provider": provider,
-                "account_id": account_id,
-                "mailbox_identity_key": mailbox_identity_key,
-                "folder": SENT_LOCATION,
-            }
-            state = self.store.folder_state(**folder_scope)
-            if state is None:
-                # Like the Inbox at setup: start at the folder's current position.
-                if not dry_run:
-                    self.store.set_folder_state(
-                        self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
-                    )
-                return 0
             try:
                 changes = self.gateway.sent_changes_since(state[0])
             except StaleMailboxCursor as exc:
@@ -2610,11 +2665,14 @@ class Watcher:
                 fallback += self._send_fallback(intent, dry_run)
             for intent in self.store.notification_intents(kind="automation_review"):
                 self._deliver_automation_review(intent, dry_run)
-        for message in self.store.pending_delivery():
-            received_at = _received_at_or_none(
-                message.received_at, observed_at=retention_observed_at
-            )
-            if received_at is None or received_at < retention_cutoff:
+        delivery = self.store.pending_delivery()
+        retained = self.store.retained_logical_messages(
+            (message.message_id for message in delivery),
+            cutoff=retention_cutoff,
+            now=retention_observed_at,
+        )
+        for message in delivery:
+            if message.message_id not in retained:
                 continue
             if deliver_notifications:
                 fallback += self._deliver_analysis(
@@ -2628,18 +2686,21 @@ class Watcher:
                 )
             elif not self.config.notifications_enabled and not dry_run:
                 self.store.mark_delivery_complete(message.message_id, notified=False)
+        stored = self.store.pending(
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
+        )
+        retained = self.store.retained_logical_messages(
+            (message.message_id for message in stored),
+            cutoff=retention_cutoff,
+            now=retention_observed_at,
+        )
+        # The store judges stored messages by the purge's rule; a preview (extra)
+        # is not stored, and this check admitted it under the same cutoff.
         for message in [
-            *self.store.pending(
-                provider=self.mailbox.provider,
-                account_id=self.mailbox.account_id,
-            ),
+            *(message for message in stored if message.message_id in retained),
             *(extra or []),
         ]:
-            received_at = _received_at_or_none(
-                message.received_at, observed_at=retention_observed_at
-            )
-            if received_at is None or received_at < retention_cutoff:
-                continue
             try:
                 if (
                     message.mailbox_identity_key is None

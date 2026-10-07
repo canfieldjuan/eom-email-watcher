@@ -12,7 +12,7 @@ from connect_automate import connect
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import config_admission_snapshot
-from eom_email_watcher.db import AdmissionProvenance, ConnectQueueFull, MessageSource
+from eom_email_watcher.db import AdmissionProvenance, ConnectQueueFull
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
@@ -173,42 +173,6 @@ def test_connect_retry_delay_is_bounded(failure_count: int, delay: int) -> None:
 def test_connect_retry_delay_rejects_negative_counts() -> None:
     with pytest.raises(ValueError, match="cannot be negative"):
         engine_api._connect_retry_delay(-1)
-
-
-@pytest.mark.parametrize(
-    ("received_at", "discovered_at", "expected"),
-    [
-        ("2026-08-10T11:59:59+00:00", "2026-09-01T12:00:00+00:00", False),
-        ("2026-08-10T12:00:00+00:00", "2026-09-01T12:00:00+00:00", True),
-        ("2026-09-10T12:00:01+00:00", "2026-09-01T12:00:00+00:00", True),
-        ("2026-09-10T12:00:01+00:00", "2026-08-10T11:59:59+00:00", False),
-        ("2026-09-10T12:00:01+00:00", "2026-09-10T12:00:00+00:00", False),
-        ("2026-09-01T12:00:00", "2026-09-01T12:00:00+00:00", False),
-        ("not-a-time", "2026-09-01T12:00:00+00:00", False),
-    ],
-)
-def test_connect_source_retention_boundary(
-    received_at: str,
-    discovered_at: str,
-    expected: bool,
-) -> None:
-    source = MessageSource(
-        "message-1",
-        "gmail",
-        "gmail-default",
-        "gmail-1",
-        received_at,
-        discovered_at,
-    )
-
-    assert (
-        engine_api._connect_source_is_retained(
-            source,
-            30,
-            observed_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
-        )
-        is expected
-    )
 
 
 @pytest.mark.parametrize("limit", [False, 0, 26])
