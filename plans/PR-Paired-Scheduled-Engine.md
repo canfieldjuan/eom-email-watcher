@@ -73,3 +73,14 @@ artifacts. An active scheduled worker must finish before desktop migration.
 ## Implementation summary / cold diff / gap audit
 
 Pending. No code changed or normal profile touched at contract creation.
+
+## Contract revision: both entrypoints open the database
+
+New evidence: CLI-first regression fails with `CLI/migration reached` because my
+unpublished deployment dispatcher returned to cli.main before the API-only check.
+The API check alone was incomplete. The same startup owner must check either
+entrypoint before handing off. Read-only protocol/version probes do not open a DB
+and remain available to the installer. Scheduled CLI checks can admit their own
+systemd MainPID (including the PyInstaller bootloader parent); other active workers
+still block migration. Test API-first and CLI-first partial updates, own-worker
+admission and another worker refusal. No downstream runtime catch is added.
