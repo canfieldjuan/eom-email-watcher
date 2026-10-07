@@ -855,6 +855,128 @@ The Microsoft boundary above was checked against these primary v1.0 references:
 
 # Durable Local Connect provider-admission queue contract
 
+## Resource-busy automation recovery amendment (accepted 2026-10-07)
+
+The operator authorized COI GPU-busy recovery. Before this contract, the
+unchanged scripts/coi_local_proof.py ran the approved native COI through the
+installed real provider/model with consumer4d3e44c. All qualified field values,
+provenance, parser/source identity, projection, replay and restart matched.
+Public `pre-change-parity.json` SHA256
+`98bc17505582137d4ae7188c9905d3543115d49fca6ef767b9386bb57e220ada`;
+`inventory.json` SHA256
+`e47c54e2178d9fff916ed03fa82f47d026bec709ff0b254c815367cf2cdfa6de`.
+These durable COI recovery artifacts include complete pins/settings, proof
+locations/results and all upstream differences. The provider's canonical
+SHARED-HOST-ATTACHMENT resource-busy revision inventories exact model,
+runtime/template, system/user prompts, strict schema and thinking settings.
+No new proof replaces that qualified harness.
+
+Parity differences are declared: staged mailbox/analysis, isolated schema30
+instead of installed schema28, the existing harness's confirm_each=false,
+fresh execution identifiers/timestamp/display name. Extraction parity passed
+before behavior changes. Normal installed mailbox/config/database are untouched.
+
+Root cause: _settle_submitted_automation_fires, introduced by87e4eed2,
+automatically retries only proven admission deadlines and settles every other
+failed provider job as final. The provider mapping introduced by my3a1539fd
+also loses authoritative GPU-busy identity. A generic retryable flag or error
+message cannot authorize replacement work; consume the origin's new typed
+PROVIDER_RESOURCE_BUSY job code. Only a validated failed status with
+retryable=true, retained known capability authority and external_effects=false
+qualifies. Unknown/effectful authority, generic PROVIDER_FAULT, nonretryable
+errors, transport failures and active/ambiguous jobs never qualify.
+
+Extend the existing generic automation retry owner and its immediate SQLite
+transaction. Revalidate eligibility under that transaction and expected fire
+state/version. Share one policy between settlement and transactional admission;
+remove the deadline-only duplicate policy. Preserve the existing first
+admission-deadline branch and its two-attempt ceiling. Resource busy shares
+that ceiling: first eligible failure creates attempt2 with a new stable request
+id; second eligible failure settles manual_review/second_resource_busy.
+The old provider job stays failed in the consumer ledger. This is not automatic
+POST replay of a failed job, and does not change provider explicit replay.
+
+Retry keeps the fire, attachment and immutable rule/provider identity. It uses
+the existing preparation/dispatch owner, clears the old prepared identity and
+confirmation receipt, and requires a new confirmation for confirm_each or
+provider-mandated confirmation. Re-fetch/re-hash the source, check current
+manifest/effects and both entitlements before each new POST. Pause eligible
+recovery while automation entitlement is inactive. Restart and concurrent pumps
+cannot create a third attempt or submit an unconfirmed replacement.
+
+Intentional differences from the inventory: (1) eligibility expands from only
+admission deadline to the typed resource refusal, because no document request
+began; (2) the existing replacement-attempt transition accepts that additional
+reason; (3) the second such failure is manual review. The confirmation-reset,
+two-attempt limit, failed-job receipts, generic queue, model and extraction
+behavior remain as qualified. No COI-specific queue/loop, error-text parser,
+schema migration, dependency/model/prompt change, normal-profile install or
+automatic-confirmation change is authorized by this amendment.
+
+Verification: declared fail-first source-level automation test must transition
+an eligible terminal busy fire to a replacement instead of failed. Exercise
+fresh confirmation, automatic rule, paused/revoked entitlements, replaced
+source/provider/effects, generic faults, retryable=false, missing authority,
+accepted/ambiguous states, repeated failure ceiling, restart and racing pumps.
+Reuse the existing provider-admission and certificate settlement tests and
+native COI harness; original real contention evidence remains retained.
+Implementation and installed recovery proof are pending, not established by
+this contract or the baseline parity receipt.
+
+### Review correction: exhausted retry settlement (accepted 2026-10-07)
+
+My implementation commitded1f756 put new-work entitlement authorization before
+the retry ceiling. A second eligible failed job can become entitlement_paused
+instead of manual_review. The scheduler's paused-failure exclusion, extended in
+that same commit, can then suppress settlement indefinitely.
+
+The existing settlement owner must settle an exhausted eligible failure before
+any entitlement or paused-state gate, from submitted or entitlement_paused. It
+creates no replacement work and uses the existing second-reason/manual_review
+transition. The scheduler must wake that same terminal decision even when the
+entitlement is inactive. Reuse the Store eligibility policy for this decision
+and the scheduler; do not duplicate its authority predicate in SQL. First
+eligible failures still pause without spinning and require current entitlement
+and fresh confirmation for replacement. Do not change interactive completion
+policy or generic fault handling.
+
+Regression: both resource_busy and admission_deadline, submitted and paused,
+automatic and confirm_each jobs, must settle attempt2 to manual_review with no
+third attempt and no entitlement check. A paused exhausted fire must be due.
+Prove fail-before/pass-after on the current source; retain first-attempt pause,
+confirmation, concurrency and ordinary certificate regressions. Extraction and
+the qualified native setup are unchanged, so reuse the recorded native parity.
+
+### Review correction: scheduler consumes eligibility (accepted 2026-10-07)
+
+My original commitded1f756 broadened paused-failure suppression using error codes
+instead of the shared eligibility rule. My follow-up239a6c67 fixed exhausted
+settlement but retained that duplicate SQL predicate. Nonretryable, unknown or
+effectful authority, and an admission deadline after provider acceptance, can
+therefore suppress a terminal automatic fire's wake-up incorrectly.
+
+Remove both the code-only SQL predicate and the separate exhausted pre-scan.
+The scheduler selects terminal linked candidates, then consumes the existing
+Store eligibility rule. An eligible paused first attempt sleeps pending renewed
+entitlement; an exhausted eligible failure wakes to manual review. An ineligible
+automatic terminal failure wakes to settle failed. Preserve the pre-existing
+interactive completion/entitlement policy. Do not copy the authority predicate
+into another SQL expression or add error-specific scheduler cases.
+
+Provider acceptance is distinct from document-model handoff. Keep resource-busy
+eligibility after accepted/processing: Invoice Processor enters processing
+before building its native runtime and can authoritatively refuse admission
+with no document handoff. A requested-only restriction would break the proved
+COI path. Admission deadlines still need requested because they lack that typed
+refusal authority. Add both accepted and processing boundary regressions.
+
+Fail-first scheduler matrix: paused automatic failures with nonretryable busy,
+unknown/effectful authority or post-admission deadline must be due after reopening
+the Store and settle failed without replacement or a spin. Preserve first-attempt
+eligible pause, exhausted settlement and interactive completion tests. Native
+model/prompt/schema/runtime and installations are unchanged; retained inventory
+and native parity remain bound to their original tested heads.
+
 **Status:** issue #117 complete. Durable storage, engine pump, Tauri host/UI
 behavior, and the exact-current Invoice Processor operational proof are
 implemented and recorded below.

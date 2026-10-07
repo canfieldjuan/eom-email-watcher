@@ -69,6 +69,7 @@ from .config import (
     update_settings,
 )
 from .db import (
+    AUTOMATION_FIRE_MAX_ATTEMPTS,
     AUTOMATION_FIRE_PENDING_WINDOW,
     CERTIFICATE_CAPABILITY_ID,
     CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
@@ -4808,9 +4809,20 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 reason="job_removed",
             )
             continue
-        if not runtime.store.connect_job_requires_automation_entitlement(
-            fire.job_id
-        ) and not _automation_entitlement_active():
+        retry_kind = runtime.store.automation_fire_retry_kind(fire.fire_id)
+        if retry_kind is not None and fire.current_attempt_no >= AUTOMATION_FIRE_MAX_ATTEMPTS:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason="second_" + retry_kind,
+            )
+            continue
+        if (
+            not runtime.store.connect_job_requires_automation_entitlement(fire.job_id)
+            and not _automation_entitlement_active()
+        ):
             if fire.state == "submitted":
                 runtime.store.transition_automation_fire(
                     fire_id=fire.fire_id,
@@ -4845,7 +4857,16 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 expected_version=fire.state_version,
             )
             continue
-        if job.error_code == "connect_queue_deadline_exceeded":
+        if retry_kind is not None:
+            if fire.state == "submitted" and not _automation_entitlement_active():
+                runtime.store.transition_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                    next_state="entitlement_paused",
+                    reason="entitlement_inactive",
+                )
+                continue
             if fire.state == "entitlement_paused":
                 runtime.store.touch_automation_fire(
                     fire_id=fire.fire_id,
@@ -4853,19 +4874,10 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                     expected_version=fire.state_version,
                 )
                 continue
-            if fire.current_attempt_no < 2:
-                runtime.store.retry_automation_fire_after_deadline(
-                    fire_id=fire.fire_id,
-                    expected_version=fire.state_version,
-                )
-            else:
-                runtime.store.transition_automation_fire(
-                    fire_id=fire.fire_id,
-                    expected_state=fire.state,
-                    expected_version=fire.state_version,
-                    next_state="manual_review",
-                    reason="second_admission_deadline",
-                )
+            runtime.store.retry_automation_fire_after_failure(
+                fire_id=fire.fire_id,
+                expected_version=fire.state_version,
+            )
             continue
         runtime.store.transition_automation_fire(
             fire_id=fire.fire_id,
