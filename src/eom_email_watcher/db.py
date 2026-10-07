@@ -7978,53 +7978,36 @@ class Store:
 
     def automation_fire_settlement_due(self) -> bool:
         with self.connection() as db:
-            exhausted = db.execute(
-                """SELECT fire_id FROM automation_fires
-                WHERE state IN ('submitted', 'entitlement_paused')
-                  AND current_attempt_no >= ? AND job_id IS NOT NULL""",
-                (AUTOMATION_FIRE_MAX_ATTEMPTS,),
-            ).fetchall()
-            if any(
-                _automation_failure_retry_kind(_automation_fire_retry_row(db, row["fire_id"]))
-                is not None
-                for row in exhausted
-            ):
-                return True
-            row = db.execute(
-                f"""SELECT 1
+            candidates = db.execute(
+                """SELECT fire.fire_id, fire.state, fire.current_attempt_no,
+                    job.job_id AS linked_job_id, job.status AS linked_status,
+                    dispatch.interactive_authorized_at,
+                    EXISTS (
+                      SELECT 1 FROM automation_fire_attempts AS attempt
+                      WHERE attempt.dispatch_request_id = fire.job_id
+                    ) AS has_attempt
                 FROM automation_fires AS fire
                 LEFT JOIN connect_attachment_jobs AS job ON job.job_id = fire.job_id
                 LEFT JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = fire.job_id
                 WHERE fire.state IN ('submitted', 'entitlement_paused')
                   AND fire.job_id IS NOT NULL
-                  AND (
-                    job.job_id IS NULL
-                    OR (
-                      job.status IN ('completed', 'failed')
-                      AND NOT (
-                        fire.state = 'entitlement_paused'
-                        AND (
-                          dispatch.interactive_authorized_at IS NOT NULL
-                          OR NOT EXISTS (
-                            SELECT 1 FROM automation_fire_attempts AS attempt
-                            WHERE attempt.dispatch_request_id = fire.job_id
-                          )
-                        )
-                      )
-                      AND NOT (
-                        job.status = 'failed'
-                        AND
-                        fire.state = 'entitlement_paused'
-                        AND job.error_code IN (
-                          {",".join("?" for _ in _AUTOMATION_FAILURE_RETRY_KINDS)}
-                        )
-                      )
+                  AND (job.job_id IS NULL OR job.status IN ('completed', 'failed'))"""
+            )
+            for row in candidates:
+                if row["linked_job_id"] is None:
+                    return True
+                if row["state"] == "entitlement_paused":
+                    kind = _automation_failure_retry_kind(
+                        _automation_fire_retry_row(db, row["fire_id"])
                     )
-                  )
-                LIMIT 1""",
-                tuple(_AUTOMATION_FAILURE_RETRY_KINDS),
-            ).fetchone()
-        return row is not None
+                    if kind is not None:
+                        if row["current_attempt_no"] >= AUTOMATION_FIRE_MAX_ATTEMPTS:
+                            return True
+                        continue
+                    if row["interactive_authorized_at"] is not None or not row["has_attempt"]:
+                        continue
+                return True
+        return False
 
     def resume_automation_fire_job(
         self,

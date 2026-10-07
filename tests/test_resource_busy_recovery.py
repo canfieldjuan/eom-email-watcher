@@ -1,6 +1,7 @@
 """Retry authority, confirmation and the bounded generic recovery transaction."""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from threading import Barrier
 
 import pytest
@@ -37,10 +38,13 @@ def prepare(tmp_path, monkeypatch, *, confirm_each=False):
     return config, runtime, selected, fire, attempt
 
 
-def fail(runtime, selected, job_id, *, code="PROVIDER_RESOURCE_BUSY", retryable=True):
+def fail(
+    runtime, selected, job_id, *, code="PROVIDER_RESOURCE_BUSY", retryable=True,
+    expected_state="requested",
+):
     runtime.store.transition_connect_job(
         job_id=job_id,
-        expected_state="requested",
+        expected_state=expected_state,
         next_state="failed",
         provider_app_id=selected.app_id,
         provider_instance_id=selected.instance_id,
@@ -292,3 +296,75 @@ def test_exhausted_recovery_settles_without_entitlement(
     )
     assert len(runtime.store.automation_fire_attempts(fire.fire_id)) == 2
     assert not runtime.store.automation_fire_settlement_due()
+
+
+@pytest.mark.parametrize("provider_state", ["accepted", "processing"])
+def test_native_busy_recovery_is_independent_of_provider_admission(
+    tmp_path, monkeypatch, provider_state
+):
+    _, runtime, selected, fire, first = prepare(tmp_path, monkeypatch)
+    runtime.store.transition_connect_job(
+        job_id=first.dispatch_request_id,
+        expected_state="requested",
+        next_state=provider_state,
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    fail(runtime, selected, first.dispatch_request_id, expected_state=provider_state)
+    assert runtime.store.connect_dispatch(first.dispatch_request_id).highest_provider_state == (
+        provider_state
+    )
+    assert runtime.store.automation_fire_retry_kind(fire.fire_id) == "resource_busy"
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    assert runtime.store.automation_fire(fire.fire_id).state == "pending_dispatch"
+    assert len(runtime.store.automation_fire_attempts(fire.fire_id)) == 2
+
+
+@pytest.mark.parametrize(
+    "direction", ["nonretryable", "unknown", "external", "deadline_accepted", "deadline_processing"]
+)
+def test_paused_ineligible_terminal_failure_wakes_after_restart(tmp_path, monkeypatch, direction):
+    _, runtime, selected, fire, first = prepare(tmp_path, monkeypatch)
+    state = "requested"
+    if direction.startswith("deadline_"):
+        state = direction.removeprefix("deadline_")
+        runtime.store.transition_connect_job(
+            job_id=first.dispatch_request_id,
+            expected_state="requested",
+            next_state=state,
+            provider_app_id=selected.app_id,
+            provider_instance_id=selected.instance_id,
+        )
+    fail(
+        runtime, selected, first.dispatch_request_id, expected_state=state,
+        code=(
+            "connect_queue_deadline_exceeded" if state != "requested" else "PROVIDER_RESOURCE_BUSY"
+        ),
+        retryable=direction != "nonretryable",
+    )
+    if direction in {"unknown", "external"}:
+        with runtime.store.connection() as db:
+            db.execute(
+                """UPDATE connect_job_dispatch SET capability_authority_known = ?,
+                    capability_external_effects = ? WHERE job_id = ?""",
+                (
+                    int(direction != "unknown"), int(direction == "external"),
+                    first.dispatch_request_id,
+                ),
+            )
+    current = runtime.store.automation_fire(fire.fire_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fire.fire_id, expected_state=current.state, expected_version=current.state_version,
+        next_state="entitlement_paused", reason="entitlement_inactive",
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    reopened = Store(runtime.store.path)
+    assert reopened.automation_fire_retry_kind(fire.fire_id) is None
+    assert reopened.automation_fire_settlement_due(), "Ineligible terminal failure was suppressed"
+    observed_at = datetime.now(UTC)
+    assert engine_api._next_connect_queue_wakeup(runtime, [], observed_at) == observed_at
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    assert runtime.store.automation_fire(fire.fire_id).state == "failed"
+    assert len(runtime.store.automation_fire_attempts(fire.fire_id)) == 1
+    assert reopened.automation_fire_settlement_due() is False
+    assert engine_api._next_connect_queue_wakeup(runtime, [], observed_at) is None
