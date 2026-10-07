@@ -107,6 +107,44 @@ AUTOMATION_FIRE_TRANSITIONS = frozenset(
     }
 )
 AUTOMATION_FIRE_MAX_ATTEMPTS = 2
+_AUTOMATION_FAILURE_RETRY_KINDS = {
+    "connect_queue_deadline_exceeded": "admission_deadline",
+    "PROVIDER_RESOURCE_BUSY": "resource_busy",
+}
+
+
+def _automation_fire_retry_row(db: sqlite3.Connection, fire_id: str) -> sqlite3.Row | None:
+    return db.execute(
+        """SELECT f.*, j.status AS linked_status, j.error_code AS linked_error_code,
+            j.error_retryable AS linked_retryable,
+            d.highest_provider_state AS linked_highest_provider_state,
+            d.capability_authority_known AS linked_authority_known,
+            d.capability_external_effects AS linked_external_effects
+        FROM automation_fires AS f
+        JOIN connect_attachment_jobs AS j ON j.job_id = f.job_id
+        JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+        WHERE f.fire_id = ?""",
+        (fire_id,),
+    ).fetchone()
+
+
+def _automation_failure_retry_kind(row: sqlite3.Row | None) -> str | None:
+    """One authority rule, read for settlement and repeated under the retry write lock."""
+    if row is None or row["linked_status"] != "failed":
+        return None
+    kind = _AUTOMATION_FAILURE_RETRY_KINDS.get(row["linked_error_code"])
+    if kind == "admission_deadline" and row["linked_highest_provider_state"] == "requested":
+        return kind
+    if (
+        kind == "resource_busy"
+        and row["linked_retryable"] == 1
+        and row["linked_authority_known"] == 1
+        and row["linked_external_effects"] == 0
+    ):
+        return kind
+    return None
+
+
 AUTOMATION_FIRE_PENDING_WINDOW = timedelta(hours=2)
 MAX_AUTOMATION_PREPARED_IDENTITY_BYTES = 32 * 1024
 MAX_GMAIL_LABEL_SELECTORS = 100
@@ -7941,7 +7979,7 @@ class Store:
     def automation_fire_settlement_due(self) -> bool:
         with self.connection() as db:
             row = db.execute(
-                """SELECT 1
+                f"""SELECT 1
                 FROM automation_fires AS fire
                 LEFT JOIN connect_attachment_jobs AS job ON job.job_id = fire.job_id
                 LEFT JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = fire.job_id
@@ -7965,11 +8003,14 @@ class Store:
                         job.status = 'failed'
                         AND
                         fire.state = 'entitlement_paused'
-                        AND job.error_code = 'connect_queue_deadline_exceeded'
+                        AND job.error_code IN (
+                          {",".join("?" for _ in _AUTOMATION_FAILURE_RETRY_KINDS)}
+                        )
                       )
                     )
                   )
-                LIMIT 1"""
+                LIMIT 1""",
+                tuple(_AUTOMATION_FAILURE_RETRY_KINDS),
             ).fetchone()
         return row is not None
 
@@ -8017,7 +8058,11 @@ class Store:
             raise RuntimeError("Automation fire disappeared after entitlement resume")
         return _automation_fire(updated)
 
-    def retry_automation_fire_after_deadline(
+    def automation_fire_retry_kind(self, fire_id: str) -> str | None:
+        with self.connection() as db:
+            return _automation_failure_retry_kind(_automation_fire_retry_row(db, fire_id))
+
+    def retry_automation_fire_after_failure(
         self,
         *,
         fire_id: str,
@@ -8028,27 +8073,18 @@ class Store:
         stamp = observed_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                """SELECT f.*, j.status AS linked_status, j.error_code AS linked_error_code,
-                    d.highest_provider_state AS linked_highest_provider_state
-                FROM automation_fires AS f
-                JOIN connect_attachment_jobs AS j ON j.job_id = f.job_id
-                JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
-                WHERE f.fire_id = ?""",
-                (fire_id,),
-            ).fetchone()
+            row = _automation_fire_retry_row(db, fire_id)
             if row is None:
                 raise KeyError(fire_id)
             current = _automation_fire(row)
+            kind = _automation_failure_retry_kind(row)
             if (
                 current.state != "submitted"
                 or current.state_version != expected_version
                 or current.current_attempt_no != 1
-                or row["linked_status"] != "failed"
-                or row["linked_error_code"] != "connect_queue_deadline_exceeded"
-                or row["linked_highest_provider_state"] != "requested"
+                or kind is None
             ):
-                raise RuntimeError("Automation retry lacks proof of unaccepted provider work")
+                raise RuntimeError("Automation retry lacks authoritative recovery proof")
             dispatch_request_id = str(uuid.uuid4())
             db.execute(
                 """INSERT INTO automation_fire_attempts(
@@ -8058,12 +8094,12 @@ class Store:
             )
             cursor = db.execute(
                 """UPDATE automation_fires SET state = 'pending_dispatch',
-                    state_version = state_version + 1, reason = 'first_admission_deadline',
+                    state_version = state_version + 1, reason = ?,
                     current_attempt_no = 2, job_id = NULL, confirmed = 0,
                     prepared_identity_sha256 = NULL, prepared_identity_json = NULL,
                     pending_since = ?, authorized_pending_seconds = 0, updated_at = ?
                 WHERE fire_id = ? AND state = 'submitted' AND state_version = ?""",
-                (stamp, stamp, fire_id, expected_version),
+                ("first_" + kind, stamp, stamp, fire_id, expected_version),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Automation retry lost its expected-state race")

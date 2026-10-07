@@ -3038,6 +3038,36 @@ def test_submitted_automation_settles_from_real_completed_connect_result(
     assert runtime.store.completed_connect_outputs(job)[0].sha256 == output.sha256
 
 
+def test_resource_busy_automation_reuses_the_bounded_retry_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch, runtime, lambda **kwargs: connect.CapabilityCatalog((selected,))
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    runtime.store.transition_connect_job(
+        job_id=attempt.dispatch_request_id,
+        expected_state="requested",
+        next_state="failed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        error={"code": "PROVIDER_RESOURCE_BUSY", "message": "Resource busy", "retryable": True},
+    )
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    retrying = runtime.store.automation_fire(fire.fire_id)
+    assert retrying is not None
+    assert retrying.state == "pending_dispatch"
+    assert retrying.current_attempt_no == 2
+    assert retrying.reason == "first_resource_busy"
+    attempts = runtime.store.automation_fire_attempts(fire.fire_id)
+    assert len(attempts) == 2
+    assert attempts[1].dispatch_request_id != attempts[0].dispatch_request_id
+    assert runtime.store.connect_job(attempt.dispatch_request_id).status == "failed"
+
+
 def test_non_deadline_provider_failure_settles_without_another_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
