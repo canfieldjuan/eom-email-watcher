@@ -28,6 +28,10 @@ from googleapiclient.errors import HttpError
 
 from .config import normalize_address
 from .mailbox import (
+    INBOX_LOCATION,
+    MESSAGE_LOCATIONS,
+    SENT_LOCATION,
+    FolderObservation,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
@@ -35,9 +39,13 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    normalize_message_id,
+    recipient_addresses,
+    reply_ids_from_headers,
     validate_operation_timeout,
 )
 from .mime import extract_body
+from .text import within_utf8_bytes
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 TOKEN_LOCK_TIMEOUT_SECONDS = 30
@@ -147,13 +155,12 @@ def _bounded_text(
     field: str,
     error_type: type[GmailError],
 ) -> str:
-    if not isinstance(value, str) or not value or _contains_control(value):
-        raise error_type(f"{field} is invalid")
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise error_type(f"{field} is invalid") from exc
-    if len(encoded) > maximum_bytes:
+    if (
+        not isinstance(value, str)
+        or not value
+        or _contains_control(value)
+        or not within_utf8_bytes(value, maximum_bytes)
+    ):
         raise error_type(f"{field} is invalid")
     return value
 
@@ -168,10 +175,12 @@ def _decode_history_cursor(cursor: str) -> tuple[str, int, str | None]:
     if cursor.startswith(LEGACY_HISTORY_CONTINUATION_PREFIX):
         raise StaleHistoryCursor("Saved Gmail history continuation uses the retired stream")
     if not cursor.startswith(HISTORY_CONTINUATION_PREFIX):
-        if not cursor.isdecimal() or len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+        if not cursor.isdecimal() or not within_utf8_bytes(
+            cursor, MAX_HISTORY_CONTINUATION_BYTES
+        ):
             raise StaleHistoryCursor("Saved Gmail history cursor is invalid")
         return cursor, 0, None
-    if len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+    if not within_utf8_bytes(cursor, MAX_HISTORY_CONTINUATION_BYTES):
         raise StaleHistoryCursor("Saved Gmail history continuation cursor is invalid")
     encoded = cursor.removeprefix(HISTORY_CONTINUATION_PREFIX)
     try:
@@ -213,7 +222,7 @@ def _history_continuation_cursor(start_history_id: str, message_ids: list[str]) 
         "start_history_id": start_history_id,
     }
     cursor = HISTORY_CONTINUATION_PREFIX + _canonical_json_bytes(payload).decode("utf-8")
-    if len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+    if not within_utf8_bytes(cursor, MAX_HISTORY_CONTINUATION_BYTES):
         raise StaleHistoryCursor("Saved Gmail history continuation exceeded transport bounds")
     return cursor
 
@@ -430,6 +439,57 @@ def gmail_credentials_configured(configured_file: Path) -> bool:
     return resolve_gmail_credentials_file(configured_file).is_file()
 
 
+# The headers one metadata fetch needs: sender and subject as before, plus the
+# recipients and RFC ids of contract D-attribution and D-identity.
+GMAIL_METADATA_HEADERS = [
+    "From", "To", "Cc", "Subject", "Date", "Message-ID", "In-Reply-To", "References",
+]
+# Gmail system labels that are admitted folders (contract D-scope).
+GMAIL_LOCATION_LABELS = {"INBOX": INBOX_LOCATION, "SENT": SENT_LOCATION}
+
+
+def _merge_history_hint(
+    hints: dict[str, FolderObservation], message_id: str, added: object, message: object
+) -> None:
+    """Fold one history addition into the message's folder observation.
+
+    The addition's own labelIds say what was added, so they place the message in
+    those folders without saying where else it is. The nested message's labelIds,
+    when the record carries them, are the whole set and make the observation
+    complete. Several additions for one id in a batch merge.
+    """
+    added_labels = added.get("labelIds") if isinstance(added, dict) else None
+    whole = message.get("labelIds") if isinstance(message, dict) else None
+    if isinstance(whole, list):
+        observation = FolderObservation(locations_from_labels(whole), complete=True)
+    elif isinstance(added_labels, list):
+        observation = FolderObservation(locations_from_labels(added_labels), complete=False)
+    else:
+        return
+    earlier = hints.get(message_id)
+    if earlier is not None:
+        observation = FolderObservation(
+            earlier.locations | observation.locations, earlier.complete or observation.complete
+        )
+    hints[message_id] = observation
+
+
+def recovery_folder_query(folders: frozenset[str]) -> str:
+    """The Gmail search clause for the admitted folders in scope (contract D-ops)."""
+    return "(in:inbox OR in:sent)" if SENT_LOCATION in folders else "in:inbox"
+
+
+def locations_from_labels(label_ids: object) -> frozenset[str]:
+    """The admitted folders a Gmail label list names (contract D-scope)."""
+    if not isinstance(label_ids, (list, tuple, frozenset, set)):
+        return frozenset()
+    return frozenset(
+        GMAIL_LOCATION_LABELS[label]
+        for label in label_ids
+        if isinstance(label, str) and label in GMAIL_LOCATION_LABELS
+    )
+
+
 def _headers(payload: dict[str, Any]) -> dict[str, str]:
     return {
         str(item.get("name", "")).casefold(): str(item.get("value", ""))
@@ -493,6 +553,11 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
         subject=headers.get("subject", "(no subject)").strip() or "(no subject)",
         received_at=_received_at(message, headers),
         labels=labels,
+        rfc_message_id=normalize_message_id(headers.get("message-id")),
+        reply_ids=reply_ids_from_headers(headers.get("in-reply-to"), headers.get("references")),
+        to=recipient_addresses(headers.get("to")),
+        cc=recipient_addresses(headers.get("cc")),
+        locations=locations_from_labels(labels),
     )
 
 
@@ -757,7 +822,7 @@ class GmailGateway:
         history_id = str(result.get("historyId", "")).strip()
         if (
             not history_id.isdecimal()
-            or len(history_id.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES
+            or not within_utf8_bytes(history_id, MAX_HISTORY_CONTINUATION_BYTES)
         ):
             raise GmailError("Gmail profile response did not contain a history cursor")
         return GmailProfile(email_address=email_address, history_id=history_id)
@@ -824,10 +889,24 @@ class GmailGateway:
             ) from exc
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
+        ids, newest, _locations = self._history_changes(start_history_id)
+        return ids, newest
+
+    def _history_changes(
+        self, start_history_id: str
+    ) -> tuple[list[str], str, dict[str, frozenset[str]]]:
+        """The changed ids, the newest cursor, and each record's admitted folders.
+
+        A history record says which folders a message was added to, so a known
+        id's change travels with it and needs no fetch (plan step 6). The
+        observations may name ids outside the returned batch: those of the prefix
+        a continuation replays, whose later events would otherwise be lost.
+        """
         request_start_history_id, skip_unique_ids, expected_prefix_digest = (
             _decode_history_cursor(start_history_id)
         )
         ids: list[str] = []
+        hints: dict[str, FolderObservation] = {}
         seen_ids: set[str] = set()
         ordered_unique_ids: list[str] = []
         page_token: str | None = None
@@ -871,6 +950,7 @@ class GmailGateway:
                                 field="Gmail history message ID",
                                 error_type=GmailError,
                             )
+                            _merge_history_hint(hints, message_id, added, message)
                             if message_id in seen_ids:
                                 continue
                             seen_ids.add(message_id)
@@ -892,9 +972,10 @@ class GmailGateway:
                                 continue
                             if len(ids) == MAX_INCREMENTAL_MESSAGE_IDS:
                                 prefix = ordered_unique_ids[: skip_unique_ids + len(ids)]
-                                return ids, _history_continuation_cursor(
-                                    request_start_history_id,
-                                    prefix,
+                                return (
+                                    ids,
+                                    _history_continuation_cursor(request_start_history_id, prefix),
+                                    dict(hints),
                                 )
                             ids.append(message_id)
                 page_token = response.get("nextPageToken")
@@ -915,11 +996,14 @@ class GmailGateway:
             raise GmailError(f"Gmail history request failed (HTTP {exc.resp.status})") from exc
         if not prefix_verified:
             raise StaleHistoryCursor("Saved Gmail history continuation cursor cannot be resumed")
-        return ids, newest
+        # Every id whose record this call saw keeps its observation, the replayed
+        # prefix included: a later event for an id returned in an earlier batch
+        # arrives here only, so it travels as an observation outside the batch.
+        return ids, newest, dict(hints)
 
     def changes_since(self, cursor: str) -> MailboxChanges:
-        message_ids, newest = self.history_message_ids(cursor)
-        return MailboxChanges(tuple(message_ids), newest)
+        message_ids, newest, locations = self._history_changes(cursor)
+        return MailboxChanges(tuple(message_ids), newest, locations)
 
     def metadata(
         self,
@@ -935,7 +1019,7 @@ class GmailGateway:
                     userId="me",
                     id=message_id,
                     format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"],
+                    metadataHeaders=GMAIL_METADATA_HEADERS,
                 )
             )
             message = self._execute_request(request, timeout_seconds=timeout_seconds)
@@ -1005,7 +1089,8 @@ class GmailGateway:
 
     def search_since(self, addresses: frozenset[str], since: datetime) -> list[str]:
         sender_terms = " ".join(f"from:{address}" for address in sorted(addresses))
-        query = f"in:inbox {{{sender_terms}}} after:{int(since.timestamp())}"
+        folders = recovery_folder_query(self.query_folders)
+        query = f"{folders} {{{sender_terms}}} after:{int(since.timestamp())}"
         ids: list[str] = []
         page_token: str | None = None
         while True:
@@ -1022,6 +1107,13 @@ class GmailGateway:
             page_token = response.get("nextPageToken")
             if not page_token:
                 return list(dict.fromkeys(ids))
+
+    # The folders a check has in scope (contract D-ops); set once per check by the
+    # watcher, so no query reads the Sent scope while it is gated off.
+    query_folders: frozenset[str] = MESSAGE_LOCATIONS
+
+    def scope_folders(self, folders: frozenset[str]) -> None:
+        self.query_folders = folders
 
     def recovery_page(
         self,
@@ -1051,7 +1143,7 @@ class GmailGateway:
                 error_type=GmailRecoveryPageInvalid,
             )
         query = (
-            f"in:inbox after:{after_exclusive_epoch} "
+            f"{recovery_folder_query(self.query_folders)} after:{after_exclusive_epoch} "
             f"before:{before_exclusive_epoch}"
         )
         try:

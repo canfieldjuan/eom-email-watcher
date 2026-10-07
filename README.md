@@ -15,6 +15,10 @@ discarded after each local inference request.
 
 - Starts at the provider's current cursor; setup does not backfill old mail.
 - Polls Gmail History, Microsoft Graph inbox delta, or IMAP UID changes for newly created messages.
+- With an active paid Connect entitlement, also polls the Sent folder (Gmail's `SENT` label, Microsoft
+  Sent Items, the IMAP `\Sent` folder or a configured name) and records which admitted folders each
+  captured message is in, with its To and Cc recipients, for vendor threads. An IMAP account with no
+  Sent folder shows "Sent mail unavailable" in Health.
 - Verifies the parsed `From` address against a case-insensitive exact allowlist in trusted config.
 - Fetches message bodies only after a sender matches.
 - Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.

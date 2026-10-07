@@ -20,6 +20,7 @@ import { automationOutcomeIdentity, automationOutcomeStatus } from "./automation
 import { inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
+import { mailAccountDetail } from "./mailAccountDetail";
 import {
   deleteVendorConfirmText,
   latestRequestFence,
@@ -301,6 +302,7 @@ interface MailAccountStatus {
   connected: boolean;
   active: boolean;
   last_check: string | null;
+  sent_scope?: "available" | "unavailable" | "not_polled" | null;
 }
 
 interface GmailLabelCatalogItem {
@@ -712,6 +714,10 @@ app.innerHTML = `
                 <span>Password or app password</span>
                 <input id="mail-server-password" name="password" type="password" maxlength="4096" autocomplete="current-password" required />
               </label>
+              <label>
+                <span>Sent folder <small>optional, for servers that list no Sent folder</small></span>
+                <input id="mail-server-sent-folder" name="sentFolder" maxlength="255" autocomplete="off" placeholder="Found automatically on most servers" />
+              </label>
               <div class="mail-server-ca">
                 <button id="mail-server-ca-choose" class="secondary-action" type="button">Choose private CA</button>
                 <button id="mail-server-ca-clear" class="secondary-action" type="button" hidden>Clear CA</button>
@@ -914,6 +920,7 @@ const mailServerSecurity = requiredElement<HTMLSelectElement>("#mail-server-secu
 const mailServerPort = requiredElement<HTMLInputElement>("#mail-server-port");
 const mailServerUsername = requiredElement<HTMLInputElement>("#mail-server-username");
 const mailServerPassword = requiredElement<HTMLInputElement>("#mail-server-password");
+const mailServerSentFolder = requiredElement<HTMLInputElement>("#mail-server-sent-folder");
 const mailServerCaChoose = requiredElement<HTMLButtonElement>("#mail-server-ca-choose");
 const mailServerCaClear = requiredElement<HTMLButtonElement>("#mail-server-ca-clear");
 const mailServerCaLabel = requiredElement<HTMLElement>("#mail-server-ca-label");
@@ -2920,6 +2927,7 @@ function currentMailServerConnection(): MailServerConnection {
     username: mailServerUsername.value,
     password: mailServerPassword.value,
     caFile: mailServerCaFile,
+    sentFolder: mailServerSentFolder.value,
   });
 }
 
@@ -3448,7 +3456,7 @@ function renderMailAccounts(data: MailAccounts): boolean {
     const title = document.createElement("strong");
     title.textContent = account.address || account.display_name;
     const detail = document.createElement("span");
-    detail.textContent = `${account.display_name} · ${account.active ? "Active" : "Retained"} · ${account.connected ? "Connected" : "Disconnected"}`;
+    detail.textContent = mailAccountDetail(account);
     identity.append(title, detail);
 
     const actions = document.createElement("div");

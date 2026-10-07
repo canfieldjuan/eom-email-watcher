@@ -122,6 +122,7 @@ from .imap import (
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
+    SENT_SCOPE_NOT_POLLED,
     MailboxAccountUnavailable,
     MailboxError,
     MailboxMessageInvalid,
@@ -173,6 +174,7 @@ from .service import (
     reconcile_mailbox_session_identity,
     run_watcher_check,
 )
+from .text import within_utf8_bytes
 
 PROTOCOL_VERSION = 1
 AUTOMATION_DISPATCH_PHASE_SECONDS = 5.0
@@ -430,14 +432,22 @@ def _mail_account_key(payload: dict[str, object]) -> tuple[str, str]:
 
 def _mail_account_public(runtime: Runtime, account: MailAccount) -> dict[str, object]:
     state = runtime.store.state(provider=account.provider, account_id=account.account_id)
+    connected = mail_account_connected(runtime.config, account)
     return {
         "account_id": account.account_id,
         "active": account.active,
         "address": account.address,
-        "connected": mail_account_connected(runtime.config, account),
+        "connected": connected,
         "display_name": account.display_name,
         "last_check": state[1] if state else None,
         "provider": account.provider,
+        # Contract D-scope: whether this account's Sent folder is in scope. An
+        # account this build cannot poll is not polled, whatever it last recorded.
+        "sent_scope": (
+            runtime.store.sent_scope(account.provider, account.account_id)
+            if connected
+            else SENT_SCOPE_NOT_POLLED
+        ),
     }
 
 
@@ -951,7 +961,7 @@ def _gmail_label_account_key(payload: dict[str, object]) -> tuple[str, str]:
     if (
         not isinstance(account_id, str)
         or not account_id
-        or len(account_id.encode("utf-8")) > 128
+        or not within_utf8_bytes(account_id, 128)
     ):
         raise ApiError("invalid_request", "account_id must be a non-empty bounded string")
     return provider, account_id
@@ -1265,7 +1275,7 @@ def _gmail_label_selector_add(request: dict[str, object]) -> dict[str, object]:
     if (
         not isinstance(label_id, str)
         or not label_id
-        or len(label_id.encode("utf-8")) > 512
+        or not within_utf8_bytes(label_id, 512)
         or any(unicodedata.category(character) == "Cc" for character in label_id)
     ):
         raise ApiError("invalid_request", "label_id is invalid")
@@ -2801,38 +2811,15 @@ def _attachment_download_matches(provider: str, byte_size: int, content: bytes) 
     return provider == IMAP_PROVIDER or len(content) == byte_size
 
 
-def _connect_source_is_retained(
-    source: MessageSource,
-    retention_days: int,
-    *,
-    observed_at: datetime,
-) -> bool:
-    try:
-        received_at = datetime.fromisoformat(source.received_at)
-        if received_at.tzinfo is None:
-            return False
-        received_at = received_at.astimezone(UTC)
-    except (OverflowError, ValueError):
-        return False
-    cutoff = observed_at - timedelta(days=retention_days)
-    if received_at <= observed_at:
-        return received_at >= cutoff
-    try:
-        discovered_at = datetime.fromisoformat(source.discovered_at)
-        if discovered_at.tzinfo is None:
-            return False
-        discovered_at = discovered_at.astimezone(UTC)
-    except (OverflowError, ValueError):
-        return False
-    return cutoff <= discovered_at <= observed_at
-
-
 def _retained_connect_message_source(runtime: Runtime, message_id: str) -> MessageSource:
     source = _configured_message_source(runtime, message_id)
-    if not _connect_source_is_retained(
-        source,
-        runtime.config.retention_days,
-        observed_at=datetime.now(UTC),
+    observed_at = datetime.now(UTC)
+    # The purge's retention rule (contract D-scope, D-identity): Connect acts on a
+    # message exactly while the purge keeps it, a newer copy of it included.
+    if message_id not in runtime.store.retained_logical_messages(
+        (message_id,),
+        cutoff=observed_at - timedelta(days=runtime.config.retention_days),
+        now=observed_at,
     ):
         raise ApiError(
             "connect_source_unavailable",
@@ -2847,6 +2834,8 @@ def _verified_mailbox_attachment_bytes(
     part_id: str,
     attachment_id: str | None,
     remaining_timeout: Callable[[], float] | None = None,
+    *,
+    source_provider_message_id: str | None = None,
 ) -> bytes:
     mailbox = load_mailbox_account(
         runtime.config,
@@ -2873,8 +2862,10 @@ def _verified_mailbox_attachment_bytes(
             )
         if remaining_timeout is not None:
             gateway.set_operation_timeout(remaining_timeout())
+        # The attachment id belongs to the copy whose content listed it (contract
+        # D-identity), so the bytes are read from that copy.
         return gateway.attachment_bytes(
-            source.provider_message_id,
+            source_provider_message_id or source.provider_message_id,
             part_id,
             attachment_id,
         )
@@ -2900,6 +2891,7 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
         source,
         part_id,
         attachment.attachment_id,
+        source_provider_message_id=attachment.source_provider_message_id,
     )
     if not _attachment_download_matches(source.provider, attachment.byte_size, content):
         raise MailboxError("Mailbox attachment size did not match stored metadata")
@@ -4342,6 +4334,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     source,
                     claimed_job.part_id,
                     attachment.attachment_id,
+                    source_provider_message_id=attachment.source_provider_message_id,
                 )
 
             try:
@@ -4519,6 +4512,7 @@ def _generic_attachment_content(
         part_id,
         current_attachment.attachment_id,
         remaining_timeout,
+        source_provider_message_id=current_attachment.source_provider_message_id,
     )
 
 
@@ -5433,6 +5427,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         source,
         part_id,
         attachment.attachment_id,
+        source_provider_message_id=attachment.source_provider_message_id,
     )
     if not _attachment_download_matches(source.provider, attachment.byte_size, content):
         raise MailboxError("Mailbox attachment size did not match stored metadata")
@@ -5590,7 +5585,7 @@ def _vendor_name(payload: dict[str, object]) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ApiError("invalid_request", "display_name must be a non-empty string")
     name = value.strip()
-    if len(name.encode("utf-8")) > MAX_VENDOR_NAME_BYTES:
+    if not within_utf8_bytes(name, MAX_VENDOR_NAME_BYTES):
         raise ApiError("invalid_request", "display_name must be at most 200 UTF-8 bytes")
     if not printable_display_name(name):
         raise ApiError(

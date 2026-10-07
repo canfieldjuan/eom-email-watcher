@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from email.utils import getaddresses
 from typing import Protocol
 
 from .mime import AttachmentDescriptor
+from .text import within_utf8_bytes
 
 DEFAULT_MAIL_PROVIDER = "gmail"
 DEFAULT_MAIL_ACCOUNT_ID = "gmail-default"
@@ -52,9 +54,26 @@ class MailboxSession:
 
 
 @dataclass(frozen=True)
+class FolderObservation:
+    """What a change record says about a message's admitted folders (D-identity).
+
+    locations are the folders the record puts the message in. complete says the
+    record carried the message's whole folder set (a Gmail record with the
+    message's labels, a Microsoft delta's one folder), as opposed to the labels
+    an addition added; only a whole set can stamp a source as fully observed.
+    """
+
+    locations: frozenset[str]
+    complete: bool
+
+
+@dataclass(frozen=True)
 class MailboxChanges:
     message_ids: tuple[str, ...]
     cursor: str
+    # Per id, what the change record says about its folders. An id absent here
+    # came with no folder information.
+    locations: Mapping[str, FolderObservation] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -70,6 +89,68 @@ class MessageMetadata:
     # supply their own thread id leave these empty.
     rfc_message_id: str | None = None
     reply_ids: tuple[str, ...] = ()
+    # Recipients in stored header order, and the admitted folders this copy is
+    # in (contract D-scope, D-attribution). Providers fill them from M2 on.
+    to: tuple[str, ...] = ()
+    cc: tuple[str, ...] = ()
+    locations: frozenset[str] = frozenset()
+
+
+# The admitted folders (contract D-scope), as locations are recorded.
+INBOX_LOCATION = "inbox"
+SENT_LOCATION = "sent"
+def read_through_sources[T](
+    provider_message_ids: Sequence[str], read: Callable[[str], T]
+) -> tuple[str, T]:
+    """Read a logical message through any of its source identities (contract D-identity).
+
+    A copy that is gone is not the message being gone: the next recorded source is
+    tried, and only when every copy is unavailable does the message count as such.
+    Returns the source that served the read with the result, since what it lists
+    (an attachment id) belongs to that copy.
+    """
+    last: MailboxMessageUnavailable | None = None
+    for provider_message_id in provider_message_ids:
+        try:
+            return provider_message_id, read(provider_message_id)
+        except MailboxMessageUnavailable as exc:
+            last = exc
+    if last is None:
+        raise MailboxMessageUnavailable("The message has no source to read")
+    raise last
+
+
+def folder_scope_key(folders: frozenset[str]) -> str:
+    """One text key for a set of folders in scope, for queries whose pages belong to it."""
+    return "+".join(sorted(folders))
+
+
+FULL_FOLDER_SCOPE = "inbox+sent"  # folder_scope_key of every admitted folder
+MESSAGE_LOCATIONS = frozenset({INBOX_LOCATION, SENT_LOCATION})
+# An account's Sent scope (contract D-scope), as health reports it.
+SENT_SCOPE_AVAILABLE = "available"
+SENT_SCOPE_UNAVAILABLE = "unavailable"
+SENT_SCOPE_NOT_POLLED = "not_polled"
+MAX_RECIPIENT_ADDRESS_BYTES = 512
+
+
+def recipient_addresses(value: object) -> tuple[str, ...]:
+    """Return the distinct casefolded addresses of a To or Cc header, in header order.
+
+    Malformed or oversized entries are dropped; the rest match normalize_address.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return ()
+    found: list[str] = []
+    for _name, address in getaddresses([value]):
+        candidate = address.strip().casefold()
+        if (
+            "@" in candidate
+            and not any(c.isspace() for c in candidate)
+            and within_utf8_bytes(candidate, MAX_RECIPIENT_ADDRESS_BYTES)
+        ):
+            found.append(candidate)
+    return tuple(dict.fromkeys(found))
 
 
 def normalize_message_id(value: object) -> str | None:
@@ -103,6 +184,20 @@ def message_id_list(value: object, limit: int | None = None) -> tuple[str, ...]:
     found = _BRACKETED_ID_RE.findall(value) or value.split()
     ids = tuple(dict.fromkeys(i for i in map(normalize_message_id, found) if i is not None))
     return ids if limit is None else ids[:limit]
+
+
+def reply_ids_from_headers(in_reply_to: object, references: object) -> tuple[str, ...]:
+    """Return a message's parent ids: In-Reply-To, then References, each bounded.
+
+    One owner for every provider (contract D-identity's id set).
+    """
+    parents = message_id_list(_header_text(in_reply_to), MAX_IDS_PER_REPLY_HEADER)
+    history = message_id_list(_header_text(references), MAX_IDS_PER_REPLY_HEADER)
+    return tuple(dict.fromkeys((*parents, *history)))
+
+
+def _header_text(value: object) -> str:
+    return "" if value is None else str(value)
 
 
 @dataclass(frozen=True)

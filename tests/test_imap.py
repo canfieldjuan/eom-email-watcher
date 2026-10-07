@@ -3,7 +3,8 @@ from __future__ import annotations
 import imaplib
 import re
 import ssl
-from datetime import UTC, datetime
+from dataclasses import asdict
+from datetime import UTC, date, datetime
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from eom_email_watcher import imap as imap_module
 from eom_email_watcher.imap import (
     CURSOR_PREFIX,
     MAX_ATTACHMENT_FILENAME_BYTES,
@@ -26,6 +28,9 @@ from eom_email_watcher.imap import (
     MAX_UID_SEARCH_SPAN,
     MESSAGE_ID_PREFIX,
     RECOVERY_CURSOR_PREFIX,
+    SENT_CURSOR_PREFIX,
+    SENT_MESSAGE_ID_PREFIX,
+    SENT_RECOVERY_CURSOR_PREFIX,
     ImapCredentials,
     ImapError,
     ImapGateway,
@@ -336,11 +341,30 @@ class FakeImap:
         uid = str(args[0])
         if "HEADER.FIELDS" in query:
             headers, _separator, _body = self.raw_message.partition(b"\r\n\r\n")
-            metadata = (
-                f"{uid} (UID {uid} RFC822.SIZE {len(self.raw_message)} "
-                'INTERNALDATE "04-Sep-2026 10:16:00 -0500")'.encode()
-            )
-            return "OK", [(metadata, headers + b"\r\n\r\n"), b")"]
+            # One literal per requested header item, as a server answers.
+            lines: list[bytes] = []
+            for line in headers.split(b"\r\n"):
+                if line[:1] in (b" ", b"\t") and lines:
+                    lines[-1] += b"\r\n" + line
+                else:
+                    lines.append(line)
+            literals: list[tuple[bytes, bytes]] = []
+            for fields in re.findall(r"HEADER\.FIELDS \(([^)]*)\)", query):
+                wanted = {name.lower() for name in fields.split()}
+                payload = b"".join(
+                    line + b"\r\n"
+                    for line in lines
+                    if line.split(b":", 1)[0].strip().lower().decode("ascii", "replace") in wanted
+                ) + b"\r\n"
+                lead = (
+                    f"{uid} (UID {uid} RFC822.SIZE {len(self.raw_message)} "
+                    'INTERNALDATE "04-Sep-2026 10:16:00 -0500" '
+                    if not literals
+                    else " "
+                )
+                prefix = f"{lead}BODY[HEADER.FIELDS ({fields})]<0> {{{len(payload)}}}"
+                literals.append((prefix.encode(), payload))
+            return "OK", [*literals, b")"]
         if "BODYSTRUCTURE" in query:
             return "OK", [f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + self.bodystructure + b")"]
         if "BODY.PEEK[]" in query:
@@ -1855,7 +1879,39 @@ def test_metadata_fetch_requests_reply_headers_as_a_separate_bounded_item() -> N
     assert metadata.reply_ids == ("parent@x", "root@x")
     fetch = next(str(call[-1]) for call in client.calls if call[:2] == ("uid", "FETCH"))
     assert f"(FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>" in fetch
+    assert f"(TO CC)]<0.{MAX_HEADER_BYTES}>" in fetch
     assert f"(IN-REPLY-TO REFERENCES)]<0.{MAX_REPLY_HEADER_BYTES}>" in fetch
+
+
+def test_oversized_recipient_headers_degrade_without_invalidating_the_message() -> None:
+    class HugeRecipients(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            status, response = super().uid(command, *args)
+            if command == "FETCH" and "HEADER.FIELDS" in str(args[-1]):
+                response = [
+                    (prefix, b"To: " + b"x" * MAX_HEADER_BYTES)
+                    if b"(TO CC)" in prefix
+                    else (prefix, payload)
+                    for prefix, payload in (i for i in response if isinstance(i, tuple))
+                ] + [b")"]
+            return status, response
+
+    gateway = ImapGateway(
+        credentials(), lambda _c, _x: HugeRecipients(raw_message=RECIPIENT_MESSAGE)
+    )
+
+    # The recipient item reached its bound: it degrades to no recipients, and the
+    # core item still yields the message (one rule, shared with the reply item).
+    metadata = gateway.metadata(message_id())
+    assert metadata.sender == "owner@example.com"
+    assert metadata.rfc_message_id == "reply@owner.example"
+    assert metadata.to == () and metadata.cc == ()
+
+
+def test_a_sent_folder_name_that_cannot_be_encoded_is_a_configuration_error() -> None:
+    with pytest.raises(ImapError) as excinfo:
+        credentials_from_connection(connection(sent_folder="Sent\udcff"))
+    assert excinfo.value.code == "imap_configuration_error"
 
 
 def test_metadata_keeps_64_references_and_drops_overlong_ids() -> None:
@@ -1938,3 +1994,342 @@ def test_message_ids_need_exactly_one_at_and_printable_characters(value: str) ->
 
 def test_a_well_formed_message_id_survives_normalization() -> None:
     assert normalize_message_id(" <Part.1.ABC@mail.example.com> ") == "Part.1.ABC@mail.example.com"
+
+
+# Thread view M2.1: the Sent folder, folder-tokened ids, recipients (contract D-scope, D-identity).
+
+RECIPIENT_MESSAGE = (
+    b"From: Owner <OWNER@Example.com>\r\n"
+    b"To: Billing <Billing@Vendor.com>, sales@vendor.com\r\n"
+    b"Cc: cc@other.com\r\n"
+    b"Subject: Re: Quote\r\n"
+    b"Date: Thu, 04 Sep 2026 10:15:00 -0500\r\n"
+    b"Message-ID: <reply@owner.example>\r\n"
+    b"\r\n"
+    b"Body\r\n"
+)
+
+
+class SentFolderImap(FakeImap):
+    """Serve INBOX and a Sent folder, each with its own UIDVALIDITY and UIDs."""
+
+    def __init__(
+        self,
+        *,
+        list_lines: list[object],
+        sent_uid_validity: int = 77,
+        sent_uid_next: int = 4,
+        sent_sequence_uids: list[int] | None = None,
+        reject: set[str] | None = None,
+        **options: object,
+    ) -> None:
+        super().__init__(**options)
+        self.reject = reject or set()
+        self.list_lines = list_lines
+        self.sent_uid_validity = sent_uid_validity
+        self.sent_uid_next = sent_uid_next
+        self.sent_sequence_uids = sent_sequence_uids or [3]
+        self.selected = "INBOX"
+
+    # Like imaplib after login: the server's capabilities, plain by default.
+    capabilities: tuple[str, ...] = ("IMAP4REV1",)
+
+    def list(self, directory: str, pattern: str) -> tuple[str, list[object]]:
+        self.calls.append(("list", directory, pattern))
+        return "OK", list(self.list_lines)
+
+    def xatom(self, name: str, *args: str) -> tuple[str, list[bytes]]:
+        self.calls.append(("xatom", name, *args))
+        return "OK", [b"LIST completed"]
+
+    def select(self, mailbox: str, readonly: bool = False) -> tuple[str, list[bytes]]:
+        self.calls.append(("select", mailbox, readonly))
+        self.readonly = readonly
+        if mailbox.strip('"') in self.reject:
+            return "NO", [b"Mailbox does not exist"]
+        self.selected = mailbox.strip('"')
+        return "OK", [str(len(self._uids())).encode("ascii")]
+
+    def _uids(self) -> list[int]:
+        return self.sequence_uids if self.selected == "INBOX" else self.sent_sequence_uids
+
+    def response(self, name: str) -> tuple[str, list[bytes]]:
+        if name == "EXPUNGE":
+            return name, []
+        if name == "LIST":
+            return name, list(self.list_lines)  # type: ignore[arg-type]
+        inbox = self.selected == "INBOX"
+        if name == "UIDVALIDITY":
+            value = self.uid_validity if inbox else self.sent_uid_validity
+        else:
+            value = self.uid_next if inbox else self.sent_uid_next
+        return name, [str(value).encode("ascii")]
+
+    def fetch(self, sequence: str, query: str) -> tuple[str, list[bytes]]:
+        self.calls.append(("fetch", sequence, query))
+        uids = self._uids()
+        selected: list[int] = []
+        for item in sequence.split(","):
+            if ":" in item:
+                start, end = (int(value) for value in item.split(":", 1))
+                selected.extend(range(start, end + 1))
+            else:
+                selected.append(int(item))
+        return "OK", [
+            f"{position} (UID {uids[position - 1]})".encode()
+            for position in selected
+            if 1 <= position <= len(uids)
+        ]
+
+
+SENT_LIST = [
+    b'(\\HasNoChildren) "/" INBOX',
+    b'(\\HasNoChildren \\Sent) "/" "Sent Messages"',
+]
+NO_SENT_LIST = [
+    b'(\\HasNoChildren) "/" INBOX',
+    b'(\\HasNoChildren) "/" Archive',
+]
+
+
+def _sent_gateway(client: SentFolderImap, values: ImapCredentials | None = None) -> ImapGateway:
+    return ImapGateway(values or credentials(), lambda _credentials, _context: client)
+
+
+def _selects(client: SentFolderImap) -> list[str]:
+    return [str(call[1]) for call in client.calls if call[0] == "select"]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (
+            b'(\\HasNoChildren \\Sent) "/" "Sent Messages"',
+            ({"\\hasnochildren", "\\sent"}, "Sent Messages"),
+        ),
+        (b'(\\Sent) "." Sent', ({"\\sent"}, "Sent")),
+        (b'(\\Noselect) NIL "[Gmail]"', ({"\\noselect"}, "[Gmail]")),
+        (b'(\\Sent) "/" "Quote \\"d\\""', ({"\\sent"}, 'Quote "d"')),
+        ((b'(\\Sent) "/" {13}', b"Sent Messages"), ({"\\sent"}, "Sent Messages")),
+        (b"garbage", None),
+        (42, None),
+    ],
+)
+def test_list_lines_parse_attributes_and_names(line: object, expected: object) -> None:
+    parsed = imap_module._parse_list_line(line)
+    assert parsed is None if expected is None else parsed == (frozenset(expected[0]), expected[1])
+
+
+def test_special_use_sent_folder_is_discovered_and_selected() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client)
+
+    assert gateway.sent_scope() == "available"
+    cursor = gateway.sent_initial_cursor()
+
+    mailbox_id = imap_mailbox_identity(credentials())
+    folder_key = imap_module._folder_key("Sent Messages")
+    assert cursor == f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:3"
+    assert '"Sent Messages"' in _selects(client)
+    assert client.readonly is True
+
+
+def test_configured_sent_folder_is_used_when_the_server_lists_none() -> None:
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Enviados"})
+    client = SentFolderImap(list_lines=NO_SENT_LIST)
+    gateway = _sent_gateway(client, values)
+
+    assert gateway.sent_scope() == "available"
+    gateway.sent_initial_cursor()
+    assert '"Enviados"' in _selects(client)
+    # The server is asked first; the configured name is the fallback.
+    assert sum(1 for call in client.calls if call[0] == "list") == 1
+
+
+def test_without_a_sent_folder_the_scope_is_unavailable() -> None:
+    client = SentFolderImap(list_lines=NO_SENT_LIST)
+    gateway = _sent_gateway(client)
+
+    assert gateway.sent_scope() == "unavailable"
+    with pytest.raises(ImapError) as excinfo:
+        gateway.sent_initial_cursor()
+    assert excinfo.value.code == "imap_sent_unavailable"
+
+
+def test_sent_ids_carry_a_folder_token_so_colliding_uids_stay_distinct() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST, sequence_uids=[3], sent_sequence_uids=[3])
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+
+    folder_key = imap_module._folder_key("Sent Messages")
+    inbox = gateway.changes_since(f"{CURSOR_PREFIX}{mailbox_id}:44:0")
+    sent = gateway.sent_changes_since(f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:0")
+
+    assert inbox.message_ids == (f"{MESSAGE_ID_PREFIX}{mailbox_id}:44:3",)
+    assert sent.message_ids == (f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{folder_key}:77:3",)
+    assert inbox.message_ids[0] != sent.message_ids[0]
+    assert sent.cursor == f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:3"
+
+
+def test_metadata_selects_the_folder_an_id_names_and_restores_inbox_validation() -> None:
+    client = SentFolderImap(
+        list_lines=SENT_LIST,
+        raw_message=RECIPIENT_MESSAGE,
+        sequence_uids=[7],
+        sent_sequence_uids=[3],
+    )
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+    folder_key = imap_module._folder_key("Sent Messages")
+    sent_id = f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{folder_key}:77:3"
+
+    with gateway.polling_session():
+        sent = gateway.metadata(sent_id)
+        inbox = gateway.metadata(message_id())
+
+    assert sent.locations == frozenset({"sent"})
+    assert sent.labels == frozenset()
+    assert sent.to == ("billing@vendor.com", "sales@vendor.com")
+    assert sent.cc == ("cc@other.com",)
+    assert inbox.locations == frozenset({"inbox"})
+    assert inbox.labels == frozenset({"INBOX"})
+    # Sent was selected for the Sent id, and INBOX again for the Inbox id.
+    assert _selects(client)[-2:] == ['"Sent Messages"', "INBOX"]
+
+
+def test_a_sent_id_for_an_unknown_folder_is_unavailable() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+    stale = f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{'f' * 64}:77:3"
+
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.metadata(stale)
+
+
+def test_connection_accepts_a_sent_folder_name_and_keeps_it_in_the_credentials_file(
+    tmp_path: Path,
+) -> None:
+    values = credentials_from_connection(connection(sent_folder=" Enviados "))
+    assert values.sent_folder == "Enviados"
+    path = tmp_path / "credentials.json"
+    write_credentials(path, values)
+    assert load_credentials(path).sent_folder == "Enviados"
+    assert credentials_from_connection(connection()).sent_folder is None
+
+
+@pytest.mark.parametrize("sent_folder", ["", "   ", "Sent\x00", "x" * 256, 7])
+def test_connection_rejects_invalid_sent_folder_names(sent_folder: object) -> None:
+    with pytest.raises(ImapError) as excinfo:
+        credentials_from_connection(connection(sent_folder=sent_folder))
+    assert excinfo.value.code == "imap_configuration_error"
+
+
+def test_a_sent_cursor_for_another_folder_is_stale() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+    other = imap_module._folder_key("Old Sent")
+
+    with pytest.raises(StaleMailboxCursor, match="Sent folder changed"):
+        gateway.sent_changes_since(f"{SENT_CURSOR_PREFIX}{mailbox_id}:{other}:77:0")
+    day = date(2026, 9, 1).toordinal()
+    stale_recovery = f"{SENT_RECOVERY_CURSOR_PREFIX}{mailbox_id}:{other}:77:3:3:{day}"
+    with pytest.raises(StaleMailboxCursor, match="Sent folder changed"):
+        gateway.sent_changes_since(stale_recovery)
+
+
+def test_sent_recovery_pages_the_sent_folder_with_folder_bound_cursors() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST, sent_sequence_uids=[3])
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+    folder_key = imap_module._folder_key("Sent Messages")
+
+    changes = gateway.sent_recover_since(datetime(2026, 9, 1, tzinfo=UTC))
+
+    assert changes.message_ids == (f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{folder_key}:77:3",)
+    assert changes.cursor == f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:3"
+    assert '"Sent Messages"' in _selects(client)
+    assert any(call[0] == "search" and "SINCE" in call for call in client.calls)
+
+
+@pytest.mark.parametrize(
+    ("name", "encoded"),
+    [
+        ("Sent", "Sent"),
+        ("A&B", "A&-B"),
+        ("Envoy\u00e9s", "Envoy&AOk-s"),
+        ("\u9001\u4fe1", "&kAFP4Q-"),
+    ],
+)
+def test_mailbox_names_are_encoded_as_modified_utf7(name: str, encoded: str) -> None:
+    assert imap_module._encode_mailbox_name(name) == encoded
+
+
+def test_a_configured_non_ascii_sent_folder_is_selected_in_wire_form() -> None:
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Envoy\u00e9s"})
+    client = SentFolderImap(list_lines=NO_SENT_LIST)
+    gateway = _sent_gateway(client, values)
+
+    assert gateway.sent_scope() == "available"
+    assert '"Envoy&AOk-s"' in _selects(client)
+
+
+def test_a_failed_folder_listing_retries_instead_of_using_the_fallback() -> None:
+    class ListingFails(SentFolderImap):
+        def list(self, directory: str, pattern: str) -> tuple[str, list[object]]:
+            self.calls.append(("list", directory, pattern))
+            return "NO", [b"LIST failed"]
+
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Custom"})
+    client = ListingFails(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client, values)
+
+    # A failed listing says nothing about \Sent: the poll sees a mailbox error and
+    # retries later, and the configured fallback is never selected in its place.
+    with pytest.raises(ImapError):
+        gateway.sent_scope()
+    assert '"Custom"' not in _selects(client)
+
+
+def test_a_failed_select_is_probed_again_on_the_next_check() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST, reject={"Sent Messages"})
+    gateway = _sent_gateway(client, credentials())
+
+    assert gateway.sent_scope() == "unavailable"
+    # The folder comes back: the next check resolves and selects it again.
+    client.reject = set()
+    assert gateway.sent_scope() == "available"
+
+
+def test_a_server_advertising_special_use_is_asked_for_it() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST)
+    client.capabilities = ("IMAP4REV1", "SPECIAL-USE")
+    gateway = _sent_gateway(client, credentials())
+
+    assert gateway.sent_scope() == "available"
+    assert ("xatom", "LIST", '""', "*", "RETURN", "(SPECIAL-USE)") in client.calls
+    assert not any(call[0] == "list" for call in client.calls)
+    assert '"Sent Messages"' in _selects(client)
+
+
+def test_an_advertised_sent_folder_wins_over_a_configured_fallback() -> None:
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Custom"})
+    client = SentFolderImap(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client, values)
+
+    assert gateway.sent_scope() == "available"
+    selects = _selects(client)
+    assert '"Sent Messages"' in selects
+    assert '"Custom"' not in selects
+
+
+def test_a_configured_sent_folder_that_cannot_be_selected_is_unavailable() -> None:
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Missing"})
+    client = SentFolderImap(list_lines=NO_SENT_LIST, reject={"Missing"})
+    gateway = _sent_gateway(client, values)
+
+    assert gateway.sent_scope() == "unavailable"
+    with pytest.raises(ImapError) as excinfo:
+        gateway.sent_initial_cursor()
+    assert excinfo.value.code == "imap_sent_unavailable"
