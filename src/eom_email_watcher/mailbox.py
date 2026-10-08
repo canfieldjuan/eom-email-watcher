@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
+from email._header_value_parser import get_address_list
 from email.utils import getaddresses
 from typing import Protocol
 
@@ -151,6 +152,69 @@ def recipient_addresses(value: object) -> tuple[str, ...]:
         ):
             found.append(candidate)
     return tuple(dict.fromkeys(found))
+
+
+@dataclass(frozen=True)
+class MailboxToken:
+    address: str
+    start: int
+    end: int
+
+
+def header_mailbox_tokens(value: str) -> tuple[MailboxToken, ...]:
+    """RFC header mailboxes with normalized identity and exact addr-spec spans.
+
+    The stdlib parser owns header syntax. It also exposes the parse tree needed
+    for spans; getaddresses alone loses those positions. Reject a repaired tree
+    rather than guessing offsets into the original header. Display names and
+    comments never produce mailboxes. Existing recipient_addresses is unchanged.
+    """
+    from .config import normalize_validated_address
+
+    try:
+        tree, remainder = get_address_list(value)
+        if remainder or str(tree) != value:
+            return ()
+        result: list[MailboxToken] = []
+
+        def significant_spans(node, offset):
+            if node.token_type == "cfws":
+                return []
+            if not isinstance(node, list):
+                return [(offset, offset + len(str(node)))]
+            spans = []
+            for child in node:
+                spans.extend(significant_spans(child, offset))
+                offset += len(str(child))
+            return spans
+
+        def visit(node, offset):
+            if node.token_type in {"display-name", "cfws", "invalid-mailbox"}:
+                return
+            if node.token_type == "addr-spec":
+                if node.all_defects:
+                    return
+                spans = significant_spans(node, offset)
+                if not spans:
+                    return
+                start, end = spans[0][0], spans[-1][1]
+                raw = value[start:end]
+                try:
+                    address = normalize_validated_address(raw)
+                except ValueError:
+                    return
+                if within_utf8_bytes(address, MAX_RECIPIENT_ADDRESS_BYTES):
+                    result.append(MailboxToken(address, start, end))
+                return
+            if isinstance(node, list):
+                for child in node:
+                    visit(child, offset)
+                    offset += len(str(child))
+
+        visit(tree, 0)
+        return tuple(result)
+    except (ValueError, IndexError, RecursionError):
+        return ()
 
 
 def normalize_message_id(value: object) -> str | None:

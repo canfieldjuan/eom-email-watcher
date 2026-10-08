@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .config import normalize_validated_address
+from .mailbox import MailboxToken as _MailboxToken
+from .mailbox import header_mailbox_tokens
 
 MAX_SCHEDULING_RESULT_BYTES = 32 * 1024
 MAX_SCHEDULING_VIOLATIONS = 32
@@ -428,25 +430,21 @@ def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) 
     )
 
 
-# Consume maximal lexical words, including quoted strings and escaped characters.
-# Spaces around @ still belong to that mailbox, rather than exposing its interior.
-# An unfinished quoted string is opaque through end-of-input.
+# Prose has one dot-atom grammar. Quoted/bracketed compounds are consumed
+# opaquely so their interiors cannot manufacture an ordinary mailbox. A
+# standalone quotation is speech; parentheses delimit parenthetical mentions.
 _QUOTED_MAILBOX_CONTENT = r'(?:\\[\s\S]|[^"\\])*'
 _QUOTED_MAILBOX_WORD = rf'"{_QUOTED_MAILBOX_CONTENT}(?:"|$)'
 _PROSE_QUOTATION = re.compile(rf'"{_QUOTED_MAILBOX_CONTENT}"')
-_MAILBOX_WORD = rf'(?:{_QUOTED_MAILBOX_WORD}|[^\s()<>,;:\[\]"]+)+'
+_BRACKETED_MAILBOX_WORD = r"\[[^\]]*(?:\]|$)"
+_MAILBOX_WORD = rf'(?:{_QUOTED_MAILBOX_WORD}|{_BRACKETED_MAILBOX_WORD}|[^\s()<>,;:\[\]"]+)+'
 _MAILBOX_LEXEME = re.compile(_MAILBOX_WORD)
+_DOT_ATOM = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+_PROSE_MAILBOX = re.compile(rf"{_DOT_ATOM}@{_DOT_ATOM}")
 
 
-@dataclass(frozen=True)
-class _MailboxToken:
-    address: str
-    start: int
-    end: int
-
-
-def _mailbox_cfws_end(text: str, position: int, limit: int) -> int:
-    """Consume RFC folding whitespace and balanced comments between mailbox parts."""
+def _opaque_compound_gap_end(text: str, position: int, limit: int) -> int:
+    """Keep spaced/parenthesized exotic compounds opaque; never normalize them."""
     while position < limit:
         if text[position].isspace():
             position += 1
@@ -468,8 +466,8 @@ def _mailbox_cfws_end(text: str, position: int, limit: int) -> int:
     return position
 
 
-def _mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
-    """Yield whole literal mailboxes and their spans from prose, never substrings."""
+def _prose_mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
+    """Yield only complete literal dot-atom mailboxes from prose."""
     tokens: list[_MailboxToken] = []
     regions = [(0, len(text))]
     while regions:
@@ -478,7 +476,7 @@ def _mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
         while (match := _MAILBOX_LEXEME.search(text, position, right)) is not None:
             start, end = match.span()
             while True:
-                next_part = _mailbox_cfws_end(text, end, right)
+                next_part = _opaque_compound_gap_end(text, end, right)
                 if text[end - 1] == "@":
                     # Keep comments/domain attached even when the lexical word
                     # ended at @. Invalid or missing domains remain opaque.
@@ -502,17 +500,21 @@ def _mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
                 # local part followed by @domain is consumed whole above.
                 regions.append((start + 1, end - 1))
                 continue
-            if "@" not in word:
+            if _PROSE_MAILBOX.fullmatch(word) is None:
                 continue
             try:
                 address = normalize_validated_address(word)
             except ValueError:
                 continue
-            # Normalization may parse a display name or trim malformed text. That
-            # cannot manufacture a token: only the whole literal word qualifies.
+            # Config validation still owns address admission; the prose grammar
+            # prevents that normalizer from interpreting header syntax here.
             if address == word.casefold():
                 tokens.append(_MailboxToken(address, start, end))
     return tuple(tokens)
+
+
+def _mailbox_tokens(text: str, *, source: str = "body") -> tuple[_MailboxToken, ...]:
+    return header_mailbox_tokens(text) if source == "sender" else _prose_mailbox_tokens(text)
 
 
 def _attendee_evidence_supported(
@@ -520,12 +522,16 @@ def _attendee_evidence_supported(
 ) -> bool:
     """Require the same complete token in a quote and its full source occurrence."""
     quote = _canonical_evidence_text(evidence.quote)
-    quote_tokens = tuple(token for token in _mailbox_tokens(quote) if token.address == address)
+    quote_tokens = tuple(
+        token
+        for token in _mailbox_tokens(quote, source=evidence.source)
+        if token.address == address
+    )
     if not quote_tokens:
         return False
     for raw_candidate in _evidence_candidates(evidence, source):
         candidate = _canonical_evidence_text(raw_candidate)
-        source_tokens = set(_mailbox_tokens(candidate))
+        source_tokens = set(_mailbox_tokens(candidate, source=evidence.source))
         position = 0
         while (position := candidate.find(quote, position)) >= 0:
             if any(
