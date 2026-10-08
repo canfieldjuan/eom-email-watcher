@@ -73,11 +73,45 @@ scheduling/model/gateway/benchmark unit files and Ruff/format/diff checks.
 
 ### Acceptance
 
-The operator authorized non-thinking qualification. This root parser revision
-follows the standing reproduce/isolate/fix-at-origin rule. It is a correctness
-repair to the existing source-evidence contract; model policy promotion remains
-blocked by the failed scheduling candidate, absent gateway run and pending
-human semantic review.
+The operator accepted the attendee-evidence repair conditionally, relayed by
+oversight at discussion_r4213328639: "I accept 218 once the tokenizer fix lands."
+This replaces the earlier assertion that qualification authorization accepted
+this new validator behavior. Oversight clears the acceptance hold after verifying
+the one class-fix push; this session does not resolve that hold. Acceptance covers
+the validator only. Scheduling/gateway/semantic gates still block 9B promotion.
+
+### Tokenizer consolidation contract (before implementation)
+
+Root cause: my commit18b641281ab294e7add19fbdd54667580bc9e2f1 introduced an
+address-specific boundary expression in scheduling.py:_attendee_evidence_supported.
+It treats a quote as a delimiter without consuming its quoted-local mailbox.
+A direct production-validator probe accepts sender@example.com from both
+"sender@example.com"@evil.com and the same syntax with whitespace before @.
+The two-character neighboring-context workaround cannot establish whole identity.
+
+Required change surface: one complete-mailbox tokenizer in scheduling.py,
+yielding normalized literal tokens and their spans. Quoted local parts and their
+escapes remain indivisible; angle brackets and prose punctuation delimit tokens.
+Tokenize both quote and full declared source with that same owner. Acceptance
+requires exact token equality at the quote's source occurrence, including its
+full span; cropped quoted strings, longer local parts/domains and malformed
+mailbox fragments cannot manufacture a smaller token. Remove the address-specific
+boundary expression and neighboring-character window. Header parsing and address
+normalization keep their existing owners; no scheduling schema or prompt change.
+
+Assumptions/blockers: the source normalizer remains the address-validity owner.
+A tokenizer may consume a malformed lexical mailbox without yielding support;
+it must never search its interior for a smaller mailbox. Oversight acceptance
+hold remains unresolved pending verification. No further inference is authorized
+by this contract, and the stopped qualification counter remains cumulative.
+
+Verification plan: fail-first public quoted-local and cropped-quoted regressions
+through validate_scheduling_output; valid quoted-local/display/punctuation forms;
+existing larger-local/domain negatives, repeated-source occurrences, wrong source,
+empty/mixed/malformed tokens, escaped and spaced quoted locals. Then adjacent
+scheduling/model/gateway/benchmark tests, Ruff and cold diff audit. Reuse retained
+offline scheduling replay; attendee support is repaired while ambiguity rejection
+remains. One class-fix push after this separate contract-only commit.
 
 ## Implementation and verification receipt
 
