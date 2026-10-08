@@ -1,5 +1,9 @@
 # Paired scheduled engine (Watcher #214)
 
+Current contract: the accepted positive deployment-description consolidation below
+supersedes earlier property-by-property admission and PATH-discovery revisions.
+Those revisions remain historical evidence of my rework, not current policy.
+
 ## Validated inventory
 
 Durable inventory: `paired-scheduled-engine-20261007/inventory.json`. It retains
@@ -336,3 +340,92 @@ Ruff and new/bootstrap format checks pass. Cold diff is test bootstrap/readers,
 regression and this contract only. No production/proof/bundle/dependency diff
 against cc7d308; reuse its native/module equality receipts for that unchanged
 source. Windows execution itself remains CI-owned and pending after publication.
+
+## Accepted positive deployment-description consolidation
+
+Operator acceptance: discussion_r4213460156 accepts proposal discussion_r4213453141
+with four conditions, reaffirmed directly in this session. This contract-only
+revision precedes implementation. The hold stays unresolved until oversight
+verifies the one consolidation push; operator clearance is required before merge.
+
+### Root cause
+
+My initialbcf90be7dd8c8d363fbc3e09ee4038d1a0063177 split desktop identity between
+installer PATH selection and runtime sys.executable, and represented the admitted
+unit graph as selected properties. My8db2017/cc7d308 extended that incomplete
+representation. Retained positive-graph-reproduction.json on7186dc9 admits an
+activation override/alternate fragment/pending reload/changed lmstudio helper,
+counts24 manager subprocesses and selects the stale first of two native inodes.
+Five published follow-up corrections repaired my initial change or follow-ups.
+
+### Required change surface
+
+- deployment.py owns one immutable description of the selected running native
+  engine inode, alias/unit directory and five canonical shipped unit payloads.
+  Installation and admission consume it. Bundle resources use systemd/ as the
+  payload owner, through the existing sidecar builder.
+- A packaged install names the concrete desktop sidecar; its native process owns
+  pairing and unit installation using its running inode. Remove PATH native
+  selection. Keep the source-only locked uv lane explicitly exempt from native
+  database admission, with no implication of paired desktop safety.
+- All five unit files, including lmstudio, are pinned: exact FragmentPath, empty
+  DropInPaths, NeedDaemonReload=false and byte/digest equality with shipped payloads.
+  Fully absent/inactive graph permits initial startup; partial/mixed/modified,
+  redirected/transient/stale-loaded/masked graphs refuse before DB migration.
+- One bounded systemctl user-manager read per normal admission covers the fixed
+  unit set and scalar metadata. One parser owns record identities/types and fails
+  on missing/duplicate/malformed metadata. No per-property subprocess API or
+  AUXILIARY_EXECUTION_PROPERTIES denylist. Keep fresh checks at each Store open;
+  active incompatible processes fail closed, observed exits require typed zero
+  re-observation, helper active execution refuses, and self/alias/file identities
+  are checked around the snapshot. No cached migration authorization.
+- DeploymentError is a distinct Exception, never RuntimeError. Existing stale and
+  concurrent handlers must propagate it. The API presents deployment_refused,
+  and packaged CLI refusal identifies deployment instead of stale/concurrent state.
+- README documents that masked units or a missing user manager intentionally block
+  every packaged desktop DB open until the deployment is repaired.
+- Deferred post-send stuck-reservation risk is filed before the push at
+  https://github.com/canfieldjuan/eom-email-watcher/issues/219. Fresh admission may
+  still refuse record_outbound and mark_outbound_ambiguous after an actual send;
+  do not retry delivery, cache admission or claim this follow-up is solved here.
+
+### Explicit non-scope
+
+No model/thinking/gateway/prompt/template setting change, 9B promotion, DocSum
+work, native runtime correction, schema changes, normal installation before
+qualification/merge, new UI flow, arbitrary dependency traversal or unrelated
+formatting. Preserve service cadence/sandbox, confirmations, dedupe/locks and
+release authority. No automatic email, unit cancellation or reservation recovery.
+
+### Assumptions and blockers
+
+The fixed shipped graph is the admitted graph; overrides require operator repair.
+Source-only uv remains exempt by explicit decision. The existing native proof
+harness and public schema28 oracle remain authoritative for packaged behavior.
+Before removing redundant argv property checks, demonstrate the exact surviving
+old argv[0]-name mutation against a new public regression; preserve its invariant
+via exact shipped payload/alias identity and prove its replacement owner mutation
+also fails. Startup scheduled-alias admission must have its own mutation regression.
+Operator clearance and independent exact-head review remain merge blockers.
+
+### Verification plan
+
+Reproduce each accepted finding before implementation. Commit minimal public
+regressions for whole graph, explicit engine selection, Store subprocess count,
+typed refusals reaching API and not swallowed by stale/concurrent handlers.
+Mutation-probe the scheduled alias startup and old argv[0] check, then their
+post-consolidation equivalents. Cover canonical/all-absent success; mixed/partial,
+redirected/modified/drop-in/stale/masked/missing manager refusal; all five units;
+timeout/output limit/malformed/duplicate/missing metadata; compatible active
+readers, active helper, incompatible PID exit, self/alias/file replacement races.
+Reuse the shared proof-manager fixture and existing smoke/Connect package proof.
+Rebuild/freeze native resources/source; original public schema28 stays unchanged
+on negatives and valid paired migration/API+CLI overlap works. Incremental adjacent
+suites plus required lint/format/bash checks, one consolidation push. No hold
+resolution before pushed class proof; oversight verifies and operator clears merge.
+
+### Implementation summary / cold diff audit / gap audit
+
+NOT DONE: implementation, fail-before/pass-after, mutation proof, rebuilt native
+proof and new-head CI/review. Acceptance and deferred issue are recorded here
+before source/tests/config edits. The following receipt will record actual evidence.
