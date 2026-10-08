@@ -1610,3 +1610,99 @@ def test_header_token_spans_preserve_cfws_and_exclude_display_names():
         ("evil@example.com", "evil@example.com"),
         ("sender@example.com", "sender(c) @ example.com"),
     ]
+
+
+@pytest.mark.parametrize(
+    "address", ["sender@\u4f8b\u3048.\u30c6\u30b9\u30c8", "jos\u00e9@example.com"]
+)
+@pytest.mark.parametrize("evidence_source", ["body", "subject", "attachment_name"])
+def test_prose_normalizer_owns_unicode_validity(address, evidence_source):
+    from dataclasses import replace
+
+    from eom_email_watcher.config import normalize_validated_address
+
+    assert normalize_validated_address(address) == address.casefold()
+    text = "Invite " + address + " please."
+    value = valid_result()
+    value["attendees"][0] = {
+        "email": address,
+        "evidence": {"source": evidence_source, "quote": text},
+    }
+    original = source()
+    fields = (
+        {evidence_source: text}
+        if evidence_source != "attachment_name"
+        else {"attachment_names": (text,)}
+    )
+    if evidence_source == "body":
+        fields["body"] = original.body + " " + text
+    result = validate(value, scheduling_source=replace(original, **fields))
+    assert result.accepted, result.violations
+
+
+@pytest.mark.parametrize("text", ["<sender@example.com>@evil.com", "evil@<sender@example.com>"])
+@pytest.mark.parametrize("cropped_quote", [False, True])
+@pytest.mark.parametrize("evidence_source", ["body", "subject", "attachment_name"])
+def test_prose_angle_compound_cannot_supply_inner_attendee(text, cropped_quote, evidence_source):
+    from dataclasses import replace
+
+    value = valid_result()
+    value["attendees"][0]["evidence"] = {
+        "source": evidence_source,
+        "quote": "sender@example.com" if cropped_quote else text,
+    }
+    original = source()
+    fields = (
+        {evidence_source: text}
+        if evidence_source != "attachment_name"
+        else {"attachment_names": (text,)}
+    )
+    if evidence_source == "body":
+        fields["body"] = original.body + " " + text
+    result = validate(value, scheduling_source=replace(original, **fields))
+    assert "attendee_unsupported" in codes(result)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '<"sender@example.com">@evil.com',
+        '[sender@example.com]@evil.com',
+        'evil@[sender@example.com]',
+        '"bob@example.com"@evil.com',
+        '"sender@example.com" @ evil.com',
+        '<sender@example.com> (comment) @evil.com',
+        'evil@ (comment) <sender@example.com>',
+        '<sender@example.com',
+        '[sender@example.com',
+        '(sender@example.com',
+        '<display sender@example.com>',
+        'sender@example.com]@evil.com',
+    ],
+)
+def test_prose_enclosure_class_never_rescans_compounds(text):
+    assert scheduling_module._mailbox_tokens(text) == ()
+
+
+def test_prose_mixed_runs_preserve_normalizer_identity_and_exact_spans():
+    text = (
+        '<sender@example.com>@evil.com; Name <jos\u00e9@example.com>. '
+        '"sender@example.com"@evil.com; (sender@\u4f8b\u3048.\u30c6\u30b9\u30c8); '
+        'He said "email sender@example.com please"; evil@<sender@example.com> '
+        + "x" * 4096 + " valid@example.com"
+    )
+    tokens = scheduling_module._mailbox_tokens(text)
+    assert {t.address for t in tokens} == {
+        "jos\u00e9@example.com", "sender@\u4f8b\u3048.\u30c6\u30b9\u30c8",
+        "sender@example.com", "valid@example.com",
+    }
+    assert len(tokens) == 4
+    for token in tokens:
+        assert text[token.start:token.end].casefold() == token.address
+
+
+def test_prose_normalizer_cannot_rewrite_literal_candidate(monkeypatch):
+    monkeypatch.setattr(
+        scheduling_module, "normalize_validated_address", lambda _: "other@example.com"
+    )
+    assert scheduling_module._mailbox_tokens("sender@example.com") == ()

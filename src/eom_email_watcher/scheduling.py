@@ -430,84 +430,104 @@ def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) 
     )
 
 
-# Prose has one dot-atom grammar. Quoted/bracketed compounds are consumed
-# opaquely so their interiors cannot manufacture an ordinary mailbox. A
-# standalone quotation is speech; parentheses delimit parenthetical mentions.
-_QUOTED_MAILBOX_CONTENT = r'(?:\\[\s\S]|[^"\\])*'
-_QUOTED_MAILBOX_WORD = rf'"{_QUOTED_MAILBOX_CONTENT}(?:"|$)'
-_PROSE_QUOTATION = re.compile(rf'"{_QUOTED_MAILBOX_CONTENT}"')
-_BRACKETED_MAILBOX_WORD = r"\[[^\]]*(?:\]|$)"
-_MAILBOX_WORD = rf'(?:{_QUOTED_MAILBOX_WORD}|{_BRACKETED_MAILBOX_WORD}|[^\s()<>,;:\[\]"]+)+'
-_MAILBOX_LEXEME = re.compile(_MAILBOX_WORD)
-_DOT_ATOM = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
-_PROSE_MAILBOX = re.compile(rf"{_DOT_ATOM}@{_DOT_ATOM}")
+# These characters describe prose boundaries, not mailbox validity. Enclosed
+# runs are consumed intact so an embedded address cannot escape a compound.
+_PROSE_ENCLOSURES = {'"': '"', "[": "]", "<": ">", "(": ")"}
+_PROSE_SEPARATORS = ",;:"
+
+
+def _prose_enclosure_end(text: str, position: int, limit: int) -> int | None:
+    stack = [_PROSE_ENCLOSURES[text[position]]]
+    position += 1
+    while position < limit and stack:
+        character = text[position]
+        if character == "\\":
+            position = min(position + 2, limit)
+            continue
+        if character == stack[-1]:
+            stack.pop()
+        elif stack[-1] != '"' and character in _PROSE_ENCLOSURES:
+            stack.append(_PROSE_ENCLOSURES[character])
+        position += 1
+    # An unfinished enclosure consumes the remainder and cannot yield support.
+    return None if stack else position
+
+
+def _prose_lexeme_end(text: str, position: int, limit: int) -> int:
+    while position < limit:
+        character = text[position]
+        if character.isspace() or character in _PROSE_SEPARATORS:
+            break
+        if character in _PROSE_ENCLOSURES:
+            position = _prose_enclosure_end(text, position, limit) or limit
+        else:
+            position += 1
+    return position
 
 
 def _opaque_compound_gap_end(text: str, position: int, limit: int) -> int:
-    """Keep spaced/parenthesized exotic compounds opaque; never normalize them."""
+    """Whitespace/comments next to @ stay inside the same lexical compound."""
     while position < limit:
         if text[position].isspace():
             position += 1
         elif text[position] == "(":
-            depth = 1
-            position += 1
-            while position < limit and depth:
-                character = text[position]
-                if character == "\\":
-                    position = min(position + 2, limit)
-                    continue
-                if character == "(":
-                    depth += 1
-                elif character == ")":
-                    depth -= 1
-                position += 1
+            position = _prose_enclosure_end(text, position, limit) or limit
         else:
             break
     return position
 
 
 def _prose_mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
-    """Yield only complete literal dot-atom mailboxes from prose."""
+    """Bound literal candidates; the configuration normalizer owns validity."""
     tokens: list[_MailboxToken] = []
     regions = [(0, len(text))]
     while regions:
         left, right = regions.pop()
         position = left
-        while (match := _MAILBOX_LEXEME.search(text, position, right)) is not None:
-            start, end = match.span()
+        while position < right:
+            if text[position].isspace() or text[position] in _PROSE_SEPARATORS:
+                position += 1
+                continue
+            start = position
+            end = _prose_lexeme_end(text, start, right)
             while True:
                 next_part = _opaque_compound_gap_end(text, end, right)
                 if text[end - 1] == "@":
-                    # Keep comments/domain attached even when the lexical word
-                    # ended at @. Invalid or missing domains remain opaque.
-                    continuation = _MAILBOX_LEXEME.match(text, next_part, right)
-                    end = continuation.end() if continuation else next_part
-                    if continuation is None:
+                    continuation = _prose_lexeme_end(text, next_part, right)
+                    end = continuation
+                    if continuation == next_part:
                         break
                 elif next_part < right and text[next_part] == "@":
                     end = next_part + 1
                 else:
                     break
             position = end
-            # Sentence punctuation is outside the mailbox. Consecutive dots stay
-            # inside an invalid lexical word; do not repair a malformed domain.
             end = start + len(text[start:end].rstrip("!?"))
             if text[start:end].endswith(".") and not text[start:end].endswith(".."):
                 end -= 1
             word = text[start:end]
-            if _PROSE_QUOTATION.fullmatch(word):
-                # A standalone prose quotation may contain addresses. A quoted
-                # local part followed by @domain is consumed whole above.
-                regions.append((start + 1, end - 1))
-                continue
-            if _PROSE_MAILBOX.fullmatch(word) is None:
+            # Strip only an enclosure covering the entire run. In particular,
+            # <mailbox>@domain and local@<mailbox> are never rescanned inside.
+            if (
+                word
+                and word[0] in {'"', "(", "<"}
+                and word[-1] == _PROSE_ENCLOSURES[word[0]]
+                and _prose_enclosure_end(text, start, end) == end
+            ):
+                if word[0] == "<":
+                    start += 1
+                    end -= 1
+                    word = text[start:end]
+                else:
+                    regions.append((start + 1, end - 1))
+                    continue
+            # One opacity rule covers every enclosure and multi-@ compound.
+            if word.count("@") != 1 or any(c in word for c in '\"[]<>()'):
                 continue
             try:
                 address = normalize_validated_address(word)
             except ValueError:
                 continue
-            # Config validation still owns address admission; the prose grammar
-            # prevents that normalizer from interpreting header syntax here.
             if address == word.casefold():
                 tokens.append(_MailboxToken(address, start, end))
     return tuple(tokens)

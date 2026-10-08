@@ -145,7 +145,10 @@ Gap audit: DONE for the accepted tokenizer origin repair. NOT DONE for fresh-hea
 CI/review, oversight acceptance-hold clearance and full 9B qualification.
 
 
-## Grammar-by-source revision before implementation
+## Grammar-by-source revision before implementation (historical)
+
+The third-round revision below supersedes the ASCII prose grammar; source
+selection, header parsing and occurrence matching from this revision remain.
 
 Operator direction: address the threads. Oversight r4213450654 confirms the
 existing validator acceptance covers this design correction without new approval.
@@ -220,3 +223,21 @@ equality, compound opacity, source selection and same-occurrence membership
 independently: the respective regression tests must fail. Replay the retained
 original completion offline, preserving scheduling ambiguity rejection and
 without generating another model response. Cold audit each changed file.
+
+
+### Third-round implementation receipt
+
+The declared Unicode/angle real-validator reproduction failed 18 cases before
+implementation. The boundary-only scanner now consumes entire enclosure compounds;
+configuration normalization admits literal candidates. Removed the duplicate ASCII
+regex and separate quoted/bracketed regex owners. Existing header/source/occurrence
+functions and prior tests are unchanged. All affected suites: 347 passed; Ruff and
+diff checks pass. Six mutations fail tracked tests: occurrence, both source-grammar
+swaps, opacity, literal identity and reinstated ASCII rejection. An initial opacity
+harness mutation failed to apply; it was corrected and rerun, and is not counted
+as regression proof. Offline original completion still rejects solely for
+new_meeting_ambiguous, with no model generation or completion rewrite. Durable
+literal-owner-receipt.json and literal-cold-diff-audit.md bind source and artifacts.
+
+Gap audit: local class repair DONE; published-head independent verification and
+CI pending. No promotion; scheduling ambiguity/live gateway/semantic review stay.
