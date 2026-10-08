@@ -558,3 +558,66 @@ refusal-adjacent-v7.txt, refusal-final-regressions-v7.txt, freeze-receipt-v7.jso
 packaged-schema-proof-v7.json and native-desktop-parser-v7.txt. Public review replies
 bind aliases by sha256. Oversight holds remain until exact-head verification and
 the operator's merge clearance.
+
+
+## Manager identity and connection-lifetime revision before implementation
+
+### Root cause
+My 659dab21 deployment description derives publication paths from the invoking
+process, omits manager ExecStart, and permits its engine to be a publication target.
+My cc7d3085 database admission is a point check rather than a lease spanning the
+connection. The first divergences are deployment.py:93-103, :253-306, :386-411
+and db.py:5233-5235. Those choices allow a different manager alias, destructive
+self-publication, and replacement while an admitted connection remains open.
+Oversight reproduced all three on ea94dae. Its real-process receiver proof is
+retained but the ignored test alone does not provide a CI regression gate.
+
+### Required change surface
+One manager-view resolver in deployment.py owns manager HOME, XDG unit directory
+and a stable manager-derived deployment lock path. No invoking-process fallback
+for manager-facing paths. Admission adds ExecStart to its one unit snapshot and
+requires scheduled service executable paths to resolve to that manager alias.
+The helper service retains its shipped non-CLI command. Manager metadata reads
+remain bounded; resolve manager environment separately from the one unit snapshot.
+The shell installer consumes this same resolver rather than deriving HOME/XDG.
+
+One deployment lease owner takes a shared lock before admission, checks under it,
+and holds it through SQLite connection creation, use, transaction cleanup and
+close. Store.connection closes SQLite before releasing the lease, including errors.
+Every publisher (install_user_services, install_source_units and shell source
+publication) takes that same lock exclusively across snapshot, alias/unit writes,
+daemon reload and post-publication verification. Shell source publication must
+move under this owner or run wholly inside its exclusive lease; no subprocess
+handoff releases the lock between writes. Source-only DB admission stays exempt.
+Refusals remain DeploymentError and retain the API deployment_refused envelope.
+
+The description rejects engines equal to, or resolving through, the canonical
+alias before any publication; advise selecting the distinct bundle sidecar.
+Remove independent shell path derivation and point-check-only connection admission.
+Add CI coverage that exercises a real refusal process and the actual desktop
+receiver (wire the existing Rust test with isolated inputs, or an equivalent
+CI-runnable subprocess test using that parser).
+
+### Explicit non-scope
+No model, prompt, runtime, qualification, mail sending, normal-profile changes,
+schema/migration changes, dependencies, UI redesign or new admitted graph shapes.
+Existing positive five-unit payload pins, typed refusals and source exemption stay.
+
+### Assumptions and blockers
+Operator acceptance relayed in 4214822245 covers this precise four-item design.
+Oversight must check this contract-only amendment before code. Any lock scope,
+holder or path-owner departure requires operator acceptance. One consolidation
+push; hold remains through independent verification and operator merge clearance.
+
+### Verification plan
+First reproduce differing engine/manager homes, direct and indirect alias engines,
+and two-process publication during a live Store.connection on the prior head.
+Regression tests must fail before implementation. Prove shared readers coexist,
+exclusive publication waits until close, errors release locks, and source/native
+publishers use the same manager lock. Mutate the connection-lifetime scope and each
+publisher's exclusive acquisition independently; their tests must fail.
+Prove manager ExecStart disagreement refuses and matching graph succeeds; all
+publication refusals precede writes. Retain isolated v7 schema28/native baseline,
+list proof substitutions/differences, rebuild and replay affected native paths.
+CI executes the real receiver; incremental source tests/lint plus required native
+proof locally, without duplicating unrelated CI matrices.
