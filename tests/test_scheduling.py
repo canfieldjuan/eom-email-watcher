@@ -1401,3 +1401,85 @@ def test_attendee_quote_can_match_a_later_complete_occurrence() -> None:
     body = source().body + " notsender@example.com, then sender@example.com."
 
     assert validate(value, scheduling_source=source(body=body)).accepted
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        '"sender@example.com"@evil.com',
+        '"long local part sender@example.com"@evil.com',
+        '"sender@example.com" @evil.com',
+        '"sender@example.com" @ evil.com',
+        '"escaped \\" local sender@example.com"@evil.com',
+        '"sender@example.com"@evil.com.',
+        '"sender@example.com" (comment) @evil.com',
+        '"sender@example.com" (nested (comment)) @evil.com',
+        '"sender@example.com"@(comment)evil.com',
+    ],
+)
+@pytest.mark.parametrize("cropped_quote", [False, True])
+def test_attendee_cannot_borrow_from_quoted_local_part(
+    source_text: str, cropped_quote: bool
+) -> None:
+    value = valid_result()
+    quote = "sender@example.com" if cropped_quote else source_text
+    value["attendees"][0]["evidence"] = {"source": "body", "quote": quote}
+    result = validate(value, scheduling_source=source(body=source().body + " " + source_text))
+
+    assert "attendee_unsupported" in codes(result)
+
+
+@pytest.mark.parametrize(
+    ("address", "quote"),
+    [
+        ('"sender"@example.com', 'Invite "sender"@example.com.'),
+        ('"first.last"@example.com', 'Invite <"first.last"@example.com>.'),
+        ('"o\\\\brien"@example.com', 'Invite "o\\\\brien"@example.com.'),
+        ("sender@example.com", "Invite sender@example.com!"),
+        ("sender@example.com", "Invite sender@example.com?"),
+        ("sender@example.com", "Invite (sender@example.com); please."),
+    ],
+)
+def test_attendee_complete_quoted_and_punctuated_mailboxes(address: str, quote: str) -> None:
+    value = valid_result()
+    value["attendees"][0] = {
+        "email": address,
+        "evidence": {"source": "body", "quote": quote},
+    }
+    assert validate(value, scheduling_source=source(body=source().body + " " + quote)).accepted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "no mailbox here",
+        '"unfinished sender@example.com',
+        '"unfinished sender@example.com \\"',
+        '"sender@example.com" @',
+        'sender@example.com"@evil.com',
+        "sender@example.com..",
+        "x@sender@example.com",
+    ],
+)
+def test_mailbox_tokenizer_does_not_extract_from_invalid_words(text: str) -> None:
+    assert scheduling_module._mailbox_tokens(text) == ()
+
+
+def test_mailbox_tokenizer_preserves_complete_identity_and_source_spans() -> None:
+    text = '<sender@example.com>, "sender@example.com"@evil.com; "sender"@example.com.'
+    tokens = scheduling_module._mailbox_tokens(text)
+    assert [token.address for token in tokens] == [
+        "sender@example.com",
+        '"sender"@example.com',
+    ]
+    for token in tokens:
+        assert text[token.start : token.end].casefold() == token.address
+
+
+def test_attendee_quote_uses_full_source_token_after_an_invalid_occurrence() -> None:
+    quote = "sender@example.com"
+    value = valid_result()
+    value["attendees"][0]["evidence"] = {"source": "body", "quote": quote}
+    body = source().body + ' "sender@example.com"@evil.com then <sender@example.com>.'
+    assert validate(value, scheduling_source=source(body=body)).accepted

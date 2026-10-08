@@ -428,24 +428,111 @@ def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) 
     )
 
 
+# Consume maximal lexical words, including quoted strings and escaped characters.
+# Spaces around @ still belong to that mailbox, rather than exposing its interior.
+# An unfinished quoted string is opaque through end-of-input.
+_QUOTED_MAILBOX_CONTENT = r'(?:\\[\s\S]|[^"\\])*'
+_QUOTED_MAILBOX_WORD = rf'"{_QUOTED_MAILBOX_CONTENT}(?:"|$)'
+_PROSE_QUOTATION = re.compile(rf'"{_QUOTED_MAILBOX_CONTENT}"')
+_MAILBOX_WORD = rf'(?:{_QUOTED_MAILBOX_WORD}|[^\s()<>,;:\[\]"]+)+'
+_MAILBOX_LEXEME = re.compile(_MAILBOX_WORD)
+
+
+@dataclass(frozen=True)
+class _MailboxToken:
+    address: str
+    start: int
+    end: int
+
+
+def _mailbox_cfws_end(text: str, position: int, limit: int) -> int:
+    """Consume RFC folding whitespace and balanced comments between mailbox parts."""
+    while position < limit:
+        if text[position].isspace():
+            position += 1
+        elif text[position] == "(":
+            depth = 1
+            position += 1
+            while position < limit and depth:
+                character = text[position]
+                if character == "\\":
+                    position = min(position + 2, limit)
+                    continue
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                position += 1
+        else:
+            break
+    return position
+
+
+def _mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
+    """Yield whole literal mailboxes and their spans from prose, never substrings."""
+    tokens: list[_MailboxToken] = []
+    regions = [(0, len(text))]
+    while regions:
+        left, right = regions.pop()
+        position = left
+        while (match := _MAILBOX_LEXEME.search(text, position, right)) is not None:
+            start, end = match.span()
+            while True:
+                next_part = _mailbox_cfws_end(text, end, right)
+                if text[end - 1] == "@":
+                    # Keep comments/domain attached even when the lexical word
+                    # ended at @. Invalid or missing domains remain opaque.
+                    continuation = _MAILBOX_LEXEME.match(text, next_part, right)
+                    end = continuation.end() if continuation else next_part
+                    if continuation is None:
+                        break
+                elif next_part < right and text[next_part] == "@":
+                    end = next_part + 1
+                else:
+                    break
+            position = end
+            # Sentence punctuation is outside the mailbox. Consecutive dots stay
+            # inside an invalid lexical word; do not repair a malformed domain.
+            end = start + len(text[start:end].rstrip("!?"))
+            if text[start:end].endswith(".") and not text[start:end].endswith(".."):
+                end -= 1
+            word = text[start:end]
+            if _PROSE_QUOTATION.fullmatch(word):
+                # A standalone prose quotation may contain addresses. A quoted
+                # local part followed by @domain is consumed whole above.
+                regions.append((start + 1, end - 1))
+                continue
+            if "@" not in word:
+                continue
+            try:
+                address = normalize_validated_address(word)
+            except ValueError:
+                continue
+            # Normalization may parse a display name or trim malformed text. That
+            # cannot manufacture a token: only the whole literal word qualifies.
+            if address == word.casefold():
+                tokens.append(_MailboxToken(address, start, end))
+    return tuple(tokens)
+
+
 def _attendee_evidence_supported(
     address: str, evidence: SchedulingEvidence, source: SchedulingSource
 ) -> bool:
-    """Match a complete mailbox in prose and in its original quoted context."""
-    mailbox = re.compile(
-        r"(?<![\w.!#$%&'*+/=?^`{|}~@-])" + re.escape(address) + r"(?![\w@-]|\.(?=\S))"
-    )
+    """Require the same complete token in a quote and its full source occurrence."""
     quote = _canonical_evidence_text(evidence.quote)
-    if not quote or not mailbox.search(quote.casefold()):
+    quote_tokens = tuple(token for token in _mailbox_tokens(quote) if token.address == address)
+    if not quote_tokens:
         return False
     for raw_candidate in _evidence_candidates(evidence, source):
         candidate = _canonical_evidence_text(raw_candidate)
+        source_tokens = set(_mailbox_tokens(candidate))
         position = 0
         while (position := candidate.find(quote, position)) >= 0:
-            end = position + len(quote)
-            # Keep neighboring characters: a quote must not crop a larger mailbox.
-            context = candidate[max(0, position - 2) : end + 2]
-            if mailbox.search(context.casefold()):
+            if any(
+                _MailboxToken(address, position + token.start, position + token.end)
+                in source_tokens
+                for token in quote_tokens
+            ):
                 return True
             position += 1
     return False

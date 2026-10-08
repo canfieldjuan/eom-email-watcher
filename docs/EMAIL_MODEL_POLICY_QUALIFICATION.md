@@ -103,7 +103,9 @@ ordinary prose. Blame traces this assumption to
 Minimal public reproduction: an attendee supported by
 `Please invite sender@example.com to our meeting.` was rejected with
 `attendee_unsupported`. The source-bound matcher now recognizes a complete
-normalized mailbox inside prose and checks the source occurrence's boundaries.
+complete normalized mailbox tokens inside prose and compares their full spans
+at the quote's original source occurrence. The quote and full source use the same
+tokenizer, including quoted local parts, escapes and balanced comments.
 It also prevents a quote cropped out of a larger local part/domain from creating
 false support. The header-parser call and its redundant validity helper are
 removed; the mailbox adapter's actual header parser is unchanged.

@@ -120,3 +120,26 @@ Fail-first prose regression:1 failed in0.37s with attendee_unsupported. After th
 Offline retained-output replay repairs only attendee support and preserves new_meeting_ambiguous rejection. The isolated mailbox variant passes; larger local/domain cropped quotes admitted before are rejected after. No new generation, source prompt/schema/corpus/default change or model promotion. See docs/EMAIL_MODEL_POLICY_QUALIFICATION.md for the single Email policy/result record.
 
 Gap audit: NOT DONE for full 9B qualification/promotion. Direct corpus safety is proven; actual gateway run, scheduling compatibility and independent semantic review remain outstanding. The bounded run stayed stopped at67 submissions.
+
+### Tokenizer implementation receipt
+
+Contract-only16e4c32731d0125272ab00c5bffb1a1be4ef6eaa preceded implementation.
+The initial quoted-local reproduction failed12 cases before the fix because
+attendee_unsupported was absent. The tokenizer now consumes whole lexical
+mailboxes, including escaped quoted locals and folding whitespace/balanced
+comments around @, and yields literal normalized identity with exact spans.
+Both quote and full source use that owner. It removes my address-specific
+boundary regex and two-character neighboring window from18b6412.
+
+Final affected scheduling/model/gateway/benchmark check:282 passed in1.00s.
+Ruff All checks passed; diff check clean. Original tests remain byte-preserved.
+Cold AST audit: the only existing definition changed is
+_attendee_evidence_supported; new helpers own tokens, spans and RFC comment
+consumption. Empty, malformed, mixed/repeated, cropped quoted/local/domain,
+escaped/unterminated and valid display/quoted/punctuation cases are covered.
+Retained scheduling replay still rejects new_meeting_ambiguous; isolated attendee
+support passes. No generation: cumulative67, gateway0, stopped reservation.
+Durable tokenizer-audit.json and tokenizer-adjacent-tests.txt record this proof.
+
+Gap audit: DONE for the accepted tokenizer origin repair. NOT DONE for fresh-head
+CI/review, oversight acceptance-hold clearance and full 9B qualification.
