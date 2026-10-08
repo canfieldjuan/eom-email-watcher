@@ -143,3 +143,33 @@ Durable tokenizer-audit.json and tokenizer-adjacent-tests.txt record this proof.
 
 Gap audit: DONE for the accepted tokenizer origin repair. NOT DONE for fresh-head
 CI/review, oversight acceptance-hold clearance and full 9B qualification.
+
+
+## Grammar-by-source revision before implementation
+
+Operator direction: address the threads. Oversight r4213450654 confirms the
+existing validator acceptance covers this design correction without new approval.
+My introducing 194ff60b7a32b947ca7d11d12475720a025029c5 mixed RFC header comments,
+CFWS, bracketed domains and display names into prose. This is the inverse of the
+original RFC parser applied to prose. Root correction note r4213849129 precedes
+implementation; this revision is committed separately first.
+
+Required surface: mailbox.py owns sender-header parsing with the real RFC parser,
+normalization and exact raw mailbox spans. scheduling.py owns one strict prose
+lexer for subject/body/attachment_name: dot-atom@dot-atom, parentheses and quotes
+as punctuation; RFC-exotic compounds remain opaque. Both token streams feed the
+existing exact identity and quote-occurrence span check. Remove the mixed RFC/prose
+comment continuation and recursion owner rather than patch its four reported sites.
+
+Tests: each bot finding belongs to its source grammar; valid sender comments and
+CFWS pass, sender display names/comments/domain interiors cannot become attendees,
+prose parenthetical mentions and quoted speech pass, exotic prose fails closed.
+Keep cropped cases and add a context-bearing cropped quote while the same address
+appears whole elsewhere. That negative must fail when occurrence equality is
+mutated to address-anywhere. Fail-first grammar cases, adjacent scheduling/mailbox/
+model/gateway/benchmark tests and Ruff; reuse retained offline qualification replay.
+
+Non-scope: existing recipient_addresses behavior, model/runtime/settings/prompts,
+normal profile and schema unchanged. No new generation/retry/gateway run or model
+promotion. Ambiguity, live gateway and semantic review remain qualification gates.
+Hold stays for independent exact-head verification; one correction push.
