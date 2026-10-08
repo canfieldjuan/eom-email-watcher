@@ -682,3 +682,48 @@ Gap audit: NOT DONE. Source/native correction is verified; exact published-head
 CI and independent oversight verification remain. The hold stays open until that
 verification and operator merge clearance. Normal installation/recovery remains
 pending after merge; this development proof is not a release or normal-host claim.
+
+
+## Review follow-up contract before implementation
+
+Root cause: a047617 treated the exported manager environment as account identity,
+checked only the pre-acquisition lock inode, used POSIX shlex for systemd's ANSI-C
+wire values, and treated a zero-test Rust exit as a proof. These are origin defects
+in my manager resolver, lease owner and CI proof runner, confirmed by review.
+The old lock-deletion probe additionally proves that one post-acquisition inode
+check alone cannot protect an old reader if deletion happened before a new open.
+
+Required surface: the existing manager resolver cross-checks exported HOME with
+pwd.getpwuid(getuid()).pw_dir, and checks the selected unit directory against the
+manager's UnitPath before any lock/publication writes. One wire decoder handles
+manager environment and UnitPath, including systemd's ANSI-C byte quoting; remove
+shlex as the production decoder. Keep loaded scheduled ExecStart admission.
+The proof runner must require exactly one successful Rust test, with negative
+zero/renamed/unignored and false/multiple result probes. Add the missing evidence
+that admission runs inside the shared lease and that shell publication keeps its
+exclusive lease after uv through unit reload and verification.
+
+The proposed lock-origin change uses the stable account-home directory inode as
+the shared/exclusive kernel coordination anchor, with one identity check after
+acquisition and the same bounded waits/inherited source descriptor. This closes
+the reproduced state-file-deletion split rather than relying on a check that the
+counterexample passes. This is a lock-path/holder departure: operator acceptance
+is pending before that implementation. Do not change the lock owner until accepted.
+
+Verification: minimal wrong-account-home and foreign-UnitPath publication probes
+must fail before and pass after with no target writes. Retain the deleted-before-
+open counterexample; separately test replacement during acquisition. Require
+fail-before zero Rust results, spaces/escaped UTF-8 manager paths, and both missing
+ordering regressions through mutation probes. Incremental deployment/proof tests,
+Ruff/bash/diff checks; rebuild and reuse v8's public schema28/native parity oracle.
+The new account check requires an explicit external NSS fixture for isolated
+native proof homes, never a production bypass: record this added OS substitution,
+prove it leaves v8's retained oracle unchanged, then use it with the new binary.
+
+Non-scope: no model/runtime/prompt, schema, authority, timer cadence, mail sending,
+normal-profile changes, dependency/version bump or new admitted graph shape.
+Canonical instructions stay in README. The unbounded-test-runner, real-bus test,
+system-python bootstrap and NFS semantics observations remain non-blocking
+follow-up work. One grouped correction push; hold remains until independent
+verification and operator merge clearance. Implementation/evidence and cold audit
+will be recorded after the probes; gap audit remains NOT DONE.
