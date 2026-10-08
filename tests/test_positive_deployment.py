@@ -9,6 +9,22 @@ ROOT = Path(__file__).resolve().parents[1]
 NAMES = tuple(sorted(path.name for path in (ROOT / "systemd").iterdir()))
 
 
+@pytest.mark.parametrize(
+    "field,value,advice",
+    [
+        ("NeedDaemonReload", "yes", "daemon-reload"),
+        ("LoadState", "masked", "unmask"),
+        ("LoadState", "not-found", "partial"),
+        ("DropInPaths", "/public/override.conf", "drop-in"),
+        ("FragmentPath", "/public/stale.service", "fragment"),
+    ],
+)
+def test_graph_refusal_names_actual_repair(paired_deployment, field, value, advice):
+    binary, _, _, _ = paired_deployment(changes={"eom-email-watcher.service": {field: value}})
+    with pytest.raises(deployment.DeploymentError, match=advice):
+        deployment.verify_scheduled_readers(binary)
+
+
 @pytest.mark.parametrize("unit", NAMES)
 @pytest.mark.parametrize(
     "field,value",
@@ -31,6 +47,233 @@ def test_store_admission_uses_one_manager_read(tmp_path, paired_deployment):
     with Store(tmp_path / "public.sqlite3").connection():
         pass
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("operation", ["health.get", "config.initialize"])
+def test_startup_refusal_uses_api_envelope(monkeypatch, operation):
+    import io
+    import json
+
+    def refuse():
+        raise deployment.DeploymentError("public startup refusal")
+
+    monkeypatch.setattr(deployment, "verify_database_admission", refuse)
+    monkeypatch.setattr(sys, "argv", ["/public/eom-mail-engine"])
+    request = {"protocol": 1, "operation": operation, "payload": {}}
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(request).encode())))
+    output = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setitem(
+        engine_api.OPERATIONS, operation, lambda _: pytest.fail("operation reached")
+    )
+    with pytest.raises(SystemExit) as exit_result:
+        deployment.main()
+    output.flush()
+    assert exit_result.value.code == 2
+    assert output.buffer.getvalue(), "startup refusal bypassed the API envelope"
+    assert json.loads(output.buffer.getvalue()) == {
+        "protocol": 1,
+        "operation": operation,
+        "ok": False,
+        "error": {"code": "deployment_refused", "message": "public startup refusal"},
+    }
+
+
+@pytest.mark.parametrize("raw,code", [
+    (b"", "invalid_json"),
+    (b"{" + b" " * engine_api.MAX_REQUEST_BYTES, "request_too_large"),
+    (b'{"protocol":99,"operation":"health.get"}', "unsupported_protocol"),
+])
+def test_api_parses_and_bounds_before_admission(monkeypatch, raw, code):
+    import io
+    import json
+
+    monkeypatch.setattr(
+        deployment, "verify_database_admission", lambda: pytest.fail("admission reached")
+    )
+    monkeypatch.setattr(sys, "argv", ["/public/eom-mail-engine"])
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw)))
+    output = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stdout", output)
+    with pytest.raises(SystemExit) as result:
+        deployment.main()
+    output.flush()
+    assert result.value.code == 2
+    assert json.loads(output.buffer.getvalue())["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    "cause", [RuntimeError("public write failure"), ValueError("public invalid write")]
+)
+def test_connect_persistence_wraps_other_errors(monkeypatch, cause):
+    failure = engine_api.connect.ConnectError("PUBLIC", "public provider refusal", retryable=False)
+
+    def refuse(*args):
+        raise cause
+
+    monkeypatch.setattr(engine_api, "_mark_connect_failed", refuse)
+    with pytest.raises(
+        RuntimeError, match="Connect failure could not be persisted safely"
+    ) as observed:
+        engine_api._persist_connect_failure(None, "public-job", None, failure)
+    assert observed.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("path", ["legacy", "generic", "entitlement", "submission"])
+def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
+    import hashlib
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    refusal = deployment.DeploymentError("public persistence refusal")
+    failure = engine_api.connect.ConnectError("PUBLIC", "public provider refusal", retryable=False)
+
+    def submit(*args):
+        raise failure
+
+    def persist(*args):
+        raise refusal
+
+    runtime = SimpleNamespace(
+        store=SimpleNamespace(
+            connect_dispatch=lambda _: SimpleNamespace(source_available=True),
+        )
+    )
+    capability = SimpleNamespace()
+    job = SimpleNamespace(
+        job_id="public-job",
+        artifact=SimpleNamespace(
+            byte_size=1,
+            sha256=hashlib.sha256(b"x").hexdigest(),
+        ),
+    )
+    client = SimpleNamespace(submit=submit)
+    monkeypatch.setattr(engine_api.connect, "ConnectClient", lambda _: client)
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", lambda _: client)
+    monkeypatch.setattr(engine_api, "_mark_connect_failed", persist)
+    monkeypatch.setattr(engine_api, "_require_generic_connect_source_lock", lambda *args: None)
+    monkeypatch.setattr(engine_api, "connect_operation_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(engine_api, "_require_submission_authority_for_job", lambda *a, **k: True)
+    with pytest.raises(deployment.DeploymentError) as observed:
+        if path == "legacy":
+            engine_api._run_connect_job(runtime, capability, job, b"x")
+        elif path == "generic":
+            engine_api._run_generic_connect_job(runtime, capability, job, b"x")
+        elif path == "entitlement":
+            engine_api._persist_connect_entitlement_failure(
+                runtime, job.job_id, capability, failure
+            )
+        else:
+            engine_api._submit_generic_connect_job(
+                runtime,
+                capability,
+                job,
+                "public-message",
+                lambda: b"x",
+                inactive_dispatch_state="waiting",
+            )
+    assert observed.value is refusal
+
+
+def test_database_connection_checks_each_later_open(tmp_path, paired_deployment):
+    from eom_email_watcher.db import Store
+
+    _, records, calls, _ = paired_deployment()
+    store = Store(tmp_path / "public.sqlite3")
+    with store.connection() as db:
+        assert db.execute("SELECT 1").fetchone()[0] == 1
+    records["eom-email-watcher.service"]["NeedDaemonReload"] = "yes"
+    with pytest.raises(deployment.DeploymentError), store.connection():
+        pytest.fail("cached admission allowed another open")
+    assert calls == ["snapshot", "snapshot"]
+
+
+def test_public_schema_28_refusal_precedes_migration(tmp_path, monkeypatch, paired_deployment):
+    import hashlib
+    import io
+    import json
+    import sqlite3
+    from contextlib import closing
+
+    from test_db import _reset_to_schema_28
+
+    from eom_email_watcher.db import SCHEMA_VERSION, Store
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    config = tmp_path / "config.toml"
+    response = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "config.initialize",
+            "config_path": str(config),
+            "payload": {
+                "model_base_url": "http://127.0.0.1:9/v1",
+                "model_name": "public-proof",
+                "timezone": "America/Chicago",
+            },
+        }
+    )
+    assert response["ok"] is True
+    database = state / "eom-email-watcher/watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    _reset_to_schema_28(store)
+    with closing(sqlite3.connect(database)) as db:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    binary, records, _, _ = paired_deployment(
+        changes={
+            "eom-email-watcher.timer": {"LoadState": "not-found"},
+        }
+    )
+    opened = []
+    connect = sqlite3.connect
+
+    def record_open(*args, **kwargs):
+        opened.append(args)
+        return connect(*args, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(sqlite3, "connect", record_open)
+        with pytest.raises(deployment.DeploymentError):
+            store.initialize()
+    assert opened == [], "migration must refuse before acquiring the database"
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+    request = {"protocol": 1, "operation": "health.get", "config_path": str(config), "payload": {}}
+
+    def invoke(argv, payload):
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload)))
+        output = io.TextIOWrapper(io.BytesIO())
+        monkeypatch.setattr(sys, "stdout", output)
+        with pytest.raises(SystemExit) as result:
+            deployment.main()
+        output.flush()
+        return result.value.code, output.buffer.getvalue()
+
+    status, output = invoke([str(binary)], json.dumps(request).encode())
+    assert status == 2
+    assert json.loads(output)["error"]["code"] == "deployment_refused"
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+    records["eom-email-watcher.timer"]["LoadState"] = "loaded"
+    status, output = invoke([str(binary)], json.dumps(request).encode())
+    assert status == 0, output
+    assert json.loads(output)["ok"] is True
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    status, output = invoke(
+        [str(binary), "--cli", "--config", str(config), "recent", "--limit", "1"], b""
+    )
+    assert status == 0
+    assert json.loads(output) == []
 
 
 def test_deployment_refusal_has_distinct_type():

@@ -521,3 +521,40 @@ fail under those mutations. Rebuild native, replay v6 graph negatives adjusted f
 API envelopes, pair/overlap and initial config refusal, real Rust parser checks.
 Affected suites, lint and local native evidence; CI owns broad duplicate suites.
 Hold remains for independent exact-head verification and operator merge clearance.
+
+
+### Refusal-boundary evidence
+
+The startup read/initialization and four persistence identity reproductions failed
+six cases before the correction. Graph-repair advice failed five; source alias
+replacement and unreadable artifact classification each failed one. The source
+installer now shares one ELF classifier and aborts on read error before any uv or
+unit publication. No separate admission owner was added for source installations.
+
+Affected deployment/Connect suites: 312 passed. Final added parsing/error-wrapping
+and installer regressions: 90 passed. Per-Store caching, migration-before-admission,
+compatible helper PIDs and no-arguments PATH discovery mutations are all caught.
+The migration-order mutation initially survived because rollback preserved bytes;
+the tracked regression now also proves no database connection is acquired.
+
+Native v7 uses the same public schema-28 input and shipped-manager substitution as
+v6. All 34 graph negatives retain schema/bytes, API refusals have typed envelopes,
+paired upgrade reaches schema30 and actual API/CLI processes overlap. The real
+Rust receiver returns deployment_refused for health and initialization; initial
+configuration remains absent and the failure is definitive. Its tracked native
+receiver test is explicitly ignored in ordinary suites and exercised by the
+isolated native proof. Four compiled modules and five unit payloads equal source.
+
+Differences from v6: bounded API input is parsed before startup admission, allowing
+its existing response owner to return the refusal. CLI stderr/exit behavior is
+unchanged. The old pre-stdin image-replacement synchronization no longer applies;
+existing current-image/per-open source regressions remain, and the native proof
+adds actual desktop read/init receiver checks. Native Python/source manifest was
+unchanged after that proof; the final shell-only read-error refusal has its direct
+fail-before/pass-after regression. No broad CI matrix was duplicated locally.
+
+Durable evidence aliases: refusal-fail-before-v7.txt, mutations-v7.json,
+refusal-adjacent-v7.txt, refusal-final-regressions-v7.txt, freeze-receipt-v7.json,
+packaged-schema-proof-v7.json and native-desktop-parser-v7.txt. Public review replies
+bind aliases by sha256. Oversight holds remain until exact-head verification and
+the operator's merge clearance.

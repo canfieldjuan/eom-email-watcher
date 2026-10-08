@@ -337,6 +337,15 @@ retrying. A deployment refusal is reported as `deployment_refused`, rather than 
 stale or concurrent update. The LM Studio helper is part of the pinned graph; its
 canonical retained active state is allowed once its execution PIDs are zero.
 
+The paired deployment requires a user manager whose effective units have no
+drop-ins, including vendor-wide `service.d` or `timer.d` overrides. A host with
+those overrides is refused until they are removed. The desktop and user manager
+must resolve the same `XDG_CONFIG_HOME` unit directory. Pending reloads require
+`systemctl --user daemon-reload`; masked units require `systemctl --user unmask`.
+For a partial graph, remove its partial five-unit installation, reload the manager,
+then reinstall the complete pair. Foreign fragments must be removed before the
+same reload/install sequence. The installer also enforces this admission policy.
+
 For an explicitly source-only installation, use the locked production uv snapshot:
 
 ```bash
@@ -353,6 +362,8 @@ LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json 
 The source-only lane is exempt from native admission and does not establish paired
 desktop safety. A desktop bundle embeds its authority at build time; do not pass a
 keyring to its installer. Both modes consume the same shipped unit payload owner.
+Source installation refuses to replace an existing native scheduled alias; use
+the concrete desktop `--engine` installer to update that paired deployment.
 Service cadence, sandbox, ntfy delivery and attachment confirmation remain as before.
 Logs contain message IDs and sanitized failure classes, not bodies or credentials.
 Post-send reservation recovery after a deployment refusal is tracked in

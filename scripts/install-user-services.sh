@@ -14,14 +14,21 @@ release_keyring_input=""
 release_keyring_stage=""
 # Installation mode is explicit; PATH cannot identify the desktop's sidecar.
 packaged_engine=""
+is_native_artifact() {
+  local artifact_magic
+  artifact_magic="$(od -An -N4 -tx1 "$1")" || {
+    echo "Cannot read the artifact identity; repair it before installation." >&2
+    exit 2
+  }
+  artifact_magic="${artifact_magic//[[:space:]]/}"
+  [[ "$artifact_magic" == 7f454c46 ]]
+}
 if [[ "$#" == 2 && "$1" == --engine && "$2" == /* ]]; then
   packaged_engine="$2"
   if [[ ! -f "$packaged_engine" || ! -x "$packaged_engine" ]]; then
     echo "The concrete desktop engine must be an executable file." >&2; exit 2
   fi
-  artifact_magic="$(od -An -N4 -tx1 "$packaged_engine")"
-  artifact_magic="${artifact_magic//[[:space:]]/}"
-  if [[ "$artifact_magic" != 7f454c46 ]]; then
+  if ! is_native_artifact "$packaged_engine"; then
     echo "Select the concrete native desktop engine, not a source shim." >&2; exit 2
   fi
   if [[ -n "$release_keyring_source" ]]; then
@@ -37,6 +44,22 @@ if [[ "$#" == 2 && "$1" == --engine && "$2" == /* ]]; then
   exit 0
 elif [[ "$#" != 1 || "$1" != --source ]]; then
   echo "Usage: install-user-services.sh --engine /absolute/desktop/sidecar OR --source" >&2
+  exit 2
+fi
+
+# uv publishes this same alias. Refuse before it can replace a native desktop
+# deployment; source installation remains independent of native admission.
+if [[ -e "$tool_bin_dir/eom-mail-watch" ]]; then
+  if [[ ! -f "$tool_bin_dir/eom-mail-watch" || ! -r "$tool_bin_dir/eom-mail-watch" ]]; then
+    echo "Cannot inspect the existing scheduled alias; repair it before source installation." >&2
+    exit 2
+  fi
+  if is_native_artifact "$tool_bin_dir/eom-mail-watch"; then
+    echo "Source installation would replace the paired native alias. Use --engine with the desktop sidecar." >&2
+    exit 2
+  fi
+elif [[ -L "$tool_bin_dir/eom-mail-watch" ]]; then
+  echo "The scheduled alias is unresolved; repair it before source installation." >&2
   exit 2
 fi
 

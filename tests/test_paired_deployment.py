@@ -104,9 +104,17 @@ def test_an_observed_exit_needs_a_subsequent_fresh_zero_snapshot(paired_deployme
 
 
 @pytest.mark.parametrize("key", ["MainPID", "ControlPID"])
-def test_helper_execution_refuses_even_with_paired_inode(paired_deployment, key):
+def test_helper_execution_refuses_even_with_paired_inode(paired_deployment, monkeypatch, key):
     binary, _, _, _ = paired_deployment(
         changes={"eom-email-lmstudio.service": {key: str(os.getpid())}}
+    )
+    original = deployment._same_executable
+    monkeypatch.setattr(
+        deployment,
+        "_same_executable",
+        lambda value, owner: (
+            True if value == f"/proc/{os.getpid()}/exe" else original(value, owner)
+        ),
     )
     with pytest.raises(deployment.DeploymentError):
         deployment.verify_scheduled_readers(binary)
@@ -229,7 +237,7 @@ def test_both_entrypoints_use_startup_admission(monkeypatch, entry):
     }[entry]
     monkeypatch.setattr(sys, "argv", argv)
     deployment.main()
-    assert events == ["admitted", "api" if entry == "api" else "cli"]
+    assert events == (["api"] if entry == "api" else ["admitted", "cli"])
 
 
 @pytest.mark.parametrize(

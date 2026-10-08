@@ -268,13 +268,28 @@ def _configured_graph(
         return False
     for unit in description.units:
         record = snapshot[unit.name]
-        if (
-            record["LoadState"] != "loaded"
-            or record["DropInPaths"] != ""
-            or record["NeedDaemonReload"] != "no"
-            or record["FragmentPath"] != str(description.unit_directory / unit.name)
-        ):
-            raise DeploymentError("The scheduled graph is not the shipped deployment; reinstall it")
+        if record["LoadState"] == "masked":
+            raise DeploymentError(
+                f"Scheduled unit {unit.name} is masked; run systemctl --user unmask {unit.name}, "
+                "then systemctl --user daemon-reload before paired installation"
+            )
+        if record["DropInPaths"]:
+            raise DeploymentError(
+                f"Scheduled unit {unit.name} has effective drop-ins; remove its user/vendor "
+                "overrides and run systemctl --user daemon-reload before paired installation"
+            )
+        if record["NeedDaemonReload"] != "no":
+            raise DeploymentError("Run systemctl --user daemon-reload before paired installation")
+        if record["LoadState"] != "loaded":
+            raise DeploymentError(
+                "The scheduled graph is partial; remove the partial five-unit installation, "
+                "run systemctl --user daemon-reload, then install the complete paired deployment"
+            )
+        if record["FragmentPath"] != str(description.unit_directory / unit.name):
+            raise DeploymentError(
+                f"Scheduled unit {unit.name} uses a foreign fragment; remove that fragment, "
+                "run systemctl --user daemon-reload, then install the paired deployment"
+            )
         if unit.name in SCHEDULED_JOBS and record["Unit"] != SCHEDULED_JOBS[unit.name][0]:
             raise DeploymentError("The scheduled timer does not target its shipped service")
         if unit.name.endswith(".service"):
@@ -413,9 +428,9 @@ def _dispatch_entrypoint() -> None:
     cli_mode = args[:1] == ["--cli"] or alias
     cli_args = args[1:] if args[:1] == ["--cli"] else args
     readonly_version = cli_mode and cli_args == ["--version"]
-    if not readonly_version:
-        verify_database_admission()
     if cli_mode:
+        if not readonly_version:
+            verify_database_admission()
         cli.main(cli_args)
     else:
         engine_api.main()

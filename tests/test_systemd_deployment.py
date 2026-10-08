@@ -383,6 +383,7 @@ def _run_installer(
     source_first: bool = True,
     artifact: bytes | None = None,
     installer_args: list[str] | None = None,
+    artifact_reader_body: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -416,6 +417,11 @@ def _run_installer(
         "rmdir",
         "od",
     ):
+        if name == "od" and artifact_reader_body is not None:
+            tool = fake_bin / name
+            tool.write_text(artifact_reader_body)
+            tool.chmod(0o700)
+            continue
         target = shutil.which(name)
         assert target is not None
         (fake_bin / name).symlink_to(target)
@@ -610,6 +616,50 @@ def test_installer_rejects_incompatible_desktop_before_publishing_services(
     assert not (tmp_path / "uv.log").exists()
     assert not (tmp_path / "systemctl.log").exists()
     assert not (home / ".config/systemd/user/eom-email-watcher.service").exists()
+
+
+@posix_installer
+def test_source_installer_preserves_existing_paired_native_alias(tmp_path):
+    home = tmp_path / "home"
+    alias = home / ".local/bin/eom-mail-watch"
+    alias.parent.mkdir(parents=True)
+    _write_native_engine(alias, "#!/bin/sh\nexit 0\n")
+    before = alias.read_bytes()
+    result = _run_installer(tmp_path, home, installer_args=["--source"])
+    assert result.returncode == 2, "source installation overwrote the paired native alias"
+    assert alias.read_bytes() == before
+    assert not (tmp_path / "uv.log").exists()
+    assert not (tmp_path / "systemctl.log").exists()
+
+
+@posix_installer
+def test_source_installer_refuses_unreadable_artifact_identity(tmp_path):
+    home = tmp_path / "home"
+    alias = home / ".local/bin/eom-mail-watch"
+    alias.parent.mkdir(parents=True)
+    _write_native_engine(alias, "#!/bin/sh\nexit 0\n")
+    before = alias.read_bytes()
+    result = _run_installer(
+        tmp_path, home, installer_args=["--source"], artifact_reader_body="#!/bin/sh\nexit 5\n"
+    )
+    assert result.returncode == 2, "an unreadable native identity was classified as source"
+    assert alias.read_bytes() == before
+    assert not (tmp_path / "uv.log").exists()
+    assert not (tmp_path / "systemctl.log").exists()
+
+
+@posix_installer
+def test_no_arguments_never_discovers_native_engine_on_path(tmp_path):
+    result = _run_installer(
+        tmp_path,
+        tmp_path / "home",
+        installer_args=[],
+        engine_body='#!/bin/sh\nprintf invoked > "$HOME/native-invoked"\nexit 0\n',
+    )
+    assert result.returncode == 2
+    assert not (tmp_path / "home/native-invoked").exists()
+    assert not (tmp_path / "uv.log").exists()
+    assert not (tmp_path / "systemctl.log").exists()
 
 
 @posix_installer
