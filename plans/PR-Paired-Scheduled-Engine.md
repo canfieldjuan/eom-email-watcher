@@ -486,3 +486,38 @@ Alias cold-diff-audit-v6.md, sha256 714135eaadc1ea39ce5336ff0bd07e7d03b7751c0153
 
 Gap audit: implementation/local/native proof DONE; new-head CI and oversight
 verification/operator merge clearance NOT DONE. Hold remains unresolved.
+
+
+## Refusal-boundary revision before implementation
+
+Operator direction: address threads after exact659dab2 review. My initial startup
+bcf90be7 and cc7d308 admission happens outside the API envelope; my659dab2 typed
+handler therefore only handles in-request changes. Four legacy broad persistence
+wrappers (first9eac8530) relabel it. My659dab2 also removed the no-cache and
+schema28 regressions. One API boundary and one persistence helper end this class.
+
+Required surface: API admission after bounded parsing inside its existing response
+owner; CLI startup unchanged. One contextual Connect persistence owner preserves
+DeploymentError and wraps other persistence errors, replacing all four copies.
+Restore repeated Store opens and public schema28 negative/paired API+CLI migration
+coverage. Real-process read/init refusals must deserialize in the desktop parser
+as deployment_refused, definitive rather than protocol_error/outcome_unknown.
+
+Small adjacent findings: graph owner names reload/unmask/drop-in/partial repair;
+source installer refuses to replace a paired native alias before snapshot writes.
+Helper PID regression must model a truly compatible PID. Empty-drop-in admission
+requires a host without effective service.d/timer.d vendor overrides; document
+the condition without inventing support claims. SCHEDULED_COMMANDS is used.
+
+Non-scope: accepted five-unit pins, selected engine and one-read invariant unchanged;
+no model/schema/dependency, normal-profile, arbitrary graph or UI redesign work.
+Existing public native schema oracle/smoke and baselinev6 own parity; only refusal
+API transport changes, to fulfill condition1. Keep per-open DB admission/no cache.
+
+Verification: fail-first startup read/init envelope and four wrapper identity cases;
+restore public schema28 and repeated-open tests. Mutation-kill per-Store caching
+and pre-admission migration; no-args PATH fallback/helper-membership tests must
+fail under those mutations. Rebuild native, replay v6 graph negatives adjusted for
+API envelopes, pair/overlap and initial config refusal, real Rust parser checks.
+Affected suites, lint and local native evidence; CI owns broad duplicate suites.
+Hold remains for independent exact-head verification and operator merge clearance.
