@@ -12,7 +12,10 @@ from pathlib import Path
 from eom_email_watcher.deployment import _MANAGER_FIELDS, SCHEDULED_JOBS, UNIT_NAMES
 
 
-def unit_records(directory: Path, *, loaded: bool) -> dict[str, dict[str, str]]:
+def unit_records(
+    directory: Path, *, loaded: bool, home: Path | None = None
+) -> dict[str, dict[str, str]]:
+    home = home or directory.parents[2]
     records = {}
     for name in UNIT_NAMES:
         item = dict(
@@ -24,7 +27,14 @@ def unit_records(directory: Path, *, loaded: bool) -> dict[str, dict[str, str]]:
             NeedDaemonReload="no",
         )
         if name.endswith(".service"):
-            item.update(MainPID="0", ControlPID="0")
+            item.update(MainPID="0", ControlPID="0", ExecStart="")
+            if loaded:
+                command = f"{home}/.lmstudio/bin/lms"
+                # Scheduled services have the same alias; helper commands are
+                # retained in shipped payloads and never admitted as readers.
+                if name != "eom-email-lmstudio.service":
+                    command = f"{home}/.local/bin/eom-mail-watch"
+                item["ExecStart"] = "{ path=" + command + " ; argv[]=" + command + " ; }"
         else:
             item["Unit"] = SCHEDULED_JOBS[name][0] if loaded else ""
         records[name] = item
@@ -45,42 +55,34 @@ def _with_manager(root: Path, environment: dict[str, str], *, installed: bool) -
     manager.mkdir(mode=0o700, exist_ok=True)
     # This is an external test manager, not a production environment waiver.
     # Reading the isolated installed files simulates daemon-reload in this fixture.
+    manager_home = Path(environment.get("HOME", str(root)))
+    configured = environment.get("XDG_CONFIG_HOME")
+    manager_config = Path(configured) if configured else manager_home / ".config"
+    manager_data = environment.get("XDG_DATA_HOME", str(manager_home / ".local/share"))
     source = (
-        "#!"
-        + sys.executable
-        + "\nimport json,os,sys\nfrom pathlib import Path\n"
-        + "names="
-        + repr(UNIT_NAMES)
-        + "\nfields="
-        + repr(_MANAGER_FIELDS)
-        + "\ninstalled="
-        + repr(installed)
-        + "\njobs="
-        + repr(SCHEDULED_JOBS)
-        + "\noverrides=Path("
-        + repr(str(root / "manager-overrides.json"))
-        + ")\n"
+        "#!" + sys.executable + "\nimport json,shlex,sys\nfrom pathlib import Path\n"
+        + "sys.path.insert(0," + repr(str(Path(__file__).parent)) + ")\n"
+        + "from packaged_proof_environment import render_unit_records,unit_records\n"
+        + "names=" + repr(UNIT_NAMES) + "\nfields=" + repr(_MANAGER_FIELDS)
+        + "\ninstalled=" + repr(installed) + "\njobs=" + repr(SCHEDULED_JOBS)
+        + "\nmanager_home=Path(" + repr(str(manager_home)) + ")"
+        + "\ndirectory=Path(" + repr(str(manager_config / "systemd/user")) + ")"
+        + "\nenvironment=" + repr({"HOME": str(manager_home),
+                                  "XDG_CONFIG_HOME": str(manager_config),
+                                  "XDG_DATA_HOME": manager_data})
+        + "\noverrides=Path(" + repr(str(root / "manager-overrides.json")) + ")\n"
         + "args=sys.argv[1:]\n"
+        + "if args==['--user','show-environment']:\n"
+        + " print('\\n'.join(k+'='+shlex.quote(v) for k,v in environment.items()));sys.exit(0)\n"
         + "if installed and (args==['--user','daemon-reload'] or "
-        "args in [['--user','enable',timer] for timer in jobs]):sys.exit(0)\n"
+        + "args in [['--user','enable',timer] for timer in jobs]):sys.exit(0)\n"
         + "if args!=['--user','show','--all','--no-pager',"
-        "'--property='+','.join(fields),*names]:sys.exit(2)\n"
-        + "home=Path(os.environ['HOME'])\n"
-        + "configured=os.environ.get('XDG_CONFIG_HOME','')\n"
-        + "config=Path(configured) if configured and Path(configured).is_absolute() "
-        "else home/'.config'\n"
-        + "directory=config/'systemd/user'\n"
+        + "'--property='+','.join(fields),*names]:sys.exit(2)\n"
         + "loaded=installed and all((directory/name).is_file() for name in names)\n"
+        + "records=unit_records(directory,loaded=loaded,home=manager_home)\n"
         + "changes=json.loads(overrides.read_text()) if overrides.exists() else {}\n"
-        + "for name in names:\n"
-        + " record=dict(Id=name,LoadState='loaded' if loaded else 'not-found',"
-        "ActiveState='inactive',FragmentPath=str(directory/name) if loaded else '',"
-        "DropInPaths='',NeedDaemonReload='no')\n"
-        + " if name.endswith('.service'):record.update(MainPID='0',ControlPID='0')\n"
-        + " else:record['Unit']=jobs[name][0] if loaded else ''\n"
-        + " record.update(changes.get(name,{}))\n"
-        + " print('\\n'.join(key+'='+value for key,value in record.items()))\n"
-        + " print()\n"
+        + "for name,item in records.items():item.update(changes.get(name,{}))\n"
+        + "print(render_unit_records(records))\n"
     )
     path = manager / "systemctl"
     path.write_text(source)

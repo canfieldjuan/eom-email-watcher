@@ -35,7 +35,7 @@ from .config import (
     exact_sender_selector_id,
     normalize_validated_address,
 )
-from .deployment import verify_database_admission
+from .deployment import database_admission
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -5231,38 +5231,38 @@ class Store:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        verify_database_admission()
-        connection = sqlite3.connect(self.path)
-        connection.execute("PRAGMA recursive_triggers = ON")
-        connection.row_factory = sqlite3.Row
-        connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
-        connection.create_function(
-            "aware_iso_epoch",
-            1,
-            _sqlite_aware_iso_epoch,
-            deterministic=True,
-        )
-        connection.create_function(
-            "message_source_key",
-            3,
-            _message_suppression_key,
-            deterministic=True,
-        )
-        connection.create_function(
-            "message_source_key",
-            4,
-            _message_suppression_key,
-            deterministic=True,
-        )
-        try:
-            yield connection
-        except Exception:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
-        finally:
-            connection.close()
+        with database_admission():
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.row_factory = sqlite3.Row
+                connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
+                connection.create_function(
+                    "aware_iso_epoch",
+                    1,
+                    _sqlite_aware_iso_epoch,
+                    deterministic=True,
+                )
+                connection.create_function(
+                    "message_source_key",
+                    3,
+                    _message_suppression_key,
+                    deterministic=True,
+                )
+                connection.create_function(
+                    "message_source_key",
+                    4,
+                    _message_suppression_key,
+                    deterministic=True,
+                )
+                yield connection
+            except Exception:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+            finally:
+                connection.close()
 
     @contextmanager
     def _source_cleanup_locks(self, message_ids: Iterable[str]) -> Iterator[None]:

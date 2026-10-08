@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import os
 import selectors
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,9 +33,13 @@ _MANAGER_FIELDS = (
     "MainPID",
     "ControlPID",
     "Unit",
+    "ExecStart",
 )
 MAX_MANAGER_BYTES = 64 * 1024
 MANAGER_TIMEOUT_SECONDS = 5
+LEASE_TIMEOUT_SECONDS = 5
+_lease_state_lock = threading.Lock()
+_shared_leases = 0
 
 
 class DeploymentError(Exception):
@@ -51,19 +59,117 @@ class DeploymentDescription:
     alias: Path
     unit_directory: Path
     units: tuple[UnitPayload, ...]
+    manager: ManagerView
+
+
+@dataclass(frozen=True)
+class ManagerView:
+    home: Path
+    unit_directory: Path
+    data_home: Path
+    alias: Path
+    lock_path: Path
+
+
+def _manager_environment() -> dict[str, str]:
+    raw = _read_manager_command(["systemctl", "--user", "show-environment"])
+    selected: dict[str, str] = {}
+    for line in raw.splitlines():
+        if not any(
+            line.startswith(key + "=") for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+        ):
+            continue
+        try:
+            words = shlex.split(line)
+        except ValueError as exc:
+            raise DeploymentError("The manager environment needs repair") from exc
+        if len(words) != 1:
+            raise DeploymentError("The manager environment needs repair")
+        key, _, value = words[0].partition("=")
+        if key in selected:
+            raise DeploymentError("The manager environment has duplicate paths")
+        selected[key] = value
+    return selected
+
+
+def manager_view() -> ManagerView:
+    environment = _manager_environment()
+    home = Path(environment.get("HOME", ""))
+    configured = Path(environment.get("XDG_CONFIG_HOME", ""))
+    configured_data = Path(environment.get("XDG_DATA_HOME", ""))
+    config = configured if configured.is_absolute() else home / ".config"
+    data = configured_data if configured_data.is_absolute() else home / ".local/share"
+    if any(not path.is_absolute() or any(c in str(path) for c in "\r\n")
+           for path in (home, config, data)):
+        raise DeploymentError("The manager must report absolute HOME and XDG paths; repair it")
+    return ManagerView(home, config / "systemd/user", data,
+                       home / ".local/bin/eom-mail-watch",
+                       home / ".local/state/eom-email-watcher/deployment.lock")
 
 
 def service_unit_directory() -> Path:
-    """One XDG resolver for installation and both packaged entrypoints."""
-    configured = os.environ.get("XDG_CONFIG_HOME")
-    root = (
-        Path(configured)
-        if configured and Path(configured).is_absolute()
-        else Path.home() / ".config"
+    """The user manager owns installation paths, including for shell publishers."""
+    return manager_view().unit_directory
+
+
+@contextmanager
+def deployment_lease(
+    view: ManagerView, *, exclusive: bool, inherited_fd: int | None = None
+) -> Iterator[int]:
+    """One bounded flock owner; inherited source publishers retain the same lease."""
+    import fcntl
+
+    global _shared_leases
+    with _lease_state_lock:
+        if exclusive and _shared_leases:
+            raise DeploymentError("Close this process's database connections before installation")
+    message = (
+        "Close the app or stop the timers, then retry installation"
+        if exclusive else "Deployment is being updated; retry after installation"
     )
-    if not root.is_absolute() or "\n" in str(root) or "\r" in str(root):
-        raise DeploymentError("Scheduled unit directory must be one absolute path")
-    return root / "systemd/user"
+    descriptor: int | None = None
+    counted = False
+    try:
+        try:
+            if inherited_fd is not None:
+                if not exclusive:
+                    raise DeploymentError("A publication lease cannot become a database lease")
+                descriptor = inherited_fd
+            else:
+                view.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                descriptor = os.open(view.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            identity = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid()
+                or (identity.st_dev, identity.st_ino) != _inode(view.lock_path)
+            ):
+                raise DeploymentError("The deployment lock cannot be identified; repair it")
+            deadline = time.monotonic() + LEASE_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB,
+                    )
+                    break
+                except BlockingIOError:
+                    if inherited_fd is not None or time.monotonic() >= deadline:
+                        raise DeploymentError(message) from None
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        except OSError as exc:
+            raise DeploymentError("The deployment lock is unavailable; repair it") from exc
+        if not exclusive:
+            with _lease_state_lock:
+                _shared_leases += 1
+                counted = True
+        yield descriptor
+    finally:
+        if counted:
+            with _lease_state_lock:
+                _shared_leases -= 1
+        if descriptor is not None and inherited_fd is None:
+            # Never unlink the lock or unlock an inherited publisher descriptor.
+            os.close(descriptor)
 
 
 def _unit_payloads() -> tuple[UnitPayload, ...]:
@@ -90,16 +196,32 @@ def _inode(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
-def deployment_description(binary: Path) -> DeploymentDescription:
-    alias = Path.home() / ".local/bin/eom-mail-watch"
-    if not binary.is_absolute() or not alias.is_absolute() or any(c in str(alias) for c in "\r\n"):
-        raise DeploymentError("The deployment must name an absolute desktop engine and alias")
+def deployment_description(binary: Path, view: ManagerView | None = None) -> DeploymentDescription:
+    view = view or manager_view()
+    if not binary.is_absolute():
+        raise DeploymentError("The deployment must name an absolute desktop engine")
     try:
-        identity = _inode(binary)
+        # Resolve parents and each final symlink separately: resolving the alias
+        # fully would lose the fact that the selected path traverses that target.
+        target = view.alias.parent.resolve() / view.alias.name
+        selected = binary
+        visited: set[Path] = set()
+        while True:
+            selected = selected.parent.resolve() / selected.name
+            if selected == target:
+                raise DeploymentError("Select the distinct bundle sidecar, not the scheduled alias")
+            if selected in visited:
+                raise DeploymentError("Select an engine without a cyclic redirect")
+            visited.add(selected)
+            if not selected.is_symlink():
+                break
+            redirect = selected.readlink()
+            selected = redirect if redirect.is_absolute() else selected.parent / redirect
+        identity = _inode(selected)
     except OSError as exc:
         raise DeploymentError("The desktop engine cannot be identified") from exc
     return DeploymentDescription(
-        binary, identity, alias, service_unit_directory(), _unit_payloads()
+        selected, identity, view.alias, view.unit_directory, _unit_payloads(), view
     )
 
 
@@ -132,6 +254,11 @@ def _manager_output(names: tuple[str, ...]) -> str:
         "--property=" + ",".join(_MANAGER_FIELDS),
         *names,
     ]
+    return _read_manager_command(command)
+
+
+def _read_manager_command(command: list[str]) -> str:
+    """Shared deadline/output bound for manager environment and unit reads."""
     try:
         with subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -182,9 +309,9 @@ def _manager_snapshot(names: tuple[str, ...]) -> dict[str, dict[str, str]]:
                 raise DeploymentError("Invalid user-manager deployment metadata")
             record[key] = value
         name = record.get("Id")
-        common = set(_MANAGER_FIELDS) - {"MainPID", "ControlPID", "Unit"}
+        common = set(_MANAGER_FIELDS) - {"MainPID", "ControlPID", "Unit", "ExecStart"}
         required = common | (
-            {"Unit"} if name and name.endswith(".timer") else {"MainPID", "ControlPID"}
+            {"Unit"} if name and name.endswith(".timer") else {"MainPID", "ControlPID", "ExecStart"}
         )
         if name not in names or name in records or required != set(record):
             raise DeploymentError("Incomplete or duplicate user-manager unit metadata")
@@ -261,6 +388,7 @@ def _configured_graph(
         and record["DropInPaths"] == ""
         and record["NeedDaemonReload"] == "no"
         and all(record.get(key, "0") == "0" for key in ("MainPID", "ControlPID"))
+        and record.get("ExecStart", "") == ""
         and (name not in SCHEDULED_JOBS or record["Unit"] in {"", SCHEDULED_JOBS[name][0]})
         for name, record in snapshot.items()
     )
@@ -292,6 +420,14 @@ def _configured_graph(
             )
         if unit.name in SCHEDULED_JOBS and record["Unit"] != SCHEDULED_JOBS[unit.name][0]:
             raise DeploymentError("The scheduled timer does not target its shipped service")
+        if unit.name in SCHEDULED_COMMANDS:
+            import re
+
+            paths = re.findall(r"\{ path=(.*?) ;", record["ExecStart"])
+            if paths != [str(description.alias)]:
+                raise DeploymentError(
+                    "The manager's ExecStart must use its paired alias; reinstall"
+                )
         if unit.name.endswith(".service"):
             for key in ("MainPID", "ControlPID"):
                 pid = int(record[key])
@@ -306,7 +442,7 @@ def _configured_graph(
     return True
 
 
-def _verify_description(description: DeploymentDescription) -> None:
+def _verify_description(description: DeploymentDescription, *, paired: bool = True) -> None:
     before = _installed_files(description)
     snapshot = _manager_snapshot(tuple(unit.name for unit in description.units))
     loaded = _configured_graph(description, snapshot)
@@ -314,7 +450,7 @@ def _verify_description(description: DeploymentDescription) -> None:
     if loaded:
         if any(files[unit.name] is None for unit in description.units):
             raise DeploymentError("The shipped deployment has missing installed units")
-        if files["alias"] != description.executable_identity:
+        if paired and files["alias"] != description.executable_identity:
             raise DeploymentError("Scheduled intake must use the concrete paired desktop engine")
     elif any(files[unit.name] is not None for unit in description.units):
         raise DeploymentError("Scheduled unit files are not loaded; reload the user manager")
@@ -326,14 +462,24 @@ def verify_scheduled_readers(binary: Path) -> None:
     _verify_description(deployment_description(binary))
 
 
-def verify_database_admission() -> None:
-    """A fresh deployment check at every packaged Linux database acquisition."""
+@contextmanager
+def database_admission() -> Iterator[None]:
+    """Hold admission through the complete packaged Linux connection lifetime."""
     if not getattr(sys, "frozen", False) or sys.platform != "linux":
+        yield
         return
     description = deployment_description(Path(sys.executable))
-    _current_engine(description)
-    _verify_description(description)
-    _current_engine(description)
+    with deployment_lease(description.manager, exclusive=False):
+        _current_engine(description)
+        _verify_description(description)
+        _current_engine(description)
+        yield
+
+
+def verify_database_admission() -> None:
+    """Read-only startup check; Store.connection owns its longer database lease."""
+    with database_admission():
+        pass
 
 
 def _atomic_unit(path: Path, content: bytes) -> None:
@@ -383,32 +529,62 @@ def _enable_timers() -> None:
         _manager_action(["enable", timer])
 
 
-def install_user_services() -> None:
+def install_user_services(selected_engine: Path | None = None) -> None:
     """The explicitly selected running native engine owns its entire deployment."""
     if not getattr(sys, "frozen", False) or sys.platform != "linux":
         raise DeploymentError("Select the concrete Linux desktop engine to install paired services")
-    description = deployment_description(Path(sys.executable))
-    _current_engine(description)
-    _configured_graph(
-        description, _manager_snapshot(tuple(unit.name for unit in description.units))
-    )
-    description.alias.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=description.alias.parent, prefix=".paired-cli-") as stage:
-        alias = Path(stage) / "eom-mail-watch"
-        alias.symlink_to(description.binary)
+    # A frozen runtime resolves sys.executable; retain the launch path from the
+    # dispatcher so an alias cannot become its own publication source.
+    description = deployment_description(selected_engine or Path(sys.executable))
+    with deployment_lease(description.manager, exclusive=True):
         _current_engine(description)
-        os.replace(alias, description.alias)
-    _install_units(description)
-    _verify_description(description)
-    _current_engine(description)
-    _enable_timers()
+        _configured_graph(
+            description, _manager_snapshot(tuple(unit.name for unit in description.units))
+        )
+        description.alias.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=description.alias.parent, prefix=".paired-cli-"
+        ) as stage:
+            alias = Path(stage) / "eom-mail-watch"
+            alias.symlink_to(description.binary)
+            _current_engine(description)
+            os.replace(alias, description.alias)
+        _install_units(description)
+        _verify_description(description)
+        _current_engine(description)
+        _enable_timers()
     print(f"Paired scheduled intake with {description.binary}.")
 
 
-def install_source_units() -> None:
-    """Explicit source-only installation uses the same shipped unit payload owner."""
-    _install_units(deployment_description(Path(sys.executable)))
-    _enable_timers()
+def install_source_units(inherited_fd: int | None = None) -> None:
+    """The shell's snapshot publication and these unit writes share one lease."""
+    description = deployment_description(Path(sys.executable))
+    with deployment_lease(description.manager, exclusive=True, inherited_fd=inherited_fd):
+        _configured_graph(description, _manager_snapshot(UNIT_NAMES))
+        _install_units(description)
+        _verify_description(description, paired=False)
+        _enable_timers()
+
+
+def confirm_source_publication(inherited_fd: int) -> None:
+    description = deployment_description(Path(sys.executable))
+    with deployment_lease(description.manager, exclusive=True, inherited_fd=inherited_fd):
+        _configured_graph(description, _manager_snapshot(UNIT_NAMES))
+
+
+def publish_source_snapshot(script: Path) -> None:
+    """Keep the exclusive open-file description across all shell/uv publication."""
+    view = manager_view()
+    with deployment_lease(view, exclusive=True) as descriptor:
+        environment = dict(os.environ, HOME=str(view.home),
+                           XDG_CONFIG_HOME=str(view.unit_directory.parent.parent),
+                           XDG_DATA_HOME=str(view.data_home))
+        result = subprocess.run(
+            ["bash", str(script), "--source-locked", str(descriptor)],
+            env=environment, pass_fds=(descriptor,), check=False,
+        )
+        if result.returncode:
+            raise SystemExit(result.returncode)
 
 
 def _dispatch_entrypoint() -> None:
@@ -422,7 +598,7 @@ def _dispatch_entrypoint() -> None:
         print(service_unit_directory())
         return
     if args == ["--install-user-services"]:
-        install_user_services()
+        install_user_services(Path(sys.argv[0]).absolute())
         return
     alias = Path(sys.argv[0]).name in {"eom-mail-watch", "eom-mail-watch.exe"}
     cli_mode = args[:1] == ["--cli"] or alias

@@ -270,13 +270,13 @@ def test_non_native_linux_lanes_remain_exempt(monkeypatch, frozen, platform):
 
 @pytest.mark.parametrize("setting", [None, "", "relative", "absolute"])
 def test_unit_directory_has_one_xdg_resolver(monkeypatch, tmp_path, setting):
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    if setting is None:
-        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    else:
-        monkeypatch.setenv(
-            "XDG_CONFIG_HOME", str(tmp_path / "custom") if setting == "absolute" else setting
+    environment = {"HOME": str(tmp_path / "home")}
+    if setting is not None:
+        environment["XDG_CONFIG_HOME"] = (
+            str(tmp_path / "custom") if setting == "absolute" else setting
         )
+    monkeypatch.setattr(deployment, "_manager_environment", lambda: environment)
+    monkeypatch.setenv("HOME", str(tmp_path / "ignored-invoking-home"))
     assert deployment.service_unit_directory() == (
         tmp_path / "custom/systemd/user"
         if setting == "absolute"

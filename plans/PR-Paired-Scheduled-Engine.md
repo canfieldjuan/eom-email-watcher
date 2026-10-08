@@ -621,3 +621,64 @@ publication refusals precede writes. Retain isolated v7 schema28/native baseline
 list proof substitutions/differences, rebuild and replay affected native paths.
 CI executes the real receiver; incremental source tests/lint plus required native
 proof locally, without duplicating unrelated CI matrices.
+
+
+## Manager/lease implementation and evidence
+
+The contract-only amendment preceded implementation and was accepted by oversight
+in 4219529406. The origin fixes replace my 659dab21 process-derived paths and
+cc7d3085 point-only admission with the shared manager view and connection lease.
+The canonical operator instructions are README's paired-deployment section.
+
+- `deployment.py:74` reads manager paths through the existing bounded process
+  reader; the description and source shell consume that single manager view.
+  The unit snapshot includes loaded scheduled `ExecStart`, pinned to its alias.
+- `deployment.py:116` owns the shared/exclusive kernel lease, typed bounded waits,
+  same-process refusal and inherited source-publication descriptor. SQLite setup,
+  transaction cleanup and close stay inside it at `db.py:5233`.
+- Native, source-unit and shell publication retain the same exclusive lease
+  across preflight, writes, reload and verification. The real source shell's uv
+  export/install phases were probed from another process and could not acquire it.
+- The native proof caught my first implementation losing the selected launch
+  path through PyInstaller's resolved `sys.executable`. The dispatcher now passes
+  its original launch path to the description owner. Direct, indirect and parent
+  alias selections fail before writes; ordinary aliased CLI reads still succeed.
+- CI invokes `run_deployment_receiver_proof.py` against the actual built engine
+  and Rust receiver. Read and initialization retain `deployment_refused`, and
+  initialization is definitive with configuration absent.
+
+Before/after: retained old-head public manager/home, self-publication and live
+connection reproductions; three minimal regression failures before the origin
+fix, plus three dispatcher failures before retaining the launch path. Final
+adjacent/source deployment suites passed. All four deliberate final-source
+mutations fail: point-only lifetime and shared acquisition in each publisher.
+The isolated real source installer suite passed 44 tests; Ruff/bash/diff checks
+are clean. No unrelated CI matrix was duplicated locally.
+
+Native parity reuses the retained v7 public schema28 bytes, five unit payloads,
+API/aliased-CLI upgrade and overlapping monthly dry-run oracle. Rebuilt v8 passes
+38 negative cases without schema/digest changes, native busy-lock refusals without
+alias/unit/DB changes, three selected-alias refusals, different invoking HOME,
+28-to-30 upgrade, real process overlap and the actual Rust receiver. Four compiled
+modules equal source and five bundled payloads are unchanged from v7.
+
+Differences from v7: fixed manager identity in the shared external fixture;
+manager-environment read plus one unit snapshot containing ExecStart; kernel
+connection/publication leases, with the same exclusive descriptor retained across
+source shell work; selected launch identity preserved before canonicalization;
+the existing native receiver is now exercised in CI. Added lock, loaded-command
+and differing-home cases supplement the unchanged v7 oracle. Development bundle,
+public DB and substituted user-manager metadata remain explicit proof limits.
+Model/template/prompt/runtime, schema, authority, cadence, confirmation and normal
+profile remain outside this correction.
+
+Durable aliases: lease-fail-before.txt, selected-launch-fail-before-v8.txt,
+lease-adjacent-v8.txt, lease-final-v8.txt, source-publisher-final-v8.txt,
+lease-mutations-final-v8.json, packaged-schema-proof-v8.json,
+freeze-receipt-v8.json and ci-native-receiver-v8.txt. Review replies bind hashes.
+The failed initial native launch proof and binary remain retained separately.
+
+Gap audit: NOT DONE. Source/native correction is verified; exact published-head
+CI and independent oversight verification remain. The hold stays open until that
+verification and operator merge clearance. Normal installation/recovery remains
+pending after merge; this development proof is not a release or normal-host claim.

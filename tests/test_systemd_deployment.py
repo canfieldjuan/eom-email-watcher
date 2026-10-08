@@ -301,9 +301,28 @@ case "$1" in
     ;;
 esac
 """
-FAKE_SYSTEMCTL = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$INSTALLER_TEST_SYSTEMCTL_LOG"
+FAKE_SYSTEMCTL = "#!" + sys.executable + "\n" + f"""
+import os,shlex,sys
+from pathlib import Path
+sys.path[:0] = [{str(ROOT / 'src')!r}, {str(ROOT / 'scripts')!r}]
+from packaged_proof_environment import unit_records, render_unit_records, UNIT_NAMES
+args=sys.argv[1:]
+home=Path(os.environ['INSTALLER_TEST_MANAGER_HOME'])
+config=Path(os.environ.get('INSTALLER_TEST_MANAGER_CONFIG',''))
+config=config if config.is_absolute() else home/'.config'
+if args==['--user','show-environment']:
+    values=dict(HOME=str(home),XDG_CONFIG_HOME=str(config),
+                XDG_DATA_HOME=os.environ.get('XDG_DATA_HOME',str(home/'.local/share')))
+    print('\\n'.join(k+'='+shlex.quote(v) for k,v in values.items()))
+elif args[:2]==['--user','show']:
+    directory=config/'systemd/user'
+    loaded=all((directory/name).is_file() for name in UNIT_NAMES)
+    print(render_unit_records(unit_records(directory,loaded=loaded,home=home)))
+else:
+    with open(os.environ['INSTALLER_TEST_SYSTEMCTL_LOG'],'a') as output:
+        output.write(' '.join(args)+'\\n')
 """
+
 posix_installer = pytest.mark.skipif(
     os.name != "posix" or shutil.which("bash") is None,
     reason="the service installer is a POSIX shell script",
@@ -405,6 +424,7 @@ def _run_installer(
     # Source-only fixture: do not discover an unrelated installed desktop on the host.
     for name in (
         "bash",
+        "python3",
         "dirname",
         "mktemp",
         "rm",
@@ -428,6 +448,7 @@ def _run_installer(
     home.mkdir(exist_ok=True)
     environment = {
         "HOME": str(home),
+        "INSTALLER_TEST_MANAGER_HOME": str(home),
         "PATH": str(fake_bin),
         "TMPDIR": str(tmp_path),
         "INSTALLER_TEST_PYTHON": sys.executable,
@@ -441,6 +462,7 @@ def _run_installer(
         environment["XDG_DATA_HOME"] = data_home
     if config_home is not None:
         environment["XDG_CONFIG_HOME"] = config_home
+        environment["INSTALLER_TEST_MANAGER_CONFIG"] = config_home
     if keyring_source is not None:
         environment["LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE"] = str(keyring_source)
     return subprocess.run(
@@ -690,7 +712,7 @@ def test_installer_pairs_both_services_without_installing_another_snapshot(tmp_p
 @posix_installer
 @pytest.mark.parametrize("setting", ["", "relative", "custom"])
 def test_source_installer_consumes_runtime_unit_directory(tmp_path, monkeypatch, setting):
-    from eom_email_watcher.deployment import service_unit_directory
+    from eom_email_watcher import deployment
 
     home = tmp_path / "home"
     value = str(tmp_path / "custom config") if setting == "custom" else setting
@@ -698,7 +720,10 @@ def test_source_installer_consumes_runtime_unit_directory(tmp_path, monkeypatch,
     assert result.returncode == 0, result.stderr
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", value)
-    directory = service_unit_directory()
+    monkeypatch.setattr(
+        deployment, "_manager_environment", lambda: {"HOME": str(home), "XDG_CONFIG_HOME": value}
+    )
+    directory = deployment.service_unit_directory()
     assert (directory / "eom-email-watcher.service").is_file()
     assert (directory / "eom-monthly-hours.service").is_file()
 
@@ -861,3 +886,28 @@ def test_protocol_mismatch_cannot_delegate_install(tmp_path):
     result = _run_installer(tmp_path, home, engine_body=body)
     assert result.returncode == 2
     assert not (home / "native-owner").exists()
+
+
+@posix_installer
+def test_source_shell_retains_exclusive_lease_through_snapshot_writes(tmp_path, monkeypatch):
+    probe = """
+python3 - <<'LOCK_PROBE'
+import fcntl, os
+from pathlib import Path
+path=Path(os.environ['HOME'])/'.local/state/eom-email-watcher/deployment.lock'
+with path.open('r') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit('source snapshot writes lost the exclusive publication lease')
+LOCK_PROBE
+"""
+    monkeypatch.setattr(sys.modules[__name__], "FAKE_UV",
+                        FAKE_UV.replace('case "$1" in', probe + 'case "$1" in'))
+    home = tmp_path / "home"
+    result = _run_installer(tmp_path, home)
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = (tmp_path / "uv.log").read_text()
+    assert "export" in log and "tool install" in log

@@ -324,8 +324,16 @@ journalctl --user -u eom-email-watcher.service --since today
 
 The selected native engine owns its paired alias and all five scheduled unit files.
 Installation never searches PATH for a desktop. Before every packaged Linux database
-open, one bounded manager read checks the shipped graph, unit-file bytes and reader
-identities. Modified or redirected units, persistent drop-ins, pending reloads,
+open, the manager environment resolves deployment paths and one bounded unit snapshot
+checks the shipped graph, loaded scheduled commands, unit-file bytes and reader
+identities. A shared deployment lease stays held until the SQLite connection closes.
+Native and source installers retain an exclusive lease across publication, reload and
+verification. A busy deployment refuses access after a bounded wait: retry a reader
+after the update; close the app or stop the timers before retrying an installer.
+The lock is under the manager's home at `.local/state/eom-email-watcher/deployment.lock`.
+Select the concrete native sidecar for installation; selecting its scheduled alias or
+a path through that alias refuses publication before writes. Modified or redirected
+units, persistent drop-ins, pending reloads,
 partial installation and incompatible running readers refuse access. Let an old
 reader finish and reinstall using the updated desktop sidecar. Compatible paired
 readers retain the existing operation locks and dedupe. See the
@@ -339,8 +347,10 @@ canonical retained active state is allowed once its execution PIDs are zero.
 
 The paired deployment requires a user manager whose effective units have no
 drop-ins, including vendor-wide `service.d` or `timer.d` overrides. A host with
-those overrides is refused until they are removed. The desktop and user manager
-must resolve the same `XDG_CONFIG_HOME` unit directory. Pending reloads require
+those overrides is refused until they are removed. The manager's `HOME` and
+`XDG_CONFIG_HOME` own the alias and unit directory, including when the desktop was
+launched with a different home. A missing or invalid manager home refuses access.
+Pending reloads require
 `systemctl --user daemon-reload`; masked units require `systemctl --user unmask`.
 For a partial graph, remove its partial five-unit installation, reload the manager,
 then reinstall the complete pair. Foreign fragments must be removed before the

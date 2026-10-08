@@ -2,6 +2,20 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The source lane's Python owner holds the exclusive deployment lease across
+# this shell and all uv/authority/unit writes. An internal phase must prove it
+# inherited that same manager lock before touching any publication target.
+if [[ "$#" == 1 && "$1" == --source ]]; then
+  PYTHONPATH="$repo_dir/src" exec python3 -c \
+    'import sys; from pathlib import Path; from eom_email_watcher.deployment import publish_source_snapshot; publish_source_snapshot(Path(sys.argv[1]))' \
+    "${BASH_SOURCE[0]}"
+elif [[ "$#" == 2 && "$1" == --source-locked && "$2" =~ ^[0-9]+$ ]]; then
+  publication_fd="$2"
+  PYTHONPATH="$repo_dir/src" python3 -c \
+    'import sys; from eom_email_watcher.deployment import confirm_source_publication; confirm_source_publication(int(sys.argv[1]))' \
+    "$publication_fd"
+  set -- --source
+fi
 unit_dir=""
 tool_bin_dir="$HOME/.local/bin"
 tool_dir="${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools"
@@ -136,7 +150,7 @@ if [[ -n "$release_keyring_input" ]]; then
 fi
 
 PYTHONPATH="$repo_dir/src" "$snapshot_python" -c \
-  'from eom_email_watcher.deployment import install_source_units; install_source_units()'
+  'import sys; from eom_email_watcher.deployment import install_source_units; install_source_units(int(sys.argv[1]))' "$publication_fd"
 
 echo "Installed and enabled eom-email-watcher.timer."
 echo "Installed and enabled eom-monthly-hours.timer."

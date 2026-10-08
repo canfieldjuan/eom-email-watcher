@@ -433,7 +433,7 @@ def test_deployment_rules_have_one_source_owner():
                     )
     assert callers["sqlite3.connect"] == [("src/eom_email_watcher/db.py", "connection")]
     assert callers["subprocess.Popen"] == [
-        ("src/eom_email_watcher/deployment.py", "_manager_output")
+        ("src/eom_email_watcher/deployment.py", "_read_manager_command")
     ]
     assert callers["_unit_payloads"] == [
         ("src/eom_email_watcher/deployment.py", "deployment_description")
@@ -483,3 +483,35 @@ def test_store_admission_launches_one_actual_manager_process(
             *deployment.UNIT_NAMES,
         ]
     ]
+
+
+def test_deployment_description_uses_manager_home(paired_deployment, monkeypatch, tmp_path):
+    binary, _, _, directory = paired_deployment()
+    manager_home = directory.parents[2]
+    monkeypatch.setattr(
+        deployment, "_manager_environment", lambda: {"HOME": str(manager_home)}, raising=False
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "invoking-home"))
+    assert deployment.deployment_description(binary).alias == (
+        manager_home / ".local/bin/eom-mail-watch"
+    )
+
+
+def test_selected_engine_cannot_be_alias(paired_deployment):
+    binary, _, _, _ = paired_deployment()
+    alias = deployment.deployment_description(binary).alias
+    with pytest.raises(deployment.DeploymentError, match="sidecar"):
+        deployment.deployment_description(alias)
+
+
+def test_publisher_refuses_a_same_process_open_connection(paired_deployment, monkeypatch, tmp_path):
+    from eom_email_watcher.db import Store
+
+    paired_deployment()
+    actions = []
+    monkeypatch.setattr(deployment, "_manager_action", lambda args: actions.append(args))
+    with Store(tmp_path / "public.sqlite3").connection(), pytest.raises(
+        deployment.DeploymentError, match="connection"
+    ):
+        deployment.install_user_services()
+    assert actions == []

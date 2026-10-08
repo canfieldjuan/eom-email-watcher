@@ -64,9 +64,11 @@ def paired_deployment(tmp_path, monkeypatch):
             wrong.symlink_to(binary)
             path = directory / "eom-email-watcher.service"
             path.write_text(path.read_text().replace("eom-mail-watch check", "wrong-name check"))
-        records = unit_records(directory, loaded=loaded)
+        records = unit_records(directory, loaded=loaded, home=home)
         for name, values in (changes or {}).items():
             records[name].update(values)
+        monkeypatch.setattr(deployment, "_manager_environment",
+                            lambda: {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")})
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
         monkeypatch.setattr(sys, "frozen", True, raising=False)
