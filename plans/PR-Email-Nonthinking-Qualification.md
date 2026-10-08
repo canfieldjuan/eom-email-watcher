@@ -272,3 +272,12 @@ quadratic rescans/copies fail quickly. Original published probe depths and
 mixed/enclosure semantic tests remain. Keep all six existing mutation probes
 and retained original completion replay unchanged. Affected suites and Ruff.
 One correction push after root note and contract-only commit.
+
+### Linear scanner receipt
+Two depth20000 operation-budget cases fail before and pass after. One match
+index is built once; nested wrappers traverse ranges without copying interiors.
+All earlier tests byte-preserved, source and occurrence definitions AST unchanged.
+Affected suites349passed; six original mutations still fail, offline completion
+still rejects ambiguity with no generation. The stray-quote false rejection is
+tracked in issue220. Native/model defaults and source input bounds unchanged.
+New-head CI/review remain pending after the one correction push.

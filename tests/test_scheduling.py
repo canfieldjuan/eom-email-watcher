@@ -1706,3 +1706,22 @@ def test_prose_normalizer_cannot_rewrite_literal_candidate(monkeypatch):
         scheduling_module, "normalize_validated_address", lambda _: "other@example.com"
     )
     assert scheduling_module._mailbox_tokens("sender@example.com") == ()
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+def test_prose_nested_enclosures_have_linear_character_work(quoted):
+    class CountedText(str):
+        work = 0
+
+        def __getitem__(self, key):
+            self.work += len(range(*key.indices(len(self)))) if isinstance(key, slice) else 1
+            assert self.work <= 20 * len(self), "scanner exceeded linear character budget"
+            return super().__getitem__(key)
+
+    depth = 20_000
+    raw = "(" * depth + "sender@example.com" + ")" * depth
+    text = CountedText('"' + raw + '"' if quoted else raw)
+    tokens = scheduling_module._mailbox_tokens(text)
+    assert len(tokens) == 1
+    assert tokens[0].address == "sender@example.com"
+    assert text[tokens[0].start:tokens[0].end] == "sender@example.com"

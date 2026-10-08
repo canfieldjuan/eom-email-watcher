@@ -436,42 +436,53 @@ _PROSE_ENCLOSURES = {'"': '"', "[": "]", "<": ">", "(": ")"}
 _PROSE_SEPARATORS = ",;:"
 
 
-def _prose_enclosure_end(text: str, position: int, limit: int) -> int | None:
-    stack = [_PROSE_ENCLOSURES[text[position]]]
-    position += 1
-    while position < limit and stack:
+def _prose_enclosure_ends(text: str) -> dict[int, int]:
+    """Index complete enclosures once, including mentions inside quoted speech."""
+    ends: dict[int, int] = {}
+    stack: list[tuple[str, int]] = []
+    quotation: tuple[int, list[tuple[str, int]]] | None = None
+    position = 0
+    while position < len(text):
         character = text[position]
-        if character == "\\":
-            position = min(position + 2, limit)
+        if character == "\\" and (stack or quotation is not None):
+            position += 2
             continue
-        if character == stack[-1]:
-            stack.pop()
-        elif stack[-1] != '"' and character in _PROSE_ENCLOSURES:
-            stack.append(_PROSE_ENCLOSURES[character])
+        if character == '"':
+            if quotation is None:
+                quotation = (position, stack)
+                stack = []
+            else:
+                opening, stack = quotation
+                ends[opening] = position + 1
+                quotation = None
+        elif stack and character == stack[-1][0]:
+            _, opening = stack.pop()
+            ends[opening] = position + 1
+        elif character in _PROSE_ENCLOSURES:
+            stack.append((_PROSE_ENCLOSURES[character], position))
         position += 1
-    # An unfinished enclosure consumes the remainder and cannot yield support.
-    return None if stack else position
+    return ends
 
 
-def _prose_lexeme_end(text: str, position: int, limit: int) -> int:
+def _prose_lexeme_end(text: str, position: int, limit: int, ends: dict[int, int]) -> int:
     while position < limit:
         character = text[position]
         if character.isspace() or character in _PROSE_SEPARATORS:
             break
         if character in _PROSE_ENCLOSURES:
-            position = _prose_enclosure_end(text, position, limit) or limit
+            position = min(ends.get(position, limit), limit)
         else:
             position += 1
     return position
 
 
-def _opaque_compound_gap_end(text: str, position: int, limit: int) -> int:
+def _opaque_compound_gap_end(text: str, position: int, limit: int, ends: dict[int, int]) -> int:
     """Whitespace/comments next to @ stay inside the same lexical compound."""
     while position < limit:
         if text[position].isspace():
             position += 1
         elif text[position] == "(":
-            position = _prose_enclosure_end(text, position, limit) or limit
+            position = min(ends.get(position, limit), limit)
         else:
             break
     return position
@@ -480,6 +491,7 @@ def _opaque_compound_gap_end(text: str, position: int, limit: int) -> int:
 def _prose_mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
     """Bound literal candidates; the configuration normalizer owns validity."""
     tokens: list[_MailboxToken] = []
+    ends = _prose_enclosure_ends(text)
     regions = [(0, len(text))]
     while regions:
         left, right = regions.pop()
@@ -489,11 +501,11 @@ def _prose_mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
                 position += 1
                 continue
             start = position
-            end = _prose_lexeme_end(text, start, right)
+            end = _prose_lexeme_end(text, start, right, ends)
             while True:
-                next_part = _opaque_compound_gap_end(text, end, right)
+                next_part = _opaque_compound_gap_end(text, end, right, ends)
                 if text[end - 1] == "@":
-                    continuation = _prose_lexeme_end(text, next_part, right)
+                    continuation = _prose_lexeme_end(text, next_part, right, ends)
                     end = continuation
                     if continuation == next_part:
                         break
@@ -502,25 +514,27 @@ def _prose_mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
                 else:
                     break
             position = end
-            end = start + len(text[start:end].rstrip("!?"))
-            if text[start:end].endswith(".") and not text[start:end].endswith(".."):
+            # Keep wrapper traversal index-only: copying each nested interior
+            # would be quadratic even with constant-time enclosure lookups.
+            while end > start and text[end - 1] in "!?":
                 end -= 1
-            word = text[start:end]
-            # Strip only an enclosure covering the entire run. In particular,
-            # <mailbox>@domain and local@<mailbox> are never rescanned inside.
             if (
-                word
-                and word[0] in {'"', "(", "<"}
-                and word[-1] == _PROSE_ENCLOSURES[word[0]]
-                and _prose_enclosure_end(text, start, end) == end
+                end > start and text[end - 1] == "."
+                and (end == start + 1 or text[end - 2] != ".")
             ):
-                if word[0] == "<":
+                end -= 1
+            if (
+                end > start
+                and text[start] in {'"', "(", "<"}
+                and ends.get(start) == end
+            ):
+                if text[start] == "<":
                     start += 1
                     end -= 1
-                    word = text[start:end]
                 else:
                     regions.append((start + 1, end - 1))
                     continue
+            word = text[start:end]
             # One opacity rule covers every enclosure and multi-@ compound.
             if word.count("@") != 1 or any(c in word for c in '\"[]<>()'):
                 continue
