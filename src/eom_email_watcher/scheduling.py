@@ -5,7 +5,6 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from email.utils import getaddresses
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -427,6 +426,29 @@ def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) 
         quote in _canonical_evidence_text(candidate)
         for candidate in _evidence_candidates(evidence, source)
     )
+
+
+def _attendee_evidence_supported(
+    address: str, evidence: SchedulingEvidence, source: SchedulingSource
+) -> bool:
+    """Match a complete mailbox in prose and in its original quoted context."""
+    mailbox = re.compile(
+        r"(?<![\w.!#$%&'*+/=?^`{|}~@-])" + re.escape(address) + r"(?![\w@-]|\.(?=\S))"
+    )
+    quote = _canonical_evidence_text(evidence.quote)
+    if not quote or not mailbox.search(quote.casefold()):
+        return False
+    for raw_candidate in _evidence_candidates(evidence, source):
+        candidate = _canonical_evidence_text(raw_candidate)
+        position = 0
+        while (position := candidate.find(quote, position)) >= 0:
+            end = position + len(quote)
+            # Keep neighboring characters: a quote must not crop a larger mailbox.
+            context = candidate[max(0, position - 2) : end + 2]
+            if mailbox.search(context.casefold()):
+                return True
+            position += 1
+    return False
 
 
 def _evidence_source_contexts(
@@ -1029,12 +1051,7 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
             continue
         if attendee.email != normalized:
             semantic.append(SchedulingViolation("attendee_not_normalized", f"{path}.email"))
-        evidence_addresses = {
-            normalize_validated_address(address)
-            for _name, address in getaddresses([attendee.evidence.quote])
-            if address and _is_valid_address(address)
-        }
-        if normalized not in evidence_addresses:
+        if not _attendee_evidence_supported(normalized, attendee.evidence, source):
             semantic.append(SchedulingViolation("attendee_unsupported", f"{path}.email"))
         if normalized == source.organizer_address:
             semantic.append(SchedulingViolation("organizer_is_attendee", f"{path}.email"))
@@ -1087,11 +1104,3 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
         result_json,
         tuple(semantic),
     )
-
-
-def _is_valid_address(value: str) -> bool:
-    try:
-        normalize_validated_address(value)
-    except ValueError:
-        return False
-    return True

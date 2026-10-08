@@ -1308,3 +1308,96 @@ def test_retry_prompt_contains_only_typed_feedback_and_the_same_source() -> None
     assert scheduling_source_sha256(scheduling_source) == scheduling_source_sha256(
         scheduling_source
     )
+
+
+def test_attendee_prose_evidence_is_supported() -> None:
+    quote = "Please invite sender@example.com to our meeting."
+    value = valid_result()
+    value["attendees"][0]["evidence"] = {"source": "body", "quote": quote}
+    result = validate(value, scheduling_source=source(body=source().body + " " + quote))
+
+    assert result.accepted, result.violations
+
+
+@pytest.mark.parametrize(
+    ("address", "quote"),
+    [
+        ("sender@example.com", "sender@example.com"),
+        ("sender@example.com", "Please invite sender@example.com to our meeting."),
+        ("sender@example.com", "Please invite SENDER@EXAMPLE.COM to our meeting."),
+        ("sender@example.com", "Invite Sender <sender@example.com>."),
+        ("sender@example.com", 'Invite "sender@example.com".'),
+        ("sender@example.com", "Invite sender@example.com."),
+        ("sender@example.com", "Invite sender@example.com, please."),
+        ("sender+ops@example.com", "Invite sender+ops@example.com to our meeting."),
+        ("first.last@example.com", "Invite first.last@example.com."),
+        ("o'brien@example.com", "Invite o'brien@example.com to our meeting."),
+        ("sender@example.com", "Invite sender@example.com\n to our meeting."),
+        ("sender@example.com", "x" * 460 + " sender@example.com"),
+    ],
+)
+def test_attendee_mailbox_forms_in_prose(address: str, quote: str) -> None:
+    value = valid_result()
+    value["attendees"][0] = {
+        "email": address,
+        "evidence": {"source": "body", "quote": quote},
+    }
+    assert validate(value, scheduling_source=source(body=source().body + " " + quote)).accepted
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "notsender@example.com",
+        "other.sender@example.com",
+        "other+sender@example.com",
+        "other-sender@example.com",
+        "other_sender@example.com",
+        "x@sender@example.com",
+        "sender@example.com.evil",
+        "sender@example.comevil",
+        "sender@example.com-other",
+        "sender@example.com_other",
+        "sender@example.com@evil",
+        "sender@example.com..evil",
+    ],
+)
+@pytest.mark.parametrize("cropped_quote", [False, True])
+def test_attendee_evidence_cannot_crop_a_larger_mailbox(
+    source_text: str, cropped_quote: bool
+) -> None:
+    value = valid_result()
+    quote = "sender@example.com" if cropped_quote else source_text
+    value["attendees"][0]["evidence"] = {"source": "body", "quote": quote}
+    result = validate(value, scheduling_source=source(body=source().body + " " + source_text))
+
+    assert "attendee_unsupported" in codes(result)
+
+
+def test_attendee_prose_quote_must_belong_to_its_declared_source() -> None:
+    quote = "Invite sender@example.com."
+    value = valid_result()
+    value["attendees"][0]["evidence"] = {"source": "subject", "quote": quote}
+    result = validate(value, scheduling_source=source(body=source().body + " " + quote))
+
+    assert "evidence_not_found" in codes(result)
+    assert "attendee_unsupported" in codes(result)
+
+
+def test_supported_attendee_does_not_clear_meeting_ambiguity() -> None:
+    quote = "Invite sender@example.com."
+    value = valid_result()
+    value["attendees"][0]["evidence"] = {"source": "body", "quote": quote}
+    value["ambiguity_reasons"] = ["The source leaves an unresolved question."]
+    result = validate(value, scheduling_source=source(body=source().body + " " + quote))
+
+    assert codes(result) == {"new_meeting_ambiguous"}
+
+
+def test_attendee_quote_can_match_a_later_complete_occurrence() -> None:
+    quote = "sender@example.com"
+    value = valid_result()
+    value["attendees"][0]["evidence"] = {"source": "body", "quote": quote}
+    body = source().body + " notsender@example.com, then sender@example.com."
+
+    assert validate(value, scheduling_source=source(body=body)).accepted

@@ -78,3 +78,11 @@ follows the standing reproduce/isolate/fix-at-origin rule. It is a correctness
 repair to the existing source-evidence contract; model policy promotion remains
 blocked by the failed scheduling candidate, absent gateway run and pending
 human semantic review.
+
+## Implementation and verification receipt
+
+Fail-first prose regression:1 failed in0.37s with attendee_unsupported. After the origin repair:128 scheduling tests passed, then248 affected scheduling/model/gateway/benchmark tests passed in1.07s. An interim documentation artifact placement hit the frozen baseline inventory count; candidate metrics now remain in durable evidence rather than altering baseline fixtures. Final scheduling plus inventory regression:129 passed in0.34s; Ruff All checks passed; diff check clean. Cold AST audit changes only validate_scheduling_output, adds _attendee_evidence_supported and removes _is_valid_address; old test content is byte-preserved.
+
+Offline retained-output replay repairs only attendee support and preserves new_meeting_ambiguous rejection. The isolated mailbox variant passes; larger local/domain cropped quotes admitted before are rejected after. No new generation, source prompt/schema/corpus/default change or model promotion. See docs/EMAIL_MODEL_POLICY_QUALIFICATION.md for the single Email policy/result record.
+
+Gap audit: NOT DONE for full 9B qualification/promotion. Direct corpus safety is proven; actual gateway run, scheduling compatibility and independent semantic review remain outstanding. The bounded run stayed stopped at67 submissions.
