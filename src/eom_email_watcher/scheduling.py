@@ -5,13 +5,14 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from email.utils import getaddresses
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .config import normalize_validated_address
+from .mailbox import MailboxToken as _MailboxToken
+from .mailbox import header_mailbox_tokens
 
 MAX_SCHEDULING_RESULT_BYTES = 32 * 1024
 MAX_SCHEDULING_VIOLATIONS = 32
@@ -427,6 +428,154 @@ def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) 
         quote in _canonical_evidence_text(candidate)
         for candidate in _evidence_candidates(evidence, source)
     )
+
+
+# These characters describe prose boundaries, not mailbox validity. Enclosed
+# runs are consumed intact so an embedded address cannot escape a compound.
+_PROSE_ENCLOSURES = {'"': '"', "[": "]", "<": ">", "(": ")"}
+_PROSE_SEPARATORS = ",;:"
+
+
+def _prose_enclosure_ends(text: str) -> dict[int, int]:
+    """Index complete enclosures once, including mentions inside quoted speech."""
+    ends: dict[int, int] = {}
+    stack: list[tuple[str, int]] = []
+    quotation: tuple[int, list[tuple[str, int]]] | None = None
+    position = 0
+    while position < len(text):
+        character = text[position]
+        if character == "\\" and (stack or quotation is not None):
+            position += 2
+            continue
+        if character == '"':
+            if quotation is None:
+                quotation = (position, stack)
+                stack = []
+            else:
+                opening, stack = quotation
+                ends[opening] = position + 1
+                quotation = None
+        elif stack and character == stack[-1][0]:
+            _, opening = stack.pop()
+            ends[opening] = position + 1
+        elif character in _PROSE_ENCLOSURES:
+            stack.append((_PROSE_ENCLOSURES[character], position))
+        position += 1
+    return ends
+
+
+def _prose_lexeme_end(text: str, position: int, limit: int, ends: dict[int, int]) -> int:
+    while position < limit:
+        character = text[position]
+        if character.isspace() or character in _PROSE_SEPARATORS:
+            break
+        if character in _PROSE_ENCLOSURES:
+            position = min(ends.get(position, limit), limit)
+        else:
+            position += 1
+    return position
+
+
+def _opaque_compound_gap_end(text: str, position: int, limit: int, ends: dict[int, int]) -> int:
+    """Whitespace/comments next to @ stay inside the same lexical compound."""
+    while position < limit:
+        if text[position].isspace():
+            position += 1
+        elif text[position] == "(":
+            position = min(ends.get(position, limit), limit)
+        else:
+            break
+    return position
+
+
+def _prose_mailbox_tokens(text: str) -> tuple[_MailboxToken, ...]:
+    """Bound literal candidates; the configuration normalizer owns validity."""
+    tokens: list[_MailboxToken] = []
+    ends = _prose_enclosure_ends(text)
+    regions = [(0, len(text))]
+    while regions:
+        left, right = regions.pop()
+        position = left
+        while position < right:
+            if text[position].isspace() or text[position] in _PROSE_SEPARATORS:
+                position += 1
+                continue
+            start = position
+            end = _prose_lexeme_end(text, start, right, ends)
+            while True:
+                next_part = _opaque_compound_gap_end(text, end, right, ends)
+                if text[end - 1] == "@":
+                    continuation = _prose_lexeme_end(text, next_part, right, ends)
+                    end = continuation
+                    if continuation == next_part:
+                        break
+                elif next_part < right and text[next_part] == "@":
+                    end = next_part + 1
+                else:
+                    break
+            position = end
+            # Keep wrapper traversal index-only: copying each nested interior
+            # would be quadratic even with constant-time enclosure lookups.
+            while end > start and text[end - 1] in "!?":
+                end -= 1
+            if (
+                end > start and text[end - 1] == "."
+                and (end == start + 1 or text[end - 2] != ".")
+            ):
+                end -= 1
+            if (
+                end > start
+                and text[start] in {'"', "(", "<"}
+                and ends.get(start) == end
+            ):
+                if text[start] == "<":
+                    start += 1
+                    end -= 1
+                else:
+                    regions.append((start + 1, end - 1))
+                    continue
+            word = text[start:end]
+            # One opacity rule covers every enclosure and multi-@ compound.
+            if word.count("@") != 1 or any(c in word for c in '\"[]<>()'):
+                continue
+            try:
+                address = normalize_validated_address(word)
+            except ValueError:
+                continue
+            if address == word.casefold():
+                tokens.append(_MailboxToken(address, start, end))
+    return tuple(tokens)
+
+
+def _mailbox_tokens(text: str, *, source: str = "body") -> tuple[_MailboxToken, ...]:
+    return header_mailbox_tokens(text) if source == "sender" else _prose_mailbox_tokens(text)
+
+
+def _attendee_evidence_supported(
+    address: str, evidence: SchedulingEvidence, source: SchedulingSource
+) -> bool:
+    """Require the same complete token in a quote and its full source occurrence."""
+    quote = _canonical_evidence_text(evidence.quote)
+    quote_tokens = tuple(
+        token
+        for token in _mailbox_tokens(quote, source=evidence.source)
+        if token.address == address
+    )
+    if not quote_tokens:
+        return False
+    for raw_candidate in _evidence_candidates(evidence, source):
+        candidate = _canonical_evidence_text(raw_candidate)
+        source_tokens = set(_mailbox_tokens(candidate, source=evidence.source))
+        position = 0
+        while (position := candidate.find(quote, position)) >= 0:
+            if any(
+                _MailboxToken(address, position + token.start, position + token.end)
+                in source_tokens
+                for token in quote_tokens
+            ):
+                return True
+            position += 1
+    return False
 
 
 def _evidence_source_contexts(
@@ -1029,12 +1178,7 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
             continue
         if attendee.email != normalized:
             semantic.append(SchedulingViolation("attendee_not_normalized", f"{path}.email"))
-        evidence_addresses = {
-            normalize_validated_address(address)
-            for _name, address in getaddresses([attendee.evidence.quote])
-            if address and _is_valid_address(address)
-        }
-        if normalized not in evidence_addresses:
+        if not _attendee_evidence_supported(normalized, attendee.evidence, source):
             semantic.append(SchedulingViolation("attendee_unsupported", f"{path}.email"))
         if normalized == source.organizer_address:
             semantic.append(SchedulingViolation("organizer_is_attendee", f"{path}.email"))
@@ -1087,11 +1231,3 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
         result_json,
         tuple(semantic),
     )
-
-
-def _is_valid_address(value: str) -> bool:
-    try:
-        normalize_validated_address(value)
-    except ValueError:
-        return False
-    return True
