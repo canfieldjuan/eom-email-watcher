@@ -23,10 +23,8 @@ def test_installer_snapshots_cli_before_installing_units() -> None:
     script = INSTALLER.read_text()
 
     locked_export = 'uv export --project "$repo_dir" --locked --no-dev --no-emit-project'
-    snapshot = (
-        'uv tool install --force --reinstall --constraints "$constraints_file" "$repo_dir"'
-    )
-    unit_install = 'install -m 0644 "$repo_dir/systemd/eom-email-watcher.service"'
+    snapshot = 'uv tool install --force --reinstall --constraints "$constraints_file" "$repo_dir"'
+    unit_install = "from eom_email_watcher.deployment import install_source_units"
     assert locked_export in script
     assert snapshot in script
     assert script.index(locked_export) < script.index(snapshot)
@@ -39,7 +37,7 @@ def test_installer_snapshots_cli_before_installing_units() -> None:
     assert stage in script
     assert promote in script
     assert script.index(stage) < script.index(promote)
-    assert '$tool_bin_dir/eom-mail-watch setup' in script
+    assert "$tool_bin_dir/eom-mail-watch setup" in script
 
 
 def test_systemd_services_use_stable_cli_snapshot() -> None:
@@ -384,6 +382,7 @@ def _run_installer(
     data_home: str | None = None,
     source_first: bool = True,
     artifact: bytes | None = None,
+    installer_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -439,7 +438,19 @@ def _run_installer(
     if keyring_source is not None:
         environment["LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE"] = str(keyring_source)
     return subprocess.run(
-        ["bash", str(INSTALLER)],
+        [
+            "bash",
+            str(INSTALLER),
+            *(
+                installer_args
+                if installer_args is not None
+                else (
+                    ["--engine", str(fake_bin / "eom-mail-engine")]
+                    if engine_body is not None or artifact is not None
+                    else ["--source"]
+                )
+            ),
+        ],
         env=environment,
         capture_output=True,
         text=True,
@@ -613,18 +624,16 @@ def test_installer_pairs_both_services_without_installing_another_snapshot(tmp_p
             '#!/bin/sh\ncase "$1" in\n'
             f'--paired-cli-version) printf "%s\\n" "{PAIRED_CLI_PROTOCOL}" ;;\n'
             '--service-unit-directory) printf "%s\\n" "$HOME/.config/systemd/user" ;;\n'
-            '--cli) test "$2" = --version ;;\n*) exit 2 ;;\nesac\n'
+            '--install-user-services) printf "%s\\n" "${0%.sh}" > "$HOME/native-owner"; '
+            'echo "Paired scheduled intake" ;;\n*) exit 2 ;;\nesac\n'
         ),
     )
     assert result.returncode == 0, result.stderr
-    alias = home / ".local/bin/eom-mail-watch"
-    assert alias.samefile(tmp_path / "fake-bin/eom-mail-engine")
+    assert Path((home / "native-owner").read_text().strip()).samefile(
+        tmp_path / "fake-bin/eom-mail-engine"
+    )
     assert not (tmp_path / "uv.log").exists()
-    for unit in ("eom-email-watcher.service", "eom-monthly-hours.service"):
-        assert (
-            "ExecStart=%h/.local/bin/eom-mail-watch "
-            in (home / ".config/systemd/user" / unit).read_text()
-        )
+    assert not (tmp_path / "systemctl.log").exists(), "shell duplicated the native owner's install"
     assert "Paired scheduled intake" in result.stdout
 
 
@@ -711,7 +720,7 @@ def test_source_environment_shim_is_not_a_packaged_engine(tmp_path):
 
 @posix_installer
 @pytest.mark.parametrize("source_first", [True, False])
-def test_source_shims_and_native_bundle_discovery_orders(tmp_path, source_first):
+def test_explicit_native_engine_is_independent_of_path_order(tmp_path, source_first):
     from eom_email_watcher.deployment import PAIRED_CLI_PROTOCOL
 
     source = tmp_path / "arbitrary runner environment/bin/eom-mail-engine"
@@ -723,7 +732,8 @@ def test_source_shims_and_native_bundle_discovery_orders(tmp_path, source_first)
         '#!/bin/sh\ncase "$1" in\n'
         f'--paired-cli-version) printf "%s\\n" "{PAIRED_CLI_PROTOCOL}" ;;\n'
         '--service-unit-directory) printf "%s\\n" "$HOME/.config/systemd/user" ;;\n'
-        '--cli) test "$2" = --version ;;\n*) exit 2 ;;\nesac\n'
+        '--install-user-services) printf "%s\\n" "${0%.sh}" > "$HOME/native-owner"; '
+        'echo "Paired scheduled intake" ;;\n*) exit 2 ;;\nesac\n'
     )
     home = tmp_path / "home"
     result = _run_installer(
@@ -732,7 +742,9 @@ def test_source_shims_and_native_bundle_discovery_orders(tmp_path, source_first)
     assert result.returncode == 0, result.stderr
     assert not marker.exists(), "source shim was executed for artifact classification"
     assert not (tmp_path / "uv.log").exists()
-    assert (home / ".local/bin/eom-mail-watch").samefile(tmp_path / "fake-bin/eom-mail-engine")
+    assert Path((home / "native-owner").read_text().strip()).samefile(
+        tmp_path / "fake-bin/eom-mail-engine"
+    )
 
 
 @posix_installer
@@ -757,3 +769,45 @@ def test_source_shim_with_no_native_bundle_is_never_executed(tmp_path):
     assert result.returncode == 0, result.stderr
     assert not marker.exists()
     assert (tmp_path / "uv.log").exists()
+
+
+@posix_installer
+def test_two_native_candidates_use_the_explicit_desktop(tmp_path):
+    body = (
+        '#!/bin/sh\ncase "$1" in\n'
+        "--paired-cli-version) echo eom-mail-engine-paired-cli-v1 ;;\n"
+        '--install-user-services) printf "%s\\n" "${0%.sh}" > "$HOME/native-owner" ;;\n'
+        "*) exit 2 ;;\nesac\n"
+    )
+    stale = tmp_path / "stale-engine"
+    _write_native_engine(stale, body)
+    home = tmp_path / "home"
+    result = _run_installer(
+        tmp_path, home, engine_body=body, source_engine=stale, source_first=True
+    )
+    assert result.returncode == 0, result.stderr
+    selected = Path((home / "native-owner").read_text().strip())
+    assert selected.samefile(tmp_path / "fake-bin/eom-mail-engine")
+    assert not selected.samefile(stale)
+
+
+@posix_installer
+def test_installation_mode_must_be_explicit(tmp_path):
+    result = _run_installer(tmp_path, tmp_path / "home", installer_args=[])
+    assert result.returncode == 2
+    assert not (tmp_path / "uv.log").exists()
+    assert not (tmp_path / "systemctl.log").exists()
+
+
+@posix_installer
+def test_protocol_mismatch_cannot_delegate_install(tmp_path):
+    body = (
+        '#!/bin/sh\ncase "$1" in\n'
+        "--paired-cli-version) echo incompatible-protocol ;;\n"
+        '--install-user-services) echo reached > "$HOME/native-owner" ;;\n'
+        "*) exit 2 ;;\nesac\n"
+    )
+    home = tmp_path / "home"
+    result = _run_installer(tmp_path, home, engine_body=body)
+    assert result.returncode == 2
+    assert not (home / "native-owner").exists()

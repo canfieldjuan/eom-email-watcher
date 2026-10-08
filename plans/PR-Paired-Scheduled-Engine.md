@@ -429,3 +429,60 @@ resolution before pushed class proof; oversight verifies and operator clears mer
 NOT DONE: implementation, fail-before/pass-after, mutation proof, rebuilt native
 proof and new-head CI/review. Acceptance and deferred issue are recorded here
 before source/tests/config edits. The following receipt will record actual evidence.
+
+### Implementation clarification: one read includes an observed exit
+
+The accepted one-read condition is literal. A mismatched observed PID refuses
+that admission, even if it exits before /proc inspection. A later independent
+admission observes typed zero and can proceed. Remove the old in-check second
+manager observation; do not waive a missing process or cache authorization.
+This is the sole exit-race difference from the earlier two-observation proof.
+The regression must show refusal then fresh-zero success, one read in each.
+Native installation is explicit --engine ABSOLUTE_SIDECAR; source-only install
+is explicit --source. Neither mode searches PATH for a desktop. Both modes
+consume deployment.py's canonical shipped payloads; native pairing stays there.
+
+Native publication ordering: preflight the existing manager graph and active
+identities before writing. Existing canonical base files may be an older release,
+so preflight validates graph identity while the post-reload check pins new bytes.
+After writing, reload and positively verify the shipped graph before enabling
+timers. A persistent activation override must not be enabled by a failed install.
+Both phases use the one graph/reader validator; each check makes one system read.
+
+
+### Consolidation implementation receipt
+
+Implemented the accepted one-owner class consolidation. deployment.py owns the
+immutable native deployment, five shipped payloads, fresh bounded manager parser,
+installation preflight/post-reload checks, file/alias/current-image barriers and
+startup admission. The builder snapshots the same payload owner; the installer
+names --engine explicitly or selects the exempt --source lane. Removed the
+per-property subprocess API, directive denylist and PATH-first engine selection.
+DeploymentError now inherits Exception and reaches the API as deployment_refused;
+existing stale/concurrent handlers propagate it without individual patches.
+
+Evidence:18fail-first expected; both original mutation survivors caught before
+removal, replacement startup/payload/type and duplicate-owner mutations caught.
+Local required suite2369passed2skip; later proof-environment and actual Store
+process-count regressions78passed1skip then37passed. Ruff/bash/diff clean. Native
+v6 build/smoke, four compiled modules and all five frozen payloads equal source.
+All34 native graph negatives preserve the public schema28 database; real native
+installation, migration30, paired API/CLI overlap and typed current-image refusal
+pass. The explicit isolated manager is a proof substitution; Windows runs in CI.
+
+The consolidation also corrected its own proof-fixture missing HOME at that
+owner, and the retained schema-oracle helper's unclosed SQLite connection. A
+public reproduction showed copying schema28 over a schema30 path with a live
+read connection still reads30 from its WAL; closing the helper fixes isolation.
+Production was unchanged for these proof corrections. Durable aliases below
+retain raw evidence, source/bundle pins and the per-file cold diff audit.
+
+Durable consolidation-v6-receipt.json, sha256 e0a25519fc49f8bc54da89ee7d5ccba9f32cae5799bfcd2f170b50fd40d265a5.
+Alias mutation-survivors-before.json, sha256 01d6921443b3d7ba69aa8b07c11b4e58f73f4612e9f70da7d32fe93aec6cac57.
+Alias mutation-survivors-after.json, sha256 023adc947491cbac4c13f8e5d268fae2d0738cfc82bff49c29a61dae084605dc.
+Alias freeze-receipt-v6.json, sha256 d7ceb9c0841a21464727e5ccbe09a1ee2c6707d50a9160f52b99ea1f20cbf944.
+Alias packaged-schema-proof-v6.json, sha256 9d66b720ec872113e499e0f048ed1fc766f9d168171bc6758c9f8af70020774f.
+Alias cold-diff-audit-v6.md, sha256 714135eaadc1ea39ce5336ff0bd07e7d03b7751c01533f7c8c4aae5b6cb404a8.
+
+Gap audit: implementation/local/native proof DONE; new-head CI and oversight
+verification/operator merge clearance NOT DONE. Hold remains unresolved.

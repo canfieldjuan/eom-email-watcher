@@ -96,6 +96,7 @@ from .db import (
     Store,
     VendorAddressConflict,
 )
+from .deployment import DeploymentError
 from .gmail import (
     TOKEN_LOCK_TIMEOUT_SECONDS,
     GmailAuthorizationRejected,
@@ -6339,6 +6340,13 @@ def _response(request: object) -> dict[str, object]:
             }
         return {
             "error": {"code": "runtime_error", "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except DeploymentError as exc:
+        return {
+            "error": {"code": "deployment_refused", "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

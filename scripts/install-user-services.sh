@@ -12,51 +12,34 @@ legacy_release_keyring="$HOME/.local/share/eom-email-watcher/connect-entitlement
 release_keyring_target=""
 release_keyring_input=""
 release_keyring_stage=""
-# An installed desktop owns both readers. Never install a separate snapshot beside it.
+# Installation mode is explicit; PATH cannot identify the desktop's sidecar.
 packaged_engine=""
-# Bundles are native ELF executables. Console shims are scripts regardless of
-# which source environment exported them. Never execute a shim to identify it.
-while IFS= read -r candidate; do
-  artifact_magic="$(od -An -N4 -tx1 "$candidate")"
+if [[ "$#" == 2 && "$1" == --engine && "$2" == /* ]]; then
+  packaged_engine="$2"
+  if [[ ! -f "$packaged_engine" || ! -x "$packaged_engine" ]]; then
+    echo "The concrete desktop engine must be an executable file." >&2; exit 2
+  fi
+  artifact_magic="$(od -An -N4 -tx1 "$packaged_engine")"
   artifact_magic="${artifact_magic//[[:space:]]/}"
-  case "$artifact_magic" in
-    7f454c46)
-      packaged_engine="$candidate"
-      break
-      ;;
-    2321*)
-      continue
-      ;;
-    *)
-      echo "Unrecognized engine artifact; rebuild it before installing services." >&2
-      exit 2
-      ;;
-  esac
-done < <(type -aP eom-mail-engine || true)
-if [[ -n "$packaged_engine" ]]; then
+  if [[ "$artifact_magic" != 7f454c46 ]]; then
+    echo "Select the concrete native desktop engine, not a source shim." >&2; exit 2
+  fi
   if [[ -n "$release_keyring_source" ]]; then
-    echo "The packaged engine embeds its approved authority; supply it at build time." >&2
-    exit 2
+    echo "The packaged engine embeds its approved authority; supply it at build time." >&2; exit 2
   fi
   if ! paired_version="$("$packaged_engine" --paired-cli-version)"; then
-    echo "Installed desktop engine has no paired CLI; rebuild it before installing services." >&2
-    exit 2
+    echo "Installed desktop engine has no paired CLI; rebuild it." >&2; exit 2
   fi
   if [[ "$paired_version" != "eom-mail-engine-paired-cli-v1" ]]; then
-    echo "Installed desktop engine has no compatible paired CLI." >&2
-    exit 2
+    echo "Installed desktop engine has no compatible paired CLI." >&2; exit 2
   fi
-  packaged_engine="$(readlink -f "$packaged_engine")"
-  test -x "$packaged_engine"
-  "$packaged_engine" --cli --version >/dev/null
-  unit_dir="$("$packaged_engine" --service-unit-directory)"
-  mkdir -p "$unit_dir" "$tool_bin_dir"
-  alias_stage="$(mktemp -d "$tool_bin_dir/.paired-cli.XXXXXX")"
-  cleanup_alias() { rm -f "$alias_stage/eom-mail-watch"; rmdir "$alias_stage"; }
-  trap cleanup_alias EXIT
-  ln -s "$packaged_engine" "$alias_stage/eom-mail-watch"
-  mv -Tf "$alias_stage/eom-mail-watch" "$tool_bin_dir/eom-mail-watch"
-else
+  "$packaged_engine" --install-user-services
+  exit 0
+elif [[ "$#" != 1 || "$1" != --source ]]; then
+  echo "Usage: install-user-services.sh --engine /absolute/desktop/sidecar OR --source" >&2
+  exit 2
+fi
+
 constraints_file="$(mktemp)"
 cleanup() {
   rm -f "$constraints_file"
@@ -129,25 +112,11 @@ if [[ -n "$release_keyring_input" ]]; then
   fi
 fi
 
-fi
-
-mkdir -p "$unit_dir"
-install -m 0644 "$repo_dir/systemd/eom-email-watcher.service" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-email-watcher.timer" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-email-lmstudio.service" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-monthly-hours.service" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-monthly-hours.timer" "$unit_dir/"
-systemctl --user daemon-reload
-systemctl --user enable eom-email-watcher.timer
-systemctl --user enable eom-monthly-hours.timer
+PYTHONPATH="$repo_dir/src" "$snapshot_python" -c \
+  'from eom_email_watcher.deployment import install_source_units; install_source_units()'
 
 echo "Installed and enabled eom-email-watcher.timer."
 echo "Installed and enabled eom-monthly-hours.timer."
-if [[ -n "$packaged_engine" ]]; then
-  echo "Paired scheduled intake with $packaged_engine."
-  echo "It will begin succeeding after: $tool_bin_dir/eom-mail-watch setup"
-  exit 0
-fi
 echo "Installed a stable eom-mail-watch snapshot at $tool_bin_dir/eom-mail-watch."
 if [[ -n "$release_keyring_target" && -f "$release_keyring_target" ]]; then
   echo "Installed the approved Connect release authority for the service snapshot."

@@ -81,7 +81,7 @@ def test_isolated_environment_does_not_forward_home_or_secret_values(
 
     environment = isolated_environment(tmp_path)
 
-    assert "HOME" not in environment
+    assert environment["HOME"] == str(tmp_path)
     assert "GITHUB_TOKEN" not in environment
     assert environment["XDG_RUNTIME_DIR"] == str(tmp_path / "runtime")
     assert environment["DOC_SUM_MODEL_BASE_URL"] == "http://127.0.0.1:9/v1"
@@ -125,49 +125,19 @@ def test_proof_check_gate_and_timeout_parser_fail_closed() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
-def test_existing_connect_environment_supplies_typed_empty_manager(tmp_path):
-    import json
-    import subprocess
+def test_existing_connect_environment_supplies_complete_empty_manager(tmp_path, monkeypatch):
+    from eom_email_watcher import deployment
 
     prepare_private_directories(tmp_path)
     environment = isolated_environment(tmp_path)
-    state = subprocess.run(
-        [
-            "systemctl",
-            "--user",
-            "show",
-            "eom-email-watcher.service",
-            "--property=LoadState",
-            "--value",
-        ],
-        env=environment,
-        capture_output=True,
-        text=True,
+    monkeypatch.setenv("PATH", environment["PATH"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    records = deployment._manager_snapshot(deployment.UNIT_NAMES)
+    assert set(records) == set(deployment.UNIT_NAMES)
+    assert all(
+        record["LoadState"] == "not-found" and record["ActiveState"] == "inactive"
+        for record in records.values()
     )
-    assert state.returncode == 0 and state.stdout.strip() == "not-found"
-    for name, expected in (
-        ("ActiveState", {"type": "s", "data": "inactive"}),
-        ("MainPID", {"type": "u", "data": 0}),
-        ("ControlPID", {"type": "u", "data": 0}),
-    ):
-        value = subprocess.run(
-            [
-                "busctl",
-                "--user",
-                "--json=short",
-                "get-property",
-                "org.freedesktop.systemd1",
-                "/org/freedesktop/systemd1/unit/eom_2demail_2dwatcher_2eservice",
-                "org.freedesktop.systemd1.Unit"
-                if name == "ActiveState"
-                else "org.freedesktop.systemd1.Service",
-                name,
-            ],
-            env=environment,
-            capture_output=True,
-            text=True,
-        )
-        assert value.returncode == 0 and json.loads(value.stdout) == expected
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
@@ -179,15 +149,32 @@ def test_shared_manager_fixture_is_explicit_and_rejects_unknown_queries(tmp_path
     original = {"PATH": "/usr/bin"}
     environment = with_empty_user_manager(tmp_path, original)
     assert original == {"PATH": "/usr/bin"}
-    command = [
-        "busctl",
-        "--user",
-        "--json=short",
-        "get-property",
-        "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1/unit/public",
-        "org.freedesktop.systemd1.Service",
-        "Unknown",
-    ]
-    result = subprocess.run(command, env=environment, capture_output=True)
+    result = subprocess.run(
+        ["systemctl", "--user", "show", "unknown"], env=environment, capture_output=True
+    )
     assert result.returncode == 2 and result.stdout == b""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
+def test_connect_manager_runs_in_the_actual_isolated_environment(tmp_path):
+    import subprocess
+
+    from eom_email_watcher import deployment
+
+    prepare_private_directories(tmp_path)
+    environment = isolated_environment(tmp_path)
+    result = subprocess.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "--all",
+            "--no-pager",
+            "--property=" + ",".join(deployment._MANAGER_FIELDS),
+            *deployment.UNIT_NAMES,
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

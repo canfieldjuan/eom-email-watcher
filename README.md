@@ -313,45 +313,51 @@ activation contract.
 
 ## Two-hour user timer
 
-After mailbox setup succeeds:
+After mailbox setup succeeds, select the concrete sidecar shipped with the desktop:
 
 ```bash
-./scripts/install-user-services.sh
+./scripts/install-user-services.sh --engine /absolute/path/to/desktop/eom-mail-engine
 systemctl --user start eom-email-watcher.timer
 systemctl --user status eom-email-watcher.timer
 journalctl --user -u eom-email-watcher.service --since today
 ```
 
-On a source-only installation, supply the approved production public-key ring for a
-paid Connect-enabled service snapshot:
+The selected native engine owns its paired alias and all five scheduled unit files.
+Installation never searches PATH for a desktop. Before every packaged Linux database
+open, one bounded manager read checks the shipped graph, unit-file bytes and reader
+identities. Modified or redirected units, persistent drop-ins, pending reloads,
+partial installation and incompatible running readers refuse access. Let an old
+reader finish and reinstall using the updated desktop sidecar. Compatible paired
+readers retain the existing operation locks and dedupe. See the
+[deployment contract](plans/PR-Paired-Scheduled-Engine.md) for the exact admission policy.
+
+**A masked unit or missing user manager intentionally blocks every packaged desktop
+database open.** Repair the unit/manager and reinstall the paired deployment before
+retrying. A deployment refusal is reported as `deployment_refused`, rather than a
+stale or concurrent update. The LM Studio helper is part of the pinned graph; its
+canonical retained active state is allowed once its execution PIDs are zero.
+
+For an explicitly source-only installation, use the locked production uv snapshot:
+
+```bash
+./scripts/install-user-services.sh --source
+```
+
+A paid Connect-enabled source snapshot also needs the approved public-key ring:
 
 ```bash
 LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json \
-  ./scripts/install-user-services.sh
+  ./scripts/install-user-services.sh --source
 ```
 
-The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
-not bodies, OAuth tokens, or model prompts. It requests the local LM Studio service so existing
-loopback installs retain automatic startup, but that optional service cannot block a gateway-backed
-watcher when LM Studio is absent or fails. On a desktop installation the installer qualifies
-the native bundle and its CLI dispatch. Source console shims are skipped regardless of
-which environment put them on PATH. The installer points `~/.local/bin/eom-mail-watch` at that same executable. Both timers and the desktop
-therefore use the same database modules after updates. At startup and before every SQLite
-connection, the bundled admission owner binds the executing process to the installed engine
-and checks the manager's effective timer targets, main/control processes and service commands.
-Auxiliary execution phases must be empty. Redirected timer targets and auxiliary command
-overrides must be corrected before updating. Legacy/mixed readers and incompatible active
-workers block database migration;
-compatible paired timers can overlap using the existing operation locks and dedupe.
-Let an incompatible running worker finish, then
-rerun the installer after upgrading the bundle. Service execution does not require a source
-checkout. Timer cadence, ntfy delivery settings and per-attachment confirmation are retained.
-
-On a machine without an installed desktop, the installer retains the locked production
-`uv tool` snapshot. Supplying the approved production public-key ring installs the validated
-source-service authority. A desktop bundle embeds that authority at build time; do not pass
-`LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to the service installer in packaged mode.
-See [paired deployment contract](plans/PR-Paired-Scheduled-Engine.md).
+The source-only lane is exempt from native admission and does not establish paired
+desktop safety. A desktop bundle embeds its authority at build time; do not pass a
+keyring to its installer. Both modes consume the same shipped unit payload owner.
+Service cadence, sandbox, ntfy delivery and attachment confirmation remain as before.
+Logs contain message IDs and sanitized failure classes, not bodies or credentials.
+Post-send reservation recovery after a deployment refusal is tracked in
+[#219](https://github.com/canfieldjuan/eom-email-watcher/issues/219); do not resend an
+uncertain delivery before manual reconciliation.
 
 ## Model output and safety
 
@@ -372,7 +378,7 @@ install the timers:
 ```bash
 uv run eom-mail-watch setup-send
 uv run eom-mail-watch send-hours --dry-run
-./scripts/install-user-services.sh
+./scripts/install-user-services.sh --source
 systemctl --user start eom-monthly-hours.timer
 ```
 

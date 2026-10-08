@@ -25,6 +25,35 @@ def _load_builder() -> ModuleType:
 build_desktop_sidecar = _load_builder()
 
 
+def _build_data(arguments: list[str]) -> list[tuple[Path, str]]:
+    return [
+        (Path(source), destination)
+        for index, argument in enumerate(arguments)
+        if argument == "--add-data"
+        for source, destination in [
+            arguments[index + 1].rsplit(build_desktop_sidecar.os.pathsep, 1)
+        ]
+    ]
+
+
+def _credential_data(arguments: list[str]) -> list[tuple[Path, str]]:
+    units = [
+        (source, destination)
+        for source, destination in _build_data(arguments)
+        if destination == "eom_email_watcher_data/systemd"
+    ]
+    shipped = build_desktop_sidecar._unit_payloads()
+    assert {source.name for source, _ in units} == {unit.name for unit in shipped}
+    assert len(units) == len(shipped)
+    expected = {unit.name: unit.content for unit in shipped}
+    assert all(source.read_bytes() == expected[source.name] for source, _ in units)
+    return [
+        (source, destination)
+        for source, destination in _build_data(arguments)
+        if destination != "eom_email_watcher_data/systemd"
+    ]
+
+
 def _load_smoke() -> ModuleType:
     path = Path(__file__).parents[1] / "scripts" / "smoke_packaged_engine.py"
     spec = importlib.util.spec_from_file_location("smoke_packaged_engine", path)
@@ -796,6 +825,7 @@ def test_sidecar_build_stages_microsoft_public_client(
     def run(arguments: list[str], **kwargs):
         calls.append(arguments)
         if "PyInstaller" in arguments:
+            _credential_data(arguments)
             built = build_directory / "dist" / build_desktop_sidecar.ENGINE_NAME
             built.write_bytes(b"engine")
         return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
@@ -805,11 +835,13 @@ def test_sidecar_build_stages_microsoft_public_client(
     output = build_desktop_sidecar.build_sidecar()
 
     assert output.read_bytes() == b"engine"
-    add_data = [
-        calls[0][index + 1] for index, argument in enumerate(calls[0]) if argument == "--add-data"
+    credentials = [
+        (source, destination)
+        for source, destination in _build_data(calls[0])
+        if destination != "eom_email_watcher_data/systemd"
     ]
-    assert len(add_data) == 1
-    staged_source, destination = add_data[0].rsplit(build_desktop_sidecar.os.pathsep, 1)
+    assert len(credentials) == 1
+    staged_source, destination = credentials[0]
     assert Path(staged_source).name == "microsoft-oauth-client.json"
     assert destination == "eom_email_watcher_data"
     assert not Path(staged_source).exists()
@@ -885,14 +917,8 @@ def _configure_fake_sidecar_build(
     def run(arguments: list[str], **kwargs):
         calls.append(arguments)
         if "PyInstaller" in arguments:
-            for index, argument in enumerate(arguments):
-                if argument == "--add-data":
-                    source, _destination = arguments[index + 1].rsplit(
-                        build_desktop_sidecar.os.pathsep,
-                        1,
-                    )
-                    source_path = Path(source)
-                    staged_files.append((source_path.name, source_path.read_bytes()))
+            for source_path, _destination in _credential_data(arguments):
+                staged_files.append((source_path.name, source_path.read_bytes()))
             built = build_directory / "dist" / build_desktop_sidecar.ENGINE_NAME
             built.write_bytes(b"engine")
         return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
@@ -1102,8 +1128,10 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     def run(arguments: list[str], **kwargs):
         calls.append(arguments)
         if "PyInstaller" in arguments:
-            add_data = arguments[arguments.index("--add-data") + 1]
-            staged_source = Path(add_data.rsplit(";", 1)[0])
+            credentials = _credential_data(arguments)
+            assert len(credentials) == 1
+            staged_source, destination = credentials[0]
+            assert destination == "connect_automate_data"
             staged_keyring.append(staged_source.read_bytes())
             built = build_directory / "dist" / f"{build_desktop_sidecar.ENGINE_NAME}.exe"
             built.write_bytes(b"engine")
@@ -1114,11 +1142,13 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     output = build_desktop_sidecar.build_sidecar()
 
     assert output.read_bytes() == b"engine"
-    add_data = [
-        calls[0][index + 1] for index, argument in enumerate(calls[0]) if argument == "--add-data"
+    credentials = [
+        (source, destination)
+        for source, destination in _build_data(calls[0])
+        if destination != "eom_email_watcher_data/systemd"
     ]
-    assert len(add_data) == 1
-    staged_source, destination = add_data[0].rsplit(";", 1)
+    assert len(credentials) == 1
+    staged_source, destination = credentials[0]
     assert Path(staged_source).name == "connect-entitlement-keyring.json"
     assert destination == "connect_automate_data"
     assert staged_keyring == [validated_keyring]
