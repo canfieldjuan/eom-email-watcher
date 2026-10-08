@@ -241,3 +241,34 @@ literal-owner-receipt.json and literal-cold-diff-audit.md bind source and artifa
 
 Gap audit: local class repair DONE; published-head independent verification and
 CI pending. No promotion; scheduling ambiguity/live gateway/semantic review stay.
+
+
+## Linear scanner revision before implementation
+
+Root cause: my 061f1b7 _prose_mailbox_tokens recursively queues whole-run
+parenthetical/quoted regions and _prose_enclosure_end rewalks their interiors.
+The repeated text slices are also quadratic; indexing matches alone must not
+leave those slices in the wrapper loop. Origin scheduling.py:439-453, :505-522.
+Oversight 4219687137 reproduced scaling and directs one owner correction.
+
+Required surface: compute enclosure match ends once with a stack pass; all
+boundary walkers share that index. Nested region traversal uses index bounds,
+constant-time match lookups and no full-interior copies. Materialize a literal
+candidate only after surrounding speech/parenthetical wrappers are removed.
+Preserve opacity, normalizer ownership, source grammar and occurrence matching.
+
+Input bound: production service.py:629-633 constructs SchedulingSource with
+bounded_gateway_text(content.body, MAX_GATEWAY_BODY_CHARS); model.py:60 sets
+100000. SchedulingSource and direct tokenization impose no independent cap.
+No new cap or source truncation in this change.
+
+Non-scope: no syntax acceptance change, normalizer/header parser, prompt/model,
+settings, gateway run, retry, promotion or deployment work. Existing false
+rejection from unmatched quotes is deferred to the grouped follow-up issue.
+
+Verification: fail-first operation-count regression at depth20000 for both
+parentheses and quoted parentheses; count indexing and copied slice lengths so
+quadratic rescans/copies fail quickly. Original published probe depths and
+mixed/enclosure semantic tests remain. Keep all six existing mutation probes
+and retained original completion replay unchanged. Affected suites and Ruff.
+One correction push after root note and contract-only commit.
