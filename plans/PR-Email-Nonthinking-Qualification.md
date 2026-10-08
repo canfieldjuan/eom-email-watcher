@@ -173,3 +173,50 @@ Non-scope: existing recipient_addresses behavior, model/runtime/settings/prompts
 normal profile and schema unchanged. No new generation/retry/gateway run or model
 promotion. Ambiguity, live gateway and semantic review remain qualification gates.
 Hold stays for independent exact-head verification; one correction push.
+
+
+## Third-round class consolidation before implementation
+
+### Root cause
+My 194ff60 prose lexer and 9b1f60d source-grammar correction independently
+restated mailbox validity in an ASCII _DOT_ATOM regex (scheduling.py:442-443),
+and split opacity by quoted/bracketed constructs (scheduling.py:436-441).
+The existing config.py:247 normalize_validated_address admits Unicode local
+parts and IDN domains, but that duplicate grammar rejects them. Treating angles
+as unconditional separators extracts an inner address from a larger compound.
+
+### Required change surface
+scheduling.py owns only maximal lexical boundaries and complete literal spans.
+One balanced enclosure scanner keeps all compounds intact, including whitespace,
+escapes, quoted speech, brackets and angles. Surrounding display brackets,
+parenthetical mentions and standalone prose quotations can supply boundaries;
+embedded enclosure syntax stays opaque. Whitespace/comments around an @ belong
+to the same opaque compound. Candidates have exactly one @ and normalization
+must equal the literal run's casefold; config.normalize_validated_address alone
+owns mailbox validity. Remove the ASCII grammar and separate quote/bracket regex
+owners. Preserve source-selected header parsing and exact quote-occurrence spans.
+
+### Explicit non-scope
+No header-parser, configuration normalizer, prompt/model/runtime/default/schema,
+corpus, retry, live gateway, semantic qualification or promotion changes.
+No downstream attendee filter or address-specific patch.
+
+### Assumptions and blockers
+Oversight review 5450823568 accepts this class design with no new acceptance
+needed; root note precedes edits and contract-only commit precedes code.
+One consolidation push. After this fix, false acceptance blocks; additional
+unusual valid syntax rejected is grouped in one follow-up issue and deferred,
+as instructed in operator comment 6051238588. Current Unicode/angle cases are
+part of this consolidation, not deferred. Promotion gates remain unchanged.
+
+### Verification plan
+Declare fail-first real-validator cases for Unicode local/IDN rejection and
+both angle compound orientations falsely supporting an inner attendee. Cover
+body, subject and attachment sources, full/cropped quotes, correct display
+angles, quoted speech/locals, parentheses, escaped/unclosed enclosures, mixed
+valid/invalid runs, empty/single/large inputs and exact spans. Retain all earlier
+regressions; scheduling/adjacent tests and Ruff/diff checks. Remove normalizer
+equality, compound opacity, source selection and same-occurrence membership
+independently: the respective regression tests must fail. Replay the retained
+original completion offline, preserving scheduling ambiguity rejection and
+without generating another model response. Cold audit each changed file.
