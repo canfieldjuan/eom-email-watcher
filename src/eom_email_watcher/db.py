@@ -8607,10 +8607,16 @@ class Store:
             if mailbox_identity_key is not None:
                 return (
                     db.execute(
-                        f"""SELECT 1 FROM messages AS m
-                        WHERE m.provider = ?1 AND m.account_id = ?2
-                          AND {_effective_message_identity_sql("m")} = ?3
-                          AND m.provider_message_id = ?4
+                        f"""SELECT 1 FROM (
+                            SELECT provider, account_id, mailbox_identity_key FROM messages
+                            WHERE provider = ?1 AND account_id = ?2
+                              AND mailbox_identity_key = ?3 AND provider_message_id = ?4
+                            UNION ALL
+                            SELECT provider, account_id, mailbox_identity_key FROM messages
+                            WHERE provider = ?1 AND account_id = ?2
+                              AND mailbox_identity_key IS NULL AND provider_message_id = ?4
+                        ) AS m
+                        WHERE {_effective_message_identity_sql("m")} = ?3
                         UNION ALL
                         SELECT 1 FROM message_locations
                         WHERE provider = ?1 AND account_id = ?2

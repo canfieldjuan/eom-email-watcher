@@ -6,6 +6,7 @@ import subprocess
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -7980,6 +7981,54 @@ def test_repeated_concurrent_copies_of_upgraded_legacy_message(tmp_path: Path) -
     assert len(store.recent(10)) == 1
     assert len(store.message_sources(root)) == 5
     assert store.pending() == []
+
+
+def test_seen_lookup_work_does_not_grow_with_unrelated_account_mail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "same@x")
+    identity = str(store.message_source(root).mailbox_identity_key)
+    original_connection = store.connection
+    work: list[int] = []
+
+    @contextmanager
+    def measured_connection():
+        with original_connection() as db:
+            steps = 0
+
+            def step() -> int:
+                nonlocal steps
+                steps += 1
+                return 0
+
+            db.set_progress_handler(step, 1)
+            try:
+                yield db
+            finally:
+                db.set_progress_handler(None, 0)
+                work.append(steps)
+
+    monkeypatch.setattr(store, "connection", measured_connection)
+    def lookup() -> bool:
+        return ProductionStore.has_seen_message(
+            store, "missing-source", provider="imap", account_id="imap-account",
+            mailbox_identity_key=identity,
+        )
+    assert lookup() is False
+    baseline = work[-1]
+    with original_connection() as db:
+        columns = [str(r["name"]) for r in db.execute("PRAGMA table_info(messages)")]
+        replacements = {"message_id", "provider_message_id", "rfc_message_id"}
+        expressions = ["?" if c in replacements else c for c in columns]
+        db.executemany(
+            f"INSERT INTO messages ({', '.join(columns)}) "
+            f"SELECT {', '.join(expressions)} FROM messages WHERE message_id = ?",
+            [(f"noise-{i}", f"noise-source-{i}", f"noise-{i}@x", root) for i in range(1000)],
+        )
+    assert lookup() is False
+    assert work[-1] <= baseline + 500, "SEEN_LOOKUP_SCANNED_UNRELATED_MAIL"
 
 
 def test_a_copy_captured_as_a_location_keeps_its_logical_message_in_retention(
