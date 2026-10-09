@@ -158,7 +158,8 @@ Each definition is the only place its rule is stated.
   - the stored messages, with their headers, received times, and recorded locations;
   - the vendor records;
   - the mailbox's verified identities ([D-vendor](#d-vendor-vendors-and-vendor_ofaddress));
-  - the active claims extractor version ([D-claims](#d-claims-claims-and-comparability)): recording a new one supersedes the previous key's claims, discrepancies, and attempts in that transaction, and reconciliation creates the replacements.
+  - the active claims extractor version ([D-claims](#d-claims-claims-and-comparability)): recording a new one supersedes the previous key's claims, discrepancies, and attempts in that transaction, and reconciliation creates the replacements;
+  - the stored claims, from which the comparison outcomes of [D-claims](#d-claims-claims-and-comparability) are computed. The reconcile pass storing a message's claims is a change to this input, including when those claims only create a link.
 
   All of them live in the database. Admission provenance and discovery order are never inputs.
 - **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`).
@@ -264,10 +265,11 @@ Each definition is the only place its rule is stated.
   - A claim's anchor and its canonical item key must be bound to that claim uniquely, from its own evidence. Item keys are canonicalized in code, never taken from the model's choice of substring. References that the claim's own message links (below) count as one candidate; the claim binds to the one of the most specific kind, in the order `invoice`, `po`, `quote`.
   - Relative and yearless dates resolve against the message's stored date context ([D-body](#d-body-stored-bodies)). Without that context they are rejected.
   - Only claims of the current extractor version exist for comparison. A new version supersedes a message's older claims atomically.
-- **Linked references.** Two references of different kinds are linked when one message's validated `reference` claims include exactly one reference of each of those two kinds, as in "Invoice 9087 for quote Q-512".
+- **Linked references.** Two references of different kinds are linked when one message's validated `reference` claims name exactly one distinct reference of each of those two kinds, as in "Invoice 9087 for quote Q-512". References are counted by kind and normalized number (the M4 plan names the normalization), so a number repeated in one message still counts once.
   - A message that names two references of one kind links neither of them, so "PO-1 total $100; PO-2 total $200" links nothing.
   - Each link joins exactly the two references that one message names.
-- **A claim's anchors** are the reference `(kind, number)` bound to it, plus every reference linked to that one by a message of the same vendor, account, and mailbox identity. Two claims share an anchor when their anchors intersect. Anchors reach one link from the bound reference and no further, so two invoices for two different POs of one quote are never paired with each other.
+- **A claim's anchors** are the reference `(kind, number)` bound to it, plus every reference linked to that one by a message of the same vendor, account, and mailbox identity. Anchors reach one link from the bound reference and no further.
+- **A shared anchor** exists when two claims' anchors intersect and, in every kind where both claims have anchors, they have one in common. A more specific reference that differs therefore keeps two claims apart even when a broader one matches: two different invoices are never paired, and invoices for different POs of one quote each pair with the quote but not with each other.
 - **`comparable(a, b)`** holds only if all of these do:
   - same vendor, in the same account and mailbox identity, whether or not the claims sit in the same thread (decision D4);
   - same type, and same validated key;
@@ -338,7 +340,7 @@ Each named plan must include these, with fail-first tests.
   - Quote segmentation, tested on top-posted, bottom-posted (`>`), inline, and Outlook-header replies.
   - The attempt record's backoff.
   - Comparison across threads ([D-claims](#d-claims-claims-and-comparability), decision D4): a quote in one thread and its invoice in another, joined by the same reference and by a linked pair, each tested on every provider.
-  - Recomputing a vendor's cross-thread outcomes when either side's message is captured, purged, superseded, or re-attributed, inside the change's own transaction ([D-derived](#d-derived-derived-state-and-invalidation)).
+  - Outcomes follow their claims ([D-derived](#d-derived-derived-state-and-invalidation)): tested with the linking message's claims stored last, after both sides, and with either side purged or re-attributed.
   - The thread view shows a cross-thread outcome in both threads, each linking to the other message.
 
 ## Operator decisions (accepted 2026-10-05, as recommended)
@@ -408,12 +410,13 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - two orders without a shared anchor stay unflagged;
   - across threads:
     - "Quote Q-512, total $1,200" in one thread and "Invoice 9087 for quote Q-512, total $1,450" in another give one discrepancy;
-    - an invoice that names only "Invoice 9087" compares with that quote once another message of the vendor says "Invoice 9087 for quote Q-512";
+    - an invoice that names only "Invoice 9087" compares with that quote as soon as the claims of another vendor message saying "Invoice 9087 for quote Q-512" are stored, even when that message is extracted last;
     - the same quote number from a different vendor is never compared;
     - two threads of one vendor whose totals share no reference, directly or through a link, are never paired;
     - an invoice that names two quotes links neither, and is compared with neither;
     - a vendor message "We received PO 4471 for quote Q-512" and, in another thread, "Invoice 9087 for PO 4471, total $1,450" pair the invoice with the quote through the PO;
-    - two invoices, one for each of two POs that the same quote links, are paired with the quote but never with each other;
+    - "Invoice I-1 for PO-1, quote Q-1" and "Invoice I-2 for PO-2, quote Q-1" each pair with quote Q-1, and never with each other;
+    - a message that names "Q-512" twice beside "Invoice 9087" still links the two;
     - a `unit_price` in another thread is compared only through a shared anchor;
     - purging the quote's thread removes the discrepancy from the invoice's thread;
   - a delivery date moved earlier is not flagged;
@@ -469,3 +472,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-06: the sixth M2 plan review: a retryable claim attempt whose backoff deadline has passed is pending derived work, so it makes coverage stale (D-reconcile).
 - 2026-10-07: the gap-stamps and M2.1 code reviews found two concepts without an owner. D-reconcile used "unconfirmed location" with no definition, so each rewording of its gap rule restated which messages the stages reach; D-identity now defines recorded locations and their confirmation, and the gap rule cites the stages' fetches. The purge, analysis, and Connect each compared a logical message's age with the cutoff on their own; D-scope now defines a logical message's received time once, as its newest copy's, for every comparison, and keeps what may be fetched separate from what the purge keeps.
 - 2026-10-09: decision D4, from the operator: the main use is an agreement made in one thread and invoiced in another, which "same thread" excluded. D-claims now compares claims across a vendor's threads in one account. It adds linked references (one message naming exactly one reference of each of two kinds) and a claim's anchors (its bound reference plus one link). Binding prefers the most specific kind. Anchor-free `unit_price` comparison stays within one thread, and outcomes show in every thread that holds a side. Retention (D1) and the gate (D3) are unchanged. M4 carries the new required items.
+- 2026-10-09: the Codex review of #224 found three gaps in D4's first draft, each fixed in its owner. D-derived now lists the stored claims as an input of the comparison outcomes, so storing an extraction recomputes them, even one that only creates a link; this replaces an event list the draft had put in the M4 items. D-claims adds a shared anchor that must agree in every kind both claims carry, so invoices for different POs of one quote no longer pair through the quote. Links count distinct references, not claim objects.
