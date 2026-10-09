@@ -38,6 +38,7 @@ from .mailbox import (
     normalize_message_id,
     recipient_addresses,
     reply_ids_from_headers,
+    validate_content_scope,
     validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
@@ -2172,7 +2173,14 @@ class ImapGateway:
             refresh_timeout,
         )
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
+        scope = validate_content_scope(scope)
+        _identity, folder_key, _validity, _uid = _decode_any_message_id(message_id)
+        location = INBOX_LOCATION if folder_key is None else SENT_LOCATION
+        if location not in scope:
+            raise MailboxMessageUnavailable("IMAP message is outside the active folder scope")
         with self._mailbox() as client:
             uid = self._checked_uid(client, message_id)
             catalog = self._catalog(client, uid, self._refresh_operation_timeout)

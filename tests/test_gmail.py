@@ -167,16 +167,19 @@ def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> No
     gateway._history_changes = lambda cursor: (["m1", "m2"], "next-cursor", {})
     gateway.search_since = lambda addresses, since: ["recovered"]
     gateway.profile_history_id = lambda: "recovery-cursor"
-    gateway.full_payload = lambda message_id: {
-        "mimeType": "text/plain",
-        "body": {"data": base64.urlsafe_b64encode(b"hello").decode()},
+    gateway._full_message = lambda message_id: {
+        "labelIds": ["INBOX"],
+        "payload": {
+            "mimeType": "text/plain",
+            "body": {"data": base64.urlsafe_b64encode(b"hello").decode()},
+        },
     }
 
     changes = gateway.changes_since("cursor")
     recovered = gateway.recover_since(
         frozenset({"a@example.com"}), datetime(2026, 9, 1, tzinfo=UTC)
     )
-    content = gateway.content("m1", 100)
+    content = gateway.content("m1", 100, scope=frozenset({"inbox"}))
 
     assert changes.message_ids == ("m1", "m2")
     assert changes.cursor == "next-cursor"
@@ -1842,3 +1845,100 @@ def test_parse_metadata_without_admitted_labels_has_no_location() -> None:
 
 def test_metadata_fetch_requests_the_thread_headers() -> None:
     assert set(GMAIL_METADATA_HEADERS) >= {"To", "Cc", "Message-ID", "In-Reply-To", "References"}
+
+
+@pytest.mark.parametrize("labels,scope", [
+    (["TRASH"], frozenset({"inbox"})), ([], frozenset({"inbox"})),
+    (None, frozenset({"inbox"})), ("INBOX", frozenset({"inbox"})),
+    (["SENT"], frozenset({"inbox"})), (["INBOX"], frozenset()),
+])
+def test_gmail_full_response_rejects_outside_active_scope(
+    labels: object, scope: frozenset[str],
+) -> None:
+    from eom_email_watcher.mailbox import MailboxMessageUnavailable
+
+    response = {
+        "labelIds": labels,
+        "payload": {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}},
+    }
+    service = SimpleNamespace(users=lambda: SimpleNamespace(messages=lambda: SimpleNamespace(
+        get=lambda **_kwargs: SimpleNamespace(execute=lambda: response),
+    )))
+    gateway = GmailGateway(service)
+    gateway.scope_folders(
+        frozenset({"inbox", "sent"}) if scope != frozenset({"inbox", "sent"})
+        else frozenset({"inbox"})
+    )
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content("m1", 100, scope=scope)
+
+
+@pytest.mark.parametrize("labels,scope", [
+    (["INBOX"], frozenset({"inbox"})),
+    (["SENT"], frozenset({"inbox", "sent"})),
+    (["TRASH", "INBOX"], frozenset({"inbox"})),
+    (["INBOX"] * gmail_module.MAX_GMAIL_LABEL_COUNT, frozenset({"inbox"})),
+    (["INBOX", "x" * gmail_module.MAX_GMAIL_LABEL_ID_BYTES], frozenset({"inbox"})),
+])
+def test_gmail_full_response_keeps_active_admitted_folder(
+    labels: list[str], scope: frozenset[str],
+) -> None:
+    response = {
+        "labelIds": labels,
+        "payload": {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}},
+    }
+    service = SimpleNamespace(users=lambda: SimpleNamespace(messages=lambda: SimpleNamespace(
+        get=lambda **_kwargs: SimpleNamespace(execute=lambda: response),
+    )))
+    gateway = GmailGateway(service)
+    gateway.scope_folders(
+        frozenset({"inbox", "sent"}) if scope != frozenset({"inbox", "sent"})
+        else frozenset({"inbox"})
+    )
+    assert gateway.content("m1", 100, scope=scope).body == "Hello"
+
+
+@pytest.mark.parametrize("labels", [
+    ["INBOX", 7], ["INBOX", ""],
+    ["INBOX", "x" * (gmail_module.MAX_GMAIL_LABEL_ID_BYTES + 1)],
+    ["INBOX"] * (gmail_module.MAX_GMAIL_LABEL_COUNT + 1),
+])
+def test_body_rejects_complete_malformed_label_evidence(labels):
+    from eom_email_watcher.mailbox import MailboxMessageUnavailable
+    response = {"labelIds": labels, "payload": {"mimeType": "text/plain"}}
+    gateway = GmailGateway(SimpleNamespace(users=lambda: SimpleNamespace(
+        messages=lambda: SimpleNamespace(
+            get=lambda **kw: SimpleNamespace(execute=lambda: response),
+        ),
+    )))
+    gateway.scope_folders(frozenset({"inbox"}))
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content("m1", 100, scope=frozenset({"inbox"}))
+
+
+def test_archived_inline_attachment_export_retains_transport_behavior():
+    response = {"labelIds": ["CATEGORY_UPDATES"], "payload": {
+        "mimeType": "multipart/mixed", "parts": [{"partId": "1", "mimeType": "application/pdf",
+        "body": {"data": base64.urlsafe_b64encode(b"%PDF-1.4").decode()}}],
+    }}
+    gateway = GmailGateway(SimpleNamespace(users=lambda: SimpleNamespace(
+        messages=lambda: SimpleNamespace(
+            get=lambda **kw: SimpleNamespace(execute=lambda: response),
+        ),
+    )))
+    assert gateway.attachment_bytes("m1", "1", None) == b"%PDF-1.4"
+
+
+@pytest.mark.parametrize(
+    "scope", [None, False, 0, "", frozenset({"archive"}), frozenset({"inbox", 7})]
+)
+def test_gmail_content_rejects_invalid_scope_before_transport(scope) -> None:
+    gateway = GmailGateway(None)
+    with pytest.raises(ValueError, match="Content scope"):
+        gateway.content("m1", 100, scope=scope)
+
+
+def test_gmail_content_requires_scope_before_transport() -> None:
+    gateway = GmailGateway(None)
+    with pytest.raises(TypeError, match="scope"):
+        gateway.content("m1", 100)

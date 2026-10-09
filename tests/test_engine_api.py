@@ -6610,7 +6610,9 @@ class FakeGmail:
     def full_payload(self, message_id: str):
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         body, attachment_names, attachments, body_source_chars = extract_body(
             self.full_payload(message_id), body_char_limit
         )
@@ -6848,7 +6850,9 @@ def test_catalog_failure_remains_primary_while_processing_persisted_pending_work
             self.change_calls += 1
             raise AssertionError("catalog failure must block discovery")
 
-        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             self.content_calls += 1
             if pending_error is not None:
                 raise pending_error

@@ -652,7 +652,7 @@ def test_metadata_and_content_skip_attachment_payload_sections() -> None:
 
     with gateway.polling_session():
         metadata = gateway.metadata(message_id())
-        content = gateway.content(message_id(), 1000)
+        content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert metadata.sender == "watched@example.com"
     assert metadata.sender_name == "Sender Name"
@@ -685,13 +685,14 @@ def test_bodystructure_size_accepts_sqlite_maximum_and_rejects_next_integer() ->
             )
 
     accepted = ImapGateway(credentials(), lambda _credentials, _context: SizedAttachment(maximum))
-    assert accepted.content(message_id(), 1000).attachments[0].byte_size == maximum
+    content = accepted.content(message_id(), 1000, scope=frozenset({"inbox"}))
+    assert content.attachments[0].byte_size == maximum
 
     rejected = ImapGateway(
         credentials(), lambda _credentials, _context: SizedAttachment(maximum + 1)
     )
     with pytest.raises(MailboxMessageInvalid) as raised:
-        rejected.content(message_id(), 1000)
+        rejected.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert raised.value.code == "imap_bodystructure_invalid"
 
@@ -715,7 +716,7 @@ def test_content_bounds_aggregate_actual_text_section_bytes(
     accepted_client = UnderreportedText(b"de")
     accepted = ImapGateway(credentials(), lambda _credentials, _context: accepted_client)
 
-    assert accepted.content(message_id(), 1000).body == "abc\nde"
+    assert accepted.content(message_id(), 1000, scope=frozenset({"inbox"})).body == "abc\nde"
     accepted_fetches = [
         str(call[-1]) for call in accepted_client.calls if call[:2] == ("uid", "FETCH")
     ]
@@ -724,7 +725,7 @@ def test_content_bounds_aggregate_actual_text_section_bytes(
 
     rejected = ImapGateway(credentials(), lambda _credentials, _context: UnderreportedText(b"def"))
     with pytest.raises(MailboxMessageInvalid) as raised:
-        rejected.content(message_id(), 1000)
+        rejected.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert raised.value.code == "imap_message_too_large"
 
@@ -761,7 +762,7 @@ def test_polling_session_reuses_consumed_uidvalidity_response() -> None:
     with gateway.polling_session():
         changes = gateway.changes_since(cursor(6))
         gateway.metadata(changes.message_ids[0])
-        gateway.content(changes.message_ids[0], 1000)
+        gateway.content(changes.message_ids[0], 1000, scope=frozenset({"inbox"}))
 
     assert client.consumed == {"UIDVALIDITY", "UIDNEXT"}
 
@@ -833,7 +834,7 @@ def test_root_multipart_attachment_is_fetched_only_after_explicit_request() -> N
 
     gateway = ImapGateway(credentials(), create)
 
-    content = gateway.content(message_id(), 1000)
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
     fetched = gateway.attachment_bytes(message_id(), "mime-0", None)
 
     assert content.body == ""
@@ -900,7 +901,7 @@ def test_non_root_multipart_attachment_export_preserves_wrapper_and_boundaries()
 
     gateway = ImapGateway(credentials(), create)
 
-    content = gateway.content(message_id(), 1000)
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
     exported = BytesParser(policy=policy.default).parsebytes(
         gateway.attachment_bytes(message_id(), "mime-0", None)
     )
@@ -964,7 +965,7 @@ def test_bodystructure_decodes_extended_and_encoded_attachment_filenames(
     client = EncodedFilename()
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
-    content = gateway.content(message_id(), 1000)
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert content.attachment_names == (expected_filename,)
     assert all("BODY.PEEK[1]" not in str(call[-1]) for call in client.calls if call)
@@ -984,7 +985,7 @@ def test_malformed_extended_filename_stays_catalogued_with_synthesized_name() ->
     client = MalformedExtendedFilename()
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
-    content = gateway.content(message_id(), 1000)
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert content.attachment_names == ("attachment-1.pdf",)
     assert all("BODY.PEEK[1]" not in str(call[-1]) for call in client.calls if call)
@@ -1001,7 +1002,7 @@ def test_unknown_text_charset_falls_back_to_utf8_replacement() -> None:
 
     gateway = ImapGateway(credentials(), lambda _credentials, _context: UnknownCharset())
 
-    assert gateway.content(message_id(), 1000).body == "caf\u00e9"
+    assert gateway.content(message_id(), 1000, scope=frozenset({"inbox"})).body == "caf\u00e9"
 
 
 def test_empty_successful_bodystructure_fetch_is_message_unavailable() -> None:
@@ -1017,7 +1018,7 @@ def test_empty_successful_bodystructure_fetch_is_message_unavailable() -> None:
     )
 
     with pytest.raises(MailboxMessageUnavailable):
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
 
 def test_bodystructure_literal_filename_is_catalogued_without_attachment_fetch() -> None:
@@ -1034,7 +1035,7 @@ def test_bodystructure_literal_filename_is_catalogued_without_attachment_fetch()
     client = LiteralFilename()
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
-    content = gateway.content(message_id(), 1000)
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert content.attachment_names == ("invoice.pdf",)
     assert all("BODY.PEEK[2]" not in str(call[-1]) for call in client.calls if call)
@@ -1053,7 +1054,8 @@ def test_bodystructure_ignores_unrelated_unsolicited_fetch_data() -> None:
 
     gateway = ImapGateway(credentials(), lambda _credentials, _context: UnsolicitedFlags())
 
-    assert gateway.content(message_id(), 1000).body == "The invoice is attached."
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
+    assert content.body == "The invoice is attached."
 
 
 def test_section_fetch_rejects_a_different_returned_section() -> None:
@@ -1068,7 +1070,7 @@ def test_section_fetch_rejects_a_different_returned_section() -> None:
     gateway = ImapGateway(credentials(), lambda _credentials, _context: WrongSection())
 
     with pytest.raises(MailboxMessageUnavailable):
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
 
 @pytest.mark.parametrize(
@@ -1089,7 +1091,7 @@ def test_section_fetch_accepts_quoted_nstrings(wire_value: bytes, expected: str)
 
     gateway = ImapGateway(credentials(), lambda _credentials, _context: QuotedSection())
 
-    assert gateway.content(message_id(), 1000).body == expected
+    assert gateway.content(message_id(), 1000, scope=frozenset({"inbox"})).body == expected
 
 
 @pytest.mark.parametrize(
@@ -1139,7 +1141,7 @@ def test_section_fetch_rejects_a_mismatched_literal_length() -> None:
     gateway = ImapGateway(credentials(), lambda _credentials, _context: InvalidLiteralLength())
 
     with pytest.raises(MailboxMessageUnavailable):
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
 
 def test_bodystructure_literal_length_mismatch_fails_closed() -> None:
@@ -1154,7 +1156,7 @@ def test_bodystructure_literal_length_mismatch_fails_closed() -> None:
     gateway = ImapGateway(credentials(), lambda _credentials, _context: InvalidLiteral())
 
     with pytest.raises(MailboxMessageInvalid) as raised:
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert raised.value.code == "imap_bodystructure_invalid"
 
@@ -1170,7 +1172,7 @@ def test_bodystructure_response_byte_limit_accepts_boundary_and_rejects_next() -
 def test_forwarded_message_is_an_attachment_not_outer_body() -> None:
     gateway = ImapGateway(credentials(), factory([], raw_message=FORWARDED_MESSAGE))
 
-    content = gateway.content(message_id(), 1000)
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert content.body == "Outer body only."
     assert content.attachment_names == ("forwarded.eml",)
@@ -1183,7 +1185,7 @@ def test_forwarded_message_is_an_attachment_not_outer_body() -> None:
 def test_filename_less_attachment_dispositions_never_join_outer_body() -> None:
     gateway = ImapGateway(credentials(), factory([], raw_message=FILENAMELESS_ATTACHMENTS))
 
-    content = gateway.content(message_id(), 1000)
+    content = gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert content.body == "Outer body only."
     assert content.attachment_names == ("attachment-1.eml", "attachment-2.txt")
@@ -1356,7 +1358,7 @@ def test_bodystructure_parser_depth_is_a_nonretryable_message_failure() -> None:
     gateway = ImapGateway(credentials(), lambda _credentials, _context: ExcessiveStructure())
 
     with pytest.raises(MailboxMessageInvalid) as raised:
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert raised.value.code == "imap_bodystructure_invalid"
 
@@ -1374,7 +1376,7 @@ def test_unrecognized_text_transfer_encoding_fails_before_section_fetch() -> Non
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
     with pytest.raises(MailboxMessageInvalid) as raised:
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert raised.value.code == "imap_bodystructure_invalid"
     assert all("BODY.PEEK[1]" not in str(call[-1]) for call in client.calls if call)
@@ -1558,7 +1560,7 @@ def test_content_fetch_rejection_is_retryable_protocol_failure(rejected_query: s
     gateway = ImapGateway(credentials(), lambda _credentials, _context: RejectedFetch())
 
     with pytest.raises(ImapError) as raised:
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert raised.value.code == "imap_protocol_error"
     assert "private server detail" not in str(raised.value)
@@ -1649,7 +1651,7 @@ def test_oversized_message_is_a_permanent_message_failure() -> None:
 
     assert gateway.metadata(message_id()).sender == "watched@example.com"
     with pytest.raises(MailboxMessageInvalid) as raised:
-        gateway.content(message_id(), 1000)
+        gateway.content(message_id(), 1000, scope=frozenset({"inbox"}))
 
     assert raised.value.code == "imap_message_too_large"
 
@@ -1821,7 +1823,7 @@ def test_live_content_reports_pre_cut_length(limit: int, expected_body: str) -> 
     client = TwoTextSections()
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
-    content = gateway.content(message_id(), limit)
+    content = gateway.content(message_id(), limit, scope=frozenset({"inbox"}))
 
     assert content.body == expected_body
     assert content.body_source_chars == 6
@@ -2333,3 +2335,44 @@ def test_a_configured_sent_folder_that_cannot_be_selected_is_unavailable() -> No
     with pytest.raises(ImapError) as excinfo:
         gateway.sent_initial_cursor()
     assert excinfo.value.code == "imap_sent_unavailable"
+
+
+@pytest.mark.parametrize(
+    "scope", [None, False, 0, "", frozenset({"archive"}), frozenset({"inbox", 7})]
+)
+def test_imap_content_rejects_invalid_scope_before_transport(scope) -> None:
+    gateway = ImapGateway(credentials(), lambda *_args: pytest.fail("transport reached"))
+    with pytest.raises(ValueError, match="Content scope"):
+        gateway.content("m1", 100, scope=scope)
+
+
+def test_imap_content_requires_scope_before_transport() -> None:
+    gateway = ImapGateway(credentials(), lambda *_args: pytest.fail("transport reached"))
+    with pytest.raises(TypeError, match="scope"):
+        gateway.content("m1", 100)
+
+
+@pytest.mark.parametrize("scope", [frozenset(), frozenset({"sent"})])
+def test_imap_content_rejects_inbox_outside_scope_before_transport(scope) -> None:
+    gateway = ImapGateway(credentials(), lambda *_args: pytest.fail("transport reached"))
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content(message_id(), 100, scope=scope)
+
+
+def test_imap_content_rejects_sent_outside_scope_before_transport() -> None:
+    gateway = ImapGateway(credentials(), lambda *_args: pytest.fail("transport reached"))
+    sent_id = f"{SENT_MESSAGE_ID_PREFIX}{imap_mailbox_identity(credentials())}:{'a' * 64}:44:7"
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content(sent_id, 100, scope=frozenset({"inbox"}))
+
+
+@pytest.mark.parametrize("scope", [frozenset({"sent"}), frozenset({"inbox", "sent"})])
+def test_imap_content_accepts_sent_in_explicit_scope(scope) -> None:
+    client = SentFolderImap(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+    folder_key = imap_module._folder_key("Sent Messages")
+    sent_id = f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{folder_key}:77:3"
+    content = gateway.content(sent_id, 100, scope=scope)
+    assert content.body == "The invoice is attached."
+    assert '"Sent Messages"' in _selects(client)

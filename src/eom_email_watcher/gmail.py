@@ -42,6 +42,7 @@ from .mailbox import (
     normalize_message_id,
     recipient_addresses,
     reply_ids_from_headers,
+    validate_content_scope,
     validate_operation_timeout,
 )
 from .mime import extract_body
@@ -515,13 +516,7 @@ def _received_at(message: dict[str, Any], headers: dict[str, str]) -> str:
         return ""
 
 
-def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
-    payload = message.get("payload") or {}
-    headers = _headers(payload)
-    raw_from = headers.get("from", "")
-    from email.utils import parseaddr
-
-    sender_name, _address = parseaddr(raw_from)
+def _validated_label_ids(message: dict[str, Any]) -> frozenset[str]:
     raw_labels = message.get("labelIds")
     if raw_labels is None:
         raw_labels = []
@@ -545,6 +540,17 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
             "gmail_message_invalid",
             "Gmail message metadata contained invalid label IDs",
         ) from exc
+    return labels
+
+
+def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
+    payload = message.get("payload") or {}
+    headers = _headers(payload)
+    raw_from = headers.get("from", "")
+    from email.utils import parseaddr
+
+    sender_name, _address = parseaddr(raw_from)
+    labels = _validated_label_ids(message)
     return MessageMetadata(
         message_id=str(message["id"]),
         thread_id=str(message["threadId"]) if message.get("threadId") else None,
@@ -1033,7 +1039,7 @@ class GmailGateway:
             raise GmailError("Gmail metadata fetch timed out or failed") from exc
         return parse_metadata(message)
 
-    def full_payload(self, message_id: str) -> dict[str, Any]:
+    def _full_message(self, message_id: str) -> dict[str, Any]:
         try:
             message = (
                 self.service.users()
@@ -1047,11 +1053,26 @@ class GmailGateway:
                     f"Gmail message {message_id} unavailable (HTTP 404)"
                 ) from exc
             raise GmailError(f"Gmail body fetch failed (HTTP {exc.resp.status})") from exc
-        return message.get("payload") or {}
+        return message
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def full_payload(self, message_id: str) -> dict[str, Any]:
+        return self._full_message(message_id).get("payload") or {}
+
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
+        scope = validate_content_scope(scope)
+        message = self._full_message(message_id)
+        try:
+            labels = _validated_label_ids(message)
+        except MailboxMessageInvalid as exc:
+            raise MessageUnavailable("Gmail body response has invalid folder evidence") from exc
+        if not (locations_from_labels(labels) & scope):
+            raise MessageUnavailable(
+                f"Gmail message {message_id} is outside the active folder scope"
+            )
         body, attachment_names, attachments, body_source_chars = extract_body(
-            self.full_payload(message_id), body_char_limit
+            message.get("payload") or {}, body_char_limit
         )
         return MessageContent(body, attachment_names, attachments, body_source_chars)
 
