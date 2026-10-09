@@ -5158,10 +5158,14 @@ def _ensure_mailbox_scope_schema(db: sqlite3.Connection) -> None:
     if "provider_message_id" not in message_columns:
         db.execute("ALTER TABLE messages ADD COLUMN provider_message_id TEXT")
         db.execute("UPDATE messages SET provider_message_id = message_id")
-    db.execute(
-        """CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_identity
-        ON messages(provider, account_id, provider_message_id)"""
-    )
+    # Before mailbox epochs, this is the source key. Once that column exists,
+    # _ensure_automate_core_schema owns the mailbox-scoped index; installing the
+    # old constraint even temporarily would reject valid retained source copies.
+    if "mailbox_identity_key" not in message_columns:
+        db.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_identity
+            ON messages(provider, account_id, provider_message_id)"""
+        )
     db.execute(
         """
         CREATE TRIGGER IF NOT EXISTS messages_require_source_identity_insert
