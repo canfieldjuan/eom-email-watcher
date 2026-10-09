@@ -811,3 +811,16 @@ the current account-home spelling so retarget/replacement is rejected. No second
 file lock or fallback. The existing symlink and dot-dot source installation probes
 are the retained compatibility guard; rerun them with the deletion/replacement
 probes before final native qualification. Preserve the initial build/failing log.
+
+
+### Oversight acceptance conditions recorded before their implementation
+
+PR217 r4224455732 relays explicit operator acceptance of the stable directory
+anchor with three conditions: typed fail-closed open/lock/identity refusal, never
+a state-file/no-lock fallback; whole-state-directory cleanup and external home-
+lock bounded refusal tests with mutations; README and contract limitations for
+non-flock home filesystems and unrelated home locks. Record these conditions in
+this contract-only commit before adding their tests/docs. Extend the same cleanup
+regression rather than introducing a second coordination owner. Unsupported home
+locking intentionally blocks access. Unrelated users' processes holding the same
+home-directory flock can delay access until the normal bounded typed refusal.
