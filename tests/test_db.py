@@ -8090,6 +8090,81 @@ def test_legacy_pending_source_collision_promotes_authorized_copy(
     assert [m.message_id for m in store.pending()] == [child]
 
 
+def test_pre_identity_source_index_still_enforces_legacy_uniqueness() -> None:
+    with sqlite3.connect(":memory:") as db:
+        db.row_factory = sqlite3.Row
+        db.execute(
+            """CREATE TABLE messages(message_id TEXT PRIMARY KEY, provider TEXT,
+                account_id TEXT, provider_message_id TEXT)"""
+        )
+        db.execute("CREATE TABLE mailbox_state(provider TEXT)")
+        db.execute("CREATE TABLE suppressed_messages(provider TEXT)")
+        db_module._ensure_mailbox_scope_schema(db)
+        db.execute("INSERT INTO messages VALUES ('a', 'imap', 'account', 'source')")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+            db.execute("INSERT INTO messages VALUES ('b', 'imap', 'account', 'source')")
+        db.execute("INSERT INTO messages VALUES ('c', 'imap', 'other-account', 'source')")
+        db.execute("INSERT INTO messages VALUES ('d', 'gmail', 'account', 'source')")
+        assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 3
+        assert "idx_messages_source_identity" in {
+            row["name"] for row in db.execute("PRAGMA index_list(messages)")
+        }
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_reopen_preserves_source_keys_across_mailbox_identities(
+    tmp_path: Path, legacy: bool,
+) -> None:
+    if legacy:
+        store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+        other = _retained_duplicate(store, "2", "same@x")
+        with store.connection() as db:
+            db.execute(
+                "UPDATE messages SET provider_message_id = ? WHERE message_id = ?",
+                (store.message_source(root).provider_message_id, other),
+            )
+    else:
+        store = Store(tmp_path / "db.sqlite3")
+        store.initialize()
+        root = _imap_message(store, "1", "same@x")
+        identity = "b" * 64
+        store.reconcile_mailbox_identity("imap", "imap-account", identity)
+        other = "replacement-copy"
+        assert store.add_message(
+            message_id=other, provider="imap", account_id="imap-account",
+            provider_message_id=store.message_source(root).provider_message_id,
+            thread_id="<same@x>", sender="a@b.com", sender_name=None, subject="S",
+            received_at="2026-09-01T12:00:00+00:00", rfc_message_id="same@x",
+        )
+    identities = {m: store.message_source(m).mailbox_identity_key for m in (root, other)}
+    for _ in range(2):
+        store = Store(store.path)
+        store.initialize()
+        assert {
+            m: store.message_source(m).mailbox_identity_key for m in (root, other)
+        } == identities
+        assert len(store.recent(10)) == (1 if legacy else 2)
+        with store.connection() as db:
+            assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+            indexes = {r["name"] for r in db.execute("PRAGMA index_list(messages)")}
+            assert "idx_messages_source_identity_v20" in indexes
+            assert "idx_messages_source_identity" not in indexes
+            row = dict(db.execute(
+                "SELECT * FROM messages WHERE message_id = ?", (other,),
+            ).fetchone())
+            row["message_id"] = "forbidden-duplicate"
+            columns = ", ".join(row)
+            placeholders = ", ".join("?" for _ in row)
+            with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+                db.execute(
+                    f"INSERT INTO messages ({columns}) VALUES ({placeholders})",
+                    tuple(row.values()),
+                )
+            assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
+    assert store.message_source(other).mailbox_identity_key == identity
+
+
 def test_current_schema_startup_retains_preexisting_coalescing_behavior(tmp_path: Path) -> None:
     store, root, identity = _upgraded_completed_legacy_message(tmp_path)
     other = _retained_duplicate(store, "0", "same@x")
