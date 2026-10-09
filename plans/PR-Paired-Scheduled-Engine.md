@@ -937,3 +937,44 @@ latest operator merge direction supplies clearance once all real gates are met.
 
 Gap audit: NOT DONE. Acceptance/inventory/reproduce/isolate/explain recorded;
 implementation, passing-after/mutations/native proof and review remain pending.
+
+
+### Pre-publication revision: portable platform-default provenance
+
+Oversight r4226762229 verifies the prior anchor correction and all four published
+CI checks, but keeps both blockers and the hold. Its contract review exposes a
+new local design error: fixed Requires=basic.target+app.slice treats this host's
+systemd255 defaults as all supported platforms. Replace that unpublished assumption
+before publication. Preserve the actual-loader inventory as evidence, not an allowlist.
+
+The shipped payload still owns explicit required edges. Additional dependencies
+may only be passive platform target/slice units with vendor/generated fragment
+provenance: no foreign service, user-writable load path, untrusted override, transient
+redirect or unsupported/missing effective metadata. Include passive target/slice
+records in the same bounded systemctl snapshot (fixed roots plus target/slice
+selectors), so their actual FragmentPath/Names/reload state is authoritative;
+do not infer loaded provenance by searching files after losing that metadata.
+Pin expected direct edges; reject extra cross-shipped edges and foreign services.
+Transitive platform-target pulls are outside this five-root admission scope.
+
+Existing shipped network-online.target can be absent in the user's manager: the
+unchanged shipped graph inventory succeeded on this host with that target absent.
+Preserve this harmless declared not-found/inactive edge only with no fragment,
+overrides or outgoing activation. Missing/unloaded non-declared defaults refuse.
+Normal loaded platform defaults must be passive and have protected fragment/input
+provenance, independent of their names or systemd version. This distinguishes
+manager-generated absence from a user-supplied target instead of assuming all
+target names are safe. Source/native proof fixtures gain independent platform
+records and the corresponding provenance substitution; no production waiver.
+
+Regressions: an unknown vendor default target passes; the same name from a user
+load directory, any foreign service, missing provenance, modified/dangling/transient
+or writable fragment refuses. Test loaded-source aliases via actual Names metadata.
+Add the full manager_view space-home proof with flags0 UnitPath + flags2 environment,
+and adjacent segments a'b' to the malformed-wire tests. Actual protected vendor
+fragment checks must be exercised as well as the external native substitute.
+No extra manager read per check; keep load-input capture and lease behavior.
+
+This revision corrects my own unpublished class assumption at _activation_sets;
+no model or production unit behavior is changed. Commit this revision separately
+before implementing the portable default rule. One grouped push remains the limit.
