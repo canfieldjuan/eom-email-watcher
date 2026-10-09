@@ -3391,6 +3391,26 @@ END;
 """
 
 
+def _effective_message_identity_sql(alias: str) -> str:
+    """Logical scope without changing stored source identity or authorization."""
+    return f"""COALESCE({alias}.mailbox_identity_key, (
+        SELECT account.legacy_identity_key FROM mail_accounts AS account
+        WHERE account.provider = {alias}.provider AND account.account_id = {alias}.account_id
+          AND account.legacy_identity_status = 'continuity_proven'
+    ))"""
+
+
+def _logical_message_rank_sql(alias: str) -> str:
+    """Prefer completed work, then canonical source order, during lookup and upgrade."""
+    return f"""CASE
+        WHEN {alias}.notified_at IS NOT NULL THEN 0
+        WHEN {alias}.status = 'summarized' THEN 1
+        WHEN {alias}.status = 'analyzed' THEN 2
+        WHEN {alias}.status = 'pending' THEN 3
+        ELSE 4
+    END"""
+
+
 def _logical_message_id(
     db: sqlite3.Connection,
     provider: str,
@@ -3402,13 +3422,96 @@ def _logical_message_id(
 ) -> str | None:
     """The stored logical message a source identity duplicates (contract D-identity)."""
     row = db.execute(
-        """SELECT message_id FROM messages
-        WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
-          AND rfc_message_id = ? AND logical_of IS NULL
-          AND provider_message_id <> ?""",
+        f"""SELECT m.message_id FROM (
+            SELECT * FROM messages
+            WHERE provider = ?1 AND account_id = ?2 AND mailbox_identity_key = ?3
+              AND rfc_message_id = ?4 AND logical_of IS NULL AND provider_message_id <> ?5
+            UNION ALL
+            SELECT * FROM messages
+            WHERE provider = ?1 AND account_id = ?2 AND mailbox_identity_key IS NULL
+              AND rfc_message_id = ?4 AND logical_of IS NULL AND provider_message_id <> ?5
+        ) AS m
+        WHERE {_effective_message_identity_sql("m")} = ?3
+        ORDER BY {_logical_message_rank_sql("m")}, m.provider_message_id
+        LIMIT 1""",
         (provider, account_id, mailbox_identity_key, rfc_message_id, other_than),
     ).fetchone()
     return str(row["message_id"]) if row is not None else None
+
+
+def _stored_source_membership_sql() -> str:
+    """Canonical rows for a source; parameters are provider, account, mailbox, source."""
+    return f"""SELECT COALESCE(m.logical_of, m.message_id) AS logical_id FROM (
+        SELECT provider, account_id, mailbox_identity_key, logical_of, message_id FROM messages
+        WHERE provider = ?1 AND account_id = ?2
+          AND mailbox_identity_key = ?3 AND provider_message_id = ?4
+        UNION ALL
+        SELECT provider, account_id, mailbox_identity_key, logical_of, message_id FROM messages
+        WHERE provider = ?1 AND account_id = ?2
+          AND mailbox_identity_key IS NULL AND provider_message_id = ?4
+    ) AS m
+    WHERE {_effective_message_identity_sql("m")} = ?3
+    UNION ALL
+    SELECT message_id AS logical_id FROM message_locations
+    WHERE provider = ?1 AND account_id = ?2
+      AND mailbox_identity_key = ?3 AND provider_message_id = ?4"""
+
+
+def _bind_pending_legacy_identity(
+    db: sqlite3.Connection, provider: str, account_id: str, *, message_id: str | None = None,
+) -> None:
+    """Bind only workable legacy rows whose effective identity is the connected mailbox."""
+    rows = db.execute(
+        f"""SELECT m.message_id, m.provider_message_id,
+            {_effective_message_identity_sql("m")} AS identity
+        FROM messages AS m
+        WHERE m.provider = ?1 AND m.account_id = ?2
+          AND m.mailbox_identity_key IS NULL AND m.status = 'pending'
+          AND m.logical_of IS NULL AND (?3 IS NULL OR m.message_id = ?3)
+          AND {_effective_message_identity_sql("m")} = (
+              SELECT account.mailbox_identity_key FROM mail_accounts AS account
+              WHERE account.provider = m.provider AND account.account_id = m.account_id
+          )""",
+        (provider, account_id, message_id),
+    ).fetchall()
+    for row in rows:
+        root = str(row["message_id"])
+        collision = db.execute(
+            """SELECT message_id, logical_of FROM messages
+            WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+              AND provider_message_id = ?""",
+            (provider, account_id, row["identity"], row["provider_message_id"]),
+        ).fetchone()
+        if collision is None:
+            db.execute(
+                "UPDATE messages SET mailbox_identity_key = ? WHERE message_id = ?",
+                (row["identity"], root),
+            )
+            continue
+        if collision["logical_of"] != root:
+            raise RuntimeError("legacy pending source collides outside its logical unit")
+        # The current copy already owns the immutable source identity. Promote it
+        # instead of assigning that identity twice; stored history stays on each row.
+        successor = str(collision["message_id"])
+        db.execute("UPDATE messages SET logical_of = NULL WHERE message_id = ?", (successor,))
+        db.execute(
+            "UPDATE messages SET logical_of = ? WHERE message_id = ? OR logical_of = ?",
+            (successor, root, root),
+        )
+        db.execute(
+            "UPDATE message_locations SET message_id = ? WHERE message_id = ?",
+            (successor, root),
+        )
+        recipients = db.execute(
+            "SELECT field, address FROM message_recipients WHERE message_id = ? ORDER BY position",
+            (root,),
+        ).fetchall()
+        _record_recipients(
+            db, message_id=successor,
+            to=tuple(str(r["address"]) for r in recipients if r["field"] == "to"),
+            cc=tuple(str(r["address"]) for r in recipients if r["field"] == "cc"),
+        )
+        _requeue_if_skipped(db, successor)
 
 
 # A run whose source row duplicates another message (logical_of) is not work
@@ -3499,12 +3602,19 @@ def _requeue_if_skipped(db: sqlite3.Connection, message_id: str) -> None:
     capture of a second copy, and a polled location), so the one path that can
     make the message readable again is the one that queues it.
     """
-    db.execute(
+    cursor = db.execute(
         """UPDATE messages SET status = 'pending', attempts = 0, next_retry_at = NULL,
             last_error = NULL
         WHERE message_id = ? AND status = 'skipped'""",
         (message_id,),
     )
+    if cursor.rowcount:
+        row = db.execute(
+            "SELECT provider, account_id FROM messages WHERE message_id = ?", (message_id,),
+        ).fetchone()
+        _bind_pending_legacy_identity(
+            db, str(row["provider"]), str(row["account_id"]), message_id=message_id,
+        )
 
 
 def _record_recipients(
@@ -3711,16 +3821,9 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
     # Every retained row was captured from the Inbox. A legacy row without a
     # mailbox identity records a location only under a proven legacy identity,
     # as M1 keyed it.
-    proven = {
-        (str(row["provider"]), str(row["account_id"])): str(row["legacy_identity_key"])
-        for row in db.execute(
-            """SELECT provider, account_id, legacy_identity_key FROM mail_accounts
-            WHERE legacy_identity_status = 'continuity_proven'
-              AND legacy_identity_key IS NOT NULL"""
-        ).fetchall()
-    }
     unlocated = db.execute(
-        """SELECT m.message_id, m.provider, m.account_id, m.mailbox_identity_key,
+        f"""SELECT m.message_id, m.provider, m.account_id,
+            {_effective_message_identity_sql("m")} AS effective_identity,
             m.provider_message_id, m.discovered_at
         FROM messages AS m
         WHERE m.logical_of IS NULL
@@ -3728,9 +3831,7 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
         ORDER BY m.message_id"""
     ).fetchall()
     for row in unlocated:
-        identity = row["mailbox_identity_key"] or proven.get(
-            (str(row["provider"]), str(row["account_id"]))
-        )
+        identity = row["effective_identity"]
         if identity is None:
             continue
         _record_locations(
@@ -3753,24 +3854,17 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
     # A legacy row without an identity belongs to the account's proven one, as the
     # locations and threads above keyed it; the rank orders completed work first.
     candidates = db.execute(
-        """SELECT message_id, provider, account_id, mailbox_identity_key, rfc_message_id,
-            provider_message_id,
-            CASE
-                WHEN notified_at IS NOT NULL THEN 0
-                WHEN status = 'summarized' THEN 1
-                WHEN status = 'analyzed' THEN 2
-                WHEN status = 'pending' THEN 3
-                ELSE 4
-            END AS rank
-        FROM messages
-        WHERE logical_of IS NULL AND rfc_message_id IS NOT NULL
-        ORDER BY rank, provider_message_id"""
+        f"""SELECT m.message_id, m.provider, m.account_id,
+            {_effective_message_identity_sql("m")} AS effective_identity,
+            m.rfc_message_id, m.provider_message_id,
+            {_logical_message_rank_sql("m")} AS rank
+        FROM messages AS m
+        WHERE m.logical_of IS NULL AND m.rfc_message_id IS NOT NULL
+        ORDER BY rank, m.provider_message_id"""
     ).fetchall()
     groups: dict[tuple[str, str, str, str], list[str]] = {}
     for row in candidates:
-        identity = row["mailbox_identity_key"]
-        if identity is None:
-            identity = proven.get((str(row["provider"]), str(row["account_id"])))
+        identity = row["effective_identity"]
         if identity is None:
             continue
         key = (
@@ -3836,17 +3930,10 @@ def _migrate_thread_identity(db: sqlite3.Connection) -> None:
     # or a legacy row stored without an identity whose mailbox was never proven
     # continuous with the current one, forms its own component. Reply headers
     # were never fetched, so every row is listed for M2's sync to complete.
-    proven = {
-        (str(row["provider"]), str(row["account_id"])): str(row["legacy_identity_key"])
-        for row in db.execute(
-            """SELECT provider, account_id, legacy_identity_key FROM mail_accounts
-            WHERE legacy_identity_status = 'continuity_proven'
-              AND legacy_identity_key IS NOT NULL"""
-        ).fetchall()
-    }
     legacy = db.execute(
-        """SELECT message_id, provider, account_id, mailbox_identity_key, thread_id
-        FROM messages WHERE thread_key IS NULL ORDER BY message_id"""
+        f"""SELECT m.message_id, m.provider, m.account_id,
+            {_effective_message_identity_sql("m")} AS effective_identity, m.thread_id
+        FROM messages AS m WHERE m.thread_key IS NULL ORDER BY m.message_id"""
     ).fetchall()
     for row in legacy:
         provider, account_id = str(row["provider"]), str(row["account_id"])
@@ -3856,7 +3943,7 @@ def _migrate_thread_identity(db: sqlite3.Connection) -> None:
                 (_provider_thread_key(row["thread_id"]), row["message_id"]),
             )
             continue
-        identity = row["mailbox_identity_key"] or proven.get((provider, account_id))
+        identity = row["effective_identity"]
         rfc_id = normalize_message_id(row["thread_id"])
         thread_key = str(uuid.uuid4())
         if rfc_id is not None and identity is not None:
@@ -6070,12 +6157,7 @@ class Store:
                     (provider, account_id),
                 )
             if previous is None and status == "continuity_proven":
-                db.execute(
-                    """UPDATE messages SET mailbox_identity_key = ?
-                    WHERE provider = ? AND account_id = ?
-                      AND mailbox_identity_key IS NULL AND status = 'pending'""",
-                    (mailbox_identity_key, provider, account_id),
-                )
+                _bind_pending_legacy_identity(db, provider, account_id)
             if provider == "gmail":
                 selector_set = db.execute(
                     """SELECT current_mailbox_identity_key, revision
@@ -8602,13 +8684,7 @@ class Store:
             if mailbox_identity_key is not None:
                 return (
                     db.execute(
-                        """SELECT 1 FROM messages
-                        WHERE provider = ?1 AND account_id = ?2
-                          AND mailbox_identity_key = ?3 AND provider_message_id = ?4
-                        UNION ALL
-                        SELECT 1 FROM message_locations
-                        WHERE provider = ?1 AND account_id = ?2
-                          AND mailbox_identity_key = ?3 AND provider_message_id = ?4
+                        f"""SELECT 1 FROM ({_stored_source_membership_sql()})
                         UNION ALL
                         SELECT 1 FROM suppressed_messages
                         WHERE provider = ?1 AND account_id = ?2 AND message_key = ?5
@@ -8991,14 +9067,7 @@ class Store:
             # A source identity is known through its row or a recorded location, the
             # same two places has_seen_message reads (contract D-identity).
             row = db.execute(
-                """SELECT COALESCE(logical_of, message_id) AS logical_id FROM messages
-                WHERE provider = ?1 AND account_id = ?2 AND mailbox_identity_key = ?3
-                  AND provider_message_id = ?4
-                UNION ALL
-                SELECT message_id AS logical_id FROM message_locations
-                WHERE provider = ?1 AND account_id = ?2 AND mailbox_identity_key = ?3
-                  AND provider_message_id = ?4
-                LIMIT 1""",
+                f"{_stored_source_membership_sql()} LIMIT 1",
                 (provider, account_id, mailbox_identity_key, provider_message_id),
             ).fetchone()
             if row is None:
