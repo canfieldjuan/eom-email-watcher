@@ -798,3 +798,16 @@ Reuse v9's native oracle, adding deletion during a real native Store connection 
 post-acquisition directory replacement. Contract-only commit precedes implementation;
 one grouped push includes all accepted review corrections. Oversight and operator
 merge hold remain until independent exact-head verification and merge clearance.
+
+
+### Anchor path correction before implementation
+
+The adjacent suite reproduced a port regression: opening the account-home spelling
+with O_NOFOLLOW rejects an already-supported symlink home. Keep that supported
+setup. The lease_anchor property resolves the authoritative account-home directory
+strictly before open; all callers still consume this one property. O_DIRECTORY /
+O_NOFOLLOW applies to that resolved anchor, and the post-acquisition check re-resolves
+the current account-home spelling so retarget/replacement is rejected. No second
+file lock or fallback. The existing symlink and dot-dot source installation probes
+are the retained compatibility guard; rerun them with the deletion/replacement
+probes before final native qualification. Preserve the initial build/failing log.
