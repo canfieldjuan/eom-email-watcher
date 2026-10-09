@@ -999,3 +999,20 @@ multiple scheduled-command negative probes, and replay the retained actual packe
 This removes the fixture's single-command assumption at its origin. No third
 reader/parser or extra system read, and no systemd payload or helper behavior edit.
 Commit this clarification before the parser/fixture correction; one grouped push.
+
+
+### Complete native word/line framing before final implementation
+
+The actual formatter probe extends beyond the earlier e-acute witness:
+NBSP/U+2003/U+2028 remain unquoted parts of a valid path, but my Python-regex
+\s tokenizer splits each into two words. The retained before packet is
+unicode-native-framing-before-v11.json. This is the same91dc098 wire-origin defect,
+not a new admitted path policy. Systemd's WHITESPACE and printed record delimiter
+are ASCII; Python Unicode whitespace and splitlines are the wrong framing owner.
+
+Use ASCII token separators and literal newline record framing in the shared
+manager tokenizer/environment/snapshot parser. Preserve UTF8 inside words and
+scalar values. Extend the independently captured formatter matrix and regressions
+with Unicode whitespace paths in both wire modes and scalar FragmentPath lines.
+Keep ASCII malformed/adjacent/escape negatives. Rebuild native after this correction;
+reuse the same v10 oracle and do not overwrite already cited v11 artifacts.
