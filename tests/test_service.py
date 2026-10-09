@@ -5839,11 +5839,12 @@ def test_a_dry_run_previews_a_logical_message_once(tmp_path: Path) -> None:
     assert result["discovered"] == 1
 
 
+@pytest.mark.parametrize("source_collision", [False, True])
 @pytest.mark.parametrize("dry_run", [True, False])
 @pytest.mark.parametrize("initial_status", ["summarized", "skipped"])
 @pytest.mark.parametrize("candidate", ["new-copy", "old-source"])
 def test_watcher_resolves_proven_legacy_message_without_recapture(
-    tmp_path: Path, dry_run: bool, initial_status: str, candidate: str,
+    tmp_path: Path, dry_run: bool, initial_status: str, candidate: str, source_collision: bool,
 ) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
@@ -5880,6 +5881,21 @@ def test_watcher_resolves_proven_legacy_message_without_recapture(
     # Restore production triggers before exercising the pending-identity bind.
     store.initialize()
     with store.connection() as db:
+        if source_collision:
+            row = dict(db.execute(
+                "SELECT * FROM messages WHERE message_id = 'legacy-completed'"
+            ).fetchone())
+            row.update(
+                message_id="current-copy", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+                logical_of="legacy-completed", admission_kind="exact_sender",
+                admission_selector_id="sender:trusted@example.com",
+                admission_mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, admitted_at=stamp,
+            )
+            columns = ", ".join(row)
+            placeholders = ", ".join("?" for _ in row)
+            db.execute(
+                f"INSERT INTO messages ({columns}) VALUES ({placeholders})", tuple(row.values()),
+            )
         db.execute("DELETE FROM message_locations")
         before = tuple(db.iterdump())
 
@@ -5908,21 +5924,26 @@ def test_watcher_resolves_proven_legacy_message_without_recapture(
     processed = not dry_run and initial_status == "skipped"
     assert model.calls == int(processed), "REQUEUED_LEGACY_NOT_ANALYZED"
     assert gateway.full_payload_calls == int(processed)
-    assert [row["message_id"] for row in store.recent(10)] == ["legacy-completed"]
-    assert store.message_source("legacy-completed").mailbox_identity_key == (
+    canonical = "current-copy" if processed and source_collision else "legacy-completed"
+    assert [row["message_id"] for row in store.recent(10)] == [canonical]
+    assert store.message_source(canonical).mailbox_identity_key == (
         TEST_MAILBOX_IDENTITY_KEY if processed else None
     )
+    if source_collision:
+        assert store.message_source("legacy-completed").mailbox_identity_key is None
     with store.connection() as db:
         if dry_run:
             assert tuple(db.iterdump()) == before
     if not dry_run:
         assert store.has_seen_message(candidate, mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY)
-        assert store.message_locations("legacy-completed") == ["inbox"]
+        assert store.message_locations(canonical) == ["inbox"]
         with store.connection() as db:
             row = db.execute(
-                "SELECT * FROM messages WHERE message_id = 'legacy-completed'"
+                "SELECT * FROM messages WHERE message_id = ?", (canonical,),
             ).fetchone()
-            assert row["admission_kind"] is None
+            assert row["admission_kind"] == (
+                "exact_sender" if processed and source_collision else None
+            )
             assert row["analysis_error_code"] != "mailbox_identity_unverified"
             if processed:
                 assert row["summary"] == "A short update."

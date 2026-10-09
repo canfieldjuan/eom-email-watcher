@@ -8025,6 +8025,71 @@ def test_skipped_legacy_message_requeues_with_proven_pending_identity(
         ).fetchone()[0] is None
 
 
+@pytest.mark.parametrize("source", ["capture", "observation", "reconciliation"])
+def test_legacy_pending_source_collision_promotes_authorized_copy(
+    tmp_path: Path, source: str,
+) -> None:
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    store.mark_skipped(root)
+    child = _retained_duplicate(store, "2", "same@x")
+    sibling = _retained_duplicate(store, "3", "same@x")
+    with store.connection() as db:
+        original = store.message_source(root).provider_message_id
+        db.execute(
+            "UPDATE messages SET provider_message_id = ?, status = 'skipped' WHERE message_id = ?",
+            (original, child),
+        )
+        db.execute("UPDATE messages SET status = 'skipped' WHERE message_id = ?", (sibling,))
+        db.execute(
+            "UPDATE messages SET logical_of = ? WHERE message_id IN (?, ?)",
+            (root, child, sibling),
+        )
+    assert [m["message_id"] for m in store.recent(10)] == [root]
+    with store.connection() as db:
+        db.execute("DELETE FROM message_locations")
+        before = dict(db.execute(
+            "SELECT * FROM messages WHERE message_id = ?", (child,),
+        ).fetchone())
+    if source == "capture":
+        assert _capture_legacy_copy(store, identity, "4") is False
+    elif source == "observation":
+        assert store.record_message_location(
+            provider="imap", account_id="imap-account", mailbox_identity_key=identity,
+            provider_message_id=original, locations=frozenset({"inbox"}),
+            to=("owner@example.com",),
+        ) == 1
+    else:
+        with store.connection() as db:
+            db.execute("UPDATE messages SET status = 'pending' WHERE message_id = ?", (root,))
+            db.execute("UPDATE mail_accounts SET mailbox_identity_key = NULL")
+        store.reconcile_mailbox_identity(
+            "imap", "imap-account", identity, legacy_status="continuity_proven",
+        )
+    assert [m.message_id for m in store.pending()] == [child]
+    assert store.message_source(root).mailbox_identity_key is None
+    assert store.message_source(child).mailbox_identity_key == identity
+    with store.connection() as db:
+        rows = db.execute("SELECT message_id, logical_of FROM messages").fetchall()
+        assert {r["message_id"]: r["logical_of"] for r in rows} == {
+            root: child, child: None, sibling: child,
+        }
+        after = dict(db.execute("SELECT * FROM messages WHERE message_id = ?", (child,)).fetchone())
+        for key in ("provider_message_id", "mailbox_identity_key", "admission_kind",
+                    "admission_selector_id", "admission_mailbox_identity_key", "admitted_at"):
+            assert after[key] == before[key]
+        assert db.execute(
+            "SELECT summary FROM messages WHERE message_id = ?", (root,),
+        ).fetchone()[0] == "Already completed"
+        assert not db.execute(
+            "SELECT 1 FROM message_locations WHERE message_id <> ?", (child,),
+        ).fetchall()
+        if source == "observation":
+            assert db.execute(
+                "SELECT address FROM message_recipients WHERE message_id = ?", (child,),
+            ).fetchone()[0] == "owner@example.com"
+    assert [m.message_id for m in store.pending()] == [child]
+
+
 def test_current_schema_startup_retains_preexisting_coalescing_behavior(tmp_path: Path) -> None:
     store, root, identity = _upgraded_completed_legacy_message(tmp_path)
     other = _retained_duplicate(store, "0", "same@x")

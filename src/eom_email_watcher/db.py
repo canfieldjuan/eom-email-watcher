@@ -3461,17 +3461,57 @@ def _bind_pending_legacy_identity(
     db: sqlite3.Connection, provider: str, account_id: str, *, message_id: str | None = None,
 ) -> None:
     """Bind only workable legacy rows whose effective identity is the connected mailbox."""
-    db.execute(
-        f"""UPDATE messages AS m SET mailbox_identity_key = {_effective_message_identity_sql("m")}
+    rows = db.execute(
+        f"""SELECT m.message_id, m.provider_message_id,
+            {_effective_message_identity_sql("m")} AS identity
+        FROM messages AS m
         WHERE m.provider = ?1 AND m.account_id = ?2
           AND m.mailbox_identity_key IS NULL AND m.status = 'pending'
-          AND (?3 IS NULL OR m.message_id = ?3)
+          AND m.logical_of IS NULL AND (?3 IS NULL OR m.message_id = ?3)
           AND {_effective_message_identity_sql("m")} = (
               SELECT account.mailbox_identity_key FROM mail_accounts AS account
               WHERE account.provider = m.provider AND account.account_id = m.account_id
           )""",
         (provider, account_id, message_id),
-    )
+    ).fetchall()
+    for row in rows:
+        root = str(row["message_id"])
+        collision = db.execute(
+            """SELECT message_id, logical_of FROM messages
+            WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+              AND provider_message_id = ?""",
+            (provider, account_id, row["identity"], row["provider_message_id"]),
+        ).fetchone()
+        if collision is None:
+            db.execute(
+                "UPDATE messages SET mailbox_identity_key = ? WHERE message_id = ?",
+                (row["identity"], root),
+            )
+            continue
+        if collision["logical_of"] != root:
+            raise RuntimeError("legacy pending source collides outside its logical unit")
+        # The current copy already owns the immutable source identity. Promote it
+        # instead of assigning that identity twice; stored history stays on each row.
+        successor = str(collision["message_id"])
+        db.execute("UPDATE messages SET logical_of = NULL WHERE message_id = ?", (successor,))
+        db.execute(
+            "UPDATE messages SET logical_of = ? WHERE message_id = ? OR logical_of = ?",
+            (successor, root, root),
+        )
+        db.execute(
+            "UPDATE message_locations SET message_id = ? WHERE message_id = ?",
+            (successor, root),
+        )
+        recipients = db.execute(
+            "SELECT field, address FROM message_recipients WHERE message_id = ? ORDER BY position",
+            (root,),
+        ).fetchall()
+        _record_recipients(
+            db, message_id=successor,
+            to=tuple(str(r["address"]) for r in recipients if r["field"] == "to"),
+            cc=tuple(str(r["address"]) for r in recipients if r["field"] == "cc"),
+        )
+        _requeue_if_skipped(db, successor)
 
 
 # A run whose source row duplicates another message (logical_of) is not work
