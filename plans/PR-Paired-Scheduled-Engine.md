@@ -822,5 +822,46 @@ lock bounded refusal tests with mutations; README and contract limitations for
 non-flock home filesystems and unrelated home locks. Record these conditions in
 this contract-only commit before adding their tests/docs. Extend the same cleanup
 regression rather than introducing a second coordination owner. Unsupported home
-locking intentionally blocks access. Unrelated users' processes holding the same
+locking intentionally blocks access. Unrelated processes holding the same
 home-directory flock can delay access until the normal bounded typed refusal.
+
+
+### Qualified grouped correction
+
+All five review findings are corrected at their owners. manager_view cross-checks
+account HOME and manager UnitPath before publication, _manager_words is the single
+byte decoder, lease_anchor resolves the account-home directory, deployment_lease
+owns shared/exclusive acquisition and both inode checks, and the CI proof runner
+requires exactly one passing native receiver test. Removed the production shlex
+and state-lock-file coordination. Canonical recovery and limitations remain README.
+
+Fail-before evidence: resolver/zero-test probes, old ANSI-C decoder, and the live
+Store deletion probe. Fail-after proof: 239 affected tests passed. File deletion,
+file recreation and whole-state-directory deletion do not admit any publisher
+while a real shared Store connection is live. Missing/unsupported directory locking
+refuses with typed DeploymentError, with no fallback; an external directory lock
+produces the normal bounded reader refusal. File-anchor, duplicate-owner, missing
+postcheck and both old ordering survivors are mutation-proven. The exact shell
+unlock-after-uv mutant is also caught. Existing symlink/dot-dot home compatibility
+is preserved; the first local v10 O_NOFOLLOW-on-spelling regression was reproduced
+and fixed at lease_anchor, with its failure/build retained before publication.
+
+Native v10 is development-profile, sha256
+8e7ce92a0bb4c2ad47f86f17f221baf26aa3bb7763f839ec6e7593483660b34d.
+Four bundled modules and five payloads equal source. The retained schema28 oracle
+still gives the same 38 negative results/digests, migration30, overlap and typed
+refusal. Additional actual native Store/SQLite wait proof shows deletion/recreation
+of the old state marker does not split exclusion: publication waits without writes
+and succeeds only after the connection closes. Space/UTF-8 native paths and exactly
+one real Rust receiver pass. Explicit external manager/NSS/public-DB substitutions
+remain; no normal-profile installation, inference, mail or NFS qualification claim.
+
+Non-blocking proof/host observations are deferred to
+https://github.com/canfieldjuan/eom-email-watcher/issues/221; reservation recovery
+remains #219. Durable aliases: grouped-correction-receipt-v10.json,
+cold-diff-audit-v10.md, parity-comparison-v10.json, packaged-schema-proof-v10.json,
+freeze-receipt-v10.json and mutation results. Review reply binds hashes and head.
+
+Gap audit: NOT DONE. Implementation/source/native correction is locally complete;
+one grouped push, exact-head CI/independent review and oversight/operator merge
+clearance remain. The existing hold is retained. No duplicate broad CI suite run.

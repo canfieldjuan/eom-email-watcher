@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import codecs
 import os
+import re
 import selectors
-import shlex
 import stat
 import subprocess
 import sys
@@ -68,7 +69,56 @@ class ManagerView:
     unit_directory: Path
     data_home: Path
     alias: Path
-    lock_path: Path
+
+    @property
+    def lease_anchor(self) -> Path:
+        return self.home.resolve(strict=True)
+
+
+def _manager_words(raw: str) -> tuple[str, ...]:
+    """Decode systemd shell_maybe_quote words without evaluating shell input."""
+    words = []
+    end = 0
+    for match in re.finditer(r"\$'(?:[^'\\]|\\.)*'|'[^']*'|[^\s'\"\\]+", raw):
+        if raw[end:match.start()].strip():
+            raise DeploymentError("Invalid manager path encoding")
+        token = match.group()
+        if token.startswith("$'"):
+            body = token[2:-1]
+            if not re.fullmatch(
+                r"(?:[^'\\]|\\(?:[abfnrtv\\'\"]|[0-3][0-7]{2}|x[0-9a-fA-F]{2}))*", body
+            ):
+                raise DeploymentError("Invalid manager path escape")
+            try:
+                token = codecs.escape_decode(body.encode("utf-8"))[0].decode("utf-8")
+            except (ValueError, UnicodeError) as exc:
+                raise DeploymentError("Invalid manager path encoding") from exc
+        elif token.startswith("'"):
+            token = token[1:-1]
+        words.append(token)
+        end = match.end()
+    if raw[end:].strip():
+        raise DeploymentError("Invalid manager path encoding")
+    return tuple(words)
+
+
+def _account_home() -> Path:
+    import pwd
+
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise DeploymentError("The account home cannot be identified") from exc
+
+
+def _manager_unit_paths() -> tuple[Path, ...]:
+    raw = _read_manager_command(["systemctl", "--user", "show", "--property=UnitPath", "--value"])
+    paths = tuple(Path(word) for word in _manager_words(raw))
+    if not paths or any(
+        not path.is_absolute() or any(c in str(path) for c in "\r\n\0") for path in paths
+    ):
+        raise DeploymentError("The manager UnitPath is invalid; repair it")
+    return paths
 
 
 def _manager_environment() -> dict[str, str]:
@@ -79,13 +129,11 @@ def _manager_environment() -> dict[str, str]:
             line.startswith(key + "=") for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
         ):
             continue
-        try:
-            words = shlex.split(line)
-        except ValueError as exc:
-            raise DeploymentError("The manager environment needs repair") from exc
+        key, _, raw_value = line.partition("=")
+        words = _manager_words(raw_value) if raw_value else ("",)
         if len(words) != 1:
             raise DeploymentError("The manager environment needs repair")
-        key, _, value = words[0].partition("=")
+        value = words[0]
         if key in selected:
             raise DeploymentError("The manager environment has duplicate paths")
         selected[key] = value
@@ -99,17 +147,34 @@ def manager_view() -> ManagerView:
     configured_data = Path(environment.get("XDG_DATA_HOME", ""))
     config = configured if configured.is_absolute() else home / ".config"
     data = configured_data if configured_data.is_absolute() else home / ".local/share"
-    if any(not path.is_absolute() or any(c in str(path) for c in "\r\n")
+    if any(not path.is_absolute() or any(c in str(path) for c in "\r\n\0")
            for path in (home, config, data)):
         raise DeploymentError("The manager must report absolute HOME and XDG paths; repair it")
-    return ManagerView(home, config / "systemd/user", data,
-                       home / ".local/bin/eom-mail-watch",
-                       home / ".local/state/eom-email-watcher/deployment.lock")
+    account = _account_home()
+    if not account.is_absolute() or home != account:
+        raise DeploymentError("The manager HOME disagrees with the account home; repair it")
+    directory = config / "systemd/user"
+    if directory not in _manager_unit_paths():
+        raise DeploymentError(
+            "The configured unit directory is absent from manager UnitPath; repair it"
+        )
+    return ManagerView(account, directory, data, home / ".local/bin/eom-mail-watch")
 
 
 def service_unit_directory() -> Path:
     """The user manager owns installation paths, including for shell publishers."""
     return manager_view().unit_directory
+
+
+def _verify_lease_identity(descriptor: int, path: Path) -> None:
+    identity = os.fstat(descriptor)
+    named = path.stat()
+    if (
+        not stat.S_ISDIR(identity.st_mode) or identity.st_uid != os.getuid()
+        or not stat.S_ISDIR(named.st_mode)
+        or (identity.st_dev, identity.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        raise DeploymentError("The deployment lock cannot be identified; repair it")
 
 
 @contextmanager
@@ -136,14 +201,10 @@ def deployment_lease(
                     raise DeploymentError("A publication lease cannot become a database lease")
                 descriptor = inherited_fd
             else:
-                view.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                descriptor = os.open(view.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            identity = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid()
-                or (identity.st_dev, identity.st_ino) != _inode(view.lock_path)
-            ):
-                raise DeploymentError("The deployment lock cannot be identified; repair it")
+                descriptor = os.open(
+                    view.lease_anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+            _verify_lease_identity(descriptor, view.lease_anchor)
             deadline = time.monotonic() + LEASE_TIMEOUT_SECONDS
             while True:
                 try:
@@ -156,6 +217,7 @@ def deployment_lease(
                     if inherited_fd is not None or time.monotonic() >= deadline:
                         raise DeploymentError(message) from None
                     time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            _verify_lease_identity(descriptor, view.lease_anchor)
         except OSError as exc:
             raise DeploymentError("The deployment lock is unavailable; repair it") from exc
         if not exclusive:
@@ -168,7 +230,7 @@ def deployment_lease(
             with _lease_state_lock:
                 _shared_leases -= 1
         if descriptor is not None and inherited_fd is None:
-            # Never unlink the lock or unlock an inherited publisher descriptor.
+            # Never replace the home anchor or unlock an inherited publisher descriptor.
             os.close(descriptor)
 
 
@@ -421,8 +483,6 @@ def _configured_graph(
         if unit.name in SCHEDULED_JOBS and record["Unit"] != SCHEDULED_JOBS[unit.name][0]:
             raise DeploymentError("The scheduled timer does not target its shipped service")
         if unit.name in SCHEDULED_COMMANDS:
-            import re
-
             paths = re.findall(r"\{ path=(.*?) ;", record["ExecStart"])
             if paths != [str(description.alias)]:
                 raise DeploymentError(

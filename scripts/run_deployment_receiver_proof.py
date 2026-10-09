@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -69,7 +70,7 @@ def main() -> None:
             ),
         )
         environment.update(EOM_TEST_REFUSAL_ENGINE=str(engine), EOM_TEST_REFUSAL_CONFIG=str(config))
-        subprocess.run(
+        proof = subprocess.run(
             [
                 binaries[0],
                 "engine::tests::packaged_deployment_refusal_is_definitive",
@@ -79,7 +80,18 @@ def main() -> None:
             ],
             env=environment,
             check=True,
+            capture_output=True,
+            text=True,
         )
+        print(proof.stdout, end="")
+        print(proof.stderr, end="")
+        summaries = re.findall(
+            r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;",
+            proof.stdout,
+            re.MULTILINE,
+        )
+        if summaries != [("1", "0", "0")]:
+            raise RuntimeError("Expected exactly one passing native receiver test")
         if config.exists():
             raise RuntimeError("Refused initialization created configuration")
     print("REAL_NATIVE_RECEIVER deployment_refused/Definitive; no configuration created")

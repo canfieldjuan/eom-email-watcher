@@ -330,7 +330,15 @@ identities. A shared deployment lease stays held until the SQLite connection clo
 Native and source installers retain an exclusive lease across publication, reload and
 verification. A busy deployment refuses access after a bounded wait: retry a reader
 after the update; close the app or stop the timers before retrying an installer.
-The lock is under the manager's home at `.local/state/eom-email-watcher/deployment.lock`.
+The real account-home directory inode is the shared/exclusive coordination anchor;
+no state lock file is used or created. Its identity is checked before and after
+acquisition, so clearing old state lock files cannot release a live connection's
+lease. Close sessions from earlier builds and stop timers before installing this
+version, because those builds used a different lock anchor. Replacing the home
+directory is not supported during a session. A home filesystem that cannot open or
+flock this directory intentionally refuses access, with no state-file fallback.
+An unrelated process locking the home directory also delays access until the normal
+bounded deployment refusal.
 Select the concrete native sidecar for installation; selecting its scheduled alias or
 a path through that alias refuses publication before writes. Modified or redirected
 units, persistent drop-ins, pending reloads,
@@ -349,7 +357,11 @@ The paired deployment requires a user manager whose effective units have no
 drop-ins, including vendor-wide `service.d` or `timer.d` overrides. A host with
 those overrides is refused until they are removed. The manager's `HOME` and
 `XDG_CONFIG_HOME` own the alias and unit directory, including when the desktop was
-launched with a different home. A missing or invalid manager home refuses access.
+launched with a different home. Before writing any lock, alias or unit, the resolver
+requires the exported `HOME` to equal the real account home and the unit directory
+to appear in the user manager's `UnitPath`. Missing or mismatched identities refuse
+access before publication. Both manager properties use one ANSI-C byte decoder,
+including paths with spaces and non-ASCII characters.
 Pending reloads require
 `systemctl --user daemon-reload`; masked units require `systemctl --user unmask`.
 For a partial graph, remove its partial five-unit installation, reload the manager,

@@ -69,6 +69,8 @@ def paired_deployment(tmp_path, monkeypatch):
             records[name].update(values)
         monkeypatch.setattr(deployment, "_manager_environment",
                             lambda: {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")})
+        monkeypatch.setattr(deployment, "_account_home", lambda: home)
+        monkeypatch.setattr(deployment, "_manager_unit_paths", lambda: (directory,))
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
         monkeypatch.setattr(sys, "frozen", True, raising=False)

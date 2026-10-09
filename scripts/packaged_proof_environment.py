@@ -6,10 +6,69 @@ Production never imports this fixture and never waives deployment admission.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 from eom_email_watcher.deployment import _MANAGER_FIELDS, SCHEDULED_JOBS, UNIT_NAMES
+
+_ACCOUNT_FIXTURE = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <pwd.h>
+#include <stdlib.h>
+#include <unistd.h>
+struct passwd *getpwuid(uid_t uid) {
+    struct passwd *(*real)(uid_t) = dlsym(RTLD_NEXT, "getpwuid");
+    struct passwd *value = real(uid);
+    const char *home = getenv("EOM_PUBLIC_PROOF_HOME");
+    static _Thread_local struct passwd copy;
+    if (!value || !home || uid != getuid()) return value;
+    copy = *value; copy.pw_dir = (char *)home; return &copy;
+}
+int getpwuid_r(uid_t uid, struct passwd *value, char *buf, size_t size,
+              struct passwd **result) {
+    int (*real)(uid_t, struct passwd *, char *, size_t, struct passwd **) =
+        dlsym(RTLD_NEXT, "getpwuid_r");
+    int status = real(uid, value, buf, size, result);
+    const char *home = getenv("EOM_PUBLIC_PROOF_HOME");
+    if (!status && *result && home && uid == getuid()) value->pw_dir = (char *)home;
+    return status;
+}
+"""
+
+
+def with_account_home(root: Path, environment: dict[str, str]) -> dict[str, str]:
+    """External NSS substitution for isolated Linux proofs, never an app waiver."""
+    if sys.platform != "linux":
+        return dict(environment)
+    folder = root / "public-account-fixture"
+    folder.mkdir(mode=0o700, exist_ok=True)
+    source, library = folder / "account.c", folder / "account.so"
+    source.write_text(_ACCOUNT_FIXTURE)
+    source.chmod(0o600)
+    subprocess.run(["cc", "-shared", "-fPIC", "-Wall", "-Werror", str(source),
+                    "-ldl", "-o", str(library)], check=True, capture_output=True, timeout=30)
+    library.chmod(0o600)
+    result = dict(environment, LD_PRELOAD=str(library),
+                  EOM_PUBLIC_PROOF_HOME=environment["HOME"])
+    return result
+
+
+def systemd_quote(value: str) -> str:
+    """Independent public fixture encoding of systemd's ANSI-C byte wire form."""
+    special = " \t\r\n\\'\"$`"
+    if value and all(32 <= ord(c) < 127 and c not in special for c in value):
+        return value
+    escaped = []
+    for byte in value.encode("utf-8"):
+        if byte in (39, 92):
+            escaped.append("\\" + chr(byte))
+        elif byte < 32 or byte >= 127:
+            escaped.append(f"\\{byte:03o}")
+        else:
+            escaped.append(chr(byte))
+    return "$'" + "".join(escaped) + "'"
 
 
 def unit_records(
@@ -60,9 +119,9 @@ def _with_manager(root: Path, environment: dict[str, str], *, installed: bool) -
     manager_config = Path(configured) if configured else manager_home / ".config"
     manager_data = environment.get("XDG_DATA_HOME", str(manager_home / ".local/share"))
     source = (
-        "#!" + sys.executable + "\nimport json,shlex,sys\nfrom pathlib import Path\n"
+        "#!" + sys.executable + "\nimport json,sys\nfrom pathlib import Path\n"
         + "sys.path.insert(0," + repr(str(Path(__file__).parent)) + ")\n"
-        + "from packaged_proof_environment import render_unit_records,unit_records\n"
+        + "from packaged_proof_environment import render_unit_records,unit_records,systemd_quote\n"
         + "names=" + repr(UNIT_NAMES) + "\nfields=" + repr(_MANAGER_FIELDS)
         + "\ninstalled=" + repr(installed) + "\njobs=" + repr(SCHEDULED_JOBS)
         + "\nmanager_home=Path(" + repr(str(manager_home)) + ")"
@@ -73,7 +132,9 @@ def _with_manager(root: Path, environment: dict[str, str], *, installed: bool) -
         + "\noverrides=Path(" + repr(str(root / "manager-overrides.json")) + ")\n"
         + "args=sys.argv[1:]\n"
         + "if args==['--user','show-environment']:\n"
-        + " print('\\n'.join(k+'='+shlex.quote(v) for k,v in environment.items()));sys.exit(0)\n"
+        + " print('\\n'.join(k+'='+systemd_quote(v) for k,v in environment.items()));sys.exit(0)\n"
+        + "if args==['--user','show','--property=UnitPath','--value']:\n"
+        + " print(systemd_quote(str(directory)));sys.exit(0)\n"
         + "if installed and (args==['--user','daemon-reload'] or "
         + "args in [['--user','enable',timer] for timer in jobs]):sys.exit(0)\n"
         + "if args!=['--user','show','--all','--no-pager',"
@@ -89,6 +150,7 @@ def _with_manager(root: Path, environment: dict[str, str], *, installed: bool) -
     path.chmod(0o700)
     result = dict(environment)
     result.setdefault("HOME", str(root))
+    result = with_account_home(root, result)
     result["PATH"] = str(manager) + os.pathsep + result.get("PATH", "")
     return result
 

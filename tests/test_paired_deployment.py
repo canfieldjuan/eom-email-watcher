@@ -277,6 +277,9 @@ def test_unit_directory_has_one_xdg_resolver(monkeypatch, tmp_path, setting):
         )
     monkeypatch.setattr(deployment, "_manager_environment", lambda: environment)
     monkeypatch.setenv("HOME", str(tmp_path / "ignored-invoking-home"))
+    monkeypatch.setattr(deployment, "_account_home", lambda: tmp_path / "home")
+    root = tmp_path / "custom" if setting == "absolute" else tmp_path / "home/.config"
+    monkeypatch.setattr(deployment, "_manager_unit_paths", lambda: (root / "systemd/user",))
     assert deployment.service_unit_directory() == (
         tmp_path / "custom/systemd/user"
         if setting == "absolute"

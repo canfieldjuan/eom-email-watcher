@@ -305,7 +305,7 @@ FAKE_SYSTEMCTL = "#!" + sys.executable + "\n" + f"""
 import os,shlex,sys
 from pathlib import Path
 sys.path[:0] = [{str(ROOT / 'src')!r}, {str(ROOT / 'scripts')!r}]
-from packaged_proof_environment import unit_records, render_unit_records, UNIT_NAMES
+from packaged_proof_environment import unit_records, render_unit_records, systemd_quote, UNIT_NAMES
 args=sys.argv[1:]
 home=Path(os.environ['INSTALLER_TEST_MANAGER_HOME'])
 config=Path(os.environ.get('INSTALLER_TEST_MANAGER_CONFIG',''))
@@ -313,7 +313,9 @@ config=config if config.is_absolute() else home/'.config'
 if args==['--user','show-environment']:
     values=dict(HOME=str(home),XDG_CONFIG_HOME=str(config),
                 XDG_DATA_HOME=os.environ.get('XDG_DATA_HOME',str(home/'.local/share')))
-    print('\\n'.join(k+'='+shlex.quote(v) for k,v in values.items()))
+    print('\\n'.join(k+'='+systemd_quote(v) for k,v in values.items()))
+elif args==['--user','show','--property=UnitPath','--value']:
+    print(systemd_quote(str(config/'systemd/user')))
 elif args[:2]==['--user','show']:
     directory=config/'systemd/user'
     loaded=all((directory/name).is_file() for name in UNIT_NAMES)
@@ -465,6 +467,8 @@ def _run_installer(
         environment["INSTALLER_TEST_MANAGER_CONFIG"] = config_home
     if keyring_source is not None:
         environment["LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE"] = str(keyring_source)
+    from packaged_proof_environment import with_account_home
+    environment = with_account_home(tmp_path, environment)
     return subprocess.run(
         [
             "bash",
@@ -723,6 +727,9 @@ def test_source_installer_consumes_runtime_unit_directory(tmp_path, monkeypatch,
     monkeypatch.setattr(
         deployment, "_manager_environment", lambda: {"HOME": str(home), "XDG_CONFIG_HOME": value}
     )
+    monkeypatch.setattr(deployment, "_account_home", lambda: home)
+    config = Path(value) if Path(value).is_absolute() else home / ".config"
+    monkeypatch.setattr(deployment, "_manager_unit_paths", lambda: (config / "systemd/user",))
     directory = deployment.service_unit_directory()
     assert (directory / "eom-email-watcher.service").is_file()
     assert (directory / "eom-monthly-hours.service").is_file()
@@ -894,14 +901,17 @@ def test_source_shell_retains_exclusive_lease_through_snapshot_writes(tmp_path, 
 python3 - <<'LOCK_PROBE'
 import fcntl, os
 from pathlib import Path
-path=Path(os.environ['HOME'])/'.local/state/eom-email-watcher/deployment.lock'
-with path.open('r') as lock:
+path=Path(os.environ['HOME'])
+fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+try:
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         pass
     else:
         raise SystemExit('source snapshot writes lost the exclusive publication lease')
+finally:
+    os.close(fd)
 LOCK_PROBE
 """
     monkeypatch.setattr(sys.modules[__name__], "FAKE_UV",
@@ -911,3 +921,29 @@ LOCK_PROBE
     assert result.returncode == 0, result.stdout + result.stderr
     log = (tmp_path / "uv.log").read_text()
     assert "export" in log and "tool install" in log
+
+
+@posix_installer
+def test_source_publication_keeps_exclusion_after_uv(tmp_path, monkeypatch):
+    check = """
+import fcntl
+log=Path(os.environ['INSTALLER_TEST_UV_LOG'])
+if log.exists() and 'tool install' in log.read_text():
+    fd=os.open(home,os.O_RDONLY|os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise SystemExit('publication lease lost after uv')
+    finally:
+        os.close(fd)
+"""
+    monkeypatch.setattr(sys.modules[__name__], "FAKE_SYSTEMCTL",
+                        FAKE_SYSTEMCTL.replace("if args==['--user','show-environment']:",
+                                               check+"\nif args==['--user','show-environment']:"))
+    result = _run_installer(tmp_path, tmp_path / "home")
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = (tmp_path / "systemctl.log").read_text()
+    assert "daemon-reload" in log and "enable eom-monthly-hours.timer" in log
