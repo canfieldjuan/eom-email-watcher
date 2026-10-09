@@ -287,11 +287,20 @@ class MailboxGateway(Protocol):
 
     def metadata(self, message_id: str) -> MessageMetadata: ...
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent: ...
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent: ...
 
     def attachment_bytes(
         self, message_id: str, part_id: str, attachment_id: str | None
     ) -> bytes: ...
+
+
+def validate_content_scope(scope: frozenset[str]) -> frozenset[str]:
+    """Validate the consumer's explicit folder policy before reading content."""
+    if not isinstance(scope, frozenset) or not scope <= MESSAGE_LOCATIONS:
+        raise ValueError("Content scope must be a frozenset of admitted locations")
+    return scope
 
 
 def validate_operation_timeout(timeout_seconds: float) -> float:

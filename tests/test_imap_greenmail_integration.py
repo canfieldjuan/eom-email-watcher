@@ -217,7 +217,9 @@ def test_engine_connects_and_polls_real_imap_without_mutating_source(tmp_path: P
     with mailbox_polling_session(session.gateway):
         plain_changes = session.gateway.changes_since(cursor)
         assert len(plain_changes.message_ids) == 1
-        plain_content = session.gateway.content(plain_changes.message_ids[0], 20_000)
+        plain_content = session.gateway.content(
+            plain_changes.message_ids[0], 20_000, scope=frozenset({"inbox"})
+        )
         assert plain_content.body == "Single-part body."
         assert plain_content.attachments == ()
     cursor = plain_changes.cursor
@@ -234,7 +236,7 @@ def test_engine_connects_and_polls_real_imap_without_mutating_source(tmp_path: P
         assert len(changes.message_ids) == 1
         message_id = changes.message_ids[0]
         metadata = session.gateway.metadata(message_id)
-        content = session.gateway.content(message_id, 20_000)
+        content = session.gateway.content(message_id, 20_000, scope=frozenset({"inbox"}))
         assert metadata.sender == WATCHED_SENDER
         assert metadata.subject == "Invoice ready"
         assert "Please review the attached invoice." in content.body
@@ -263,7 +265,9 @@ def test_engine_connects_and_polls_real_imap_without_mutating_source(tmp_path: P
         multipart_changes = session.gateway.changes_since(cursor)
         assert len(multipart_changes.message_ids) == 1
         multipart_message_id = multipart_changes.message_ids[0]
-        multipart_content = session.gateway.content(multipart_message_id, 20_000)
+        multipart_content = session.gateway.content(
+            multipart_message_id, 20_000, scope=frozenset({"inbox"})
+        )
         assert multipart_content.body == "Please review the attached message bundle."
         assert multipart_content.attachment_names == ("bundle.eml",)
         multipart_attachment = multipart_content.attachments[0]

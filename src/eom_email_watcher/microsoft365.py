@@ -36,6 +36,7 @@ from .mailbox import (
     StaleMailboxCursor,
     normalize_message_id,
     recipient_addresses,
+    validate_content_scope,
     validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
@@ -697,7 +698,9 @@ class Microsoft365Gateway:
         self._folder_ids = cached
         return folder_id
 
-    def _locations(self, parent_folder_id: object) -> frozenset[str]:
+    def _locations(
+        self, parent_folder_id: object, *, scope: frozenset[str] | None = None
+    ) -> frozenset[str]:
         """The admitted folder a message's parent is, checking the Inbox first.
 
         Sent Items is looked up only for a message outside the Inbox, so an Inbox
@@ -706,7 +709,9 @@ class Microsoft365Gateway:
         """
         if not isinstance(parent_folder_id, str):
             return frozenset()
-        in_scope = getattr(self, "_folders_in_scope", MESSAGE_LOCATIONS)
+        in_scope = (
+            scope if scope is not None else getattr(self, "_folders_in_scope", MESSAGE_LOCATIONS)
+        )
         for folder, location in FOLDER_LOCATIONS.items():
             if location in in_scope and self._folder_id(folder) == parent_folder_id:
                 return frozenset({location})
@@ -801,7 +806,10 @@ class Microsoft365Gateway:
                 return tuple(descriptors)
             current = _safe_graph_url(next_link)
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
+        scope = validate_content_scope(scope)
         encoded_id = quote(_graph_id(message_id, "message id"), safe="")
         query = urlencode({"$select": "body,hasAttachments,parentFolderId"})
         response = self._request(
@@ -810,7 +818,7 @@ class Microsoft365Gateway:
             missing_is_message=True,
         )
         document = _response_document(response, "message content")
-        if not self._locations(document.get("parentFolderId")):
+        if not self._locations(document.get("parentFolderId"), scope=scope):
             raise MailboxMessageUnavailable(
                 f"Microsoft message {message_id} is outside the active folder scope"
             )

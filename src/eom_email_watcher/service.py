@@ -183,10 +183,11 @@ def _scope_gateway(gateway: object, folders: frozenset[str]) -> None:
 
 
 def _content_from_sources(
-    gateway: MailboxGateway, provider_message_ids: Sequence[str], body_char_limit: int
+    gateway: MailboxGateway, provider_message_ids: Sequence[str], body_char_limit: int,
+    *, scope: frozenset[str],
 ) -> tuple[str, MessageContent]:
     return read_through_sources(
-        provider_message_ids, lambda source: gateway.content(source, body_char_limit)
+        provider_message_ids, lambda source: gateway.content(source, body_char_limit, scope=scope)
     )
 
 
@@ -592,7 +593,10 @@ def process_scheduling_automations(
                         raise MailboxMessageUnavailable(
                             "Scheduling source is no longer in the inbox"
                         )
-                    content = mailbox.gateway.content(work.provider_message_id, body_char_limit)
+                    content = mailbox.gateway.content(
+                        work.provider_message_id, body_char_limit,
+                        scope=frozenset({INBOX_LOCATION}),
+                    )
             except MailboxMessageUnavailable as exc:
                 capacity_used += 1
                 logger.info("Scheduling run %s source unavailable: %s", run.run_id, exc)
@@ -1543,6 +1547,7 @@ class Watcher:
                 checked_at = datetime.now(UTC)
                 try:
                     self._process_pending(
+                        scope=_folders_in_scope(self._gated_class_allowed()),
                         dry_run=dry_run,
                         deliver_notifications=deliver_notifications,
                         extra=[],
@@ -1573,6 +1578,7 @@ class Watcher:
                 if pending_current_identity:
                     checked_at = datetime.now(UTC)
                     return self._finish_active_result(
+                        scope=_folders_in_scope(self._gated_class_allowed()),
                         added=0,
                         purged=0,
                         recovered=False,
@@ -1793,6 +1799,7 @@ class Watcher:
             )
 
         return self._finish_active_result(
+            scope=folders,
             added=len(dry_run_messages),
             purged=0,
             recovered=True,
@@ -2020,6 +2027,7 @@ class Watcher:
     def _finish_active_result(
         self,
         *,
+        scope: frozenset[str],
         added: int,
         purged: int,
         recovered: bool,
@@ -2034,6 +2042,7 @@ class Watcher:
         recovery_status: GmailRecoveryState | None = None,
     ) -> dict[str, int | bool | str]:
         summarized, fallback = self._process_pending(
+            scope=scope,
             dry_run=dry_run,
             deliver_notifications=deliver_notifications,
             extra=dry_run_messages or [],
@@ -2116,6 +2125,7 @@ class Watcher:
                         "Gmail recovery stopped without durable state"
                     )
                 return self._finish_active_result(
+                    scope=folders,
                     added=added,
                     purged=purged,
                     recovered=True,
@@ -2244,6 +2254,7 @@ class Watcher:
                         "Gmail recovery stopped without durable state"
                     ) from exc
                 return self._finish_active_result(
+                    scope=folders,
                     added=added,
                     purged=purged,
                     recovered=True,
@@ -2288,6 +2299,7 @@ class Watcher:
             dry_run_messages=dry_run_messages,
         )
         return self._finish_active_result(
+            scope=folders,
             added=added,
             purged=purged,
             recovered=recovered,
@@ -2652,6 +2664,7 @@ class Watcher:
     def _process_pending(
         self,
         *,
+        scope: frozenset[str],
         dry_run: bool,
         deliver_notifications: bool,
         extra: list[PendingMessage] | None = None,
@@ -2741,7 +2754,7 @@ class Watcher:
                     )
                 )
                 served_by, content = _content_from_sources(
-                    self.gateway, source_ids, body_char_limit
+                    self.gateway, source_ids, body_char_limit, scope=scope
                 )
                 if not dry_run:
                     self.store.replace_attachments(

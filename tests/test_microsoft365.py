@@ -573,7 +573,7 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
     )
 
     metadata = gateway.metadata("message-1")
-    content = gateway.content("message-1", 100)
+    content = gateway.content("message-1", 100, scope=frozenset({"inbox"}))
     attachment = content.attachments[0]
     payload = gateway.attachment_bytes(
         "message-1",
@@ -691,7 +691,7 @@ def test_message_content_reports_pre_cut_length(limit: int, expected_body: str) 
     gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
 
     gateway._folder_ids = {"inbox": "inbox-folder-id"}
-    content = gateway.content("message-1", limit)
+    content = gateway.content("message-1", limit, scope=frozenset({"inbox"}))
 
     assert content.body == expected_body
     assert content.body_source_chars == 9
@@ -898,9 +898,12 @@ def test_graph_content_rejects_outside_active_scope_before_attachments(
         })
     gateway = Microsoft365Gateway("token", "owner@example.com", graph_client(handler))
     gateway._folder_ids = {"inbox": "inbox-folder-id", "sentitems": "sent-folder-id"}
-    gateway.scope_folders(scope)
+    gateway.scope_folders(
+        frozenset({"inbox", "sent"}) if scope != frozenset({"inbox", "sent"})
+        else frozenset({"inbox"})
+    )
     with pytest.raises(MailboxMessageUnavailable):
-        gateway.content("m1", 100)
+        gateway.content("m1", 100, scope=scope)
     assert len(requests) == 1
     assert "parentFolderId" in requests[0].url.params["$select"]
 
@@ -917,5 +920,29 @@ def test_graph_content_accepts_current_admitted_folder(folder: str, scope: froze
         }),
     ))
     gateway._folder_ids = {"inbox": "inbox-folder-id", "sentitems": "sent-folder-id"}
-    gateway.scope_folders(scope)
-    assert gateway.content("m1", 100).body == "Hello"
+    gateway.scope_folders(
+        frozenset({"inbox", "sent"}) if scope != frozenset({"inbox", "sent"})
+        else frozenset({"inbox"})
+    )
+    assert gateway.content("m1", 100, scope=scope).body == "Hello"
+
+
+@pytest.mark.parametrize(
+    "scope", [None, False, 0, "", frozenset({"archive"}), frozenset({"inbox", 7})]
+)
+def test_microsoft365_content_rejects_invalid_scope_before_transport(scope) -> None:
+    gateway = Microsoft365Gateway(
+        "token", "owner@example.com",
+        graph_client(lambda request: pytest.fail("transport reached")),
+    )
+    with pytest.raises(ValueError, match="Content scope"):
+        gateway.content("m1", 100, scope=scope)
+
+
+def test_microsoft365_content_requires_scope_before_transport() -> None:
+    gateway = Microsoft365Gateway(
+        "token", "owner@example.com",
+        graph_client(lambda request: pytest.fail("transport reached")),
+    )
+    with pytest.raises(TypeError, match="scope"):
+        gateway.content("m1", 100)

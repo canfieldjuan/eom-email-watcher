@@ -144,7 +144,9 @@ class FakeGmail:
         self.full_payload_calls += 1
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         body, attachment_names, attachments, body_source_chars = extract_body(
             self.full_payload(message_id), body_char_limit
         )
@@ -243,18 +245,24 @@ class AutomationGateway:
             frozenset({"INBOX"}),
         )
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         assert message_id == "schedule-1"
         return MessageContent(self.body[:body_char_limit], (), (), len(self.body))
 
 
 class AnyAutomationGateway(AutomationGateway):
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         return MessageContent(self.body[:body_char_limit], (), (), len(self.body))
 
 
 class MissingAutomationSource(AutomationGateway):
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         raise MessageUnavailable("deleted")
 
 
@@ -262,24 +270,32 @@ class MovedAutomationSource(AutomationGateway):
     def metadata(self, message_id: str) -> MessageMetadata:
         raise MessageUnavailable("no longer in inbox")
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         pytest.fail("A source outside the inbox must not be fetched")
 
 
 class FailingAutomationProvider(AutomationGateway):
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         raise Microsoft365Error("temporarily unavailable")
 
 
 class FailingOlderAutomationProvider(AutomationGateway):
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         if message_id == "older-failure":
             raise Microsoft365Error("temporarily unavailable")
         return MessageContent(self.body[:body_char_limit], (), (), len(self.body))
 
 
 class MetadataHeavyAutomationProvider(AutomationGateway):
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         names = tuple(
             f"attachment-{index}-{'x' * MAX_GATEWAY_ATTACHMENT_NAME_CHARS}.pdf"
             for index in range(MAX_GATEWAY_ATTACHMENT_COUNT + 1)
@@ -288,7 +304,9 @@ class MetadataHeavyAutomationProvider(AutomationGateway):
 
 
 class MalformedUnicodeAutomationProvider(AutomationGateway):
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         body = f"{self.body}\ud800"
         return MessageContent(body[:body_char_limit], (), (), len(body))
 
@@ -346,7 +364,9 @@ class FailingCaptureModel(FakeModel):
 
 
 class InvalidContentGmail(FakeGmail):
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         raise MailboxMessageInvalid("message_too_large", "Message exceeds the safe size limit")
 
 
@@ -373,9 +393,11 @@ class PollScopedGmail(FreshGmail):
         assert self.in_polling_session is True
         return super().metadata(message_id)
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         assert self.in_polling_session is True
-        return super().content(message_id, body_char_limit)
+        return super().content(message_id, body_char_limit, scope=scope)
 
 
 class InvalidMetadataGmail(FreshGmail):
@@ -874,7 +896,9 @@ def test_current_identity_pending_work_survives_last_selector_removal_without_po
         def metadata(self, message_id: str) -> MessageMetadata:
             pytest.fail("pending-only processing performed discovery metadata")
 
-        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             assert message_id == "current-pending"
             return MessageContent("current mailbox body", (), (), 20)
 
@@ -935,7 +959,9 @@ def test_public_check_processes_current_pending_work_without_watch_selectors(
         def metadata(self, message_id: str) -> MessageMetadata:
             pytest.fail("public pending-only processing fetched discovery metadata")
 
-        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             assert message_id == "current-pending-public"
             return MessageContent("current mailbox body", (), (), 20)
 
@@ -1462,7 +1488,9 @@ def test_a_recovery_restarts_its_page_when_the_folder_scope_changes(
 
 def test_content_is_read_through_any_source_of_a_logical_message() -> None:
     class Copies:
-        def content(self, provider_message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, provider_message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             if provider_message_id == "imap:mailbox:44:1":
                 raise MailboxMessageUnavailable("expunged")
             return MessageContent(f"body of {provider_message_id}", (), (), 4)
@@ -1477,11 +1505,13 @@ def test_content_is_read_through_any_source_of_a_logical_message() -> None:
     )
 
     ids = tuple(s.provider_message_id for s in sources)
-    served_by, content = service_module._content_from_sources(Copies(), ids, 100)
+    served_by, content = service_module._content_from_sources(
+        Copies(), ids, 100, scope=frozenset({"inbox"})
+    )
     assert served_by == "imap:sent:77:3"
     assert content.body == "body of imap:sent:77:3"
     with pytest.raises(MailboxMessageUnavailable):
-        service_module._content_from_sources(Copies(), ids[:1], 100)
+        service_module._content_from_sources(Copies(), ids[:1], 100, scope=frozenset({"inbox"}))
 
 
 def test_a_lost_history_cursor_marks_every_observation_incomplete(
@@ -5224,7 +5254,9 @@ def test_replacement_mailbox_fails_stale_pending_before_provider_fetch(
         def history_message_ids(self, cursor: str):
             return [], "201"
 
-        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             pytest.fail("a stale pending source reached the replacement mailbox")
 
     result = Watcher(cfg, store, ReplacementGateway(), FakeModel()).check()
@@ -5441,7 +5473,9 @@ def test_imap_uidvalidity_change_recovers_before_advancing_and_inerts_old_scoped
                 frozenset({"INBOX"}),
             )
 
-        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             return MessageContent(
                 "invoice",
                 ("invoice.pdf",),
@@ -5485,7 +5519,9 @@ class LongBodyGmail(FakeGmail):
         super().__init__()
         self.body = body
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         self.full_payload_calls += 1
         body, body_source_chars = bounded_body_text(self.body, body_char_limit)
         return MessageContent(body, (), (), body_source_chars)
@@ -5590,7 +5626,9 @@ def test_imap_capture_threads_a_reply_with_its_root(tmp_path: Path) -> None:
                 reply_ids=replies,
             )
 
-        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             return MessageContent("body", (), (), 4)
 
     Watcher(cfg, store, MailboxSession("imap", account_id, ThreadedGateway()), FakeModel()).check()
@@ -5912,10 +5950,12 @@ def test_watcher_resolves_proven_legacy_message_without_recapture(
                 rfc_message_id="same@x", received_at=stamp,
             )
 
-        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        def content(
+            self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+        ) -> MessageContent:
             if message_id != candidate:
                 raise MailboxMessageUnavailable("old source is gone")
-            return super().content(message_id, body_char_limit)
+            return super().content(message_id, body_char_limit, scope=scope)
 
     gateway = AnotherCopy()
     model = FakeModel()
@@ -6110,7 +6150,9 @@ class SentPollingGateway(ImapGateway):
             locations=frozenset({"sent"}),
         )
 
-    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
         return MessageContent("body", (), (), 4)
 
 
@@ -6352,8 +6394,8 @@ def test_pending_discards_moved_body_response_and_tries_valid_copy(
     )))
     real.scope_folders(frozenset({"inbox"}))
     class MovedGmail(FakeGmail):
-        def content(self, source, limit):
-            return real.content(source, limit)
+        def content(self, source, limit, *, scope: frozenset[str]):
+            return real.content(source, limit, scope=scope)
     bodies = []
     class ObservedModel(FakeModel):
         def analyze(self, **kwargs):
@@ -6363,7 +6405,7 @@ def test_pending_discards_moved_body_response_and_tries_valid_copy(
     Watcher(cfg, store, MovedGmail(), model)._process_pending(
         dry_run=False, deliver_notifications=False,
         retention_cutoff=now - timedelta(days=1), retention_observed_at=now,
-        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, scope=frozenset({"inbox"}),
     )
     assert reads == (["moved", "safe"] if fallback else ["moved"])
     assert bodies == (["Hello"] if fallback else [])
@@ -6371,3 +6413,105 @@ def test_pending_discards_moved_body_response_and_tries_valid_copy(
     row = store.recent(1)[0]
     assert row["status"] == ("summarized" if fallback else "skipped")
     assert row["summary"] == ("A short update." if fallback else None)
+
+
+@pytest.mark.parametrize("sent", [False, True])
+def test_scheduling_body_read_uses_inbox_scope_after_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sent: bool,
+) -> None:
+    monkeypatch.setattr(Watcher, "_gated_class_allowed", staticmethod(lambda: False))
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
+    scopes = []
+
+    import httpx
+
+    from eom_email_watcher.microsoft365 import Microsoft365Gateway
+
+    graph = Microsoft365Gateway("token", "owner@example.com", httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+            "parentFolderId": "sent-id" if sent else "inbox-id",
+            "hasAttachments": False,
+            "body": {"contentType": "text", "content": AutomationGateway.body},
+        })),
+    ))
+    graph._folder_ids = {"inbox": "inbox-id", "sentitems": "sent-id"}
+
+    class ScopedAutomation(AutomationGateway):
+        def content(self, message_id, body_char_limit, *, scope: frozenset[str]):
+            scopes.append(scope)
+            return graph.content(message_id, body_char_limit, scope=scope)
+
+    allow_automation_processing(monkeypatch, ScopedAutomation())
+    model = ExtractionModel([valid_scheduling_output()])
+    process_scheduling_automations(cfg, store, model)
+    assert scopes == [frozenset({"inbox"})]
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert current.state == ("source_unavailable" if sent else "proposing")
+    assert len(model.extraction_calls) == (0 if sent else 1)
+
+
+@pytest.mark.parametrize("catalog_error", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("sent", [False, True])
+def test_pending_shortcut_passes_inbox_scope_without_polling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, catalog_error: bool,
+    gated: bool, sent: bool,
+) -> None:
+    monkeypatch.setattr(Watcher, "_gated_class_allowed", staticmethod(lambda: gated))
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail", "gmail-default", TEST_MAILBOX_IDENTITY_KEY, legacy_status="replacement",
+    )
+    stamp = datetime.now(UTC).isoformat()
+    store.add_message(
+        message_id="pending", provider_message_id="pending", thread_id=None,
+        sender="trusted@example.com", sender_name=None, subject="S", received_at=stamp,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=AdmissionProvenance(
+            kind="exact_sender", selector_id="sender:trusted@example.com", display_name=None,
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, admitted_at=stamp,
+        ),
+    )
+    scopes = []
+    from eom_email_watcher.gmail import GmailGateway
+
+    graph_response = {
+        "labelIds": ["SENT"] if sent else ["INBOX"],
+        "payload": {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}},
+    }
+    real = GmailGateway(SimpleNamespace(users=lambda: SimpleNamespace(
+        messages=lambda: SimpleNamespace(
+            get=lambda **kwargs: SimpleNamespace(execute=lambda: graph_response),
+        ),
+    )))
+
+    class PendingScope(FakeGmail):
+        def content(self, message_id, body_char_limit, *, scope: frozenset[str]):
+            scopes.append(scope)
+            return real.content(message_id, body_char_limit, scope=scope)
+
+        def changes_since(self, cursor):
+            pytest.fail("Shortcut must not poll")
+
+    model = FakeModel()
+    watcher = Watcher(cfg, store, PendingScope(), model)
+    if catalog_error:
+        def unavailable(*args):
+            raise service_module.GmailLabelCatalogUnavailable("catalog unavailable")
+        monkeypatch.setattr(watcher, "_active_gmail_label_selectors", unavailable)
+        with pytest.raises(service_module.GmailLabelCatalogUnavailable):
+            watcher.check(deliver_notifications=False)
+    else:
+        watcher.check(deliver_notifications=False)
+    expected_scope = frozenset({"inbox", "sent"}) if gated else frozenset({"inbox"})
+    assert scopes == [expected_scope]
+    assert model.calls == (0 if sent and not gated else 1)
+    assert store.recent(1)[0]["summary"] == (
+        None if sent and not gated else "A short update."
+    )
