@@ -1046,3 +1046,38 @@ substitutions are explicit. No normal-profile/model/mail changes.
 
 Gap audit: DONE implementation/local origin proof/parity/mutations/cold audit;
 NOT DONE exact-head CI and independent oversight after grouped push. Hold remains.
+
+
+### Accepted consumed-manager projection correction
+
+Operator Approved accepts root proposal6079176121 before implementation.
+
+## Rule21 root-cause checkpoint: bound the consumed manager projection
+
+Published head8714a9c999140fb20bf671b169db0b811938a882 has all four CI checks green. Claude verified v11, but confirmed the remaining cap blocker r4227139982. No tracked code change, push or merge this round.
+
+**Root cause and my churn.** One new blocking finding is caused by my latest8714a9c: _manager_output at deployment.py:344 widens the bounded snapshot to all target/slice units. git log -L also traces the shared raw-output cap to my659dab21 (extracted into _read_manager_command by a047617). _read_manager_command at :358 counts everything before projection; _manager_snapshot at :397 repeats a whole-raw-string cap. All these are my implementation. Raising the cap or adding caller-specific exceptions will not end this class.
+
+**Reproduce/isolate/explain.** Exact current reader, real child stdout pipes, public input:4 failed,2passed. One unrelated80KB environment value and many small unrelated assignments both reject valid selected HOME/XDG values. Five roots plus500 unrelated platform records reject, whether roots occur first or last. Both oversized selected-value controls correctly refuse. Failure originates at deployment.py:383 before selection, with The user manager returned too much deployment metadata. It depends on session state outside our deployment and prevents every packaged DB read/install.
+
+**Proposed single-owner correction, after acceptance.**
+- The existing manager reader owns bounded streaming capture and explicit selection semantics for its three read forms. Environment retains only HOME/XDG_CONFIG_HOME/XDG_DATA_HOME. UnitPath remains the fully consumed path array. The graph retains five shipped roots and the direct target/slice dependencies they name, including Names-based aliases/provenance.
+- Preserve one manager graph subprocess, deadline/child cleanup, shared/exclusive lease, typed DeploymentError and current activation/provenance validation. No second live graph read and no fixed default-name list. Selection must be record-order independent; candidate records preceding roots require bounded private scratch from that same captured stream, not a later live rescan. Keep per-record buffering bounded and scratch cleanup inside the reader lifetime.
+- Apply the existing64KiB retained budget after selection, with a per-record bound. Stream-discard unrelated environment values rather than buffering an oversized ignored assignment. Do not silently truncate selected values or discard malformed/missing/mixed selected records. Remove the duplicated whole-raw cap assumption from the parser; every consumer receives the bounded selected representation.
+- Required surface: deployment.py reader/selection/parser owner, adjacent reader fixtures/regressions, canonical README and accepted contract. No db/schema, unit payloads, model/gateway, dependencies, mail policy, normal-profile changes or UI redesign. The rare ExecStart delimiter issue remains deferred in#221.
+
+**Inventory/parity and verification.** Reuse v11 native/public schema28 oracle and all activation/provenance/lease/Unicode tests. Production selection is the only semantic difference: unrelated session records cease to consume the deployment budget. On the same selected records, the graph and verdict must match the proven baseline. Add roots-first/last, direct dependency before/after roots, alias ambiguity, chunk/UTF8 boundaries, mixed/missing metadata, selected record and aggregate cap min/max/over, timeout and child cleanup tests. Current4wrong refusals must pass; oversized selected input must still refuse. Mutation-prove restoring the raw cap and removing selected/per-record bounds. Rebuild once, replay retained38negative migration/overlap/Store/receiver oracle plus padded native environment/graph positives and oversized selected negatives. Adjacent tests/lint, final cold audit, one grouped push after contract-only acceptance commit.
+
+**The cut and decision.** This is a primary-path false refusal caused by my widened query. Bookkeeping is not a blocker. Recommend continue once with this single-reader correction, defer#221, and retain the independent hold until exact-head verification. Under Rule21, this new root proposal needs acceptance before implementation.
+
+**Merge authorization.** The operator's earlier direct instruction in this chat was: "Merge any PRs we own that are merge ready too." Standing operator Rule7 also owns green/reviewed/clean merge. I will not merge with your unresolved verification hold; once actual gates are met, existing direction supplies clearance without asking again.
+
+Evidence aliases: manager-selection-fail-before-v12.txt SHA256 35dd8bd9a6837d68944067985679b904dbd69186abab56ef29440f85bc588e31; test_manager_selection_v12.py SHA256 a609a7561aaa8174dbc226a3b8b6b4969ba20091ceaabb481829b86d206dd2a7. Durable public evidence outside worktrees. Gap audit NOT DONE: reproduce/isolate/explain complete; acceptance, implementation/pass-after, native parity and independent review pending.
+
+
+Capture clarification: graph records can precede the five roots. The reader may
+spill bounded record buffers to a private automatically cleaned temporary file
+from this same pipe while discovering direct dependencies. Keep in-memory buffers
+and retained output bounded; the existing deadline covers capture and selection.
+No second live manager observation, truncation or arbitrary platform count limit.
+Temporary scratch is not durable proof and never goes into the normal profile.
