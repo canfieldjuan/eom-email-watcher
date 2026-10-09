@@ -253,7 +253,7 @@ Each definition is the only place its rule is stated.
     - its `total` is present and re-derives from its exact text with the parsers validation uses, under the record's own number format;
     - its currency was printed on the document (the record's `currency.source` is `printed`), and the total is in that currency;
     - the record's arithmetic is checked, and its total residual is zero or absent.
-  - **The claim** is one `amount` claim with role `total`, bound to the record's invoice number. Its evidence is the total's page and exact text. A record that fails a condition gives no claim and counts toward "Some claims could not be verified". Its other components, its dates, and its line items give no claims: the total is the only value the record's arithmetic corroborates.
+  - **The claim** is one `amount` claim with role `total`, bound to the record's invoice number. Its evidence is the attachment's file name, then the total's page and exact text. A record that fails a condition gives no claim and counts toward "Some claims could not be verified". Its other components, its dates, and its line items give no claims: the total is the only value the record's arithmetic corroborates.
   - **Trust (decision D5).** The `total` label is Invoice Processor's: its own code admits an amount's role only when the surrounding text proves it, and withholds the amount otherwise. Email Watcher checks what the record lets it check (the value against its text, the printed currency, the arithmetic, and the email naming the invoice number), and every outcome shows the page and exact text, so the user can confirm it against the PDF.
   - Record text is untrusted provider output, and renders as text only.
 - **Types (closed):**
@@ -263,7 +263,7 @@ Each definition is the only place its rule is stated.
   - `term`: text, displayed only;
   - `reference`: a `(kind, number)` pair, with kind in `invoice`, `quote`, `po`. References are used only as anchors.
 - **Keying.** Claims from the authored text, the message's reference profile (below), and attempts are keyed by `(message, attributed vendor, extractor version)`; claims from an invoice record are keyed by `(message, attributed vendor, selected record, record mapping version)`. They, and the discrepancies citing them, exist only while their message is offered under that key (Source above). When the message stops being offered, or its attributed vendor changes, they are deleted ([D-derived](#d-derived-derived-state-and-invalidation)). That covers a vendor's deletion or re-creation, and a message that turns outbound.
-- **Attempts.** Each key has one durable attempt record, with one of three outcomes:
+- **Attempts.** Each authored-text key has one durable attempt record, with one of three outcomes. An invoice-record key has none, since its claim needs no model call:
   - `succeeded`;
   - `retryable`: the model or its transport was unavailable. Another attempt is made after a backoff deadline, and the message shows "Claims unavailable, will retry";
   - `rejected`: the response failed the schema. It is permanent for that version, and the message shows "Claims unavailable".
@@ -277,7 +277,7 @@ Each definition is the only place its rule is stated.
   - A claim's anchor and its canonical item key must be bound to that claim uniquely, from its own evidence. Item keys are canonicalized in code, never taken from the model's choice of substring.
   - Relative and yearless dates resolve against the message's stored date context ([D-body](#d-body-stored-bodies)). Without that context they are rejected.
   - Only claims of their source's current version exist for comparison: the claims extractor version for authored text, and the record mapping version for invoice records. A new version supersedes a message's older claims atomically.
-- **A message's reference profile** is computed in code, never from the model's output, when the message's claims are stored: a scan of its authored text with the reference kind patterns that validation uses. For each kind, the profile holds the one reference the scan finds, or marks the kind *several* when the scan finds more than one, counting references by kind and normalized number (the M4 plan names the patterns and the normalization). A kind the scan finds no reference of is absent from the profile.
+- **A message's reference profile** is computed in code, never from the model's output, whenever the message is offered and its authored text is available, whatever its extraction attempt's outcome: a scan of its authored text with the reference kind patterns that validation uses. For each kind, the profile holds the one reference the scan finds, or marks the kind *several* when the scan finds more than one, counting references by kind and normalized number (the M4 plan names the patterns and the normalization). A kind the scan finds no reference of is absent from the profile.
 - **`comparable(a, b)`** holds only if all of these do:
   - same vendor, in the same account and mailbox identity;
   - same type, and same validated key;
@@ -285,7 +285,7 @@ Each definition is the only place its rule is stated.
     - **in one thread:** a shared bound anchor `(kind, number)`, needed for `amount` roles other than `unit_price` and for `date_commitment` and `quantity`;
     - **in different threads (decision D4):** profile agreement, for every type;
     - **profile agreement:** the two messages' reference profiles have a reference in common and, in every kind both profiles hold, the same single reference. A kind marked several in either profile, while the other profile holds that kind, never agrees. Only the two messages' own profiles count, so claims never pair through a third message;
-    - **record pairing**, instead of both, when either claim comes from an invoice record: the record's claim pairs with the other message's claims of the same type and key that are bound to the record's invoice number, when that number is in the other message's profile; when there are none, it pairs by profile agreement;
+    - **record pairing**, instead of both, when either claim comes from an invoice record: the record's claim pairs with the other message's claims of the same type and key that are bound to the record's invoice number, when that number is in the other message's profile; when there are none, it pairs by profile agreement, and only when the record's own message profile holds the record's invoice number as its single invoice reference;
   - neither claim is a `reference`, a `term`, or `other`;
   - they come from different messages.
 - **Outcome.** Every thread that holds one of the claims shows the outcome, with a link to the other claim's message when that message sits in another thread.
@@ -359,7 +359,7 @@ Each named plan must include these, with fail-first tests.
   - Each use condition failing on its own: no invoice number, an email that does not name it, a total that does not re-derive, an inferred currency, unchecked arithmetic, and a non-zero total residual.
   - Record pairing preferring the claim bound to the record's invoice number, tested in one thread and across threads.
   - A newer record, and a new record mapping version, each superseding claims in one transaction.
-  - Page-and-text evidence shown for every claim from a record.
+  - File-name, page, and text evidence shown for every claim from a record, tested on a message with two PDF attachments.
 
 ## Operator decisions (accepted 2026-10-05, as recommended)
 
@@ -452,6 +452,8 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
     - an email "Quote Q-512 total $100; Invoice 9087 total $120" and a PDF record for invoice 9087 compare the PDF's total with the $120 invoice total only;
     - a PDF record for invoice I-1 and an email "Invoice I-1 total $100; Invoice I-2 total $200; quote Q-1" are never paired, because that email marks invoices several;
     - two emails that each name several invoices and the same quote never pair their PDFs through the quote;
+    - a PDF record for invoice I-2 in an email "Invoice I-1 for quote Q-1 attached; invoice I-2 attached for reference" is never paired with "Quote Q-1 total $100";
+    - a PDF's total pairs through its email's quote number even when the email's own extraction attempt was rejected;
     - a PDF's subtotal, tax, due date, and line items give no claims;
     - a newer record for the same attachment replaces the older record's claim;
     - purging the message deletes its invoice records;
@@ -520,3 +522,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - Profile agreement within one thread now applies only when an invoice record is involved, so authored claims keep their per-claim anchors.
 - 2026-10-09: the second Codex review of #228 found that the email-confirmed number, the label, and the currency still could not be proven from a 1.0 record. The operator chose to trust Invoice Processor's own label check now (decision D5), with its accepted risk recorded. The currency must be printed, which the record states. Record pairing, one rule for both thread modes, prefers the other message's claim bound to the record's invoice number before profile agreement. The dependency now links D-scope's purge instead of restating it.
 - 2026-10-09: the third Codex review of #228 found that a reference profile treated a kind named several times like a kind never named, so profile agreement ignored it, and an ambiguous invoice kind could vanish during record pairing's fallback. D-claims' profile now marks such a kind *several*, and profile agreement fails when either profile marks a kind several while the other holds it. That also makes D4's authored pairings stricter in the same way. Per-claim binding inside a message that names several invoices still never decides, as D4 established.
+- 2026-10-09: the fourth Codex review of #228. Record pairing's profile fallback now requires the record's own message to name the record's invoice number as its only invoice. A profile no longer waits for extraction to store claims. A record claim's evidence names its attachment. Attempt records belong to authored-text keys only.
