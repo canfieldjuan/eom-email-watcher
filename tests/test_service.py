@@ -5840,8 +5840,10 @@ def test_a_dry_run_previews_a_logical_message_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("dry_run", [True, False])
-def test_watcher_does_not_recapture_a_proven_completed_legacy_message(
-    tmp_path: Path, dry_run: bool,
+@pytest.mark.parametrize("initial_status", ["summarized", "skipped"])
+@pytest.mark.parametrize("candidate", ["new-copy", "old-source"])
+def test_watcher_resolves_proven_legacy_message_without_recapture(
+    tmp_path: Path, dry_run: bool, initial_status: str, candidate: str,
 ) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
@@ -5866,7 +5868,8 @@ def test_watcher_does_not_recapture_a_proven_completed_legacy_message(
             """UPDATE messages SET mailbox_identity_key = NULL, admission_kind = NULL,
                 admission_selector_id = NULL, admission_display_name = NULL,
                 admission_mailbox_identity_key = NULL, admitted_at = NULL,
-                status = 'summarized', summary = 'Already completed'"""
+                status = ?, summary = 'Already completed'""",
+            (initial_status,),
         )
         db.execute(
             """UPDATE mail_accounts SET legacy_identity_status = 'continuity_proven',
@@ -5874,29 +5877,55 @@ def test_watcher_does_not_recapture_a_proven_completed_legacy_message(
                 WHERE provider = 'gmail' AND account_id = 'gmail-default'""",
             (TEST_MAILBOX_IDENTITY_KEY,),
         )
+    # Restore production triggers before exercising the pending-identity bind.
+    store.initialize()
     with store.connection() as db:
+        db.execute("DELETE FROM message_locations")
         before = tuple(db.iterdump())
 
     class AnotherCopy(FakeGmail):
-        def history_message_ids(self, cursor: str):
-            return ["new-copy"], "200"
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            return MailboxChanges(
+                (candidate,), "200",
+                {candidate: FolderObservation(frozenset({"inbox"}), True)},
+            )
 
         def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
             return replace(
-                super().metadata("allowed"), message_id=message_id, rfc_message_id="same@x",
+                super().metadata("allowed"), message_id=message_id,
+                rfc_message_id="same@x", received_at=stamp,
             )
 
+        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+            if message_id != candidate:
+                raise MailboxMessageUnavailable("old source is gone")
+            return super().content(message_id, body_char_limit)
+
     gateway = AnotherCopy()
-    result = Watcher(cfg, store, gateway, FakeModel()).check(dry_run=dry_run)
+    model = FakeModel()
+    result = Watcher(cfg, store, gateway, model).check(dry_run=dry_run)
     assert result["discovered"] == 0
-    assert gateway.full_payload_calls == 0
+    processed = not dry_run and initial_status == "skipped"
+    assert model.calls == int(processed), "REQUEUED_LEGACY_NOT_ANALYZED"
+    assert gateway.full_payload_calls == int(processed)
     assert [row["message_id"] for row in store.recent(10)] == ["legacy-completed"]
-    assert store.message_source("legacy-completed").mailbox_identity_key is None
+    assert store.message_source("legacy-completed").mailbox_identity_key == (
+        TEST_MAILBOX_IDENTITY_KEY if processed else None
+    )
     with store.connection() as db:
         if dry_run:
             assert tuple(db.iterdump()) == before
     if not dry_run:
-        assert store.has_seen_message("new-copy", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY)
+        assert store.has_seen_message(candidate, mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY)
+        assert store.message_locations("legacy-completed") == ["inbox"]
+        with store.connection() as db:
+            row = db.execute(
+                "SELECT * FROM messages WHERE message_id = 'legacy-completed'"
+            ).fetchone()
+            assert row["admission_kind"] is None
+            assert row["analysis_error_code"] != "mailbox_identity_unverified"
+            if processed:
+                assert row["summary"] == "A short update."
 
 
 def test_gmail_label_added_to_a_known_message_records_its_second_location(
