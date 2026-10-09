@@ -1842,3 +1842,46 @@ def test_parse_metadata_without_admitted_labels_has_no_location() -> None:
 
 def test_metadata_fetch_requests_the_thread_headers() -> None:
     assert set(GMAIL_METADATA_HEADERS) >= {"To", "Cc", "Message-ID", "In-Reply-To", "References"}
+
+
+@pytest.mark.parametrize("labels,scope", [
+    (["TRASH"], frozenset({"inbox"})), ([], frozenset({"inbox"})),
+    (None, frozenset({"inbox"})), ("INBOX", frozenset({"inbox"})),
+    (["SENT"], frozenset({"inbox"})), (["INBOX"], frozenset()),
+])
+def test_gmail_full_response_rejects_outside_active_scope(
+    labels: object, scope: frozenset[str],
+) -> None:
+    from eom_email_watcher.mailbox import MailboxMessageUnavailable
+
+    response = {
+        "labelIds": labels,
+        "payload": {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}},
+    }
+    service = SimpleNamespace(users=lambda: SimpleNamespace(messages=lambda: SimpleNamespace(
+        get=lambda **_kwargs: SimpleNamespace(execute=lambda: response),
+    )))
+    gateway = GmailGateway(service)
+    gateway.scope_folders(scope)
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content("m1", 100)
+
+
+@pytest.mark.parametrize("labels,scope", [
+    (["INBOX"], frozenset({"inbox"})),
+    (["SENT"], frozenset({"inbox", "sent"})),
+    (["TRASH", "INBOX"], frozenset({"inbox"})),
+])
+def test_gmail_full_response_keeps_active_admitted_folder(
+    labels: list[str], scope: frozenset[str],
+) -> None:
+    response = {
+        "labelIds": labels,
+        "payload": {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}},
+    }
+    service = SimpleNamespace(users=lambda: SimpleNamespace(messages=lambda: SimpleNamespace(
+        get=lambda **_kwargs: SimpleNamespace(execute=lambda: response),
+    )))
+    gateway = GmailGateway(service)
+    gateway.scope_folders(scope)
+    assert gateway.content("m1", 100).body == "Hello"

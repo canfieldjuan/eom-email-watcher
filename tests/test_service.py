@@ -6305,3 +6305,69 @@ def test_a_stale_sent_cursor_recovers_the_gap_before_moving_on(
     assert last_success - timedelta(minutes=6) <= since <= last_success
     assert store.folder_state(**scope)[0].endswith(":77:3")
     assert store.message_locations(store.recent(1)[0]["message_id"]) == ["sent"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_pending_discards_moved_body_response_and_tries_valid_copy(
+    tmp_path: Path, fallback: bool,
+) -> None:
+    from eom_email_watcher.gmail import GmailGateway
+
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail", "gmail-default", TEST_MAILBOX_IDENTITY_KEY, legacy_status="replacement",
+    )
+    now = datetime.now(UTC)
+    stamp = now.isoformat()
+    admission = AdmissionProvenance(
+        kind="exact_sender", selector_id="sender:trusted@example.com", display_name=None,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, admitted_at=stamp,
+    )
+    assert store.add_message(
+        message_id="root", provider_message_id="moved", thread_id="thread",
+        sender="trusted@example.com", sender_name=None, subject="S", received_at=stamp,
+        rfc_message_id="scope@x", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=admission,
+    )
+    if fallback:
+        assert store.add_message(
+            message_id="copy", provider_message_id="safe", thread_id="thread",
+            sender="trusted@example.com", sender_name=None, subject="S", received_at=stamp,
+            rfc_message_id="scope@x", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            admission=admission,
+        ) is False
+    reads = []
+    def get(**kwargs):
+        source = kwargs["id"]
+        reads.append(source)
+        body = "TVVTVF9OT1RfQU5BTFlaRQ==" if source == "moved" else "SGVsbG8="
+        return SimpleNamespace(execute=lambda: {
+            "labelIds": ["TRASH"] if source == "moved" else ["INBOX"],
+            "payload": {"mimeType": "text/plain", "body": {"data": body}},
+        })
+    real = GmailGateway(SimpleNamespace(users=lambda: SimpleNamespace(
+        messages=lambda: SimpleNamespace(get=get),
+    )))
+    real.scope_folders(frozenset({"inbox"}))
+    class MovedGmail(FakeGmail):
+        def content(self, source, limit):
+            return real.content(source, limit)
+    bodies = []
+    class ObservedModel(FakeModel):
+        def analyze(self, **kwargs):
+            bodies.append(kwargs["body"])
+            return super().analyze(**kwargs)
+    model = ObservedModel()
+    Watcher(cfg, store, MovedGmail(), model)._process_pending(
+        dry_run=False, deliver_notifications=False,
+        retention_cutoff=now - timedelta(days=1), retention_observed_at=now,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    assert reads == (["moved", "safe"] if fallback else ["moved"])
+    assert bodies == (["Hello"] if fallback else [])
+    assert model.calls == int(fallback)
+    row = store.recent(1)[0]
+    assert row["status"] == ("summarized" if fallback else "skipped")
+    assert row["summary"] == ("A short update." if fallback else None)

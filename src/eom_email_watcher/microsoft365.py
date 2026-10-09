@@ -803,13 +803,17 @@ class Microsoft365Gateway:
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         encoded_id = quote(_graph_id(message_id, "message id"), safe="")
-        query = urlencode({"$select": "body,hasAttachments"})
+        query = urlencode({"$select": "body,hasAttachments,parentFolderId"})
         response = self._request(
             f"{GRAPH_ROOT}/me/messages/{encoded_id}?{query}",
             prefer_text=True,
             missing_is_message=True,
         )
         document = _response_document(response, "message content")
+        if not self._locations(document.get("parentFolderId")):
+            raise MailboxMessageUnavailable(
+                f"Microsoft message {message_id} is outside the active folder scope"
+            )
         attachments = (
             self._attachments(message_id) if document.get("hasAttachments") is True else ()
         )

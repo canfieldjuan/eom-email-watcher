@@ -560,6 +560,7 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
         return httpx.Response(
             200,
             json={
+                "parentFolderId": "inbox-folder-id",
                 "body": {"contentType": "text", "content": " First line \n\n Second line "},
                 "hasAttachments": True,
             },
@@ -597,7 +598,7 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
         request
         for request in requests
         if request.url.path.endswith("/messages/message-1")
-        and request.url.params.get("$select") == "body,hasAttachments"
+        and request.url.params.get("$select") == "body,hasAttachments,parentFolderId"
     )
     assert 'outlook.body-content-type="text"' in content_request.headers["prefer"]
 
@@ -681,6 +682,7 @@ def test_message_content_reports_pre_cut_length(limit: int, expected_body: str) 
         return httpx.Response(
             200,
             json={
+                "parentFolderId": "inbox-folder-id",
                 "body": {"contentType": "text", "content": "  abcd \n\n efgh "},
                 "hasAttachments": False,
             },
@@ -688,6 +690,7 @@ def test_message_content_reports_pre_cut_length(limit: int, expected_body: str) 
 
     gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
 
+    gateway._folder_ids = {"inbox": "inbox-folder-id"}
     content = gateway.content("message-1", limit)
 
     assert content.body == expected_body
@@ -874,3 +877,45 @@ def test_sent_recovery_restarts_the_sent_items_delta_from_since() -> None:
     delta = next(r for r in requests if "/messages/delta" in r.url.path)
     assert "sentitems" in delta.url.path
     assert "receivedDateTime ge 2026-09-01T12:00:00Z" in str(delta.url.params.get("$filter"))
+
+
+@pytest.mark.parametrize("folder,scope", [
+    ("archive-folder-id", frozenset({"inbox"})), (None, frozenset({"inbox"})),
+    ("", frozenset({"inbox"})), (0, frozenset({"inbox"})),
+    ("sent-folder-id", frozenset({"inbox"})), ("inbox-folder-id", frozenset()),
+])
+def test_graph_content_rejects_outside_active_scope_before_attachments(
+    folder: object, scope: frozenset[str],
+) -> None:
+    requests = []
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("/attachments"):
+            return httpx.Response(200, json={"value": []})
+        return httpx.Response(200, json={
+            "parentFolderId": folder, "hasAttachments": True,
+            "body": {"contentType": "text", "content": "must not reach analysis"},
+        })
+    gateway = Microsoft365Gateway("token", "owner@example.com", graph_client(handler))
+    gateway._folder_ids = {"inbox": "inbox-folder-id", "sentitems": "sent-folder-id"}
+    gateway.scope_folders(scope)
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content("m1", 100)
+    assert len(requests) == 1
+    assert "parentFolderId" in requests[0].url.params["$select"]
+
+
+@pytest.mark.parametrize("folder,scope", [
+    ("inbox-folder-id", frozenset({"inbox"})),
+    ("sent-folder-id", frozenset({"inbox", "sent"})),
+])
+def test_graph_content_accepts_current_admitted_folder(folder: str, scope: frozenset[str]) -> None:
+    gateway = Microsoft365Gateway("token", "owner@example.com", graph_client(
+        lambda _request: httpx.Response(200, json={
+            "parentFolderId": folder, "hasAttachments": False,
+            "body": {"contentType": "text", "content": "Hello"},
+        }),
+    ))
+    gateway._folder_ids = {"inbox": "inbox-folder-id", "sentitems": "sent-folder-id"}
+    gateway.scope_folders(scope)
+    assert gateway.content("m1", 100).body == "Hello"

@@ -1047,6 +1047,10 @@ class GmailGateway:
                     f"Gmail message {message_id} unavailable (HTTP 404)"
                 ) from exc
             raise GmailError(f"Gmail body fetch failed (HTTP {exc.resp.status})") from exc
+        if not (locations_from_labels(message.get("labelIds")) & self.query_folders):
+            raise MessageUnavailable(
+                f"Gmail message {message_id} is outside the active folder scope"
+            )
         return message.get("payload") or {}
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
