@@ -88,6 +88,10 @@ OWNED_PHRASES = {
         r"reference profile\*\* is computed in code",
         r"never pair through a third message",
         r"the anchor condition for where the two claims sit",
+        r"selected record is its valid `invoice.extract` record",
+        r"the vendor's own words say this PDF is their invoice",
+        r"\*\*record pairing\*\*, instead of both",
+        r"marks the kind \*several\*",
     ],
 }
 

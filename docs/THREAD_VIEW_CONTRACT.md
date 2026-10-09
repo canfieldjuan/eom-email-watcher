@@ -1,6 +1,6 @@
 # Thread View and Vendor Claims Contract
 
-Status: accepted by the operator on 2026-10-05, with D1-D3 as recommended, and restructured the same day into a definitions-first form (see the revision log). Decision D4 (comparison across a vendor's threads) was added on 2026-10-09. Each milestone still needs its own accepted plan before code.
+Status: accepted by the operator on 2026-10-05, with D1-D3 as recommended, and restructured the same day into a definitions-first form (see the revision log). Decision D4 (comparison across a vendor's threads) was added on 2026-10-09, and decision D5 (invoice PDFs as a claim source) was proposed the same day. Each milestone still needs its own accepted plan before code.
 
 **How to read and change this contract.**
 
@@ -15,7 +15,7 @@ Status: accepted by the operator on 2026-10-05, with D1-D3 as recommended, and r
 
 ## Why this arc exists
 
-The operator wants Email Watcher users to "keep vendors honest". A user should see a whole conversation with a vendor, including what was quoted, promised, or agreed earlier and their own replies. They should be told when a later message or invoice departs from an earlier claim, including when the agreement and the invoice arrive in different threads (decision D4).
+The operator wants Email Watcher users to "keep vendors honest". A user should see a whole conversation with a vendor, including what was quoted, promised, or agreed earlier and their own replies. They should be told when a later message or invoice departs from an earlier claim, including when the agreement and the invoice arrive in different threads (decision D4) and when the invoice's figures are only in an attached PDF (decision D5).
 
 Today the product cannot do this, by construction. The findings below come from `origin/main` at `8c1e076`, re-checked at `6a068bf`.
 
@@ -100,7 +100,7 @@ Each definition is the only place its rule is stated.
 - **Purge.**
   - A message outside a followed thread is purged once it is older than the cutoff, as today.
   - A followed thread is purged as one unit once its newest message is older than the cutoff (decision D1) and the account's coverage is current ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)), so a thread whose newer replies are still unfetched is kept.
-  - Purge takes bodies, claims, discrepancies, and claim attempts with their message. Deletes run with `PRAGMA secure_delete = ON`.
+  - Purge takes bodies, claims, discrepancies, claim attempts, and invoice records with their message. Deletes run with `PRAGMA secure_delete = ON`.
 
 ### D-capture: what is stored, and its provenance
 
@@ -159,7 +159,8 @@ Each definition is the only place its rule is stated.
   - the vendor records;
   - the mailbox's verified identities ([D-vendor](#d-vendor-vendors-and-vendor_ofaddress));
   - the active claims extractor version ([D-claims](#d-claims-claims-and-comparability)): recording a new one supersedes the previous key's claims, discrepancies, and attempts in that transaction, and reconciliation creates the replacements;
-  - the stored claims and reference profiles, from which the comparison outcomes of [D-claims](#d-claims-claims-and-comparability) are computed. The reconcile pass storing a message's claims is a change to this input.
+  - the stored claims and reference profiles, from which the comparison outcomes of [D-claims](#d-claims-claims-and-comparability) are computed. The reconcile pass storing a message's claims is a change to this input;
+  - the stored invoice records and the record mapping version ([D-claims](#d-claims-claims-and-comparability)): storing a record, or a new mapping version, is a change to this input, and the selected records' claims follow in that transaction.
 
   All of them live in the database. Admission provenance and discovery order are never inputs.
 - **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`).
@@ -217,6 +218,7 @@ Each definition is the only place its rule is stated.
     - Never gated, and never calls a provider or model.
   - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, body storage, reconcile, and claim extraction.
     - All need the paid entitlement `connect.capability_exchange` (decision D3, `require_connect_entitlement`).
+  - **automation:** producing invoice records ([D-claims](#d-claims-claims-and-comparability)). Only the user's own enabled rule that runs `invoice.extract` produces them, so they need `connect.automations` as well, as every rule does (decision D5, `_require_automation_entitlement`). Claims from a stored record are derived state, not an operation, and need no entitlement.
   - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, and dismissing a suggestion.
     - Never gated.
 - **The desktop shows controls by class.**
@@ -244,14 +246,24 @@ Each definition is the only place its rule is stated.
      - the reply header that introduces a quote: an `On ... wrote:` line, or an Outlook `From:/Sent:/To:/Subject:` block. An unprefixed Outlook header quotes everything after it.
 
   Everything else is the *authored text*, including text written below a `>`-quoted block. Subjects and quoted history are never evidence. The segmentation algorithm belongs to the M4 plan.
+- **Invoice records (decision D5)** are the second source of an offered message.
+  - **Selection.** An attachment's selected record is its valid `invoice.extract` record with the latest settlement; among equal settlement times, the one whose Connect job id sorts last in byte order. Only selected records are ever used.
+  - **Use.** A selected record gives a claim only when all of these hold:
+    - its `invoice_number` is present, and the message's authored text names that same invoice number as an `invoice` reference, so the vendor's own words say this PDF is their invoice to the mailbox;
+    - its `total` is present and re-derives from its exact text with the parsers validation uses, under the record's own number format;
+    - its currency was printed on the document (the record's `currency.source` is `printed`), and the total is in that currency;
+    - the record's arithmetic is checked, and its total residual is zero or absent.
+  - **The claim** is one `amount` claim with role `total`, bound to the record's invoice number. Its evidence is the attachment's file name, then the total's page and exact text. A record that fails a condition gives no claim and counts toward "Some claims could not be verified". Its other components, its dates, and its line items give no claims: the total is the only value the record's arithmetic corroborates.
+  - **Trust (decision D5).** The `total` label is Invoice Processor's: its own code admits an amount's role only when the surrounding text proves it, and withholds the amount otherwise. Email Watcher checks what the record lets it check (the value against its text, the printed currency, the arithmetic, and the email naming the invoice number), and every outcome shows the page and exact text, so the user can confirm it against the PDF.
+  - Record text is untrusted provider output, and renders as text only.
 - **Types (closed):**
   - `amount`: value, currency, and a role in `total`, `subtotal`, `tax`, `shipping`, `deposit`, `unit_price`, `other`;
   - `date_commitment`: a `what` in `delivery`, `completion`, `payment_due`, `service_start`, `other`, and a date;
   - `quantity`: an item and a count;
   - `term`: text, displayed only;
   - `reference`: a `(kind, number)` pair, with kind in `invoice`, `quote`, `po`. References are used only as anchors.
-- **Keying.** Claims, the message's reference profile (below), and attempts are keyed by `(message, attributed vendor, extractor version)`. They, and the discrepancies citing them, exist only while their message is offered under that key (Source above). When the message stops being offered, or its attributed vendor changes, they are deleted ([D-derived](#d-derived-derived-state-and-invalidation)). That covers a vendor's deletion or re-creation, and a message that turns outbound.
-- **Attempts.** Each key has one durable attempt record, with one of three outcomes:
+- **Keying.** Claims from the authored text, the message's reference profile (below), and attempts are keyed by `(message, attributed vendor, extractor version)`; claims from an invoice record are keyed by `(message, attributed vendor, selected record, record mapping version)`. They, and the discrepancies citing them, exist only while their message is offered under that key (Source above). When the message stops being offered, or its attributed vendor changes, they are deleted ([D-derived](#d-derived-derived-state-and-invalidation)). That covers a vendor's deletion or re-creation, and a message that turns outbound.
+- **Attempts.** Each authored-text key has one durable attempt record, with one of three outcomes. An invoice-record key has none, since its claim needs no model call:
   - `succeeded`;
   - `retryable`: the model or its transport was unavailable. Another attempt is made after a backoff deadline, and the message shows "Claims unavailable, will retry";
   - `rejected`: the response failed the schema. It is permanent for that version, and the message shows "Claims unavailable".
@@ -264,14 +276,16 @@ Each definition is the only place its rule is stated.
 - **Binding (algorithm in the M4 plan).**
   - A claim's anchor and its canonical item key must be bound to that claim uniquely, from its own evidence. Item keys are canonicalized in code, never taken from the model's choice of substring.
   - Relative and yearless dates resolve against the message's stored date context ([D-body](#d-body-stored-bodies)). Without that context they are rejected.
-  - Only claims of the current extractor version exist for comparison. A new version supersedes a message's older claims atomically.
-- **A message's reference profile** is computed in code, never from the model's output, when the message's claims are stored: a scan of its authored text with the reference kind patterns that validation uses. For each kind, the profile holds the one reference the scan finds, counted by kind and normalized number (the M4 plan names the patterns and the normalization). A kind the scan finds no reference of, or several, is absent from the profile.
+  - Only claims of their source's current version exist for comparison: the claims extractor version for authored text, and the record mapping version for invoice records. A new version supersedes a message's older claims atomically.
+- **A message's reference profile** is computed in code, never from the model's output, whenever the message is offered and its authored text is available, whatever its extraction attempt's outcome: a scan of its authored text with the reference kind patterns that validation uses. For each kind, the profile holds the one reference the scan finds, or marks the kind *several* when the scan finds more than one, counting references by kind and normalized number (the M4 plan names the patterns and the normalization). A kind the scan finds no reference of is absent from the profile.
 - **`comparable(a, b)`** holds only if all of these do:
   - same vendor, in the same account and mailbox identity;
   - same type, and same validated key;
   - the anchor condition for where the two claims sit:
     - **in one thread:** a shared bound anchor `(kind, number)`, needed for `amount` roles other than `unit_price` and for `date_commitment` and `quantity`;
-    - **in different threads (decision D4):** for every type, the two messages' reference profiles have a reference in common and, in every kind both profiles hold, the same reference. Only the two messages' own profiles count, so claims never pair through a third message;
+    - **in different threads (decision D4):** profile agreement, for every type;
+    - **profile agreement:** the two messages' reference profiles have a reference in common and, in every kind both profiles hold, the same single reference. A kind marked several in either profile, while the other profile holds that kind, never agrees. Only the two messages' own profiles count, so claims never pair through a third message;
+    - **record pairing**, instead of both, when either claim comes from an invoice record: the record's claim pairs with the other message's claims of the same type and key that are bound to the record's invoice number, when that number is in the other message's profile; when there are none, it pairs by profile agreement, and only when the record's own message profile holds the record's invoice number as its single invoice reference;
   - neither claim is a `reference`, a `term`, or `other`;
   - they come from different messages.
 - **Outcome.** Every thread that holds one of the claims shows the outcome, with a link to the other claim's message when that message sits in another thread.
@@ -313,6 +327,7 @@ Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No mi
 - **M2, capture:** [D-capture](#d-capture-what-is-stored-and-its-provenance), [D-follow](#d-follow-followed-threads), [D-derived](#d-derived-derived-state-and-invalidation), [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass), [D-body](#d-body-stored-bodies), and [D-scope](#d-scope-in-scope-messages-and-retention). That includes Sent capture and the purge, with the retention settings copy.
 - **M3, the thread view**, with its CSP and the inbox copy.
 - **M4, [D-claims](#d-claims-claims-and-comparability).** Deploying the extractor makes coverage stale, so retained messages get claim attempts.
+- **M6, invoice claims (decision D5):** the invoice-record source of [D-claims](#d-claims-claims-and-comparability), after M4 and after the invoice-record automation (Dependencies).
 - **M5, domains and suggestions:** the domain operations of [D-ops](#d-ops-operation-classes-and-gating), and suggestion candidates under [D-vendor](#d-vendor-vendors-and-vendor_ofaddress).
 
 ### Required items carried to milestone plans
@@ -339,17 +354,28 @@ Each named plan must include these, with fail-first tests.
   - Comparison across threads ([D-claims](#d-claims-claims-and-comparability), decision D4): a quote in one thread and its invoice in another, joined by a reference both messages name, tested on every provider.
   - Outcomes follow their claims ([D-derived](#d-derived-derived-state-and-invalidation)): tested with either side's claims stored last, and with either side purged or re-attributed.
   - The thread view shows a cross-thread outcome in both threads, each linking to the other message.
+- **M6:**
+  - Selection, tested with two records of one attachment settled at the same time.
+  - Each use condition failing on its own: no invoice number, an email that does not name it, a total that does not re-derive, an inferred currency, unchecked arithmetic, and a non-zero total residual.
+  - Record pairing preferring the claim bound to the record's invoice number, tested in one thread and across threads.
+  - A newer record, and a new record mapping version, each superseding claims in one transaction.
+  - File-name, page, and text evidence shown for every claim from a record, tested on a message with two PDF attachments.
 
 ## Operator decisions (accepted 2026-10-05, as recommended)
 
 - **D1:** a followed thread is purged as a unit, by its newest message ([D-scope](#d-scope-in-scope-messages-and-retention)).
 - **D2:** no encryption at rest in this arc. Bodies get today's `0600` database in a `0700` directory (`db.py:4502`, `db.py:4826`), plus the secure deletes of D-scope. SQLCipher would be its own arc.
 - **D3:** gate on the existing `connect.capability_exchange` ([D-ops](#d-ops-operation-classes-and-gating)).
+- **D5 (operator, proposed 2026-10-09):** an invoice total that is only in an attached PDF becomes a claim when the vendor's email names that invoice's number ([D-claims](#d-claims-claims-and-comparability)). The operator chose to trust Invoice Processor's own label check rather than wait for evidence Email Watcher could verify itself. The accepted risk is that an email naming an invoice it says is not the mailbox's can still be compared; the outcome shows its evidence. Reading the PDF is an automation, the user's own rule that runs Invoice Processor's `invoice.extract`, so it needs Connect and Automations; the comparison itself stays under D3. Email Watcher never reads the PDF's contents itself.
 - **D4 (operator, 2026-10-09):** claims are compared across all of a vendor's threads, not only within one ([D-claims](#d-claims-claims-and-comparability)). A quote, invoice, or PO number that both messages name unambiguously, not the thread, decides that two claims concern the same deal. Retention (D1) is unchanged, so only retained threads take part.
 
 ## Dependencies
 
 - **Gateway mode needs a registered claims task** (for example `email.vendor_claims.extract` v1) before M4 works there. Today's tasks are `email.analyze` and `email.schedule.extract` (`model.py:433-435`).
+- **The invoice-record automation needs its own accepted contract before the M6 plan**, modeled on `docs/CERTIFICATE_EXPIRY_LEDGER_AUTOMATION_CONTRACT.md`. It must validate the provider-owned `invoice.extract` 1.0 record (`record_version` 1.1) strictly and fail closed. It must store one record per `(message, part, Connect job)`, with its settlement time, canonical JSON, and digest and no attachment bytes, exactly once per settled job, inside the transaction that settles it, and delete it under [D-scope](#d-scope-in-scope-messages-and-retention)'s purge. The generic `connect.invoke` dispatcher stays the only path to the provider.
+- **`invoice.extract` 1.0 reports no PO or quote number** (invoice-processor `src/invoice_processor/schema.py`, `InvoiceRecord`, at `8e953b2`). A PDF invoice therefore pairs across threads only through its invoice number, or through references its email names in its own words ([D-claims](#d-claims-claims-and-comparability)). Pairing through a quote or PO printed only in the PDF needs a later `invoice.extract` version that reports them.
+- **`invoice.extract` reads every input as an invoice to pay.** Its record has no bill-to, direction, or document type, so a vendor's quote, statement, or credit note looks like an invoice. D-claims therefore uses a record only when the vendor's email names its invoice number.
+- **`invoice.extract` 1.0 does not say which printed label proved an amount's role.** Its `exact_text` is the value alone, and its role admission (`_withhold_unproven_money_roles`, `src/invoice_processor/pipeline.py` at `8e953b2`) stays inside the provider. Claims beyond the arithmetic-checked total need a later version that reports that evidence.
 - **Gmail restricted-scope distribution (#74).** Storing bodies locally should be reviewed against it before a public release.
 
 ## Explicit non-scope
@@ -358,7 +384,7 @@ Each named plan must include these, with fail-first tests.
 - Any cloud model or cloud storage.
 - More than one active mailbox at a time (#149).
 - Thread-level AI summaries.
-- Attachment content in claims.
+- Attachment content in claims, other than the invoice records of decision D5.
 - Changing today's per-message analysis, notifications, scheduling, or Connect behavior.
 
 ## Acceptance evidence
@@ -366,6 +392,7 @@ Each named plan must include these, with fail-first tests.
 Each milestone plan names its fail-first tests. The arc-level scenarios are:
 
 - **The core scenario**, on each provider: a fixture thread with an inbound quote, an outbound reply, and an inbound invoice that differs, giving one discrepancy with both quotes.
+- **The invoice-PDF scenario**, on each provider: "Quote Q-512, total $1,200" in one thread, and in another an email "Invoice 9087 for quote Q-512 attached" whose PDF record has invoice 9087 and total $1,450. Together they give one discrepancy, citing the quote's text and the PDF's page and exact text.
 - **The cross-thread scenario**, on each provider: the same quote and invoice in two different threads of one vendor, joined by the quote number, giving one discrepancy that both threads show, each linking to the other.
 - **No trace:** a non-vendor message leaves no row.
 - **No new bodies:** a watched non-vendor message, or a label-only message, outside any followed thread stores no body.
@@ -415,6 +442,22 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
     - "Invoice 9087, balance $1,450" pairs with "Invoice 9087 for quote Q-512, total $1,450" but not with the quote, because claims never pair through a third message;
     - a `unit_price` in another thread is compared only when the two profiles share a reference;
     - purging the quote's thread removes the discrepancy from the invoice's thread;
+  - from invoice PDFs:
+    - a PDF's total never compares with its own email's text, since both come from one message;
+    - the invoice-PDF scenario's two emails in one thread also give one discrepancy, through profile agreement;
+    - a PDF whose email says only "invoice attached", without its number, gives no claim;
+    - a vendor's quote PDF sent as "Quote Q-512 attached" gives no claim;
+    - an email naming invoice 9087 with a PDF record for invoice 9088 gives no claim;
+    - a total that re-derives to another value, an inferred currency, unchecked arithmetic, or a non-zero total residual gives no claim, counted as unverified;
+    - an email "Quote Q-512 total $100; Invoice 9087 total $120" and a PDF record for invoice 9087 compare the PDF's total with the $120 invoice total only;
+    - a PDF record for invoice I-1 and an email "Invoice I-1 total $100; Invoice I-2 total $200; quote Q-1" are never paired, because that email marks invoices several;
+    - two emails that each name several invoices and the same quote never pair their PDFs through the quote;
+    - a PDF record for invoice I-2 in an email "Invoice I-1 for quote Q-1 attached; invoice I-2 attached for reference" is never paired with "Quote Q-1 total $100";
+    - a PDF's total pairs through its email's quote number even when the email's own extraction attempt was rejected;
+    - a PDF's subtotal, tax, due date, and line items give no claims;
+    - a newer record for the same attachment replaces the older record's claim;
+    - purging the message deletes its invoice records;
+    - with Automations lapsed, no new record is requested, and claims from stored records stay readable;
   - a delivery date moved earlier is not flagged;
   - an unavailable model leaves a retryable attempt that succeeds later;
   - a message longer than `body_char_limit` is extracted from its bounded slice.
@@ -471,3 +514,12 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-09: the Codex review of #224 found three gaps in D4's first draft, each fixed in its owner. D-derived now lists the stored claims as an input of the comparison outcomes, so storing an extraction recomputes them, even one that only creates a link; this replaces an event list the draft had put in the M4 items. D-claims adds a shared anchor that must agree in every kind both claims carry, so invoices for different POs of one quote no longer pair through the quote. Links count distinct references, not claim objects.
 - 2026-10-09: the second Codex review of #224 found that link counts still trusted the model to return every reference, so an omitted quote could create a false link. Linked references now come from a deterministic scan of the authored text with validation's kind patterns. A model omission can only leave a link out, never add one.
 - 2026-10-09: the third Codex review of #224 found three more gaps, all in the link graph: links had no lifecycle of their own, unrelated one-link neighbors could veto a valid pairing, and per-claim binding bypassed the authored-text ambiguity check. The graph is removed rather than patched. Pairing across threads now reads only the two messages' own reference profiles, computed in code from the authored text and keyed and deleted with the claims, and never goes through a third message. Per-claim binding is again only the same-thread anchor.
+- 2026-10-09: decision D5, proposed by the operator: invoice figures that are only in a PDF were outside D-claims, which made the main invoice case mostly unreachable. Invoice records from the user's own `invoice.extract` rule are now a second claim source. They are mapped in code, anchored by their invoice number, re-derived from the provider's exact text, and fed into the message's reference profile. Producing records needs Automations; deriving claims from them is local. The same-thread anchor condition also accepts profile agreement, so a quote and its PDF invoice in one thread pair exactly as they would across threads. Milestone M6 and the invoice-record automation contract are new dependencies. `invoice.extract` 1.0's lack of PO and quote numbers is recorded as a limit.
+- 2026-10-09: the first Codex review of #228 found eight gaps in D5's draft, with four roots, each fixed at its owner.
+  - Trust: a vendor PDF was assumed to be a payable invoice with correctly labeled values. A record is now used only when the vendor's email names its invoice number, which also settles a missing number. Because the 1.0 record cannot prove other labels, only the arithmetic-checked total becomes a claim.
+  - Selection: one deterministic selected record per attachment. Record claims carry a mapping version, and records purge with their message.
+  - Profiles are again authored text only, so a superseded record cannot leave a stale invoice number behind.
+  - Profile agreement within one thread now applies only when an invoice record is involved, so authored claims keep their per-claim anchors.
+- 2026-10-09: the second Codex review of #228 found that the email-confirmed number, the label, and the currency still could not be proven from a 1.0 record. The operator chose to trust Invoice Processor's own label check now (decision D5), with its accepted risk recorded. The currency must be printed, which the record states. Record pairing, one rule for both thread modes, prefers the other message's claim bound to the record's invoice number before profile agreement. The dependency now links D-scope's purge instead of restating it.
+- 2026-10-09: the third Codex review of #228 found that a reference profile treated a kind named several times like a kind never named, so profile agreement ignored it, and an ambiguous invoice kind could vanish during record pairing's fallback. D-claims' profile now marks such a kind *several*, and profile agreement fails when either profile marks a kind several while the other holds it. That also makes D4's authored pairings stricter in the same way. Per-claim binding inside a message that names several invoices still never decides, as D4 established.
+- 2026-10-09: the fourth Codex review of #228. Record pairing's profile fallback now requires the record's own message to name the record's invoice number as its only invoice. A profile no longer waits for extraction to store claims. A record claim's evidence names its attachment. Attempt records belong to authored-text keys only.
