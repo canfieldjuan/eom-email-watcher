@@ -85,10 +85,9 @@ OWNED_PHRASES = {
         r"`comparable\(a, b\)`",
         r"Claims unavailable",
         r"later than promised",
-        r"exactly one distinct reference of each of those two kinds",
-        r"in every kind where both claims have anchors",
-        r"one link from the bound reference",
-        r"most specific kind",
+        r"reference profile\*\* is computed in code",
+        r"never pair through a third message",
+        r"the anchor condition for where the two claims sit",
     ],
 }
 
