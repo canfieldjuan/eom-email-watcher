@@ -90,6 +90,7 @@ OWNED_PHRASES = {
         r"the anchor condition for where the two claims sit",
         r"selected record is its valid `invoice.extract` record",
         r"the vendor's own words say this PDF is their invoice",
+        r"\*\*record pairing\*\*, instead of both",
     ],
 }
 
