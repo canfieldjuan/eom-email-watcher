@@ -865,3 +865,75 @@ freeze-receipt-v10.json and mutation results. Review reply binds hashes and head
 Gap audit: NOT DONE. Implementation/source/native correction is locally complete;
 one grouped push, exact-head CI/independent review and oversight/operator merge
 clearance remain. The existing hold is retained. No duplicate broad CI suite run.
+
+
+## Accepted origin correction: activation inputs and systemd wire modes
+
+Operator direction "Address blockers first" accepts root note6074450383 and
+origin-correction-contract-v11.md (SHA256
+5d766212d885aad44f1a7f4180d9e19b9ab58822049573f85dc8a2bc2214e12e).
+Record acceptance before implementation. Both findings are my own churn:
+659dab21's incomplete manager projection and 91dc098's wire decoder/proof encoder.
+
+Root cause: deployment.py loses effective activation dependencies at its manager
+projection; its decoder treats generic properties as ANSI-C environment output.
+The public probe on91dc098 gives18failed1passed. Actual systemd255 loader adds
+legacy-reader/start for wants/requires/upholds directories. Its actual formatter
+uses flags0 for UnitPath versus flags2 for show-environment. The v10 space-path
+proof's incorrect external substitute is not real-bus parity.
+
+Inventory: same five shipped payloads, public schema28 oracle/migration30 and
+Store/publisher lifetime lane. No model/runtime-profile/prompt/mail/schema change.
+Offline actual systemd255 accepts all unchanged shipped units; the service
+Requires baseline is basic.target + app.slice, Wants is declared in each payload,
+and each timer Triggers its shipped service. Other activation sets are empty.
+Raw systemd-shipped-graph-v11.txt SHA256
+10ad776d1260b7598779bd8cfdcdadac35e11d3df6e200b9e5ed0c6f6446426a.
+Every difference is the dependency projection, load-input capture and corrected
+wire fixture below. Retain and reuse the v10 oracle rather than inventing a new one.
+
+Required change surface: deployment.py is the single description/validation
+owner for Store and native/source/shell publishers. Its one bounded manager
+snapshot includes positive activation sets and unit Names. Expected sets derive
+from the shipped payloads plus the qualified service defaults above. Validate
+Requires/Requisite/Wants/BindsTo/Upholds/OnSuccess/OnFailure/Triggers as one class;
+missing, foreign, duplicate or mixed metadata refuses with DeploymentError.
+Names pins the five roots without unqualified aliases. Preserve source-only DB
+exemption, lease ordering/lifetime and one manager snapshot per check.
+
+Clarification from pre-installation tracing: an absent fragment cannot expose
+hooks to be loaded after writing that fragment. Carry the manager's full UnitPath
+in ManagerView and extend the existing installed-input owner to capture every
+supported root's auxiliary load input before publication, not only fragment bytes.
+The shipped input manifest has no dependency/drop-in sidecars. Validate this
+positive manifest across all manager search paths, including type/prefix drop-ins,
+and observe it on both sides of the manager snapshot. Reject nonempty/malformed
+unshipped sidecar inputs before native/source publication, even with all fragments
+absent. Loaded effective dependencies additionally catch manager-only/stale inputs.
+This removes the incomplete fragment-only assumption at its input owner; do not
+create a downstream output scanner or per-caller directory checks.
+
+_manager_words remains one bounded non-evaluating tokenizer, with explicit
+POSIX-environment versus generic-property modes. Enforce complete word separators,
+valid escapes and strict UTF8, and route both readers through it. Remove the shared
+ANSI-C encoder assumption in packaged_proof_environment and its source-installer
+fixture. Check independent encoders against the actual systemd formatter matrix.
+README remains the canonical deployment/recovery instruction owner.
+
+Explicit non-scope: do not modify systemd unit payloads, db/engine API protocols,
+SQLite migrations, mail/scheduling policy, model/gateway/qualification settings,
+dependencies or desktop product shape. No normal-profile writes or model/mail calls.
+
+Verification: existing18failures must pass; extend regressions to all-absent
+pre-publication hooks, foreign load paths, aliases, missing/foreign/mixed effective
+sets and both publishers/Store. Preserve positive ordinary graph/defaults and
+space/UTF8/symlink homes. Independent actual-loader and formatter parity precedes
+native claims. Mutations remove collection/validation, reverse wire mode and weaken
+word boundaries; each must fail its regression. Adjacent deployment tests + Ruff +
+bash/diff checks, then corrected native oracle/API/CLI and retained Store lease
+probes. One contract-only commit first and one grouped implementation push after
+cold diff. Independent oversight hold remains through exact-head verification;
+latest operator merge direction supplies clearance once all real gates are met.
+
+Gap audit: NOT DONE. Acceptance/inventory/reproduce/isolate/explain recorded;
+implementation, passing-after/mutations/native proof and review remain pending.
