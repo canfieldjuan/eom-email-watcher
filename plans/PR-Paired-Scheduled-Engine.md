@@ -978,3 +978,24 @@ No extra manager read per check; keep load-input capture and lease behavior.
 This revision corrects my own unpublished class assumption at _activation_sets;
 no model or production unit behavior is changed. Commit this revision separately
 before implementing the portable default rule. One grouped push remains the limit.
+
+
+### Actual-manager serialization correction before implementation
+
+The live one-read candidate snapshot is34344bytes/100blocks. It exposes another
+pre-existing error in my659dab21 manager representation: systemctl serializes a
+multi-command ExecStart array as repeated ExecStart= lines. The shipped LM Studio
+helper has two commands, but my proof stub modeled only one. _manager_snapshot
+refuses the actual two-command helper as duplicate metadata before admission.
+No repeated unit IDs occur in this captured packet. Retain live-manager-raw-v11.txt
+as the actual serialization witness; no native build until its shape is accepted.
+
+Normalize repeated ExecStart lines into one ordered array representation at the
+same snapshot parser. Other duplicate fields/IDs remain malformed. Each scheduled
+service still requires exactly one paired path; multiple scheduled commands refuse.
+Correct the shared external fixture to serialize both shipped helper commands as
+the actual tool does. Add a public two-command helper regression and malformed /
+multiple scheduled-command negative probes, and replay the retained actual packet.
+This removes the fixture's single-command assumption at its origin. No third
+reader/parser or extra system read, and no systemd payload or helper behavior edit.
+Commit this clarification before the parser/fixture correction; one grouped push.
