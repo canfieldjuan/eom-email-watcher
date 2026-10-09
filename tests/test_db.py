@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -7816,6 +7817,169 @@ def test_logical_message_id_finds_the_stored_copy_a_source_duplicates(tmp_path: 
     assert store.logical_message_id(
         "imap", "imap-account", identity, "same@x", other_than="imap:mailbox:44:1"
     ) is None
+
+
+def _upgraded_completed_legacy_message(tmp_path: Path) -> tuple[Store, str, str]:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "same@x")
+    identity = str(store.message_source(root).mailbox_identity_key)
+    with store.connection() as db:
+        db.execute("DROP TRIGGER messages_admission_provenance_immutable")
+        db.execute(
+            """UPDATE messages SET mailbox_identity_key = NULL, admission_kind = NULL,
+                admission_selector_id = NULL, admission_display_name = NULL,
+                admission_mailbox_identity_key = NULL, admitted_at = NULL,
+                status = 'summarized', summary = 'Already completed'"""
+        )
+        db.execute(
+            """UPDATE mail_accounts SET legacy_identity_status = 'continuity_proven',
+                legacy_identity_key = ? WHERE provider = 'imap' AND account_id = 'imap-account'""",
+            (identity,),
+        )
+    _reset_to_schema_28(store)
+    store.initialize()
+    return store, root, identity
+
+
+def _capture_legacy_copy(
+    store: Store, identity: str, suffix: str, *, rfc_id: str | None = "same@x",
+) -> bool:
+    return ProductionStore.add_message(
+        store,
+        message_id=f"copy-{suffix}", provider="imap", account_id="imap-account",
+        provider_message_id=f"imap:sent:77:{suffix}", mailbox_identity_key=identity,
+        thread_id="<same@x>", rfc_message_id=rfc_id, sender="a@b.com",
+        sender_name=None, subject="S", received_at="2026-09-01T12:00:00+00:00",
+        locations=frozenset({"sent"}),
+        admission=db_module.AdmissionProvenance(
+            kind="exact_sender", selector_id="sender:a@b.com", display_name=None,
+            mailbox_identity_key=identity, admitted_at="2026-09-01T12:00:00+00:00",
+        ),
+    )
+
+
+def test_upgrade_then_live_copy_does_not_recapture_completed_legacy_message(
+    tmp_path: Path,
+) -> None:
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    assert _capture_legacy_copy(store, identity, "2") is False, "COPY_WAS_RECAPTURED"
+    assert store.logical_message_id(
+        "imap", "imap-account", identity, "same@x", other_than="imap:sent:77:2"
+    ) == root
+    assert [m["message_id"] for m in store.recent(10)] == [root]
+    assert store.pending() == []
+    assert store.message_locations(root) == ["inbox", "sent"]
+    sources = store.message_sources(root)
+    assert [(s.provider_message_id, s.mailbox_identity_key) for s in sources] == [
+        ("imap:mailbox:44:1", None), ("imap:sent:77:2", identity),
+    ]
+    with store.connection() as db:
+        row = db.execute("SELECT * FROM messages WHERE message_id = ?", (root,)).fetchone()
+        assert row["mailbox_identity_key"] is None
+        assert row["admission_kind"] is None
+        assert row["admission_mailbox_identity_key"] is None
+        assert row["summary"] == "Already completed"
+        assert row["status"] == "summarized"
+
+
+@pytest.mark.parametrize(
+    ("status", "legacy_key", "matches"),
+    [("continuity_proven", "same", True), ("continuity_proven", None, False),
+     ("continuity_proven", "other", False), ("unresolved", "same", False),
+     ("replacement", "same", False)],
+)
+def test_effective_legacy_identity_boundaries(
+    tmp_path: Path, status: str, legacy_key: str | None, matches: bool,
+) -> None:
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    with store.connection() as db:
+        # Remove assumed locations so seen lookup must evaluate the row itself.
+        db.execute("DELETE FROM message_locations")
+        db.execute(
+            """UPDATE mail_accounts SET legacy_identity_status = ?, legacy_identity_key = ?
+                WHERE provider = 'imap' AND account_id = 'imap-account'""",
+            (status, identity if legacy_key == "same" else "b" * 64 if legacy_key else None),
+        )
+    assert store.logical_message_id(
+        "imap", "imap-account", identity, "same@x", other_than="other-source"
+    ) == (root if matches else None)
+    assert store.has_seen_message(
+        "imap:mailbox:44:1", provider="imap", account_id="imap-account",
+        mailbox_identity_key=identity,
+    ) is matches
+    for provider, account in (("gmail", "imap-account"), ("imap", "different-account")):
+        assert store.logical_message_id(
+            provider, account, identity, "same@x", other_than="other-source"
+        ) is None
+
+
+def test_explicit_identity_wins_over_legacy_proof(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "same@x")
+    identity = str(store.message_source(root).mailbox_identity_key)
+    with store.connection() as db:
+        db.execute(
+            """UPDATE mail_accounts SET legacy_identity_status = 'continuity_proven',
+                legacy_identity_key = ? WHERE provider = 'imap' AND account_id = 'imap-account'""",
+            ("b" * 64,),
+        )
+    assert store.logical_message_id(
+        "imap", "imap-account", identity, "same@x", other_than="copy"
+    ) == root
+    assert store.logical_message_id(
+        "imap", "imap-account", "b" * 64, "same@x", other_than="copy"
+    ) is None
+
+
+def test_replacement_mailbox_does_not_recapture_under_legacy_identity(tmp_path: Path) -> None:
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    replacement = "b" * 64
+    store.reconcile_mailbox_identity("imap", "imap-account", replacement)
+    assert _capture_legacy_copy(store, replacement, "2") is True
+    assert store.logical_message_id(
+        "imap", "imap-account", replacement, "same@x", other_than="imap:sent:77:2"
+    ) is None
+    assert store.message_source(root).mailbox_identity_key is None
+    with pytest.raises(db_module.MailboxIdentityChanged):
+        _capture_legacy_copy(store, identity, "3")
+
+
+@pytest.mark.parametrize("rfc_id", [None, "not-an-id", "different@x"])
+def test_legacy_capture_does_not_join_missing_or_different_message_ids(
+    tmp_path: Path, rfc_id: str | None,
+) -> None:
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    assert _capture_legacy_copy(store, identity, "2", rfc_id=rfc_id) is True
+    assert len(store.recent(10)) == 2
+    assert store.message_source(root).mailbox_identity_key is None
+
+
+def test_legacy_lookup_prefers_completed_without_repairing_existing_rows(tmp_path: Path) -> None:
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    pending = _retained_duplicate(store, "0", "same@x")
+    assert store.logical_message_id(
+        "imap", "imap-account", identity, "same@x", other_than="new-copy"
+    ) == root
+    assert _capture_legacy_copy(store, identity, "3") is False
+    with store.connection() as db:
+        rows = db.execute(
+            "SELECT message_id, logical_of FROM messages ORDER BY message_id"
+        ).fetchall()
+    assert {r["message_id"]: r["logical_of"] for r in rows} == {root: None, pending: None}
+
+
+def test_repeated_concurrent_copies_of_upgraded_legacy_message(tmp_path: Path) -> None:
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    def capture(suffix: str) -> bool:
+        return _capture_legacy_copy(Store(store.path), identity, suffix)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(capture, ("2", "3", "4", "5"))) == [False] * 4
+    assert _capture_legacy_copy(store, identity, "2") is False
+    assert len(store.recent(10)) == 1
+    assert len(store.message_sources(root)) == 5
+    assert store.pending() == []
 
 
 def test_a_copy_captured_as_a_location_keeps_its_logical_message_in_retention(

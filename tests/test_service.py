@@ -5839,6 +5839,66 @@ def test_a_dry_run_previews_a_logical_message_once(tmp_path: Path) -> None:
     assert result["discovered"] == 1
 
 
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_watcher_does_not_recapture_a_proven_completed_legacy_message(
+    tmp_path: Path, dry_run: bool,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail", "gmail-default", TEST_MAILBOX_IDENTITY_KEY, legacy_status="replacement",
+    )
+    store.set_state("100", datetime.now(UTC), mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY)
+    stamp = datetime.now(UTC).isoformat()
+    store.add_message(
+        message_id="legacy-completed", provider_message_id="old-source", thread_id="thread",
+        sender="trusted@example.com", sender_name=None, subject="S", received_at=stamp,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, rfc_message_id="same@x",
+        admission=AdmissionProvenance(
+            kind="exact_sender", selector_id="sender:trusted@example.com", display_name=None,
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, admitted_at=stamp,
+        ),
+    )
+    with store.connection() as db:
+        db.execute("DROP TRIGGER messages_admission_provenance_immutable")
+        db.execute(
+            """UPDATE messages SET mailbox_identity_key = NULL, admission_kind = NULL,
+                admission_selector_id = NULL, admission_display_name = NULL,
+                admission_mailbox_identity_key = NULL, admitted_at = NULL,
+                status = 'summarized', summary = 'Already completed'"""
+        )
+        db.execute(
+            """UPDATE mail_accounts SET legacy_identity_status = 'continuity_proven',
+                legacy_identity_key = ?
+                WHERE provider = 'gmail' AND account_id = 'gmail-default'""",
+            (TEST_MAILBOX_IDENTITY_KEY,),
+        )
+    with store.connection() as db:
+        before = tuple(db.iterdump())
+
+    class AnotherCopy(FakeGmail):
+        def history_message_ids(self, cursor: str):
+            return ["new-copy"], "200"
+
+        def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+            return replace(
+                super().metadata("allowed"), message_id=message_id, rfc_message_id="same@x",
+            )
+
+    gateway = AnotherCopy()
+    result = Watcher(cfg, store, gateway, FakeModel()).check(dry_run=dry_run)
+    assert result["discovered"] == 0
+    assert gateway.full_payload_calls == 0
+    assert [row["message_id"] for row in store.recent(10)] == ["legacy-completed"]
+    assert store.message_source("legacy-completed").mailbox_identity_key is None
+    with store.connection() as db:
+        if dry_run:
+            assert tuple(db.iterdump()) == before
+    if not dry_run:
+        assert store.has_seen_message("new-copy", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY)
+
+
 def test_gmail_label_added_to_a_known_message_records_its_second_location(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
