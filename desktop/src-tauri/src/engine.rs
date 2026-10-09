@@ -4498,6 +4498,32 @@ esac"#,
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "requires an isolated packaged deployment proof environment"]
+    fn packaged_deployment_refusal_is_definitive() {
+        let binary = std::env::var("EOM_TEST_REFUSAL_ENGINE")
+            .expect("proof must select its retained native engine");
+        let config = std::env::var("EOM_TEST_REFUSAL_CONFIG")
+            .expect("proof must select its isolated config");
+        let engine = Engine::with_command(binary, vec![], PathBuf::from(config));
+        let error = engine.health().expect_err("read must refuse deployment");
+        assert_eq!(error.code, "deployment_refused");
+        let error = engine
+            .initialize_config(
+                "UTC".into(),
+                "http://127.0.0.1:9/v1".into(),
+                "public-proof".into(),
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .expect_err("initialization must refuse before any effect");
+        assert_eq!(error.code, "deployment_refused");
+        assert_eq!(
+            error.config_initialization_failure_class(),
+            ConfigInitializationFailureClass::Definitive
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn config_initialize_lost_reply_is_structured_as_outcome_unknown() {
         let engine = Engine::with_command(
             "sh",

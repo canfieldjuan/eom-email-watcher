@@ -14,6 +14,8 @@ from pathlib import Path
 
 from connect_automate.entitlement import APPROVED_RELEASE_AUTHORITIES
 
+from eom_email_watcher.deployment import _unit_payloads
+
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_DIRECTORY = SCRIPT_DIRECTORY.parent
 BUILD_DIRECTORY = PROJECT_DIRECTORY / ".sidecar-build"
@@ -282,6 +284,13 @@ def build_sidecar() -> Path:
     ]
 
     with ExitStack() as stack:
+        for unit in _unit_payloads():
+            staged_unit = stack.enter_context(
+                _staged_build_bytes(unit.content, unit.name, "deployment-unit.")
+            )
+            pyinstaller_arguments.extend(
+                ["--add-data", f"{staged_unit}{os.pathsep}eom_email_watcher_data/systemd"]
+            )
         expected_mail_providers: list[str] = []
         if oauth_source_value:
             oauth_source = Path(oauth_source_value)

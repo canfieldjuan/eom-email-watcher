@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import runpy
-import sys
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -17,7 +16,6 @@ from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
 
 SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
 PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-local-proof.py"))
 FIXTURE_PART_ID = PROOF_SCRIPT["FIXTURE_PART_ID"]
 FIXTURE_MODEL_DIGEST = PROOF_SCRIPT["FIXTURE_MODEL_DIGEST"]

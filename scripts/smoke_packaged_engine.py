@@ -11,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from packaged_proof_environment import with_empty_user_manager
+
 PROTOCOL_VERSION = 1
 ENGINE_TIMEOUT_SECONDS = 90
 EXPECTED_ENTITLEMENT_STATES = ("authority_unavailable", "missing")
@@ -129,6 +131,24 @@ def _snapshot_admission_token(response: dict[str, object]) -> dict[str, object]:
     return dict(token)
 
 
+def _cli_read(binary: Path, config_path: Path, environment: dict[str, str]) -> None:
+    result = subprocess.run(
+        [str(binary), "--cli", "--config", str(config_path), "recent", "--limit", "1"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=ENGINE_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise PackagedEngineSmokeError("Packaged CLI could not read the engine-owned database")
+    try:
+        value = json.loads(result.stdout)
+    except ValueError as exc:
+        raise PackagedEngineSmokeError("Packaged CLI returned invalid JSON") from exc
+    if value != []:
+        raise PackagedEngineSmokeError("Packaged CLI did not read the empty smoke database")
+
+
 def smoke_packaged_engine(
     binary: Path,
     expected_entitlement_state: str,
@@ -164,6 +184,8 @@ def smoke_packaged_engine(
         for key in ("APPDATA", "HOME", "LOCALAPPDATA", "USERPROFILE", "XDG_CONFIG_HOME"):
             environment[key] = str(private_root)
         environment["XDG_STATE_HOME"] = str(state_home.resolve())
+        if sys.platform == "linux":
+            environment = with_empty_user_manager(temporary, environment)
 
         initialized = _request(
             isolated_binary,
@@ -265,6 +287,8 @@ def smoke_packaged_engine(
             raise PackagedEngineSmokeError(
                 "Packaged engine zero-sender watcher check was not safely inactive"
             )
+
+        _cli_read(isolated_binary, config_path, environment)
 
 
 def main() -> None:

@@ -12,7 +12,6 @@ from eom_email_watcher.config import load_config
 from eom_email_watcher.db import Store
 
 SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
 PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-packaged-deb-proof.py"))
 
 PackagedConnectProofError = PROOF_SCRIPT["PackagedConnectProofError"]
@@ -82,7 +81,7 @@ def test_isolated_environment_does_not_forward_home_or_secret_values(
 
     environment = isolated_environment(tmp_path)
 
-    assert "HOME" not in environment
+    assert environment["HOME"] == str(tmp_path)
     assert "GITHUB_TOKEN" not in environment
     assert environment["XDG_RUNTIME_DIR"] == str(tmp_path / "runtime")
     assert environment["DOC_SUM_MODEL_BASE_URL"] == "http://127.0.0.1:9/v1"
@@ -123,3 +122,59 @@ def test_proof_check_gate_and_timeout_parser_fail_closed() -> None:
     for value in ("0", "-1", "1.5", "not-a-number"):
         with pytest.raises(argparse.ArgumentTypeError):
             positive_seconds(value)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
+def test_existing_connect_environment_supplies_complete_empty_manager(tmp_path, monkeypatch):
+    from eom_email_watcher import deployment
+
+    prepare_private_directories(tmp_path)
+    environment = isolated_environment(tmp_path)
+    monkeypatch.setenv("PATH", environment["PATH"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    records = deployment._manager_snapshot(deployment.UNIT_NAMES)
+    assert set(deployment.UNIT_NAMES).issubset(records)
+    assert all(
+        record["LoadState"] == "not-found" and record["ActiveState"] == "inactive"
+        for name, record in records.items() if name in deployment.UNIT_NAMES
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
+def test_shared_manager_fixture_is_explicit_and_rejects_unknown_queries(tmp_path):
+    import subprocess
+
+    from packaged_proof_environment import with_empty_user_manager
+
+    original = {"PATH": "/usr/bin"}
+    environment = with_empty_user_manager(tmp_path, original)
+    assert original == {"PATH": "/usr/bin"}
+    result = subprocess.run(
+        ["systemctl", "--user", "show", "unknown"], env=environment, capture_output=True
+    )
+    assert result.returncode == 2 and result.stdout == b""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux proof manager")
+def test_connect_manager_runs_in_the_actual_isolated_environment(tmp_path):
+    import subprocess
+
+    from eom_email_watcher import deployment
+
+    prepare_private_directories(tmp_path)
+    environment = isolated_environment(tmp_path)
+    result = subprocess.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            "--all",
+            "--no-pager",
+            "--property=" + ",".join(deployment._MANAGER_FIELDS),
+            *deployment.UNIT_NAMES, *deployment._PLATFORM_SELECTORS,
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

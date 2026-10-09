@@ -313,33 +313,101 @@ activation contract.
 
 ## Two-hour user timer
 
-After mailbox setup succeeds:
+After mailbox setup succeeds, select the concrete sidecar shipped with the desktop:
 
 ```bash
-./scripts/install-user-services.sh
+./scripts/install-user-services.sh --engine /absolute/path/to/desktop/eom-mail-engine
 systemctl --user start eom-email-watcher.timer
 systemctl --user status eom-email-watcher.timer
 journalctl --user -u eom-email-watcher.service --since today
 ```
 
-For a paid Connect-enabled service snapshot, supply the approved production public-key ring when
-installing:
+The selected native engine owns its paired alias and all five scheduled unit files.
+Installation never searches PATH for a desktop. Before every packaged Linux database
+open, the manager environment resolves deployment paths and one bounded unit snapshot
+checks the shipped graph, loaded scheduled commands, unit-file bytes and reader
+identities. A shared deployment lease stays held until the SQLite connection closes.
+Native and source installers retain an exclusive lease across publication, reload and
+verification. A busy deployment refuses access after a bounded wait: retry a reader
+after the update; close the app or stop the timers before retrying an installer.
+The real account-home directory inode is the shared/exclusive coordination anchor;
+no state lock file is used or created. Its identity is checked before and after
+acquisition, so clearing old state lock files cannot release a live connection's
+lease. Close sessions from earlier builds and stop timers before installing this
+version, because those builds used a different lock anchor. Replacing the home
+directory is not supported during a session. A home filesystem that cannot open or
+flock this directory intentionally refuses access, with no state-file fallback.
+An unrelated process locking the home directory also delays access until the normal
+bounded deployment refusal.
+Select the concrete native sidecar for installation; selecting its scheduled alias or
+a path through that alias refuses publication before writes. Modified or redirected
+units, persistent drop-ins, pending reloads,
+partial installation and incompatible running readers refuse access. Let an old
+reader finish and reinstall using the updated desktop sidecar. Compatible paired
+readers retain the existing operation locks and dedupe. See the
+[deployment contract](plans/PR-Paired-Scheduled-Engine.md) for the exact admission policy.
+
+**A masked unit or missing user manager intentionally blocks every packaged desktop
+database open.** Repair the unit/manager and reinstall the paired deployment before
+retrying. A deployment refusal is reported as `deployment_refused`, rather than a
+stale or concurrent update. The LM Studio helper is part of the pinned graph; its
+canonical retained active state is allowed once its execution PIDs are zero.
+
+The paired deployment requires a user manager whose effective units have no
+drop-ins, including vendor-wide `service.d` or `timer.d` overrides. A host with
+those overrides is refused until they are removed. The manager's `HOME` and
+`XDG_CONFIG_HOME` own the alias and unit directory, including when the desktop was
+launched with a different home. Before writing any lock, alias or unit, the resolver
+requires the exported `HOME` to equal the real account home and the unit directory
+to appear in the user manager's `UnitPath`. Missing or mismatched identities refuse
+access before publication. One decoder handles the manager environment's ANSI-C
+quoting and UnitPath's generic double quoting, including spaces and non-ASCII paths.
+
+The five shipped units also pin their direct activation dependencies. Unshipped
+services refuse admission. Additional OS defaults may be passive targets or slices
+only when the manager reports protected vendor/generated inputs, without user-write
+authority or untrusted overrides. This permits new vendor default names after an
+OS upgrade. The shipped, inactive network target may be absent. Transitive platform
+target dependencies are outside this five-unit policy.
+
+Auxiliary dependency and override inputs across the manager's load paths must
+match the shipped deployment too. Retained `.wants`, `.requires`, `.upholds` or
+nonempty drop-in directories refuse before installation writes, even when the base
+units are absent. Remove the unshipped inputs and reload the manager before retrying.
+The manager reader streams its output and retains only the three consumed environment
+keys, the shipped roots and their direct platform dependencies. Unrelated session
+variables and platform units do not consume the retained metadata budget. UnitPath
+is fully consumed; retained metadata and individual graph records remain bounded.
+Record ordering cannot hide a dependency, and capture/selection share one deadline.
+Pending reloads require
+`systemctl --user daemon-reload`; masked units require `systemctl --user unmask`.
+For a partial graph, remove its partial five-unit installation, reload the manager,
+then reinstall the complete pair. Foreign fragments must be removed before the
+same reload/install sequence. The installer also enforces this admission policy.
+
+For an explicitly source-only installation, use the locked production uv snapshot:
+
+```bash
+./scripts/install-user-services.sh --source
+```
+
+A paid Connect-enabled source snapshot also needs the approved public-key ring:
 
 ```bash
 LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json \
-  ./scripts/install-user-services.sh
+  ./scripts/install-user-services.sh --source
 ```
 
-The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
-not bodies, OAuth tokens, or model prompts. It requests the local LM Studio service so existing
-loopback installs retain automatic startup, but that optional service cannot block a gateway-backed
-watcher when LM Studio is absent or fails. The installer snapshots the current source revision and
-its locked production dependencies into an isolated `uv tool` environment, and both timers execute
-`~/.local/bin/eom-mail-watch`; changing the branch in a development checkout cannot silently
-downgrade the production watcher. Rerun the installer from the intended revision to update that
-service snapshot. Supplying the approved production Connect public-key ring installs a validated
-copy for the non-frozen service snapshot; without it, mailbox watching remains available while
-paid Connect and automation features fail closed as unavailable.
+The source-only lane is exempt from native admission and does not establish paired
+desktop safety. A desktop bundle embeds its authority at build time; do not pass a
+keyring to its installer. Both modes consume the same shipped unit payload owner.
+Source installation refuses to replace an existing native scheduled alias; use
+the concrete desktop `--engine` installer to update that paired deployment.
+Service cadence, sandbox, ntfy delivery and attachment confirmation remain as before.
+Logs contain message IDs and sanitized failure classes, not bodies or credentials.
+Post-send reservation recovery after a deployment refusal is tracked in
+[#219](https://github.com/canfieldjuan/eom-email-watcher/issues/219); do not resend an
+uncertain delivery before manual reconciliation.
 
 ## Model output and safety
 
@@ -360,7 +428,7 @@ install the timers:
 ```bash
 uv run eom-mail-watch setup-send
 uv run eom-mail-watch send-hours --dry-run
-./scripts/install-user-services.sh
+./scripts/install-user-services.sh --source
 systemctl --user start eom-monthly-hours.timer
 ```
 

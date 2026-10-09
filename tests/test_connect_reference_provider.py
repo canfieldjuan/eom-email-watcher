@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 import pytest
 from connect_automate import connect
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-
-from connect_reference_provider import (  # noqa: E402
+from connect_reference_provider import (
     INSPECT_CAPABILITY_ID,
     INSPECT_OUTPUT_MEDIA_TYPE,
     INSPECT_PAYLOAD,

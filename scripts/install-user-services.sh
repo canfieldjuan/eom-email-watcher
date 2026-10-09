@@ -2,7 +2,21 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+# The source lane's Python owner holds the exclusive deployment lease across
+# this shell and all uv/authority/unit writes. An internal phase must prove it
+# inherited that same manager lock before touching any publication target.
+if [[ "$#" == 1 && "$1" == --source ]]; then
+  PYTHONPATH="$repo_dir/src" exec python3 -c \
+    'import sys; from pathlib import Path; from eom_email_watcher.deployment import publish_source_snapshot; publish_source_snapshot(Path(sys.argv[1]))' \
+    "${BASH_SOURCE[0]}"
+elif [[ "$#" == 2 && "$1" == --source-locked && "$2" =~ ^[0-9]+$ ]]; then
+  publication_fd="$2"
+  PYTHONPATH="$repo_dir/src" python3 -c \
+    'import sys; from eom_email_watcher.deployment import confirm_source_publication; confirm_source_publication(int(sys.argv[1]))' \
+    "$publication_fd"
+  set -- --source
+fi
+unit_dir=""
 tool_bin_dir="$HOME/.local/bin"
 tool_dir="${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools"
 release_keyring_source="${LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE:-}"
@@ -12,6 +26,57 @@ legacy_release_keyring="$HOME/.local/share/eom-email-watcher/connect-entitlement
 release_keyring_target=""
 release_keyring_input=""
 release_keyring_stage=""
+# Installation mode is explicit; PATH cannot identify the desktop's sidecar.
+packaged_engine=""
+is_native_artifact() {
+  local artifact_magic
+  artifact_magic="$(od -An -N4 -tx1 "$1")" || {
+    echo "Cannot read the artifact identity; repair it before installation." >&2
+    exit 2
+  }
+  artifact_magic="${artifact_magic//[[:space:]]/}"
+  [[ "$artifact_magic" == 7f454c46 ]]
+}
+if [[ "$#" == 2 && "$1" == --engine && "$2" == /* ]]; then
+  packaged_engine="$2"
+  if [[ ! -f "$packaged_engine" || ! -x "$packaged_engine" ]]; then
+    echo "The concrete desktop engine must be an executable file." >&2; exit 2
+  fi
+  if ! is_native_artifact "$packaged_engine"; then
+    echo "Select the concrete native desktop engine, not a source shim." >&2; exit 2
+  fi
+  if [[ -n "$release_keyring_source" ]]; then
+    echo "The packaged engine embeds its approved authority; supply it at build time." >&2; exit 2
+  fi
+  if ! paired_version="$("$packaged_engine" --paired-cli-version)"; then
+    echo "Installed desktop engine has no paired CLI; rebuild it." >&2; exit 2
+  fi
+  if [[ "$paired_version" != "eom-mail-engine-paired-cli-v1" ]]; then
+    echo "Installed desktop engine has no compatible paired CLI." >&2; exit 2
+  fi
+  "$packaged_engine" --install-user-services
+  exit 0
+elif [[ "$#" != 1 || "$1" != --source ]]; then
+  echo "Usage: install-user-services.sh --engine /absolute/desktop/sidecar OR --source" >&2
+  exit 2
+fi
+
+# uv publishes this same alias. Refuse before it can replace a native desktop
+# deployment; source installation remains independent of native admission.
+if [[ -e "$tool_bin_dir/eom-mail-watch" ]]; then
+  if [[ ! -f "$tool_bin_dir/eom-mail-watch" || ! -r "$tool_bin_dir/eom-mail-watch" ]]; then
+    echo "Cannot inspect the existing scheduled alias; repair it before source installation." >&2
+    exit 2
+  fi
+  if is_native_artifact "$tool_bin_dir/eom-mail-watch"; then
+    echo "Source installation would replace the paired native alias. Use --engine with the desktop sidecar." >&2
+    exit 2
+  fi
+elif [[ -L "$tool_bin_dir/eom-mail-watch" ]]; then
+  echo "The scheduled alias is unresolved; repair it before source installation." >&2
+  exit 2
+fi
+
 constraints_file="$(mktemp)"
 cleanup() {
   rm -f "$constraints_file"
@@ -26,7 +91,7 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$unit_dir" "$tool_bin_dir" "$tool_dir"
+mkdir -p "$tool_bin_dir" "$tool_dir"
 uv export --project "$repo_dir" --locked --no-dev --no-emit-project --format requirements.txt \
   --output-file "$constraints_file" >/dev/null
 UV_TOOL_BIN_DIR="$tool_bin_dir" UV_TOOL_DIR="$tool_dir" \
@@ -37,6 +102,10 @@ test -x "$tool_bin_dir/eom-mail-watch"
 # installer from creating or syncing an environment inside the source checkout.
 snapshot_python="$tool_dir/eom-email-watcher/bin/python"
 test -x "$snapshot_python"
+unit_dir="$(
+  PYTHONPATH="$repo_dir/src" "$snapshot_python" -c \
+    'from eom_email_watcher.deployment import service_unit_directory; print(service_unit_directory())'
+)"
 
 validate_release_keyring() {
   PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$1" "$snapshot_python" -c \
@@ -80,14 +149,8 @@ if [[ -n "$release_keyring_input" ]]; then
   fi
 fi
 
-install -m 0644 "$repo_dir/systemd/eom-email-watcher.service" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-email-watcher.timer" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-email-lmstudio.service" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-monthly-hours.service" "$unit_dir/"
-install -m 0644 "$repo_dir/systemd/eom-monthly-hours.timer" "$unit_dir/"
-systemctl --user daemon-reload
-systemctl --user enable eom-email-watcher.timer
-systemctl --user enable eom-monthly-hours.timer
+PYTHONPATH="$repo_dir/src" "$snapshot_python" -c \
+  'import sys; from eom_email_watcher.deployment import install_source_units; install_source_units(int(sys.argv[1]))' "$publication_fd"
 
 echo "Installed and enabled eom-email-watcher.timer."
 echo "Installed and enabled eom-monthly-hours.timer."

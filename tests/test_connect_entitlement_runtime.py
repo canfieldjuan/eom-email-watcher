@@ -11,10 +11,8 @@ from pathlib import Path
 
 import pytest
 from connect_automate import connect, entitlement
+from connect_reference_provider import REFERENCE_APP_ID, ReferenceProvider
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from connect_reference_provider import REFERENCE_APP_ID, ReferenceProvider  # noqa: E402
 
 
 def _encoded(value: bytes) -> str:

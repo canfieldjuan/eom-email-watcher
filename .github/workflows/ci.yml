@@ -141,4 +141,9 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Exercise real native deployment refusal and desktop receiver
+        run: >-
+          uv run --project .. python ../scripts/run_deployment_receiver_proof.py
+          src-tauri/binaries/eom-mail-engine-$(rustc --print host-tuple)
+          --manifest src-tauri/Cargo.toml
       - run: pnpm tauri build --no-bundle

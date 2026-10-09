@@ -10,12 +10,15 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
+
+from packaged_proof_environment import with_empty_user_manager
 
 from eom_email_watcher.db import AdmissionProvenance, Store
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
@@ -100,6 +103,8 @@ def isolated_environment(root: Path) -> dict[str, str]:
             "XDG_RUNTIME_DIR": str(root / "runtime"),
         }
     )
+    if sys.platform == "linux":
+        environment = with_empty_user_manager(root, environment)
     return environment
 
 

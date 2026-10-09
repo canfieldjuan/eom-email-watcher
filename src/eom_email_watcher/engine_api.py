@@ -30,6 +30,7 @@ from connect_automate.locking import (
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
+from . import deployment
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -96,6 +97,7 @@ from .db import (
     Store,
     VendorAddressConflict,
 )
+from .deployment import DeploymentError
 from .gmail import (
     TOKEN_LOCK_TIMEOUT_SECONDS,
     GmailAuthorizationRejected,
@@ -3378,6 +3380,26 @@ def _mark_connect_failed(
     raise RuntimeError("Connect failure could not be persisted after concurrent updates")
 
 
+def _persist_connect_failure(
+    store: Store,
+    job_id: str,
+    provider: connect.ProviderCapability
+    | connect.DiscoveredCapability
+    | connect.RegisteredCapability,
+    failure: connect.ConnectError,
+    *,
+    context: str = "Connect failure",
+) -> None:
+    """One persistence boundary; deployment refusal retains its original identity."""
+    try:
+        _mark_connect_failed(store, job_id, provider, failure)
+    except DeploymentError:
+        raise
+    except Exception:
+        logger.exception("%s could not be persisted", context)
+        raise RuntimeError(f"{context} could not be persisted safely") from failure
+
+
 def _run_connect_job(
     runtime: Runtime,
     provider: connect.ProviderCapability,
@@ -3408,11 +3430,7 @@ def _run_connect_job(
         return _connect_result(persisted)
     except connect.ConnectError as exc:
         if not exc.retryable and exc.code != "JOB_NOT_FOUND":
-            try:
-                _mark_connect_failed(runtime.store, job.job_id, provider, exc)
-            except Exception:
-                logger.exception("Connect failure could not be persisted")
-                raise RuntimeError("Connect failure could not be persisted safely") from exc
+            _persist_connect_failure(runtime.store, job.job_id, provider, exc)
         raise
 
 
@@ -3447,11 +3465,7 @@ def _run_generic_connect_job(
         initial = client.submit(job, content) if content is not None else client.get(job)
     except connect.ConnectError as exc:
         if content is not None and not exc.retryable and exc.code != "JOB_NOT_FOUND":
-            try:
-                _mark_connect_failed(runtime.store, job.job_id, capability, exc)
-            except Exception:
-                logger.exception("Connect v2 failure could not be persisted")
-                raise RuntimeError("Connect failure could not be persisted safely") from exc
+            _persist_connect_failure(runtime.store, job.job_id, capability, exc)
         raise
     persisted = _apply_connect_update(runtime.store, initial)
     return _finish_generic_connect_job(
@@ -3564,11 +3578,9 @@ def _persist_connect_entitlement_failure(
     capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     failure: connect.ConnectError,
 ) -> None:
-    try:
-        _mark_connect_failed(runtime.store, job_id, capability, failure)
-    except Exception:
-        logger.exception("Connect entitlement failure could not be persisted")
-        raise RuntimeError("Connect entitlement failure could not be persisted safely") from failure
+    _persist_connect_failure(
+        runtime.store, job_id, capability, failure, context="Connect entitlement failure"
+    )
 
 
 def _defer_inactive_automation_job(
@@ -3832,11 +3844,7 @@ def _submit_generic_connect_job(
                 initial = client.submit(tracked, payload)
             except connect.ConnectError as exc:
                 if not exc.retryable and exc.code != "JOB_NOT_FOUND":
-                    try:
-                        _mark_connect_failed(runtime.store, tracked.job_id, capability, exc)
-                    except Exception:
-                        logger.exception("Connect v2 failure could not be persisted")
-                        raise RuntimeError("Connect failure could not be persisted safely") from exc
+                    _persist_connect_failure(runtime.store, tracked.job_id, capability, exc)
                 else:
                     _defer_generic_connect_error(
                         runtime,
@@ -6203,6 +6211,7 @@ def dispatch(request: object) -> dict[str, object]:
     operation = request.get("operation")
     if not isinstance(operation, str) or operation not in OPERATIONS:
         raise ApiError("unsupported_operation", "operation is not supported")
+    deployment.verify_database_admission()
     return OPERATIONS[operation](request)
 
 
@@ -6339,6 +6348,13 @@ def _response(request: object) -> dict[str, object]:
             }
         return {
             "error": {"code": "runtime_error", "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except DeploymentError as exc:
+        return {
+            "error": {"code": "deployment_refused", "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
