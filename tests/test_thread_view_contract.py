@@ -85,6 +85,9 @@ OWNED_PHRASES = {
         r"`comparable\(a, b\)`",
         r"Claims unavailable",
         r"later than promised",
+        r"exactly one reference of each of those two kinds",
+        r"one link from the bound reference",
+        r"most specific kind",
     ],
 }
 
