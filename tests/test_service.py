@@ -6517,8 +6517,10 @@ def test_pending_shortcut_passes_inbox_scope_without_polling(
     )
 
 
-@pytest.mark.parametrize("latest", ["partial", "whole", "unrelated"])
-def test_real_history_observation_controls_source_confirmation(tmp_path: Path, latest: str) -> None:
+@pytest.mark.parametrize("latest", ["partial", "whole", "unrelated", "same_record", "truncated"])
+def test_real_history_observation_controls_source_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, latest: str,
+) -> None:
     from eom_email_watcher.gmail import GmailGateway
 
     cfg = config(tmp_path)
@@ -6547,6 +6549,13 @@ def test_real_history_observation_controls_source_confirmation(tmp_path: Path, l
         {"messagesAdded": [{"message": {"id": "m", "labelIds": ["INBOX"]}}]},
         {"labelsAdded": [later]},
     ]}
+    if latest == "same_record":
+        response["history"][0]["labelsAdded"] = response["history"].pop()["labelsAdded"]
+    elif latest == "truncated":
+        from eom_email_watcher import gmail as gmail_module
+
+        monkeypatch.setattr(gmail_module, "MAX_INCREMENTAL_MESSAGE_IDS", 1)
+        response["history"].insert(1, {"messagesAdded": [{"message": {"id": "other"}}]})
     real = GmailGateway(SimpleNamespace(users=lambda: SimpleNamespace(
         history=lambda: SimpleNamespace(
             list=lambda **kwargs: SimpleNamespace(execute=lambda: response),
@@ -6563,8 +6572,8 @@ def test_real_history_observation_controls_source_confirmation(tmp_path: Path, l
             "ORDER BY location", ("m",),
         ).fetchall()
     assert [row["location"] for row in rows] == (
-        ["inbox"] if latest == "unrelated" else ["inbox", "sent"]
+        ["inbox"] if latest in {"unrelated", "truncated"} else ["inbox", "sent"]
     )
     assert [row["recorded_at"] is not None for row in rows] == (
-        [False, False] if latest == "partial" else [True] * len(rows)
+        [latest not in {"partial", "truncated"}] * len(rows)
     )

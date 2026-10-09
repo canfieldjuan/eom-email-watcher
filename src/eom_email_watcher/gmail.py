@@ -449,32 +449,41 @@ GMAIL_METADATA_HEADERS = [
 GMAIL_LOCATION_LABELS = {"INBOX": INBOX_LOCATION, "SENT": SENT_LOCATION}
 
 
-def _merge_history_hint(
-    hints: dict[str, FolderObservation], message_id: str, added: object, message: object
-) -> None:
-    """Fold one history addition into the message's folder observation.
+class _HistoryFolderObservations:
+    """Fold fields within a record, then records within a drained history range."""
 
-    The addition's own labelIds say what was added, so they place the message in
-    those folders without saying where else it is. The nested message's labelIds,
-    when the record carries them, are the whole set and make the observation
-    complete. Several additions for one id in a batch merge.
-    """
-    added_labels = added.get("labelIds") if isinstance(added, dict) else None
-    whole = message.get("labelIds") if isinstance(message, dict) else None
-    if isinstance(whole, list):
-        observation = FolderObservation(locations_from_labels(whole), complete=True)
-    elif isinstance(added_labels, list):
-        observation = FolderObservation(locations_from_labels(added_labels), complete=False)
-    else:
-        return
-    earlier = hints.get(message_id)
-    if earlier is not None:
-        if not observation.complete and not observation.locations:
+    def __init__(self) -> None:
+        self._hints: dict[str, FolderObservation] = {}
+        self._whole_in_record: set[str] = set()
+
+    def begin_record(self) -> None:
+        self._whole_in_record.clear()
+
+    def add(self, message_id: str, added: object, message: object) -> None:
+        added_labels = added.get("labelIds") if isinstance(added, dict) else None
+        whole = message.get("labelIds") if isinstance(message, dict) else None
+        if isinstance(whole, list):
+            self._whole_in_record.add(message_id)
+            locations = locations_from_labels(whole)
+        elif isinstance(added_labels, list):
+            locations = locations_from_labels(added_labels)
+        else:
             return
-        observation = FolderObservation(
-            earlier.locations | observation.locations, observation.complete
-        )
-    hints[message_id] = observation
+        complete = message_id in self._whole_in_record
+        earlier = self._hints.get(message_id)
+        if earlier is not None:
+            if not complete and not locations:
+                return
+            locations |= earlier.locations
+        self._hints[message_id] = FolderObservation(locations, complete=complete)
+
+    def snapshot(self, *, drained: bool) -> dict[str, FolderObservation]:
+        return {
+            message_id: FolderObservation(
+                observation.locations, complete=drained and observation.complete
+            )
+            for message_id, observation in self._hints.items()
+        }
 
 
 def recovery_folder_query(folders: frozenset[str]) -> str:
@@ -902,7 +911,7 @@ class GmailGateway:
 
     def _history_changes(
         self, start_history_id: str
-    ) -> tuple[list[str], str, dict[str, frozenset[str]]]:
+    ) -> tuple[list[str], str, dict[str, FolderObservation]]:
         """The changed ids, the newest cursor, and each record's admitted folders.
 
         A history record says which folders a message was added to, so a known
@@ -914,7 +923,7 @@ class GmailGateway:
             _decode_history_cursor(start_history_id)
         )
         ids: list[str] = []
-        hints: dict[str, FolderObservation] = {}
+        hints = _HistoryFolderObservations()
         seen_ids: set[str] = set()
         ordered_unique_ids: list[str] = []
         page_token: str | None = None
@@ -946,6 +955,7 @@ class GmailGateway:
                 for event in events:
                     if not isinstance(event, dict):
                         raise GmailError("Gmail history response is invalid")
+                    hints.begin_record()
                     for event_field in ("messagesAdded", "labelsAdded"):
                         additions = event.get(event_field, [])
                         if not isinstance(additions, list):
@@ -958,7 +968,7 @@ class GmailGateway:
                                 field="Gmail history message ID",
                                 error_type=GmailError,
                             )
-                            _merge_history_hint(hints, message_id, added, message)
+                            hints.add(message_id, added, message)
                             if message_id in seen_ids:
                                 continue
                             seen_ids.add(message_id)
@@ -983,7 +993,7 @@ class GmailGateway:
                                 return (
                                     ids,
                                     _history_continuation_cursor(request_start_history_id, prefix),
-                                    dict(hints),
+                                    hints.snapshot(drained=False),
                                 )
                             ids.append(message_id)
                 page_token = response.get("nextPageToken")
@@ -1007,7 +1017,7 @@ class GmailGateway:
         # Every id whose record this call saw keeps its observation, the replayed
         # prefix included: a later event for an id returned in an earlier batch
         # arrives here only, so it travels as an observation outside the batch.
-        return ids, newest, dict(hints)
+        return ids, newest, hints.snapshot(drained=True)
 
     def changes_since(self, cursor: str) -> MailboxChanges:
         message_ids, newest, locations = self._history_changes(cursor)
