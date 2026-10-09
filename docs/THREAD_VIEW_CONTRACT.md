@@ -277,14 +277,14 @@ Each definition is the only place its rule is stated.
   - A claim's anchor and its canonical item key must be bound to that claim uniquely, from its own evidence. Item keys are canonicalized in code, never taken from the model's choice of substring.
   - Relative and yearless dates resolve against the message's stored date context ([D-body](#d-body-stored-bodies)). Without that context they are rejected.
   - Only claims of their source's current version exist for comparison: the claims extractor version for authored text, and the record mapping version for invoice records. A new version supersedes a message's older claims atomically.
-- **A message's reference profile** is computed in code, never from the model's output, when the message's claims are stored: a scan of its authored text with the reference kind patterns that validation uses. For each kind, the profile holds the one reference the scan finds, counted by kind and normalized number (the M4 plan names the patterns and the normalization). A kind the scan finds no reference of, or several, is absent from the profile.
+- **A message's reference profile** is computed in code, never from the model's output, when the message's claims are stored: a scan of its authored text with the reference kind patterns that validation uses. For each kind, the profile holds the one reference the scan finds, or marks the kind *several* when the scan finds more than one, counting references by kind and normalized number (the M4 plan names the patterns and the normalization). A kind the scan finds no reference of is absent from the profile.
 - **`comparable(a, b)`** holds only if all of these do:
   - same vendor, in the same account and mailbox identity;
   - same type, and same validated key;
   - the anchor condition for where the two claims sit:
     - **in one thread:** a shared bound anchor `(kind, number)`, needed for `amount` roles other than `unit_price` and for `date_commitment` and `quantity`;
     - **in different threads (decision D4):** profile agreement, for every type;
-    - **profile agreement:** the two messages' reference profiles have a reference in common and, in every kind both profiles hold, the same reference. Only the two messages' own profiles count, so claims never pair through a third message;
+    - **profile agreement:** the two messages' reference profiles have a reference in common and, in every kind both profiles hold, the same single reference. A kind marked several in either profile, while the other profile holds that kind, never agrees. Only the two messages' own profiles count, so claims never pair through a third message;
     - **record pairing**, instead of both, when either claim comes from an invoice record: the record's claim pairs with the other message's claims of the same type and key that are bound to the record's invoice number, when that number is in the other message's profile; when there are none, it pairs by profile agreement;
   - neither claim is a `reference`, a `term`, or `other`;
   - they come from different messages.
@@ -450,6 +450,8 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
     - an email naming invoice 9087 with a PDF record for invoice 9088 gives no claim;
     - a total that re-derives to another value, an inferred currency, unchecked arithmetic, or a non-zero total residual gives no claim, counted as unverified;
     - an email "Quote Q-512 total $100; Invoice 9087 total $120" and a PDF record for invoice 9087 compare the PDF's total with the $120 invoice total only;
+    - a PDF record for invoice I-1 and an email "Invoice I-1 total $100; Invoice I-2 total $200; quote Q-1" are never paired, because that email marks invoices several;
+    - two emails that each name several invoices and the same quote never pair their PDFs through the quote;
     - a PDF's subtotal, tax, due date, and line items give no claims;
     - a newer record for the same attachment replaces the older record's claim;
     - purging the message deletes its invoice records;
@@ -517,3 +519,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - Profiles are again authored text only, so a superseded record cannot leave a stale invoice number behind.
   - Profile agreement within one thread now applies only when an invoice record is involved, so authored claims keep their per-claim anchors.
 - 2026-10-09: the second Codex review of #228 found that the email-confirmed number, the label, and the currency still could not be proven from a 1.0 record. The operator chose to trust Invoice Processor's own label check now (decision D5), with its accepted risk recorded. The currency must be printed, which the record states. Record pairing, one rule for both thread modes, prefers the other message's claim bound to the record's invoice number before profile agreement. The dependency now links D-scope's purge instead of restating it.
+- 2026-10-09: the third Codex review of #228 found that a reference profile treated a kind named several times like a kind never named, so profile agreement ignored it, and an ambiguous invoice kind could vanish during record pairing's fallback. D-claims' profile now marks such a kind *several*, and profile agreement fails when either profile marks a kind several while the other holds it. That also makes D4's authored pairings stricter in the same way. Per-claim binding inside a message that names several invoices still never decides, as D4 established.

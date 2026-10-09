@@ -91,6 +91,7 @@ OWNED_PHRASES = {
         r"selected record is its valid `invoice.extract` record",
         r"the vendor's own words say this PDF is their invoice",
         r"\*\*record pairing\*\*, instead of both",
+        r"marks the kind \*several\*",
     ],
 }
 
