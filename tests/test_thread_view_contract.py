@@ -88,6 +88,8 @@ OWNED_PHRASES = {
         r"reference profile\*\* is computed in code",
         r"never pair through a third message",
         r"the anchor condition for where the two claims sit",
+        r"most recently settled valid `invoice.extract` record",
+        r"is the bound anchor of every claim from that record",
     ],
 }
 
