@@ -243,7 +243,7 @@ def test_full_resolver_accepts_real_space_path_wire_modes(monkeypatch):
     # Literal captures follow the independently retained real formatter matrix.
     environment = "HOME=$'/public/manager home'\nXDG_CONFIG_HOME=$'/public/config space'\n"
     paths = '"/public/config space/systemd/user" /usr/lib/systemd/user\n'
-    def read(command):
+    def read(command, **kwargs):
         return environment if command[-1] == "show-environment" else paths
     monkeypatch.setattr(deployment, "_read_manager_command", read)
     monkeypatch.setattr(deployment, "_account_home", lambda: home)
@@ -274,7 +274,9 @@ def test_native_unicode_space_is_path_data(monkeypatch, space, posix):
     value = "/public/user" + space + "name"
     wire = systemd_quote(value, posix=posix)
     assert deployment._manager_words(wire, posix=posix) == (value,)
-    monkeypatch.setattr(deployment, "_read_manager_command", lambda _: "HOME=" + wire + "\n")
+    monkeypatch.setattr(
+        deployment, "_read_manager_command", lambda _, **kwargs: "HOME=" + wire + "\n"
+    )
     assert deployment._manager_environment() == {"HOME": value}
 
 

@@ -245,7 +245,7 @@ def test_manager_environment_parser_keeps_quoted_paths_and_ignores_other_keys(mo
     monkeypatch.setattr(
         deployment,
         "_read_manager_command",
-        lambda _: (
+        lambda _, **kwargs: (
             "HOME=$'/public/manager home'\n"
             "XDG_CONFIG_HOME=$'/public/custom config'\nOTHER=ignored\n"
         ),

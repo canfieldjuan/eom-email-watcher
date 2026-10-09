@@ -1081,3 +1081,33 @@ from this same pipe while discovering direct dependencies. Keep in-memory buffer
 and retained output bounded; the existing deadline covers capture and selection.
 No second live manager observation, truncation or arbitrary platform count limit.
 Temporary scratch is not durable proof and never goes into the normal profile.
+
+
+### Consumed-projection qualification
+
+Approved root6079176121 recorded contract-only8b91c9f before code. Shared reader
+selection replaces the whole-raw cap at its origin. Per-record and aggregate
+retained limits preserve MAX_MANAGER_BYTES; no caller workaround or second live
+read. Existing normalized record validation is extracted into one shared parser.
+
+Immutable published-source regression4failed; current adjacent/original suite
+449passed. Raw-cap, selected-cap and record-cap mutations fail intended tests.
+Real retained manager100records reduce to the identical consumed8records/3548bytes;
+actual-manager-selection-parity-v12.json SHA256
+25e71ebde2ef1f767f48057837dfc46b0c984256ec28154c2ba2e8e69d64e0cf.
+Native freeze/source/five payloads match; freeze-receipt-v12.json SHA256
+19b1b6ddb3abd15dbdd4e28ac71fb81bef2bddd20855cf33dc55bf25f59e71ee.
+Native SHA2565f5e710197055080e043dc230c1f84558ccb43db92f65b4acbb690a57c5dae66.
+Retained38refusals/public digest/migration/overlap/Store exclusion/desktop receiver
+remain identical; packaged-schema-proof-v12.json SHA256
+2cbc3e156724e5e2dc3d007c1b306ffa12b79141b7740ef133067fa800f8e57c.
+Native24activation cases/vendor positive and spaceUTF8 positive remain. New native
+80KB ignored environment +500unrelated platform records admit API/CLI with roots
+first/last, including installer/initialize. Four oversized-input cases refuse
+with schema28/digest unchanged; native-manager-selection-v12.json SHA256
+7320c59a83578f94e747dc86e0221fb81befc82f42e604ca922a6218714481d0.
+Durable public evidence and explicit substitutions outside worktrees; no normal
+profile/model/mail changes. Cold audit cold-diff-audit-v12.md.
+
+Gap audit DONE local origin fix/reproduction/regressions/mutations/native parity;
+NOT DONE new-head CI and independent oversight after the grouped push. Hold stays.

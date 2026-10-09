@@ -88,7 +88,9 @@ def test_receiver_proof_rejects_zero_executed_tests(monkeypatch, tmp_path, summa
     ],
 )
 def test_manager_environment_decodes_native_wire(monkeypatch, encoded, expected):
-    monkeypatch.setattr(deployment, "_read_manager_command", lambda _: "HOME=" + encoded + "\n")
+    monkeypatch.setattr(
+        deployment, "_read_manager_command", lambda _, **kwargs: "HOME=" + encoded + "\n"
+    )
     assert deployment._manager_environment() == {"HOME": expected}
 
 

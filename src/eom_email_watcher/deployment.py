@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +34,7 @@ _ACTIVATION_FIELDS = (
     "Triggers",
 )
 _PLATFORM_SELECTORS = ("*.target", "*.slice")
+_MANAGER_ENVIRONMENT_KEYS = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
 _MANAGER_FIELDS = (
     "Names", "Transient",
     *_ACTIVATION_FIELDS,
@@ -155,11 +156,11 @@ def _manager_unit_paths() -> tuple[Path, ...]:
 
 
 def _manager_environment() -> dict[str, str]:
-    raw = _read_manager_command(["systemctl", "--user", "show-environment"])
+    raw = _read_manager_command(["systemctl", "--user", "show-environment"], mode="environment")
     selected: dict[str, str] = {}
     for line in raw.split("\n"):
         if not any(
-            line.startswith(key + "=") for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+            line.startswith(key + "=") for key in _MANAGER_ENVIRONMENT_KEYS
         ):
             continue
         key, _, raw_value = line.partition("=")
@@ -352,40 +353,157 @@ def _manager_output(names: tuple[str, ...]) -> str:
         "--property=" + ",".join(_MANAGER_FIELDS),
         *names, *_PLATFORM_SELECTORS,
     ]
-    return _read_manager_command(command)
+    return _read_manager_command(command, mode="units", names=names)
 
 
-def _read_manager_command(command: list[str]) -> str:
-    """Shared deadline/output bound for manager environment and unit reads."""
+@contextmanager
+def _manager_scratch():
+    with tempfile.TemporaryFile() as scratch:
+        yield scratch
+
+
+class _ManagerCapture:
+    """Select one pipe's consumed metadata before applying its retained budget."""
+
+    def __init__(self, mode: str, names: tuple[str, ...], deadline: float):
+        self.mode = mode
+        self.names = names
+        self.deadline = deadline
+        self.output = bytearray()
+        self.pending = bytearray()
+        self.skip_line = False
+        self.selected_line = False
+        self.resources = ExitStack()
+        self.scratch = (
+            self.resources.enter_context(_manager_scratch()) if mode == "units" else None
+        )
+
+    def close(self) -> None:
+        self.resources.close()
+
+    def _check_deadline(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise DeploymentError("The user manager did not respond before the deadline")
+
+    @staticmethod
+    def _check_size(size: int) -> None:
+        if size > MAX_MANAGER_BYTES:
+            raise DeploymentError("The user manager returned too much deployment metadata")
+
+    def _retain(self, value: bytes) -> None:
+        self._check_size(len(self.output) + len(value))
+        self.output.extend(value)
+
+    def _environment(self, chunk: bytes) -> None:
+        prefixes = tuple((key + "=").encode("ascii") for key in _MANAGER_ENVIRONMENT_KEYS)
+        pieces = chunk.split(b"\n")
+        for index, piece in enumerate(pieces):
+            if not self.skip_line:
+                self.pending.extend(piece)
+                if not self.selected_line:
+                    self.selected_line = any(self.pending.startswith(key) for key in prefixes)
+                    self.skip_line = not self.selected_line and not any(
+                        key.startswith(self.pending) for key in prefixes
+                    )
+                    if self.skip_line:
+                        self.pending.clear()
+                if self.selected_line:
+                    self._check_size(len(self.output) + len(self.pending))
+            if index < len(pieces) - 1:
+                if self.selected_line:
+                    self._retain(bytes(self.pending) + b"\n")
+                self.pending.clear()
+                self.skip_line = self.selected_line = False
+
+    def _record(self, block: bytes) -> None:
+        self._check_size(len(block))
+        if block:
+            assert self.scratch is not None
+            self.scratch.write(len(block).to_bytes(4, "big"))
+            self.scratch.write(block)
+
+    def feed(self, chunk: bytes) -> None:
+        self._check_deadline()
+        if self.mode == "environment":
+            self._environment(chunk)
+        elif self.mode == "units":
+            self.pending.extend(chunk)
+            while b"\n\n" in self.pending:
+                block, _, rest = self.pending.partition(b"\n\n")
+                self._record(block)
+                self.pending = bytearray(rest)
+            # A record's final newline may be awaiting its separator in the next chunk.
+            self._check_size(len(self.pending.rstrip(b"\n")))
+        else:
+            self._retain(chunk)
+
+    def _records(self) -> Iterator[tuple[bytes, dict[str, str]]]:
+        assert self.scratch is not None
+        self.scratch.seek(0)
+        while header := self.scratch.read(4):
+            self._check_deadline()
+            block = self.scratch.read(int.from_bytes(header, "big"))
+            yield block, _manager_record(block.decode("utf-8", errors="strict"), self.names)
+
+    def _graph(self) -> None:
+        roots = set()
+        dependencies = set()
+        for _, record in self._records():
+            name = record["Id"]
+            if name in self.names:
+                if name in roots:
+                    raise DeploymentError("Incomplete or duplicate user-manager unit metadata")
+                roots.add(name)
+                for field in _ACTIVATION_FIELDS:
+                    dependencies.update(_manager_words(record[field]))
+        for block, record in self._records():
+            name = record["Id"]
+            aliases = _manager_words(record["Names"])
+            if name in self.names or name in dependencies or dependencies.intersection(aliases):
+                self._retain(block + b"\n\n")
+
+    def finish(self) -> str:
+        self._check_deadline()
+        if self.mode == "environment" and self.selected_line:
+            self._retain(bytes(self.pending))
+        elif self.mode == "units":
+            self._record(bytes(self.pending).rstrip(b"\n"))
+            self._graph()
+        return self.output.decode("utf-8", errors="strict")
+
+
+def _read_manager_command(
+    command: list[str], *, mode: str = "all", names: tuple[str, ...] = ()
+) -> str:
+    """One deadline and bounded selection owner for every manager read form."""
     try:
         with subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         ) as process:
             try:
                 assert process.stdout is not None
-                output = bytearray()
                 deadline = time.monotonic() + MANAGER_TIMEOUT_SECONDS
-                with selectors.DefaultSelector() as selector:
-                    selector.register(process.stdout, selectors.EVENT_READ)
-                    while True:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0 or not selector.select(remaining):
-                            raise DeploymentError(
-                                "The user manager did not respond before the deadline"
-                            )
-                        chunk = os.read(
-                            process.stdout.fileno(), min(8192, MAX_MANAGER_BYTES + 1 - len(output))
+                capture = _ManagerCapture(mode, names, deadline)
+                try:
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(process.stdout, selectors.EVENT_READ)
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0 or not selector.select(remaining):
+                                raise DeploymentError(
+                                    "The user manager did not respond before the deadline"
+                                )
+                            chunk = os.read(process.stdout.fileno(), 8192)
+                            if not chunk:
+                                break
+                            capture.feed(chunk)
+                    if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                        raise DeploymentError(
+                            "The user manager is unavailable; repair the deployment"
                         )
-                        if not chunk:
-                            break
-                        output.extend(chunk)
-                        if len(output) > MAX_MANAGER_BYTES:
-                            raise DeploymentError(
-                                "The user manager returned too much deployment metadata"
-                            )
-                if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
-                    raise DeploymentError("The user manager is unavailable; repair the deployment")
-                return output.decode("utf-8", errors="strict")
+                    return capture.finish()
+                finally:
+                    capture.close()
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -394,59 +512,67 @@ def _read_manager_command(command: list[str]) -> str:
         raise DeploymentError("The user manager is unavailable; repair the deployment") from exc
 
 
+def _manager_record(block: str, names: tuple[str, ...]) -> dict[str, str]:
+    record: dict[str, str] = {}
+    for line in block.split("\n"):
+        key, separator, value = line.partition("=")
+        if separator != "=" or key not in _MANAGER_FIELDS:
+            raise DeploymentError("Invalid user-manager deployment metadata")
+        if key == "ExecStart" and value and (
+            not value.startswith("{ path=") or not value.endswith(" }")
+        ):
+            raise DeploymentError("Invalid manager command-array metadata")
+        if key in record:
+            if key != "ExecStart" or not value or not record[key]:
+                raise DeploymentError("Invalid user-manager deployment metadata")
+            record[key] += "\n" + value
+        else:
+            record[key] = value
+    name = record.get("Id")
+    common = set(_MANAGER_FIELDS) - {"MainPID", "ControlPID", "Unit", "ExecStart"}
+    required = common | (
+        {"Unit"} if name and name.endswith(".timer") else
+        {"MainPID", "ControlPID", "ExecStart"} if name and name.endswith(".service") else set()
+    )
+    allowed = name in names or bool(name and name.endswith((".target", ".slice")))
+    if not allowed or required != set(record):
+        raise DeploymentError("Incomplete or duplicate user-manager unit metadata")
+    if record["ActiveState"] not in {
+        "active",
+        "inactive",
+        "failed",
+        "activating",
+        "deactivating",
+        "reloading",
+        "maintenance",
+        "refreshing",
+    }:
+        raise DeploymentError("Invalid user-manager activity state")
+    if record["Transient"] not in {"yes", "no"}:
+        raise DeploymentError("Invalid user-manager transient state")
+    if record["NeedDaemonReload"] not in {"yes", "no"}:
+        raise DeploymentError("Invalid user-manager reload state")
+    for key in ("MainPID", "ControlPID"):
+        if key in record and (
+            not record[key].isascii()
+            or not record[key].isdigit()
+            or len(record[key]) > 10
+            or int(record[key]) > 2**32 - 1
+        ):
+            raise DeploymentError("Invalid user-manager process identity")
+    return record
+
+
 def _manager_snapshot(names: tuple[str, ...]) -> dict[str, dict[str, str]]:
     raw = _manager_output(names)
-    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_MANAGER_BYTES:
+    if not isinstance(raw, str):
         raise DeploymentError("Invalid user-manager deployment metadata")
     records: dict[str, dict[str, str]] = {}
     for block in raw.strip("\n").split("\n\n"):
-        record: dict[str, str] = {}
-        for line in block.split("\n"):
-            key, separator, value = line.partition("=")
-            if separator != "=" or key not in _MANAGER_FIELDS:
-                raise DeploymentError("Invalid user-manager deployment metadata")
-            if key == "ExecStart" and value and (
-                not value.startswith("{ path=") or not value.endswith(" }")
-            ):
-                raise DeploymentError("Invalid manager command-array metadata")
-            if key in record:
-                if key != "ExecStart" or not value or not record[key]:
-                    raise DeploymentError("Invalid user-manager deployment metadata")
-                record[key] += "\n" + value
-            else:
-                record[key] = value
-        name = record.get("Id")
-        common = set(_MANAGER_FIELDS) - {"MainPID", "ControlPID", "Unit", "ExecStart"}
-        required = common | (
-            {"Unit"} if name and name.endswith(".timer") else
-            {"MainPID", "ControlPID", "ExecStart"} if name and name.endswith(".service") else set()
-        )
-        allowed = name in names or bool(name and name.endswith((".target", ".slice")))
-        if not allowed or name in records or required != set(record):
+        record = _manager_record(block, names)
+        name = record["Id"]
+        if name in records:
             raise DeploymentError("Incomplete or duplicate user-manager unit metadata")
-        if record["ActiveState"] not in {
-            "active",
-            "inactive",
-            "failed",
-            "activating",
-            "deactivating",
-            "reloading",
-            "maintenance",
-            "refreshing",
-        }:
-            raise DeploymentError("Invalid user-manager activity state")
-        if record["Transient"] not in {"yes", "no"}:
-            raise DeploymentError("Invalid user-manager transient state")
-        if record["NeedDaemonReload"] not in {"yes", "no"}:
-            raise DeploymentError("Invalid user-manager reload state")
-        for key in ("MainPID", "ControlPID"):
-            if key in record and (
-                not record[key].isascii()
-                or not record[key].isdigit()
-                or len(record[key]) > 10
-                or int(record[key]) > 2**32 - 1
-            ):
-                raise DeploymentError("Invalid user-manager process identity")
         records[name] = record
     if not set(names).issubset(records):
         raise DeploymentError("Incomplete user-manager deployment graph")

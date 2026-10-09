@@ -374,6 +374,11 @@ Auxiliary dependency and override inputs across the manager's load paths must
 match the shipped deployment too. Retained `.wants`, `.requires`, `.upholds` or
 nonempty drop-in directories refuse before installation writes, even when the base
 units are absent. Remove the unshipped inputs and reload the manager before retrying.
+The manager reader streams its output and retains only the three consumed environment
+keys, the shipped roots and their direct platform dependencies. Unrelated session
+variables and platform units do not consume the retained metadata budget. UnitPath
+is fully consumed; retained metadata and individual graph records remain bounded.
+Record ordering cannot hide a dependency, and capture/selection share one deadline.
 Pending reloads require
 `systemctl --user daemon-reload`; masked units require `systemctl --user unmask`.
 For a partial graph, remove its partial five-unit installation, reload the manager,
