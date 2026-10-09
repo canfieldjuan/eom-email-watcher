@@ -708,7 +708,10 @@ the shared/exclusive kernel coordination anchor, with one identity check after
 acquisition and the same bounded waits/inherited source descriptor. This closes
 the reproduced state-file-deletion split rather than relying on a check that the
 counterexample passes. This is a lock-path/holder departure: operator acceptance
-is pending before that implementation. Do not change the lock owner until accepted.
+is pending before that implementation. Do not change the coordination anchor
+until accepted. The requested post-acquisition identity check on the current file
+anchor is independently authorized; it detects replacement during acquisition,
+but must not be described as solving deletion before a new open.
 
 Verification: minimal wrong-account-home and foreign-UnitPath publication probes
 must fail before and pass after with no target writes. Retain the deleted-before-
@@ -727,3 +730,71 @@ system-python bootstrap and NFS semantics observations remain non-blocking
 follow-up work. One grouped correction push; hold remains until independent
 verification and operator merge clearance. Implementation/evidence and cold audit
 will be recorded after the probes; gap audit remains NOT DONE.
+
+
+### Local review correction evidence
+
+Contract-only a4c26f7 precedes the authorized correction. The account/UnitPath
+preflight and ANSI-C decoder are implemented at manager_view/_manager_words;
+_verify_lease_identity owns the same pre/post check for the existing file anchor.
+The CI receiver runner requires exactly one passing test. Two ordering gaps now
+have regression tests, with both owner mutations and the exact shell unlock-after-
+uv mutation caught. Canonical recovery/identity and lock-limit guidance is README.
+
+Affected source suite: 226 passed. Final lint passed; the post-check and source
+shell tests each passed after their final edits. Native v9 is development-profile
+527833441d12e7ec310a2fbec652183c9cca10633a7efdf914c1b349b779106d; compiled source
+and all five shipped payloads match the freeze. Both wrong-account-home and
+foreign-UnitPath cases refuse before lock/alias/unit writes. Space/UTF-8 home
+installation, initialization, health and alias CLI pass. The retained v8 public
+oracle is equal after the added external NSS fixture and on v9: 38 negatives,
+unchanged schema28/digest on refusal, paired migration30 and overlap. The updated
+CI helper exercised exactly one real native Rust receiver test successfully.
+Durable aliases: parity-comparison-v9.json, packaged-schema-proof-v9.json,
+freeze-receipt-v9.json, native-path-wire-v9.json, review-final-source-v9.txt,
+ci-native-receiver-final-v9.txt, ordering mutation results, cold-diff-audit-v9.md.
+Review-facing artifact hashes belong in the receipt/reply after publication.
+
+Gap audit: NOT DONE. The current owner still admits deletion-before-open while an
+old reader holds the deleted inode; deleted-before-open-postcheck-v9.json records
+this actual-source counterexample. The tested directory-anchor prototype is not
+implemented because the accepted contract requires approval for that departure.
+One grouped push is pending that decision; no correction has been published and
+no new-head CI/review is claimed. Oversight and operator merge hold remain.
+
+
+## Accepted stable coordination anchor
+
+The operator's "Continue" directs the pending tested anchor correction. Record
+this acceptance before implementation. The lease owner uses the real account-home
+directory inode, opened read-only with O_DIRECTORY/O_NOFOLLOW, as its sole shared /
+exclusive flock anchor. ManagerView names that anchor explicitly; no state lock
+file is created or used. Its fstat type/owner/dev/inode must match the named home
+before and immediately after acquisition. Preserve bounded waiting, same-process
+shared-reader refusal, inherited source-publisher descriptor and connection lifetime.
+
+This removes the state-file-deletion split at deployment_lease, the component
+that creates a new coordination inode after deletion. Remove all state-file
+reader/publisher/proof assumptions; tests and canonical README use the same home
+anchor. Keep the retained deletion-before-open counterexample and directory
+prototype as the before/specification evidence. Add a real cross-process regression
+using an actual Store connection and all three publishers; deleting/recreating
+legacy state files must not admit publication or mutate alias/units/database.
+The directory post-acquisition identity test must reject a replaced home inode.
+
+This changes coordination between versions. Old file-lock readers do not hold the
+new anchor, so active readers require the existing native executable identity gate:
+no mixed native images, same shipped command/alias pin, and all source publishers
+share this owner. Close existing app sessions and stop timers before installing
+this version; canonical README documents this transition. Whole-home replacement,
+unsupported filesystems and unrelated programs flocking the home are not claimed
+safe; identity changes refuse and unsupported locks retain typed refusal.
+
+Qualification differences from v9: home directory instead of deletable file is the
+anchor; native external flock holders open that directory. Same public schema28,
+five units, account fixture, settings and no inference/mail remain. First fail the
+new deletion regression on the current file owner, then prove it after origin fix.
+Reuse v9's native oracle, adding deletion during a real native Store connection and
+post-acquisition directory replacement. Contract-only commit precedes implementation;
+one grouped push includes all accepted review corrections. Oversight and operator
+merge hold remain until independent exact-head verification and merge clearance.
