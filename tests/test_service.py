@@ -6515,3 +6515,65 @@ def test_pending_shortcut_passes_inbox_scope_without_polling(
     assert store.recent(1)[0]["summary"] == (
         None if sent and not gated else "A short update."
     )
+
+
+@pytest.mark.parametrize("latest", ["partial", "whole", "unrelated", "same_record", "truncated"])
+def test_real_history_observation_controls_source_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, latest: str,
+) -> None:
+    from eom_email_watcher.gmail import GmailGateway
+
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail", "gmail-default", TEST_MAILBOX_IDENTITY_KEY, legacy_status="replacement",
+    )
+    now = datetime.now(UTC)
+    stamp = now.isoformat()
+    store.add_message(
+        message_id="m", provider_message_id="m", thread_id=None,
+        sender="trusted@example.com", sender_name=None, subject="S", received_at=stamp,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, capture_timezone="America/Chicago",
+        admission=AdmissionProvenance(
+            kind="exact_sender", selector_id="sender:trusted@example.com", display_name=None,
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, admitted_at=stamp,
+        ),
+    )
+    later = {"message": {"id": "m"}, "labelIds": ["SENT"]}
+    if latest == "whole":
+        later["message"]["labelIds"] = ["SENT"]
+    elif latest == "unrelated":
+        later["labelIds"] = ["STARRED"]
+    response = {"historyId": "300", "history": [
+        {"messagesAdded": [{"message": {"id": "m", "labelIds": ["INBOX"]}}]},
+        {"labelsAdded": [later]},
+    ]}
+    if latest == "same_record":
+        response["history"][0]["labelsAdded"] = response["history"].pop()["labelsAdded"]
+    elif latest == "truncated":
+        from eom_email_watcher import gmail as gmail_module
+
+        monkeypatch.setattr(gmail_module, "MAX_INCREMENTAL_MESSAGE_IDS", 1)
+        response["history"].insert(1, {"messagesAdded": [{"message": {"id": "other"}}]})
+    real = GmailGateway(SimpleNamespace(users=lambda: SimpleNamespace(
+        history=lambda: SimpleNamespace(
+            list=lambda **kwargs: SimpleNamespace(execute=lambda: response),
+        ),
+    )))
+    observed = real.changes_since("100").locations["m"]
+    Watcher(cfg, store, FakeGmail(), FakeModel())._record_known_message_location(
+        "m", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, checked_at=now,
+        folders=frozenset({"inbox", "sent"}), observed=observed,
+    )
+    with store.connection() as db:
+        rows = db.execute(
+            "SELECT location, recorded_at FROM message_locations WHERE message_id = ? "
+            "ORDER BY location", ("m",),
+        ).fetchall()
+    assert [row["location"] for row in rows] == (
+        ["inbox"] if latest in {"unrelated", "truncated"} else ["inbox", "sent"]
+    )
+    assert [row["recorded_at"] is not None for row in rows] == (
+        [latest not in {"partial", "truncated"}] * len(rows)
+    )
