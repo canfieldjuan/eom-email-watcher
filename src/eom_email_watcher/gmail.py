@@ -469,8 +469,10 @@ def _merge_history_hint(
         return
     earlier = hints.get(message_id)
     if earlier is not None:
+        if not observation.complete and not observation.locations:
+            return
         observation = FolderObservation(
-            earlier.locations | observation.locations, earlier.complete or observation.complete
+            earlier.locations | observation.locations, observation.complete
         )
     hints[message_id] = observation
 

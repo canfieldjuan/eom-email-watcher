@@ -1942,3 +1942,103 @@ def test_gmail_content_requires_scope_before_transport() -> None:
     gateway = GmailGateway(None)
     with pytest.raises(TypeError, match="scope"):
         gateway.content("m1", 100)
+
+
+@pytest.mark.parametrize("records,complete", [
+    ([{"message": {"id": "m", "labelIds": ["INBOX"]}},
+      {"message": {"id": "m"}, "labelIds": ["SENT"]}], False),
+    ([{"message": {"id": "m"}, "labelIds": ["SENT"]},
+      {"message": {"id": "m", "labelIds": ["INBOX"]}}], True),
+    ([{"message": {"id": "m", "labelIds": ["INBOX"]}},
+      {"message": {"id": "m", "labelIds": ["SENT"]}}], True),
+    ([{"message": {"id": "m"}, "labelIds": ["INBOX"]},
+      {"message": {"id": "m"}, "labelIds": ["SENT"]}], False),
+])
+def test_history_completeness_follows_latest_folder_evidence(records, complete) -> None:
+    response = {"historyId": "300", "history": [
+        {"labelsAdded": [record]} for record in records
+    ]}
+    changes = GmailGateway(FakeHistoryService(response)).changes_since("100")
+    assert changes.message_ids == ("m",)
+    assert changes.locations["m"] == FolderObservation(
+        frozenset({"inbox", "sent"}), complete=complete,
+    )
+
+
+def test_history_paged_partial_evidence_does_not_inherit_completeness() -> None:
+    first = {"historyId": "300", "nextPageToken": "next", "history": [
+        {"messagesAdded": [{"message": {"id": "m", "labelIds": ["INBOX"]}}]},
+    ]}
+    second = {"historyId": "300", "history": [
+        {"labelsAdded": [{"message": {"id": "m"}, "labelIds": ["SENT"]}]},
+    ]}
+    service = FakeHistoryService(first)
+    service.history.list = lambda **kwargs: FakeRequest(
+        second if kwargs.get("pageToken") else first,
+    )
+    changes = GmailGateway(service).changes_since("100")
+    assert changes.message_ids == ("m",)
+    assert changes.locations["m"] == FolderObservation(
+        frozenset({"inbox", "sent"}), complete=False,
+    )
+
+
+def test_history_replayed_prefix_partial_evidence_clears_completeness(monkeypatch) -> None:
+    monkeypatch.setattr(gmail_module, "MAX_INCREMENTAL_MESSAGE_IDS", 1)
+    response = {"historyId": "300", "history": [
+        {"messagesAdded": [{"message": {"id": "m", "labelIds": ["INBOX"]}}]},
+        {"messagesAdded": [{"message": {"id": "other"}}]},
+        {"labelsAdded": [{"message": {"id": "m"}, "labelIds": ["SENT"]}]},
+    ]}
+    gateway = GmailGateway(FakeHistoryService(response))
+    first = gateway.changes_since("100")
+    second = gateway.changes_since(first.cursor)
+    assert first.message_ids == ("m",)
+    assert first.locations["m"].complete is True
+    assert second.message_ids == ("other",)
+    assert second.locations["m"] == FolderObservation(
+        frozenset({"inbox", "sent"}), complete=False,
+    )
+
+
+@pytest.mark.parametrize("record", [
+    {"message": {"id": "m"}, "labelIds": ["STARRED"]},
+    {"message": {"id": "m"}, "labelIds": []},
+    {"message": {"id": "m"}},
+])
+@pytest.mark.parametrize("complete", [False, True])
+def test_history_unrelated_or_absent_evidence_preserves_previous_observation(
+    record, complete: bool,
+) -> None:
+    prior = ({"message": {"id": "m", "labelIds": ["INBOX"]}} if complete
+             else {"message": {"id": "m"}, "labelIds": ["INBOX"]})
+    response = {"historyId": "300", "history": [
+        {"labelsAdded": [prior]},
+        {"labelsAdded": [record]},
+    ]}
+    changes = GmailGateway(FakeHistoryService(response)).changes_since("100")
+    assert changes.locations["m"] == FolderObservation(frozenset({"inbox"}), complete=complete)
+
+
+def test_later_empty_whole_set_preserves_history_but_confirms_observation() -> None:
+    response = {"historyId": "300", "history": [
+        {"labelsAdded": [{"message": {"id": "m"}, "labelIds": ["SENT"]}]},
+        {"messagesAdded": [{"message": {"id": "m", "labelIds": []}}]},
+    ]}
+    changes = GmailGateway(FakeHistoryService(response)).changes_since("100")
+    assert changes.locations["m"] == FolderObservation(frozenset({"sent"}), complete=True)
+
+
+@pytest.mark.parametrize("labels,locations", [
+    (["INBOX"], frozenset({"inbox"})),
+    (["STARRED", "SENT"], frozenset({"inbox", "sent"})),
+])
+def test_partial_admitted_evidence_clears_complete_even_without_a_new_location(
+    labels, locations,
+) -> None:
+    response = {"historyId": "300", "history": [
+        {"messagesAdded": [{"message": {"id": "m", "labelIds": ["INBOX"]}}]},
+        {"labelsAdded": [{"message": {"id": "m"}, "labelIds": labels}]},
+    ]}
+    changes = GmailGateway(FakeHistoryService(response)).changes_since("100")
+    assert changes.locations["m"] == FolderObservation(locations, complete=False)
