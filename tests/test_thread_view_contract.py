@@ -85,6 +85,9 @@ OWNED_PHRASES = {
         r"`comparable\(a, b\)`",
         r"Claims unavailable",
         r"later than promised",
+        r"reference profile\*\* is computed in code",
+        r"never pair through a third message",
+        r"the anchor condition for where the two claims sit",
     ],
 }
 
