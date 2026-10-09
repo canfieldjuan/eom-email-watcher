@@ -360,8 +360,20 @@ those overrides is refused until they are removed. The manager's `HOME` and
 launched with a different home. Before writing any lock, alias or unit, the resolver
 requires the exported `HOME` to equal the real account home and the unit directory
 to appear in the user manager's `UnitPath`. Missing or mismatched identities refuse
-access before publication. Both manager properties use one ANSI-C byte decoder,
-including paths with spaces and non-ASCII characters.
+access before publication. One decoder handles the manager environment's ANSI-C
+quoting and UnitPath's generic double quoting, including spaces and non-ASCII paths.
+
+The five shipped units also pin their direct activation dependencies. Unshipped
+services refuse admission. Additional OS defaults may be passive targets or slices
+only when the manager reports protected vendor/generated inputs, without user-write
+authority or untrusted overrides. This permits new vendor default names after an
+OS upgrade. The shipped, inactive network target may be absent. Transitive platform
+target dependencies are outside this five-unit policy.
+
+Auxiliary dependency and override inputs across the manager's load paths must
+match the shipped deployment too. Retained `.wants`, `.requires`, `.upholds` or
+nonempty drop-in directories refuse before installation writes, even when the base
+units are absent. Remove the unshipped inputs and reload the manager before retrying.
 Pending reloads require
 `systemctl --user daemon-reload`; masked units require `systemctl --user unmask`.
 For a partial graph, remove its partial five-unit installation, reload the manager,

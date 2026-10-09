@@ -142,8 +142,8 @@ def test_manager_unit_path_rejects_partial_or_invalid_arrays(monkeypatch, wire):
         deployment._manager_unit_paths()
 
 
-def test_unit_path_uses_same_byte_decoder_as_environment(monkeypatch):
-    wire = r"$'/public/user name/\303\251/systemd/user' /public/other"
+def test_unit_path_uses_generic_mode_of_shared_decoder(monkeypatch):
+    wire = '"/public/user name/\u00e9/systemd/user" /public/other'
     monkeypatch.setattr(deployment, "_read_manager_command", lambda _: wire)
     assert deployment._manager_unit_paths() == (
         Path("/public/user name/\u00e9/systemd/user"),

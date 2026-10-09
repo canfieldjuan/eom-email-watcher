@@ -315,7 +315,7 @@ if args==['--user','show-environment']:
                 XDG_DATA_HOME=os.environ.get('XDG_DATA_HOME',str(home/'.local/share')))
     print('\\n'.join(k+'='+systemd_quote(v) for k,v in values.items()))
 elif args==['--user','show','--property=UnitPath','--value']:
-    print(systemd_quote(str(config/'systemd/user')))
+    print(systemd_quote(str(config/'systemd/user'),posix=False))
 elif args[:2]==['--user','show']:
     directory=config/'systemd/user'
     loaded=all((directory/name).is_file() for name in UNIT_NAMES)

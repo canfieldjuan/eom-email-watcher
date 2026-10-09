@@ -90,7 +90,12 @@ def paired_deployment(tmp_path, monkeypatch):
         def output(names):
             assert names == deployment.UNIT_NAMES
             calls.append("snapshot")
-            return render_unit_records(records)
+            return render_unit_records({
+                name: {key: value for key, value in record.items()
+                       if key in deployment._MANAGER_FIELDS}
+                for name, record in records.items()
+                if name in deployment.UNIT_NAMES or hasattr(deployment, "_PLATFORM_SELECTORS")
+            })
 
         monkeypatch.setattr(deployment, "_manager_output", output)
         return binary, records, calls, directory

@@ -133,10 +133,10 @@ def test_existing_connect_environment_supplies_complete_empty_manager(tmp_path, 
     monkeypatch.setenv("PATH", environment["PATH"])
     monkeypatch.setenv("HOME", str(tmp_path))
     records = deployment._manager_snapshot(deployment.UNIT_NAMES)
-    assert set(records) == set(deployment.UNIT_NAMES)
+    assert set(deployment.UNIT_NAMES).issubset(records)
     assert all(
         record["LoadState"] == "not-found" and record["ActiveState"] == "inactive"
-        for record in records.values()
+        for name, record in records.items() if name in deployment.UNIT_NAMES
     )
 
 
@@ -171,7 +171,7 @@ def test_connect_manager_runs_in_the_actual_isolated_environment(tmp_path):
             "--all",
             "--no-pager",
             "--property=" + ",".join(deployment._MANAGER_FIELDS),
-            *deployment.UNIT_NAMES,
+            *deployment.UNIT_NAMES, *deployment._PLATFORM_SELECTORS,
         ],
         env=environment,
         capture_output=True,

@@ -480,7 +480,7 @@ def test_store_admission_launches_one_actual_manager_process(
             "--all",
             "--no-pager",
             "--property=" + ",".join(deployment._MANAGER_FIELDS),
-            *deployment.UNIT_NAMES,
+            *deployment.UNIT_NAMES, *deployment._PLATFORM_SELECTORS,
         ]
     ]
 

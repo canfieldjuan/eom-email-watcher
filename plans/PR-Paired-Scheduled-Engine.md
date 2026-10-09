@@ -1016,3 +1016,33 @@ scalar values. Extend the independently captured formatter matrix and regression
 with Unicode whitespace paths in both wire modes and scalar FragmentPath lines.
 Keep ASCII malformed/adjacent/escape negatives. Rebuild native after this correction;
 reuse the same v10 oracle and do not overwrite already cited v11 artifacts.
+
+
+### Activation/wire correction qualification
+
+Local accepted correction complete. Cold audit alias cold-diff-audit-v11-final.md
+covers the origin ownership and declared differences. Published91dc098 original
+probe18failed1passed and committed whole-class replay109failed1passed; final
+adjacent/original regression suite417passed, collection owner1passed. Unicode
+framing7fail-before7pass-after. Collection/activation/input/provenance/default-name/
+wire/separator/command-array mutations are caught. Actual formatter52rows and
+captured manager100records/two helper commands qualify the corrected transport.
+
+Final native SHA256
+e4151c92e9096e4fe8a1fa0cff30d5f09ec3e44dd62eed31c1542c0aa1b8a433.
+freeze-receipt-v11-final.json SHA256
+ebb7f30983dd8e1d871d3331acd4f106cb5b29e092316ccc39828b7b0c923a43
+binds compiled modules and unchanged five payloads. Reused v10 oracle remains
+identical:38negative cases, public fixture, paired upgrade/overlap, actual native
+Store cleanup exclusion and desktop receiver. packaged-schema-proof-v11-final.json
+SHA256 e8ad2272eb900dbc21665d9199be2f84f2643a6b9a1a0a33b56b4b8473c1a205.
+Additional native24activation refusals preserve schema28/digest; unknown protected
+vendor target succeeds. native-activation-proof-v11-final.json SHA256
+c3145cbb21fc83cd7f9058258f1e5d1966c1c9b0a9f8d0ab4305cb86eff2ca7d.
+Native space/UTF8 install/init/health/alias succeeds; native-path-wire-v11-final.json
+SHA256 28c6e795412b0f96b0e1938b122109c045ca43a2cfe298a9115095a7f6c51c30.
+All evidence is durable outside the checkout; external manager/NSS/public-data
+substitutions are explicit. No normal-profile/model/mail changes.
+
+Gap audit: DONE implementation/local origin proof/parity/mutations/cold audit;
+NOT DONE exact-head CI and independent oversight after grouped push. Hold remains.
