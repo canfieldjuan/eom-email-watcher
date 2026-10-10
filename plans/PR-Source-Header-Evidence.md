@@ -1,6 +1,6 @@
 # Source-header evidence prerequisite (F3)
 
-Status: PROPOSED. Contract and plan only; implementation follows acceptance.
+Status: ACCEPTED. The operator accepted this plan; plan PR #229 merged as `b24e099c4d9c1cd237affa2712c71d28f853bc8c`. Implementation follows in a separate PR.
 
 ## Contract
 
@@ -29,7 +29,7 @@ No timezone backfill, recipient replacement, extra provider fetch, admission cha
 
 Schema 30 has no reliable independent source-header fact. Existing confirmation timestamps can contain the demonstrated false positive; recipient rows and capture context cannot distinguish every fetched copy. The migration therefore conservatively discards confirmation once and reconstructs no header evidence. This can increase future discovery fetches within its existing bounds, but migration itself performs no network or model calls.
 
-Schema 31 is currently unimplemented but reserved by the accepted M2 plan. This prerequisite consumes 31; M2.2, M2.3, and M2.4 become 32, 33, and 34. M2.2's messages-rebuild backup becomes `pre-v32`, with source version 31. This renumbering changes no accepted milestone behavior or backup guarantees. Acceptance of this amendment is required before implementation.
+Schema 31 is currently unimplemented but reserved by the accepted M2 plan. This prerequisite consumes 31; M2.2, M2.3, and M2.4 become 32, 33, and 34. M2.2's messages-rebuild backup becomes `pre-v32`, with source version 31. This renumbering changes no accepted milestone behavior or backup guarantees. The operator accepted this amendment before implementation.
 
 ## Implementation plan
 
@@ -60,7 +60,7 @@ Run targeted regression and adjacent DB/service tests, Ruff, and the thread-view
 
 ## Implementation summary
 
-This PR contains the proposed owning definition, prerequisite plan, and future schema-reference changes only. Runtime code and repository regression tests are not yet modified. Private evidence is durable outside the worktree and can be cited by alias and SHA256 in the PR.
+Plan PR #229 contained the owning definition, prerequisite plan, and future schema-reference changes only. Its diff did not modify runtime code or repository regression tests. Private evidence is durable outside the worktree and can be cited by alias and SHA256 in the PR.
 
 ## Cold diff audit
 
@@ -72,4 +72,4 @@ This PR contains the proposed owning definition, prerequisite plan, and future s
 
 NOT DONE
 
-Implementation, passing regression evidence, migration qualification, and exact-head implementation review remain pending acceptance of this plan. The plan does not claim that M2.3 discovery or source evidence has shipped.
+Plan PR #229 did not implement or qualify the runtime change. Implementation evidence and exact-head implementation review belong to the separate implementation PR. The plan does not claim that M2.3 discovery or source evidence has shipped.

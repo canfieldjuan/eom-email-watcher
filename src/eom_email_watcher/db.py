@@ -48,7 +48,7 @@ from .mailbox import (
 from .mime import AttachmentDescriptor, body_was_truncated
 from .text import within_utf8_bytes
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -3367,10 +3367,7 @@ CREATE TABLE IF NOT EXISTS message_locations (
     mailbox_identity_key TEXT NOT NULL,
     provider_message_id TEXT NOT NULL,
     location TEXT NOT NULL CHECK (location IN ('inbox', 'sent')),
-    -- When the folders were observed with every admitted folder in scope. NULL for a
-    -- row the schema-30 migration assumed (the pre-M2 poller admitted from the Inbox
-    -- only) or observed while Sent was out of scope: neither says whether the message
-    -- is also in Sent. The first observation under full scope stamps it.
+    -- Confirmation cache computed by the source-observation owner (D-identity).
     recorded_at TEXT,
     -- The copy's own receive time when this location came from a captured copy that
     -- got no row of its own (contract D-identity); the purge keeps the logical
@@ -3390,6 +3387,44 @@ BEGIN
     DELETE FROM messages WHERE logical_of = OLD.message_id;
 END;
 """
+
+
+SOURCE_OBSERVATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS message_source_observations (
+    message_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    mailbox_identity_key TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL,
+    headers_observed_at TEXT CHECK (headers_observed_at IS NULL OR headers_observed_at <> ''),
+    folder_observed_at TEXT NOT NULL CHECK (folder_observed_at <> ''),
+    folder_complete INTEGER NOT NULL CHECK (folder_complete IN (0, 1)),
+    PRIMARY KEY (provider, account_id, mailbox_identity_key, provider_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_source_observations_message
+    ON message_source_observations(message_id);
+CREATE TRIGGER IF NOT EXISTS messages_delete_source_observations
+AFTER DELETE ON messages
+BEGIN
+    DELETE FROM message_source_observations WHERE message_id = OLD.message_id;
+END;
+"""
+
+
+def _reparent_logical_sources(db: sqlite3.Connection, old: str, new: str) -> None:
+    """Move logical-owned sources, preserving all per-row historical payloads."""
+    for table in ("message_locations", "message_source_observations"):
+        db.execute(f"UPDATE {table} SET message_id = ? WHERE message_id = ?", (new, old))
+    recipients = db.execute(
+        "SELECT field, address FROM message_recipients WHERE message_id = ? ORDER BY position",
+        (old,),
+    ).fetchall()
+    _record_recipients(
+        db,
+        message_id=new,
+        to=tuple(str(r["address"]) for r in recipients if r["field"] == "to"),
+        cc=tuple(str(r["address"]) for r in recipients if r["field"] == "cc"),
+    )
 
 
 def _effective_message_identity_sql(alias: str) -> str:
@@ -3459,7 +3494,11 @@ def _stored_source_membership_sql() -> str:
 
 
 def _bind_pending_legacy_identity(
-    db: sqlite3.Connection, provider: str, account_id: str, *, message_id: str | None = None,
+    db: sqlite3.Connection,
+    provider: str,
+    account_id: str,
+    *,
+    message_id: str | None = None,
 ) -> None:
     """Bind only workable legacy rows whose effective identity is the connected mailbox."""
     rows = db.execute(
@@ -3499,19 +3538,7 @@ def _bind_pending_legacy_identity(
             "UPDATE messages SET logical_of = ? WHERE message_id = ? OR logical_of = ?",
             (successor, root, root),
         )
-        db.execute(
-            "UPDATE message_locations SET message_id = ? WHERE message_id = ?",
-            (successor, root),
-        )
-        recipients = db.execute(
-            "SELECT field, address FROM message_recipients WHERE message_id = ? ORDER BY position",
-            (root,),
-        ).fetchall()
-        _record_recipients(
-            db, message_id=successor,
-            to=tuple(str(r["address"]) for r in recipients if r["field"] == "to"),
-            cc=tuple(str(r["address"]) for r in recipients if r["field"] == "cc"),
-        )
+        _reparent_logical_sources(db, root, successor)
         _requeue_if_skipped(db, successor)
 
 
@@ -3656,22 +3683,59 @@ def _record_locations(
     mailbox_identity_key: str,
     provider_message_id: str,
     locations: Iterable[str],
-    recorded_at: str | None,
+    observed_at: str,
+    scope_complete: bool,
+    headers_observed: bool,
     received_at: str | None = None,
 ) -> int:
-    """Record one observation of a source identity's admitted folders (D-identity).
-
-    Returns the number of new rows. recorded_at says whether the observation was
-    complete (every admitted folder in scope, plan step 5): a complete one stamps
-    the source's rows, an incomplete one (None) clears their stamp, so the stamp
-    always describes the latest observation. received_at is the copy's own
-    receive time when the copy got no row of its own, so the purge can see it.
-    """
-    recorded = 0
+    """One transactional source-observation owner (contract D-identity)."""
+    locations = frozenset(locations)
+    if not locations <= MESSAGE_LOCATIONS:
+        raise ValueError("unknown message location")
+    if headers_observed and not locations:
+        raise ValueError("header observation requires an admitted location")
+    at = datetime.fromisoformat(observed_at)
+    if at.tzinfo is None:
+        raise ValueError("source observation time requires a timezone")
+    at = at.astimezone(UTC)
+    stamp = at.isoformat()
     source = (provider, account_id, mailbox_identity_key, provider_message_id)
-    for location in sorted(set(locations)):
-        if location not in MESSAGE_LOCATIONS:
-            raise ValueError(f"unknown message location {location!r}")
+    earlier = db.execute(
+        """SELECT headers_observed_at, folder_observed_at, folder_complete
+        FROM message_source_observations WHERE provider = ? AND account_id = ?
+        AND mailbox_identity_key = ? AND provider_message_id = ?""",
+        source,
+    ).fetchone()
+    header_at = stamp if headers_observed else None
+    selected_at, complete = stamp, scope_complete
+    if earlier is not None:
+        prior_at = datetime.fromisoformat(earlier["folder_observed_at"])
+        # Wall-clock rollback can defer a genuinely newer event;
+        # the next observation/discovery repairs it (accepted plan oversight P3).
+        if prior_at > at:
+            selected_at, complete = earlier["folder_observed_at"], bool(earlier["folder_complete"])
+        elif prior_at == at:
+            complete = scope_complete and bool(earlier["folder_complete"])
+        prior_header = earlier["headers_observed_at"]
+        if prior_header is not None and (
+            header_at is None or datetime.fromisoformat(prior_header) > at
+        ):
+            header_at = prior_header
+    db.execute(
+        """INSERT INTO message_source_observations(
+            message_id, provider, account_id, mailbox_identity_key, provider_message_id,
+            headers_observed_at, folder_observed_at, folder_complete
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(provider, account_id, mailbox_identity_key, provider_message_id)
+        DO UPDATE SET message_id = excluded.message_id,
+            headers_observed_at = excluded.headers_observed_at,
+            folder_observed_at = excluded.folder_observed_at,
+            folder_complete = excluded.folder_complete""",
+        (message_id, *source, header_at, selected_at, int(complete)),
+    )
+    recorded_at = selected_at if complete and header_at is not None else None
+    recorded = 0
+    for location in sorted(locations):
         recorded += db.execute(
             """INSERT OR IGNORE INTO message_locations(
                 message_id, provider, account_id, mailbox_identity_key,
@@ -3687,6 +3751,29 @@ def _record_locations(
         (recorded_at, received_at, *source),
     )
     return recorded
+
+
+def _migrate_source_observations(db: sqlite3.Connection, observed_at: str) -> None:
+    """Do not reconstruct header evidence from schema-30 proxies."""
+    rows = db.execute(
+        """SELECT DISTINCT message_id, provider, account_id, mailbox_identity_key,
+        provider_message_id FROM message_locations"""
+    ).fetchall()
+    # Discard proxy evidence if a test/partially initialized old schema carries it.
+    db.execute("DELETE FROM message_source_observations")
+    for row in rows:
+        _record_locations(
+            db,
+            message_id=row["message_id"],
+            provider=row["provider"],
+            account_id=row["account_id"],
+            mailbox_identity_key=row["mailbox_identity_key"],
+            provider_message_id=row["provider_message_id"],
+            locations=(),
+            observed_at=observed_at,
+            scope_complete=False,
+            headers_observed=False,
+        )
 
 
 def _ensure_sent_capture_tables(db: sqlite3.Connection) -> None:
@@ -3813,7 +3900,7 @@ def _refresh_logical_messages_view(db: sqlite3.Connection) -> None:
     )
 
 
-def _migrate_sent_capture(db: sqlite3.Connection) -> None:
+def _migrate_sent_capture(db: sqlite3.Connection, observed_at: str) -> None:
     """Schema 30 rows: every message has a location; rows that are one message coalesce."""
     db.execute(
         """CREATE INDEX IF NOT EXISTS idx_messages_logical_identity
@@ -3844,7 +3931,9 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
             provider_message_id=str(row["provider_message_id"]),
             locations=(INBOX_LOCATION,),
             # Assumed, not observed: the pre-M2 poller admitted from the Inbox only.
-            recorded_at=None,
+            observed_at=observed_at,
+            scope_complete=False,
+            headers_observed=False,
         )
     # Rows sharing a logical identity are one message (contract D-identity): the
     # row in the most advanced processing state keeps the identity (notified, then
@@ -3883,10 +3972,7 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
             db.execute(
                 "UPDATE messages SET logical_of = ? WHERE message_id = ?", (canonical, duplicate)
             )
-            db.execute(
-                "UPDATE message_locations SET message_id = ? WHERE message_id = ?",
-                (canonical, duplicate),
-            )
+            _reparent_logical_sources(db, duplicate, canonical)
 
 
 MAX_THREAD_KEY_BYTES = 512
@@ -5371,17 +5457,19 @@ class Store:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        migration_observed_at = datetime.now(UTC).isoformat()
         with self.connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
+            db.execute("BEGIN IMMEDIATE")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Database schema version {version} is newer than supported "
                     f"version {SCHEMA_VERSION}"
                 )
-            db.executescript(
+            _execute_transactional_script(
+                db,
                 """
-                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS mailbox_state (
                     provider TEXT NOT NULL,
                     account_id TEXT NOT NULL,
@@ -5721,8 +5809,11 @@ class Store:
                 """,
             )
             _ensure_sent_capture_tables(db)
+            _execute_transactional_script(db, SOURCE_OBSERVATION_SCHEMA)
             _migrate_thread_identity(db)
-            _migrate_sent_capture(db)
+            _migrate_sent_capture(db, migration_observed_at)
+            if version < 31:
+                _migrate_source_observations(db, migration_observed_at)
             _refresh_logical_messages_view(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
@@ -8619,19 +8710,35 @@ class Store:
             )
 
     def clear_location_stamps(
-        self, provider: str, account_id: str, mailbox_identity_key: str
+        self,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str,
+        *,
+        now: datetime | None = None,
     ) -> None:
-        """A gap in polling makes every observation of the account incomplete.
-
-        A cursor that expired or recovered may have missed folder changes, so the
-        stamps are cleared and discovery (plan step 16) observes the messages again.
-        """
+        """Record an account's polling gap through the source-observation owner."""
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
-            db.execute(
-                """UPDATE message_locations SET recorded_at = NULL
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """SELECT DISTINCT message_id, provider_message_id FROM message_locations
                 WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?""",
                 (provider, account_id, mailbox_identity_key),
-            )
+            ).fetchall()
+            for row in rows:
+                _record_locations(
+                    db,
+                    message_id=row["message_id"],
+                    provider=provider,
+                    account_id=account_id,
+                    mailbox_identity_key=mailbox_identity_key,
+                    provider_message_id=row["provider_message_id"],
+                    locations=(),
+                    observed_at=stamp,
+                    scope_complete=False,
+                    headers_observed=False,
+                )
 
     def message_sources(self, message_id: str) -> tuple[MessageSource, ...]:
         """Every source identity a logical message can be read from (contract D-identity).
@@ -8815,6 +8922,16 @@ class Store:
             thread_key = _provider_thread_key(thread_id)
         if not locations:
             raise ValueError("a captured message names at least one admitted folder")
+        placeholders = ", ".join("?" for _ in suppression_keys)
+        if (
+            db.execute(
+                f"SELECT 1 FROM suppressed_messages WHERE provider = ? AND account_id = ? "
+                f"AND message_key IN ({placeholders}) LIMIT 1",
+                (provider, account_id, *suppression_keys),
+            ).fetchone()
+            is not None
+        ):
+            return False
         # A second location of an already-captured logical identity is recorded,
         # not captured again (contract D-identity).
         if rfc_message_id is not None:
@@ -8835,7 +8952,9 @@ class Store:
                     mailbox_identity_key=mailbox_identity_key,
                     provider_message_id=source_message_id,
                     locations=locations,
-                    recorded_at=discovered_at if scope_complete else None,
+                    observed_at=discovered_at,
+                    scope_complete=scope_complete,
+                    headers_observed=True,
                     received_at=received_at,
                 )
                 _record_recipients(db, message_id=logical_id, to=to, cc=cc)
@@ -8847,20 +8966,14 @@ class Store:
                         db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
                     )
                 return False
-        placeholders = ", ".join("?" for _ in suppression_keys)
         cursor = db.execute(
-            f"""INSERT OR IGNORE INTO messages(
+            """INSERT OR IGNORE INTO messages(
                 message_id, provider, account_id, mailbox_identity_key, provider_message_id,
                 thread_id, sender, sender_name, subject, received_at, discovered_at,
                 admission_kind, admission_selector_id, admission_display_name,
                 admission_mailbox_identity_key, admitted_at, thread_key, rfc_message_id,
                 capture_timezone
-            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            WHERE NOT EXISTS (
-                SELECT 1 FROM suppressed_messages
-                WHERE provider = ? AND account_id = ?
-                  AND message_key IN ({placeholders})
-            )""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 message_id,
                 provider,
@@ -8881,9 +8994,6 @@ class Store:
                 thread_key,
                 rfc_message_id,
                 capture_timezone,
-                provider,
-                account_id,
-                *suppression_keys,
             ),
         )
         inserted = cursor.rowcount == 1
@@ -8901,7 +9011,9 @@ class Store:
                 mailbox_identity_key=mailbox_identity_key,
                 provider_message_id=source_message_id,
                 locations=locations,
-                recorded_at=discovered_at if scope_complete else None,
+                observed_at=discovered_at,
+                scope_complete=scope_complete,
+                headers_observed=True,
             )
         return inserted
 
@@ -8926,7 +9038,9 @@ class Store:
         locations: frozenset[str] = frozenset({INBOX_LOCATION}),
         scope_complete: bool = True,
         capture_timezone: str | None = None,
+        observed_at: datetime | None = None,
     ) -> bool:
+        stamp = (observed_at or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             return self._insert_message_in_transaction(
@@ -8942,7 +9056,7 @@ class Store:
                 subject=subject,
                 received_at=received_at,
                 admission=admission,
-                discovered_at=datetime.now(UTC).isoformat(),
+                discovered_at=stamp,
                 rfc_message_id=rfc_message_id,
                 reply_ids=reply_ids,
                 to=to,
@@ -9055,17 +9169,15 @@ class Store:
         to: tuple[str, ...] = (),
         cc: tuple[str, ...] = (),
         scope_complete: bool = True,
-        headers_observed: bool = True,
+        headers_observed: bool,
         now: datetime | None = None,
     ) -> int:
         """Record an observation of a stored source identity's folders; new rows.
 
         The folders may be empty (the message is in none of the folders in scope);
         the observation still stamps or clears the source's rows (_record_locations).
-        A stamp means folders and headers were both observed (plan step 5): a
-        retained row, whose headers were never fetched, is stamped only by an
-        observation that fetched them, never by a change record's folders alone.
-        Recipients that came with the observation fill a row that has none.
+        The source-observation owner computes confirmation (contract D-identity).
+        Only accepted header observations may fill missing recipients.
         """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
@@ -9078,14 +9190,6 @@ class Store:
             ).fetchone()
             if row is None:
                 return 0
-            retained = (
-                db.execute(
-                    "SELECT capture_timezone IS NULL FROM messages WHERE message_id = ?",
-                    (str(row["logical_id"]),),
-                ).fetchone()[0]
-                == 1
-            )
-            complete = scope_complete and (headers_observed or not retained)
             recorded = _record_locations(
                 db,
                 message_id=str(row["logical_id"]),
@@ -9094,9 +9198,12 @@ class Store:
                 mailbox_identity_key=mailbox_identity_key,
                 provider_message_id=provider_message_id,
                 locations=locations,
-                recorded_at=stamp if complete else None,
+                observed_at=stamp,
+                scope_complete=scope_complete,
+                headers_observed=headers_observed,
             )
-            _record_recipients(db, message_id=str(row["logical_id"]), to=to, cc=cc)
+            if headers_observed:
+                _record_recipients(db, message_id=str(row["logical_id"]), to=to, cc=cc)
             if locations:
                 # A folder observed again is a readable source again, new row or not.
                 _requeue_if_skipped(db, str(row["logical_id"]))
