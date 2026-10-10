@@ -57,6 +57,60 @@ def test_retained_fetched_headers_persist(tmp_path: Path, to):
         )
 
 
+
+@pytest.mark.parametrize("to", [(), ("vendor@example.com",)])
+def test_join_capture_persists_its_own_header_evidence(tmp_path: Path, to):
+    store, root, _ = _coalesced_pair(tmp_path)
+    scope = {**_source_scope(store, root), "provider_message_id": "imap:sent:77:3"}
+    assert store.add_message(
+        message_id="joined-copy",
+        **scope,
+        thread_id="<root@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="root@x",
+        locations=frozenset({"sent"}),
+        scope_complete=False,
+        to=to,
+        observed_at=FIRST,
+    ) is False
+    assert _stamps(store, scope) == [None]
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT count(*) FROM messages WHERE message_id = 'joined-copy'"
+        ).fetchone()[0] == 0
+    store = Store(store.path)
+    store.initialize()
+    later = FIRST + timedelta(seconds=1)
+    store.record_message_location(
+        **scope, locations=frozenset({"sent"}), headers_observed=False, now=later
+    )
+    assert _stamps(store, scope) == [later.isoformat()]
+
+
+@pytest.mark.parametrize("headers_observed", [False, True])
+def test_recipient_write_requires_header_observation(tmp_path: Path, headers_observed):
+    store, root, _ = _coalesced_pair(tmp_path)
+    scope = _source_scope(store, root)
+    store.record_message_location(
+        **scope,
+        locations=frozenset({"inbox"}),
+        headers_observed=headers_observed,
+        to=("to@vendor.com",),
+        cc=("cc@vendor.com",),
+        now=FIRST,
+    )
+    with store.connection() as db:
+        actual = [tuple(r) for r in db.execute(
+            "SELECT field, address FROM message_recipients WHERE message_id = ? "
+            "ORDER BY field", (root,),
+        )]
+    assert actual == ([("cc", "cc@vendor.com"), ("to", "to@vendor.com")]
+                      if headers_observed else [])
+
+
 def test_unfetched_copy_cannot_borrow_capture_context(tmp_path: Path):
     store, root, duplicate = _coalesced_pair(tmp_path)
     with store.connection() as db:
