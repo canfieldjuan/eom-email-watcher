@@ -335,7 +335,7 @@ unknown-size descriptor never matches and a real zero-byte attachment matches
 only when the provider explicitly supplied verified integer zero. Other
 attachment predicates and `attachment.count` may still use that descriptor.
 
-`attachment.document_class` is a per-attachment condition whose value comes from attachment inspection, not from the message. A rule that carries it still needs its `attachment.media_type` condition. It is never decided inside `mark_analyzed`, so the matcher still reads no provider output: a rule that carries it commits a class check there instead of a fire, counted with fires toward `MAX_AUTOMATION_FIRES_PER_MESSAGE`, and the check resolves later, in the pump. That resolution is the one other place fires are created. `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules) owns its timing, the rule revision a check matches, its identity fence, and what disabling or deleting a rule does to open checks; this contract owns the condition's syntax only.
+`attachment.document_class` is a per-attachment condition whose value comes from attachment inspection, not from the message. The existing required `attachment.media_type` selector still applies. `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules) owns class-check creation and resolution, fan-out accounting, rule-version binding, identity fencing, and cancellation; this contract owns the condition's syntax only.
 
 Filename matching is platform-independent: replace `\\` with `/` in the
 persisted filename, take the final slash-delimited component, case-fold both it

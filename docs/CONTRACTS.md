@@ -1073,9 +1073,7 @@ flag is part of the active-invocation identity, so an `engine` invocation
 never joins, and is never joined by, any other. Every other rule here applies
 to `engine` jobs unchanged: lanes, the 25-job cap, first-in-first-out order,
 the admission deadline, reconciliation, source locks, and cleanup. The
-inspection contract decides when an `engine` job may be enqueued: only while
-no other job waits in its lane and no other `engine` job there is
-nonterminal.
+inspection contract (I-budget) owns when an `engine` job may be enqueued.
 
 If a legacy database already contains multiple active rows for one fingerprint,
 migration preserves every identity as `reconciling` rather than discarding work
