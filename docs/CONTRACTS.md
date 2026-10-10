@@ -1063,10 +1063,10 @@ Every v2 job is either an `engine` job (attachment inspection or extraction)
 or not, recorded immutably in the transaction that inserts its row. Every job
 created as today, and every job that exists when this amendment is installed,
 is not an `engine` job and keeps today's authorization and joining rules
-unchanged, including a legacy job joined by both an interactive invocation and
-a fire. An `engine` job is bound to its message, part, inspection attempt,
+unchanged. An `engine` job is bound to its message, part, inspection attempt,
 capability identity and version, provider instance, and input SHA-256. Every
-POST of an `engine` job revalidates both `connect.capability_exchange` and
+POST of an `engine` job consumes the current explicit selection recorded by
+attachment inspection (I-selection), and revalidates both `connect.capability_exchange` and
 `connect.automations`; without either, a job proven not accepted fails with
 the existing `CONNECT_ENTITLEMENT_REQUIRED` error and no POST. The `engine`
 flag is part of the active-invocation identity, so an `engine` invocation

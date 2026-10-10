@@ -483,10 +483,9 @@ rule-set revision, and existing scheduling admission with
 attempts, and never evaluates or commits a truncated descriptor/fire subset.
 Normal evaluation clears the nullable error field. Provider MIME traversal,
 attachment-name materialization, and descriptor persistence predate this engine
-and remain unchanged, except that attachment inspection records each part's
-effective media type and Content-ID when descriptors are stored
-(`docs/ATTACHMENT_INSPECTION_CONTRACT.md`, I-scope); the matcher's attachment
-media type is that effective type; bounding that shared ingestion path is explicitly deferred
+and remain unchanged, except that attachment inspection records each part's Content-ID and embedded
+status before descriptors are stored (`docs/ATTACHMENT_INSPECTION_CONTRACT.md`,
+I-scope); bounding that shared ingestion path is explicitly deferred
 rather than smuggled into the Automate core.
 
 `mark_analyzed` remains the single commit boundary:
