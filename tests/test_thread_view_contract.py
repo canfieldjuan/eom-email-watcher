@@ -42,6 +42,7 @@ OWNED_PHRASES = {
         r"`INBOX` or `SENT` label",
         r"`\\Sent`",
         r"secure_delete",
+        r"all message-owned content and state",
         r"Sent mail unavailable",
     ],
     "D-capture": [
@@ -61,6 +62,7 @@ OWNED_PHRASES = {
         r"\*\*Its inputs\*\* are exactly",
         r"by any path",
         r"That list is illustrative",
+        r"stored attachment inventory, including descriptors and embedded status",
     ],
     "D-reconcile": [
         r"coverage record",
