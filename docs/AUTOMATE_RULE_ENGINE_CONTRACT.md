@@ -295,6 +295,7 @@ The closed matrix is:
 | `attachment.filename` | `glob` |
 | `attachment.byte_size` | `lte` |
 | `attachment.count` | `gte`, `lte` |
+| `attachment.document_class` | `equals`, `in` |
 
 Each admitted field/operator pair has one operand schema:
 
@@ -313,6 +314,8 @@ Each admitted field/operator pair has one operand schema:
 | `attachment.filename glob` | case-folded non-empty pattern, at most 512 characters, with no `/` or `\\` |
 | `attachment.byte_size lte` | strict integer from 0 through 104,857,600 |
 | `attachment.count gte/lte` | strict integer from 0 through 64 |
+| `attachment.document_class equals` | one of `invoice`, `quote`, `receipt`, `credit_note`, `statement`, `other`, `mixed`, `unknown` |
+| `attachment.document_class in` | 1..8 distinct members of that closed class set |
 
 Booleans are not integers for numeric operands. `in` never accepts a scalar;
 `equals` never accepts a list. `attachment.count` is only a rule-threshold
@@ -329,6 +332,8 @@ value; the compatibility integer remains zero in that case. A numeric
 unknown-size descriptor never matches and a real zero-byte attachment matches
 only when the provider explicitly supplied verified integer zero. Other
 attachment predicates and `attachment.count` may still use that descriptor.
+
+`attachment.document_class` is a per-attachment condition whose value comes from attachment inspection, not from the message. It is never decided inside the analysis transaction above: a rule that carries it commits a class check there instead of a fire, and the check resolves when that attachment's inspection settles under the active classifier. `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules) owns that timing, the rule revision a check matches, and what disabling or deleting a rule does to open checks; this contract owns the condition's syntax only.
 
 Filename matching is platform-independent: replace `\\` with `/` in the
 persisted filename, take the final slash-delimited component, case-fold both it
@@ -937,3 +942,4 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 13 (2026-09-12):** required evidence before legacy marker
   binding, failed closed on ambiguous overlapping recovery, and separated
   transient mailbox-identity lookup failures from invalid rule definitions.
+- **Amendment (2026-10-10, proposed with #231):** added the per-attachment `attachment.document_class` condition (`equals`, `in`) over attachment inspection's closed class set. Its evaluation timing belongs to `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules): it is decided when the attachment's inspection settles, never at analysis time, so an email's category can never stop classification.
