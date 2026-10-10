@@ -2262,7 +2262,7 @@ def test_gmail_validation_schema_bump_rejects_previous_binary(
     store.initialize()
 
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
     monkeypatch.setattr(db_module, "SCHEMA_VERSION", 26)
     with pytest.raises(RuntimeError, match="newer than supported version 26"):
@@ -2285,7 +2285,7 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         tables = {
             str(row["name"])
             for row in db.execute(
@@ -2341,7 +2341,7 @@ def test_schema_26_migrates_current_validation_with_explicit_catalog_state(
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert db.execute(
             "SELECT catalog_state FROM gmail_label_validation_sets"
         ).fetchone()[0] == "current"
@@ -6269,7 +6269,7 @@ def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path) -> None:
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         triggers = {
             str(row["name"])
             for row in db.execute(
@@ -6545,7 +6545,7 @@ def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
     assert len({keys[old], keys[first_copy], keys[idless], keys[malformed]}) == 4
     assert keys["microsoft-old"] not in {keys[old], keys[idless], keys[malformed]}
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert db.execute(
             "SELECT rfc_message_id FROM messages WHERE message_id = ?", (old,)
         ).fetchone()[0] == "old-root@x"
@@ -6907,11 +6907,16 @@ def test_record_message_location_adds_only_new_locations(tmp_path: Path) -> None
         "provider_message_id": row[3],
     }
     assert store.message_locations("gmail-1") == ["inbox"]
-    assert store.record_message_location(**scope, locations=frozenset({"inbox", "sent"})) == 1
-    assert store.record_message_location(**scope, locations=frozenset({"sent"})) == 0
+    assert store.record_message_location(**scope, locations=frozenset({"inbox", "sent"}),
+        headers_observed=True,
+    ) == 1
+    assert store.record_message_location(**scope, locations=frozenset({"sent"}),
+        headers_observed=True,
+    ) == 0
     assert store.message_locations("gmail-1") == ["inbox", "sent"]
     assert store.record_message_location(
-        **{**scope, "provider_message_id": "unknown"}, locations=frozenset({"sent"})
+        **{**scope, "provider_message_id": "unknown"}, locations=frozenset({"sent"}),
+        headers_observed=True,
     ) == 0
 
 
@@ -6931,7 +6936,7 @@ def test_schema_29_upgrade_locates_retained_rows_and_coalesces_duplicates(tmp_pa
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         logical = {
             row[0]: row[1]
             for row in db.execute("SELECT message_id, logical_of FROM messages").fetchall()
@@ -7007,6 +7012,7 @@ def test_imap_merge_ranks_by_the_smallest_recorded_location(tmp_path: Path) -> N
     assert store.record_message_location(
         provider="imap", account_id="imap-account", mailbox_identity_key=identity,
         provider_message_id="imap:mailbox:44:5", locations=frozenset({"sent"}),
+        headers_observed=True,
     ) == 1
     with store.connection() as db:
         db.execute(
@@ -7218,11 +7224,13 @@ def test_record_message_location_fills_missing_recipients_once(tmp_path: Path) -
         locations=frozenset({"sent"}),
         to=("a@vendor.com", "b@vendor.com"),
         cc=("c@o.com",),
+        headers_observed=True,
     ) == 1
     assert recipients() == expected
     # A later fetch never replaces what a row already has.
     store.record_message_location(
-        **scope, locations=frozenset({"sent"}), to=("other@vendor.com",)
+        **scope, locations=frozenset({"sent"}), to=("other@vendor.com",),
+        headers_observed=True,
     )
     assert recipients() == expected
 
@@ -7336,7 +7344,9 @@ def test_location_count_is_per_source_identity(tmp_path: Path) -> None:
     assert per_source(root_scope) == ["inbox"]
     assert per_source(duplicate_scope) == ["inbox"]
 
-    assert store.record_message_location(**duplicate_scope, locations=frozenset({"sent"})) == 1
+    assert store.record_message_location(**duplicate_scope, locations=frozenset({"sent"}),
+        headers_observed=True,
+    ) == 1
     assert per_source(duplicate_scope) == ["inbox", "sent"]
     assert per_source(root_scope) == ["inbox"]
     assert store.message_locations(root) == ["inbox", "sent"]
@@ -7356,9 +7366,11 @@ def test_upgrade_assumes_inbox_and_the_first_observation_stamps_it(tmp_path: Pat
         return [row[0] for row in rows]
 
     assert recorded() == [None]
-    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    observed_at = datetime.now(UTC) + timedelta(seconds=1)
     assert (
-        store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at)
+        store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at,
+            headers_observed=True,
+        )
         == 0
     )
     assert recorded() == [observed_at.isoformat()]
@@ -7424,9 +7436,10 @@ def test_locations_observed_with_sent_out_of_scope_are_not_stamped(tmp_path: Pat
         return [row[0] for row in rows]
 
     assert stamps() == [None]
-    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    observed_at = datetime.now(UTC) + timedelta(seconds=1)
     assert store.record_message_location(
-        **scope, locations=frozenset({"inbox", "sent"}), now=observed_at
+        **scope, locations=frozenset({"inbox", "sent"}), now=observed_at,
+        headers_observed=True,
     ) == 1
     assert stamps() == [observed_at.isoformat(), observed_at.isoformat()]
 
@@ -7517,11 +7530,15 @@ def test_an_incomplete_observation_clears_the_stamp_and_may_name_no_folder(
 
     assert stamps() != [None]
     # Observed with Sent out of scope, in no folder in scope: nothing new, stamp cleared.
-    assert store.record_message_location(**scope, locations=frozenset(), scope_complete=False) == 0
+    assert store.record_message_location(**scope, locations=frozenset(), scope_complete=False,
+        headers_observed=False,
+    ) == 0
     assert stamps() == [None]
     # A later complete observation stamps it again.
-    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
-    store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at)
+    observed_at = datetime.now(UTC) + timedelta(seconds=1)
+    store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at,
+        headers_observed=True,
+    )
     assert stamps() == [observed_at.isoformat()]
 
 
@@ -7538,7 +7555,7 @@ def test_a_change_record_never_stamps_a_retained_row(tmp_path: Path) -> None:
             ).fetchall()
         return [row[0] for row in rows]
 
-    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    observed_at = datetime.now(UTC) + timedelta(seconds=1)
     # A star on the retained row names its folders, but its headers were never fetched.
     store.record_message_location(
         **scope, locations=frozenset({"inbox", "sent"}), headers_observed=False, now=observed_at
@@ -7547,7 +7564,8 @@ def test_a_change_record_never_stamps_a_retained_row(tmp_path: Path) -> None:
     assert stamps() == [None, None]
     # The fetch that brings its headers completes the observation.
     store.record_message_location(
-        **scope, locations=frozenset({"inbox", "sent"}), to=("a@v.com",), now=observed_at
+        **scope, locations=frozenset({"inbox", "sent"}), to=("a@v.com",), now=observed_at,
+        headers_observed=True,
     )
     assert stamps() == [observed_at.isoformat(), observed_at.isoformat()]
 
@@ -7583,6 +7601,7 @@ def test_a_coalesced_copy_s_later_folder_is_recorded_on_its_logical_message(
         mailbox_identity_key=identity,
         provider_message_id="imap:sent:77:3",
         locations=frozenset({"inbox", "sent"}),
+        headers_observed=True,
     ) == 1
     assert store.message_locations(first) == ["inbox", "sent"]
 
@@ -7998,6 +8017,7 @@ def test_seen_legacy_source_without_locations_records_its_observation(tmp_path: 
     recorded = store.record_message_location(
         provider="imap", account_id="imap-account", mailbox_identity_key=identity,
         provider_message_id="imap:mailbox:44:1", locations=frozenset({"sent"}),
+        headers_observed=True,
     )
     assert recorded == 1, "SEEN_LEGACY_OBSERVATION_DROPPED"
     assert store.message_locations(root) == ["sent"]
@@ -8016,6 +8036,7 @@ def test_skipped_legacy_message_requeues_with_proven_pending_identity(
         store.record_message_location(
             provider="imap", account_id="imap-account", mailbox_identity_key=identity,
             provider_message_id="imap:mailbox:44:1", locations=frozenset({"inbox"}),
+            headers_observed=True,
         )
     assert store.message_source(root).mailbox_identity_key == identity, "LEGACY_REQUEUE_UNVERIFIED"
     assert [m.message_id for m in store.pending()] == [root]
@@ -8044,6 +8065,8 @@ def test_legacy_pending_source_collision_promotes_authorized_copy(
             "UPDATE messages SET logical_of = ? WHERE message_id IN (?, ?)",
             (root, child, sibling),
         )
+        db_module._reparent_logical_sources(db, child, root)
+        db_module._reparent_logical_sources(db, sibling, root)
     assert [m["message_id"] for m in store.recent(10)] == [root]
     with store.connection() as db:
         db.execute("DELETE FROM message_locations")
@@ -8057,6 +8080,7 @@ def test_legacy_pending_source_collision_promotes_authorized_copy(
             provider="imap", account_id="imap-account", mailbox_identity_key=identity,
             provider_message_id=original, locations=frozenset({"inbox"}),
             to=("owner@example.com",),
+            headers_observed=True,
         ) == 1
     else:
         with store.connection() as db:
@@ -8082,6 +8106,9 @@ def test_legacy_pending_source_collision_promotes_authorized_copy(
         ).fetchone()[0] == "Already completed"
         assert not db.execute(
             "SELECT 1 FROM message_locations WHERE message_id <> ?", (child,),
+        ).fetchall()
+        assert not db.execute(
+            "SELECT 1 FROM message_source_observations WHERE message_id <> ?", (child,),
         ).fetchall()
         if source == "observation":
             assert db.execute(
@@ -8281,7 +8308,9 @@ def test_a_skipped_message_is_queued_again_when_a_known_folder_is_observed_again
         "provider_message_id": row[3],
     }
     # The message left and re-entered the Inbox: no new row, but a readable source.
-    assert store.record_message_location(**scope, locations=frozenset({"inbox"})) == 0
+    assert store.record_message_location(**scope, locations=frozenset({"inbox"}),
+        headers_observed=True,
+    ) == 0
     assert [m.message_id for m in store.pending()] == ["gmail-1"]
 
 
