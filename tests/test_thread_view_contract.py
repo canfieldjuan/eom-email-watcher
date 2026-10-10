@@ -90,7 +90,7 @@ OWNED_PHRASES = {
         r"the anchor condition for where the two claims sit",
         r"selected record is its valid `invoice.extract` record",
         r"the document's own class, not the email, decides that the attachment is an invoice",
-        r"\*\*An attachment's inspection\*\* \(\[attachment inspection\]",
+        r"\*\*An attachment's classification evidence\*\*",
         r"\*\*A message's invoice\*\*, which only record pairing reads",
         r"\*\*record pairing\*\*, instead of both",
         r"marks the kind \*several\*",
