@@ -5460,15 +5460,16 @@ class Store:
         migration_observed_at = datetime.now(UTC).isoformat()
         with self.connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
+            db.execute("BEGIN IMMEDIATE")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Database schema version {version} is newer than supported "
                     f"version {SCHEMA_VERSION}"
                 )
-            db.executescript(
+            _execute_transactional_script(
+                db,
                 """
-                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS mailbox_state (
                     provider TEXT NOT NULL,
                     account_id TEXT NOT NULL,

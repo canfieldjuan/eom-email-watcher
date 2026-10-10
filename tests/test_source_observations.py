@@ -1,6 +1,7 @@
 """Source header facts and folder-event ordering at the storage boundary."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event
@@ -470,3 +471,63 @@ def test_real_schema30_upgrade_creates_table_atomically(tmp_path: Path, monkeypa
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
     assert _stamps(upgraded, scope) == [None]
+
+
+@pytest.mark.parametrize("newer_schema", [False, True])
+def test_delayed_initializer_does_not_repeat_header_invalidation(tmp_path: Path, newer_schema):
+    store, root, _ = _coalesced_pair(tmp_path)
+    scope = _source_scope(store, root)
+    with store.connection() as db:
+        db.execute("PRAGMA user_version = 30")
+    before_lock, resume = Event(), Event()
+
+    class DelayedConnection:
+        def __init__(self, db):
+            self.db = db
+
+        def __getattr__(self, name):
+            return getattr(self.db, name)
+
+        def wait_before_lock(self, sql):
+            if sql.lstrip().startswith("BEGIN IMMEDIATE"):
+                before_lock.set()
+                assert resume.wait(timeout=15)
+
+        def execute(self, sql, *args):
+            self.wait_before_lock(sql)
+            return self.db.execute(sql, *args)
+
+        def executescript(self, sql):
+            self.wait_before_lock(sql)
+            return self.db.executescript(sql)
+
+    class DelayedStore(Store):
+        @contextmanager
+        def connection(self):
+            with super().connection() as db:
+                yield DelayedConnection(db)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(DelayedStore(store.path).initialize)
+        try:
+            assert before_lock.wait(timeout=15)
+            store.initialize()
+            store.record_message_location(
+                **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
+            )
+            assert _stamps(store, scope) == [FIRST.isoformat()]
+            if newer_schema:
+                with store.connection() as db:
+                    db.execute(f"PRAGMA user_version = {db_module.SCHEMA_VERSION + 1}")
+        finally:
+            resume.set()
+        if newer_schema:
+            with pytest.raises(RuntimeError, match="newer than supported"):
+                pending.result(timeout=15)
+        else:
+            pending.result(timeout=15)
+    assert _stamps(store, scope) == [FIRST.isoformat()]
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == (
+            db_module.SCHEMA_VERSION + int(newer_schema)
+        )
