@@ -100,7 +100,7 @@ Each definition is the only place its rule is stated.
 - **Purge.**
   - A message outside a followed thread is purged once it is older than the cutoff, as today.
   - A followed thread is purged as one unit once its newest message is older than the cutoff (decision D1) and the account's coverage is current ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)), so a thread whose newer replies are still unfetched is kept.
-  - Purge takes all message-owned content and state, including bodies, claims, discrepancies, attempts, attachment inventory, classification evidence, operational status and reasons, and invoice records. The shared queue retains only the non-content reconciliation tombstone and lane ownership required by `docs/CONTRACTS.md` until an authoritative terminal outcome; it stores no late result content. Deletes run with `PRAGMA secure_delete = ON`.
+  - Purge takes all message-owned content and state, including bodies, claims, discrepancies, attempts, attachment inventory, classification evidence, operational status and reasons, and invoice records. The shared queue retains only the non-content reconciliation tombstone and lane ownership required by `docs/CONTRACTS.md` until an authoritative terminal outcome; it stores no late result content. Shared content-hash cache cleanup follows attachment inspection, I-cache. Deletes run with `PRAGMA secure_delete = ON`.
 
 ### D-capture: what is stored, and its provenance
 
@@ -165,7 +165,7 @@ Each definition is the only place its rule is stated.
   - the stored attachment classification evidence and its recorded selection provenance ([D-claims](#d-claims-claims-and-comparability)), from which record eligibility is computed. A change to that evidence is a change to this input.
 
   All of them live in the database. Mail-capture admission provenance and discovery order are never inputs.
-- **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`).
+- **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`). A Connect settlement in the background pump is the one exception: it holds the lane and source locks in the order `docs/CONTRACTS.md` fixes and recomputes in its own `BEGIN IMMEDIATE` transaction, which serializes it with every other writer.
   - The paths include capture, a recorded location, deletion, purge, an IMAP merge, a vendor record change, and a verified identity being added or changed. That list is illustrative; the rule is not.
 - **Only local work happens in that transaction.** It recomputes state and deletes what a definition no longer allows. Anything that needs a provider or the model, such as a body to fetch or claims to extract, is left to the reconcile pass ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)).
 
@@ -220,7 +220,7 @@ Each definition is the only place its rule is stated.
     - Never gated, and never calls a provider or model.
   - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, body storage, reconcile, and claim extraction.
     - All need the paid entitlement `connect.capability_exchange` (decision D3, `require_connect_entitlement`).
-  - **automation:** producing invoice records ([D-claims](#d-claims-claims-and-comparability)). Only the user's own enabled rule that runs `invoice.extract` produces them, so they need `connect.automations` as well, as every rule does (decision D5, `_require_automation_entitlement`). Claims from a stored record are derived state, not an operation, and need no entitlement.
+  - **automation:** inspecting explicitly selected attachments and producing invoice records (attachment inspection, I-selection and I-gate). Inspection and extraction require both `connect.capability_exchange` and `connect.automations` at handoff; an account being watched and a valid licence do not select artifacts. The shared queue owns the checks, as each operation requires (decision D5). Claims from a stored record are derived state, not an operation, and need no entitlement.
   - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, and dismissing a suggestion.
     - Never gated.
 - **The desktop shows controls by class.**
@@ -562,3 +562,5 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 
 - 2026-10-10: the first review of the isolated D5 draft found two omissions introduced by its split: D-scope enumerated settled evidence but omitted operational state, and D-derived omitted the attachment inventory that record pairing reads. The purge now covers all message-owned content and state while preserving the shared queue's reconciliation ownership; attachment descriptors and embedded status are explicit derived-state inputs. Operational vocabulary and embedded-part classification remain owned by consumer integration, and its generation-settlement scenario is removed from the claims-only draft.
 - 2026-10-10: the operator chose to keep existing verified PDF claims visible when checking is disabled and stop new checking/handoffs. D-claims consumes recorded evidence-selection provenance, not the current account switch. A cache hit or pre-existing record alone cannot authorize claims for an attachment never selected.
+
+- 2026-10-10: the separate inspection-pipeline proposal amends only purge ownership, settlement transaction integration, and the paid operation class here. D5 claims semantics remain the separate PR #234. Explicit selection stays required by shared ADR-0003.
