@@ -1068,7 +1068,7 @@ capability identity and version, provider instance, and input SHA-256. Every
 POST of an `engine` job consumes the current explicit selection recorded by
 attachment inspection (I-selection), and revalidates both `connect.capability_exchange` and
 `connect.automations`; without either, a job proven not accepted fails with
-the existing `CONNECT_ENTITLEMENT_REQUIRED` error and no POST. The `engine`
+the existing `CONNECT_ENTITLEMENT_REQUIRED` error and no POST. If the selection is revoked or no longer covers the source, a job proven not accepted instead fails terminally with `connect_selection_inactive`; a changed verified mailbox identity fails with `connect_mailbox_identity_changed`. Both are truthful no-POST outcomes consumed by I-state, not entitlement errors. These refusals require authoritative non-acceptance; possibly provider-owned identities keep reconciliation and lane ownership, with no unauthorized new POST. The `engine`
 flag is part of the active-invocation identity, so an `engine` invocation
 never joins, and is never joined by, any other. Every other rule here applies
 to `engine` jobs unchanged: lanes, the 25-job cap, first-in-first-out order,
