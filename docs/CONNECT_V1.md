@@ -149,7 +149,9 @@ The v1 protection is same-OS-user possession of a fresh per-process bearer token
 runtime registration. The provider rejects browser-Origin requests; the consumer rejects remote
 endpoints and redirects. This does not cryptographically authenticate an application against a
 hostile process running as the same user. Email Watcher grants no mailbox or credential-store access:
-only an explicitly selected attachment's bytes cross the boundary.
+only an explicitly selected attachment's bytes cross the boundary. Engine-origin attachment
+inspection and extraction are the one exception, decided by the operator on 2026-10-10 and owned by
+`docs/ATTACHMENT_INSPECTION_CONTRACT.md`.
 
 ## Deferred
 

@@ -1044,7 +1044,8 @@ different durable provider instances may run concurrently. Two capabilities on
 one instance may not.
 
 An active logical invocation is identified by the existing v2 invocation
-fingerprint together with its message and attachment. That fingerprint binds
+fingerprint together with its message, attachment, and origin (Job origin,
+below). That fingerprint binds
 the selected provider/version/instance, capability/version, trusted artifact
 identity, and canonical parameters; it excludes the caller-generated `job_id`.
 Enqueue performs active-fingerprint lookup and insertion in one immediate
@@ -1054,6 +1055,24 @@ the same active logical invocation, exactly one row wins and both callers
 receive that row's original stable `job_id`. A terminal failure permits a new
 explicit invocation; process-local click suppression is never the deduplication
 boundary.
+
+### Job origin
+
+Amended with `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (proposed in #231).
+Every v2 job carries an immutable origin, written in the transaction that
+inserts its row: `interactive` (a user's explicit invocation), `automation` (a
+rule fire's attempt), or `engine` (attachment inspection or extraction). An
+`engine` job is bound to its message, part, inspection attempt, capability
+identity and version, provider instance, and input SHA-256. Every POST of an
+`engine` job revalidates both `connect.capability_exchange` and
+`connect.automations`; without either, a job proven not accepted fails with
+the existing `CONNECT_ENTITLEMENT_REQUIRED` error and no POST. Because the
+origin is part of the active-invocation identity, an `engine` invocation never
+joins, and is never joined by, an invocation of another origin. Every other
+rule here applies to `engine` jobs unchanged: lanes, the 25-job cap,
+first-in-first-out order, the admission deadline, reconciliation, source
+locks, and cleanup. The inspection contract bounds how many `engine` jobs a
+lane may hold before it enqueues one.
 
 If a legacy database already contains multiple active rows for one fingerprint,
 migration preserves every identity as `reconciling` rather than discarding work
