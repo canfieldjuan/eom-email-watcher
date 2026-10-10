@@ -1925,7 +1925,6 @@ class Watcher:
                     locations=frozenset(),
                     scope_complete=False,
                     headers_observed=False,
-                    now=checked_at,
                 )
                 self.store.finish_gmail_recovery_candidate(
                     self.mailbox.account_id,
@@ -1943,6 +1942,7 @@ class Watcher:
                     provider_message_id,
                     timeout_seconds=remaining_seconds,
                 )
+                metadata_observed_at = datetime.now(UTC)
             except (MailboxMessageUnavailable, MailboxMessageInvalid):
                 self.store.finish_gmail_recovery_candidate(
                     self.mailbox.account_id,
@@ -2018,7 +2018,7 @@ class Watcher:
                     ),
                     admission=admission.provenance(),
                     metadata_label_ids=metadata.labels,
-                    now=checked_at,
+                    now=metadata_observed_at,
                 )
                 added += int(inserted)
             terminal += 1
@@ -2336,6 +2336,7 @@ class Watcher:
         An id that arrives with a folder observation but outside the batch (a Gmail
         continuation replays its prefix) is handled like any other: known or new.
         """
+        folder_observed_at = datetime.now(UTC)
         added = 0
         batch = set(message_ids)
         candidates = (*message_ids, *(i for i in known_locations if i not in batch))
@@ -2353,7 +2354,7 @@ class Watcher:
                     self._record_known_message_location(
                         provider_message_id,
                         mailbox_identity_key=mailbox_identity_key,
-                        checked_at=checked_at,
+                        observed_at=folder_observed_at,
                         folders=folders,
                         observed=hint,
                     )
@@ -2365,6 +2366,7 @@ class Watcher:
                 continue
             try:
                 metadata = self.gateway.metadata(provider_message_id)
+                metadata_observed_at = datetime.now(UTC)
             except MailboxMessageUnavailable as exc:
                 logger.info(
                     "Skipping message %s (gone before fetch): %s",
@@ -2433,6 +2435,7 @@ class Watcher:
                 cc=metadata.cc,
                 locations=_admitted_locations(metadata, metadata.labels, folders),
                 capture_timezone=self.config.timezone,
+                observed_at=metadata_observed_at,
                 scope_complete=_scope_complete(folders),
             ):
                 added += 1
@@ -2481,19 +2484,13 @@ class Watcher:
         provider_message_id: str,
         *,
         mailbox_identity_key: str,
-        checked_at: datetime,
+        observed_at: datetime,
         folders: frozenset[str],
         observed: FolderObservation,
     ) -> None:
-        """A known id came back through polling with its folders (contract D-identity).
+        """Forward a folder-only hint to the D-identity source-observation owner.
 
-        The change record says which folders the message is in, so nothing is fetched
-        (plan step 6). A record that is not a whole folder set and names no admitted
-        folder in scope (a star, a read) says nothing about folders and changes
-        nothing. Otherwise the folders in scope are recorded; the observation is
-        complete, and stamps the source's rows, only when the record carried the
-        whole set and every admitted folder was in scope (plan step 5), and clears
-        their stamp otherwise, so the message is observed again by discovery.
+        Partial hints naming no admitted folder convey no folder information.
         """
         if not observed.complete and not (observed.locations & folders):
             return
@@ -2505,7 +2502,7 @@ class Watcher:
             locations=observed.locations & folders,
             scope_complete=_scope_complete(folders) and observed.complete,
             headers_observed=False,
-            now=checked_at,
+            now=observed_at,
         )
 
     def _poll_sent_folder(

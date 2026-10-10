@@ -5734,6 +5734,12 @@ def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
     assert store.recent(5) == []
     assert store.state(provider="gmail", account_id="gmail-default")[0] == "200"
     gateway.whole = False
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    assert gateway.metadata_calls == 1
+    with store.connection() as db:
+        assert db.execute("SELECT count(*) FROM message_source_observations").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM message_recipients").fetchone()[0] == 0
 
     # The same message in both folders is admitted from the Inbox only.
     gateway.labels = frozenset({"INBOX", "SENT"})
@@ -6563,7 +6569,7 @@ def test_real_history_observation_controls_source_confirmation(
     )))
     observed = real.changes_since("100").locations["m"]
     Watcher(cfg, store, FakeGmail(), FakeModel())._record_known_message_location(
-        "m", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, checked_at=now,
+        "m", mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY, observed_at=datetime.now(UTC),
         folders=frozenset({"inbox", "sent"}), observed=observed,
     )
     with store.connection() as db:
