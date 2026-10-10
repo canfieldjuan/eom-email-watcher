@@ -75,7 +75,7 @@ What a slice captures is what its capture decision admits at the time; mail that
 4. **IMAP Sent identity.** Sent ids are `eom-imap-sent-v1:<mailbox_id>:<folder_sha256>:<UIDVALIDITY>:<UID>`, the folder token of C/D-identity. Inbox ids are unchanged. `_checked_uid` validates against the folder the id names (`imap.py:1500-1507`).
 5. **Storage (schema 30):**
    - `message_recipients(message_id, field, position, address)`, written at capture for every captured message. Outbound attribution reads it (C/D-attribution).
-   - `message_locations(message_id, provider, account_id, mailbox_identity_key, provider_message_id, location, recorded_at, received_at)`, primary key `(provider, account_id, mailbox_identity_key, provider_message_id, location)`. One source identity is recorded once per location, so a Gmail message with both labels has two rows under one id. `received_at` is the copy's own received time, recorded with a copy that joined an existing logical message (step 6), so the message's received time can be its newest copy's (C/D-scope). `recorded_at` says whether the source identity's latest observation was complete: folders and headers both. It is set when the folders were observed with every admitted folder in scope on a row whose headers were fetched; it is NULL when the row was assumed by the migration or when the latest observation came with Sent out of scope (step 2), which clears an earlier stamp, since neither says whether the message is also in Sent. A retained row, whose headers were never fetched, stays unstamped whatever a change record says about its folders, until the fetch that brings its recipients (discovery, step 16). A gap in polling (C/D-reconcile) clears every stamp of the account, since folder changes during it went unobserved.
+   - `message_locations(message_id, provider, account_id, mailbox_identity_key, provider_message_id, location, recorded_at, received_at)`, primary key `(provider, account_id, mailbox_identity_key, provider_message_id, location)`. One source identity is recorded once per location, so a Gmail message with both labels has two rows under one id. `received_at` is the copy's own received time, recorded with a copy that joined an existing logical message (step 6), so the message's received time can be its newest copy's (C/D-scope). `recorded_at` stores confirmation under C/D-identity. Source-header evidence and its migration are owned by the prerequisite plan; this timestamp records the latest folder observation, not whether a message has capture date context.
    - `messages.logical_of`, NULL for a logical message. It holds the canonical row's id for a row that duplicates one.
    - A trigger deletes a message's recipients and locations with it, so `delete_message`, `clear_messages`, and the purge leave no orphan rows, and a stale location key never blocks a later recapture.
    - A source identity is known through its row, a recorded location, or a suppression (`has_seen_message`), so a copy recorded as a location is never captured or analyzed as a message of its own. A copy is fetched only to serve its logical message's content, below, or to confirm an unconfirmed location (step 16). A logical message is read through any of its source identities, canonical first: a copy that is gone is not the message being gone, and a message whose analysis was skipped because its only copy was gone is queued again when another copy is recorded. An attachment catalog records the copy that listed it (`message_attachments.source_provider_message_id`), and its bytes are read from that copy, since attachment ids belong to one copy.
@@ -87,13 +87,17 @@ What a slice captures is what its capture decision admits at the time; mail that
      - no row is deleted, so per-row summaries, attachments, and automation runs survive (the M2 required item);
      - the rows that are messages to readers are defined once, as the `logical_messages` view, recreated after every migration. Every reader that treats rows as messages selects from it: the inbox listing (`query_inbox`, which `recent` wraps), the pending and delivery queues, the notification intents and their count, and the pending-work check, so an upgraded duplicate is listed, analyzed, and notified only through its canonical row. Paths that act on storage units (delete, suppress, locations, the trigger) read the table. The duplicate's own summary and attachments stay stored under its row, reachable through its logical message (M3's thread view lists copies).
 6. **A second location** of a captured logical identity is recorded on the logical message, inside the capture transaction (C/D-identity). It is not a new row, and it gets no admission or analysis.
-   - Gmail and Microsoft ids span folders, so a known id comes back through polling when its labels or folder change (a `SENT` label added, a move into Sent Items, a star). The change record names folders the message is in, and polling records the ones in scope from it and fetches nothing. Microsoft's delta names the folder it was read from, the whole set, since a message is in one folder. Gmail's history is a delta: an addition's `labelIds` say which labels were added and the nested message carries only its id, so a record is a whole set only in the rare case it carries the message's `labelIds`. A record that adds no admitted folder, a star or a read, says nothing about folders and changes nothing. One that adds an admitted folder records it, and since it does not say where else the message is, the observation is incomplete and clears the stamp (step 5), so discovery (step 16) observes the message again; only a whole set under full scope stamps a captured row's source rows, and a retained row stays unstamped either way. Removals are not polled: a recorded location means the message was seen there, and whether it is still there is derived work (stage (c)). Sent is in scope only while the gated class is allowed (step 2). The event is a changed input of that message (step 9): it is in an admitted folder again, so a completed unavailable reason cannot stand. A retained row's missing recipients arrive with discovery's fetch (step 16), since the migration cannot reconstruct To/Cc and D-attribution reads them once a Sent location turns the message outbound. IMAP copies have folder-tokened ids (step 4) and reach the same transaction through their logical identity.
+   - Gmail and Microsoft ids span folders, so a known id comes back through polling when its labels or folder change (a `SENT` label added, a move into Sent Items, a star). The change record names folders the message is in, and polling records the ones in scope from it and fetches nothing. Microsoft's delta names the folder it was read from, the whole set, since a message is in one folder. Gmail's history is a delta: an addition's `labelIds` say which labels were added and the nested message carries only its id, so a record is a whole set only in the rare case it carries the message's `labelIds`. A record that adds no admitted folder, a star or a read, says nothing about folders and changes nothing. One that adds an admitted folder records it, and since it does not say where else the message is, the observation is incomplete and clears the stamp (step 5), so discovery (step 16) observes the message again; confirmation follows C/D-identity using the source-header evidence from the prerequisite plan. Removals are not polled: a recorded location means the message was seen there, and whether it is still there is derived work (stage (c)). Sent is in scope only while the gated class is allowed (step 2). The event is a changed input of that message (step 9): it is in an admitted folder again, so a completed unavailable reason cannot stand. A retained row's missing recipients arrive with discovery's fetch (step 16), since the migration cannot reconstruct To/Cc and D-attribution reads them once a Sent location turns the message outbound. IMAP copies have folder-tokened ids (step 4) and reach the same transaction through their logical identity.
    - IMAP survivor ranking (`_imap_thread_key`, M1) reads each logical message's smallest source identity across all its recorded locations (C/D-identity's canonical order), so a later location can decide which component survives a merge.
 7. **Health.** `health.get` reports each account's Sent scope as the last check recorded it: available, unavailable, or not polled, the last whenever Sent was out of scope at that check, whatever an earlier active check found. The desktop shows "Sent mail unavailable" on that account. The scope is one `mailbox_sent_scope` row per account, written only by the check's Sent decision (step 2); no row means not polled.
 
+### Source-header evidence prerequisite
+
+Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) proposes schema 31 for the source evidence required by D-identity. This amendment reserves the following schemas as 32 (M2.2), 33 (M2.3), and 34 (M2.4); it changes no milestone behavior or operator decision.
+
 ### M2.2 — Derived state and capture kinds
 
-8. **Derived storage (schema 31):**
+8. **Derived storage (schema 32):**
    - `message_derived(message_id, direction, vendor_id, match)`, the stored attribution of C/D-attribution, through `vendor_of` with its match (C/D-vendor);
    - `thread_follow(provider, account_id, mailbox_identity_key, thread_key, followed, owner_vendor_id)`, the C/D-follow cache;
    - `thread_watermarks(provider, account_id, mailbox_identity_key, thread_key, synced_through)`, for C/D-reconcile.
@@ -102,7 +106,7 @@ What a slice captures is what its capture decision admits at the time; mail that
 9. **One recompute function, `_recompute_derived(db, changed)`, owns C/D-derived.**
    - It takes the changed inputs: message ids, thread keys, vendor addresses, identities, or (M4) the extractor version, whose change supersedes the previous key's claims as C/D-derived says. From them it finds the affected logical messages, then their threads.
    - It recomputes attribution, then the follow cache. It deletes the cache row of an empty thread (C/D-follow), the watermark of any thread that is not followed (C/D-reconcile), and the bodies a newly unfollowed thread may not keep (M2.4, C/D-body). A message that gains a location, or that polling reports in an admitted folder again (step 6), loses its unavailable reason (M2.4), `outside_folders` or `source_gone` alike: a copy that arrived or returned can supply the body, so stage (c) fetches it again.
-   - The schema-31 migration calls it over every retained message, so an upgraded database has its attribution and follow rows before anything changes.
+   - The schema-32 migration calls it over every retained message, so an upgraded database has its attribution and follow rows before anything changes.
    - Every writer of an input calls it in its own transaction:
      - capture and location recording;
      - `delete_message` and `clear_messages`;
@@ -129,9 +133,9 @@ What a slice captures is what its capture decision admits at the time; mail that
     - `admission_kind` gains `vendor_address`, `vendor_domain`, `sent_to_vendor`, and `thread_follow`.
     - SQLite cannot change a CHECK in place, so `messages` is rebuilt by SQLite's documented procedure (create, copy, drop, rename, then recreate its indexes and triggers). Earlier migrations rebuilt `automation_fires` this way (`db.py:3484-3506`).
     - `PRAGMA foreign_key_check` and `integrity_check` run inside the migration transaction, which rolls back on any finding.
-    - **Backup (decision 3).** Before that transaction, the migration writes `VACUUM INTO` a private backup next to the database, mode 0600, at a fresh path per attempt: `<database>.pre-v31.<UTC timestamp>.bak`. `VACUUM INTO` refuses an existing file, so a fixed path would block every retry after a failure.
+    - **Backup (decision 3).** Before that transaction, the migration writes `VACUUM INTO` a private backup next to the database, mode 0600, at a fresh path per attempt: `<database>.pre-v32.<UTC timestamp>.bak`. `VACUUM INTO` refuses an existing file, so a fixed path would block every retry after a failure.
       - If the backup cannot be written (for example, the disk is full), the migration does not start, and the engine reports the error with the database unchanged.
-      - Once the migrated database has opened and its checks have passed, every `pre-v31` backup is deleted. If the migration fails, the newest backup is kept and older ones are removed, so the database can be restored by hand and the next start retries.
+      - Once the migrated database has opened and its checks have passed, every `pre-v32` backup is deleted. If the migration fails, the newest backup is kept and older ones are removed, so the database can be restored by hand and the next start retries.
     - The set's other owners widen together:
       - `_validate_admission_provenance` (`db.py:4164-4195`);
       - `AdmissionDecision.kind` (`service.py:127-141`);
@@ -141,7 +145,7 @@ What a slice captures is what its capture decision admits at the time; mail that
 
 ### M2.3 — The reconcile pass
 
-13. **Storage (schema 32):**
+13. **Storage (schema 33):**
     - `coverage_generation(provider, account_id, mailbox_identity_key, generation, entitlement_active, retention_days, sent_folder)`, C/D-reconcile's counter and the last observed entitlement state, retention, and resolved Sent folder (its scope and, for IMAP, its folder key). One function, `_bump_coverage_generation`, increments it, and every input change calls it in its own transaction: each vendor mutation, for every configured account's row (vendor records are global, and an inactive account must find its coverage stale when it returns); `register_mail_account` and `update_mail_account_identity`, which change a verified identity; the check, when the entitlement state, `retention_days`, or resolved Sent folder it observes differs from the recorded ones (so an edited `config.toml` or `imap_sent_folder` counts, as does `SPECIAL-USE` resolving to another folder or Sent becoming available, and `settings.update` needs no bump of its own); a cursor expiry or recovery; and (M4) an extractor version change;
     - `reconcile_coverage(provider, account_id, mailbox_identity_key, generation, recorded_at)`, the reconciled generation;
     - `reconcile_progress(...)`, which holds the two values frozen when the pass started, the generation and the start time, plus the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields. Every bound a pass query uses derives from the frozen start (step 16), so nothing about a resumed query can move with the clock or the configuration. Progress belongs to the generation it froze: when the current generation differs, the check discards it and starts a fresh pass, so a page token is never reused against a changed query.
@@ -173,7 +177,7 @@ What a slice captures is what its capture decision admits at the time; mail that
 
 ### M2.4 — Bodies and the followed-thread purge
 
-20. **Storage (schema 33):**
+20. **Storage (schema 34):**
     - `message_bodies(message_id, text, stored_chars, source_chars, fetched_at)`. The date context lives on the message (step 5).
     - `message_body_unavailable(message_id, reason)`, where `reason` is `source_gone` or `outside_folders`.
     - Both are tied to their message by step 5's delete trigger, extended to them, so `delete_message`, `clear_messages`, and the purge need nothing of their own, and no marker outlives its message to be inherited by a recapture.
@@ -212,7 +216,7 @@ What a slice captures is what its capture decision admits at the time; mail that
 - **An IMAP server with neither SPECIAL-USE nor a configured Sent name** has no Sent scope, and health shows it.
 - **A body fetch whose source is gone** records `source_gone`, a completed state until a copy arrives or returns (step 9).
 - **A failed `messages` rebuild** rolls back the whole migration, so the previous binary still opens the database. Its pre-migration backup stays in place (step 11).
-- **No room for the backup:** the migration does not start, the engine reports the error, and the database stays at v30.
+- **No room for the backup:** the migration does not start, the engine reports the error, and the database stays at v31.
 
 ## Files touched
 
@@ -264,12 +268,12 @@ What a slice captures is what its capture decision admits at the time; mail that
 - **Gating.** With the gated class inactive, only today's kinds are captured.
 - **Thread purge.** From M2.2, a followed thread keeps every message through the purge, whatever its age, until M2.3's coverage-gated purge; a thread whose oldest message is past the cutoff and whose newest is not keeps both.
 - **The `messages` rebuild:**
-  - a v30 database keeps every row, index, trigger, and provenance value;
+  - a v31 database keeps every row, index, trigger, and provenance value;
   - `foreign_key_check` and `integrity_check` are clean;
-  - v30 code refuses v31;
+  - v31 code refuses v32;
   - the backup is written at mode 0600 and a fresh path before the rebuild, and every backup is deleted after a successful open;
-  - a rebuild failure injected after the backup keeps both the v30 database and its backup, and the next start retries with a new backup, keeping only the newest;
-  - a backup that cannot be written leaves the database at v30, unchanged.
+  - a rebuild failure injected after the backup keeps both the v31 database and its backup, and the next start retries with a new backup, keeping only the newest;
+  - a backup that cannot be written leaves the database at v31, unchanged.
 
 **M2.3**
 - **Staleness, one case each:** no record, a vendor address added, an address removed and re-added, a verified identity changed, raised retention through `settings.update` and through an edited `config.toml`, an entitlement lapse observed and then reactivation, an extractor change, a recovered cursor, a followed thread without a watermark, a message polled into a followed thread (pending derived work), and (M4) a retryable claim attempt whose deadline passed. Many polls with no change never make coverage stale.
