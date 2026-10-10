@@ -42,6 +42,7 @@ OWNED_PHRASES = {
         r"`INBOX` or `SENT` label",
         r"`\\Sent`",
         r"secure_delete",
+        r"all message-owned content and state",
         r"Sent mail unavailable",
     ],
     "D-capture": [
@@ -61,6 +62,7 @@ OWNED_PHRASES = {
         r"\*\*Its inputs\*\* are exactly",
         r"by any path",
         r"That list is illustrative",
+        r"stored attachment inventory, including descriptors and embedded status",
     ],
     "D-reconcile": [
         r"coverage record",
@@ -89,7 +91,9 @@ OWNED_PHRASES = {
         r"never pair through a third message",
         r"the anchor condition for where the two claims sit",
         r"selected record is its valid `invoice.extract` record",
-        r"the vendor's own words say this PDF is their invoice",
+        r"the document's own class, not the email, decides that the attachment is an invoice",
+        r"\*\*An attachment's classification evidence\*\*",
+        r"\*\*A message's invoice\*\*, which only record pairing reads",
         r"\*\*record pairing\*\*, instead of both",
         r"marks the kind \*several\*",
     ],
