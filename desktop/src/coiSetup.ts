@@ -21,6 +21,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
       </div>
       <p data-field="status" role="status" aria-live="polite">Open Expiry Ledger to load setup.</p>
       <p data-field="locked" hidden><span class="capability-locked">Automations locked</span> <button type="button" data-action="view-connect">View Connect</button></p>
+      <pre data-field="selection" hidden></pre>
       <form>
         <fieldset disabled>
           <div class="coi-rule-fields">
@@ -43,6 +44,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     if (!item) throw new Error(`Missing COI setup element: ${selector}`);
     return item;
   };
+  const selectionReview = get<HTMLElement>('[data-field="selection"]');
   const saved = get<HTMLSelectElement>('[data-field="saved"]');
   const name = get<HTMLInputElement>('[data-field="name"]');
   const mailbox = get<HTMLSelectElement>('[data-field="mailbox"]');
@@ -95,6 +97,14 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     };
   }
   function renderState(): void {
+    selectionReview.hidden = current === null;
+    const snapshot = current?.selection;
+    selectionReview.textContent = snapshot ? [
+      `Saved selection: ${snapshot.provider.app_id} ${snapshot.provider.version} / ${snapshot.capability.id} ${snapshot.capability.version}`,
+      `Required features: ${snapshot.acknowledged_manifest_features?.join(", ") || "none"}`,
+      ...snapshot.capability.parameters.filter((parameter) => Object.hasOwn(parameter, "fixed_value"))
+        .map((parameter) => `${parameter.name} (${parameter.value_type}): ${JSON.stringify(parameter.fixed_value)}`),
+    ].join("\n") : "Legacy/none: this revision has no saved selection snapshot.";
     fieldset.disabled = gate.busy || !loaded || !editable || gate.needsRefresh;
     saved.disabled = gate.busy || !loaded;
     newButton.disabled = gate.busy || !loaded || gate.needsRefresh;

@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from connect_automate import connect
 from connect_automate.locking import connect_operation_lock, connect_source_lock_path
 
 from .automation.rules import (
@@ -35,6 +36,7 @@ from .config import (
     exact_sender_selector_id,
     normalize_validated_address,
 )
+from .connect_selection import decode_selection, encode_selection
 from .deployment import database_admission
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
@@ -48,7 +50,7 @@ from .mailbox import (
 from .mime import AttachmentDescriptor, body_was_truncated
 from .text import within_utf8_bytes
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -493,6 +495,10 @@ CREATE TABLE IF NOT EXISTS connect_job_dispatch (
     capability_produces_json TEXT NOT NULL DEFAULT '[]' CHECK (
         length(capability_produces_json) BETWEEN 2 AND 4096
     ),
+    required_manifest_features_json TEXT NOT NULL DEFAULT '[]' CHECK (
+        length(required_manifest_features_json) BETWEEN 2 AND 256
+    ),
+    selection_json TEXT CHECK (length(selection_json) BETWEEN 2 AND 65536),
     interactive_authorized_at TEXT,
     automation_paused_at TEXT,
     highest_provider_state TEXT NOT NULL DEFAULT 'requested' CHECK (
@@ -1549,6 +1555,7 @@ class AutomationRuleSummary:
 class AutomationRuleDetail:
     summary: AutomationRuleSummary
     definition: dict[str, object] | None
+    selection: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -2240,6 +2247,8 @@ class ConnectDispatch:
     capability_confirmation_required: bool
     capability_authority_known: bool
     capability_produces: tuple[str, ...]
+    required_manifest_features: tuple[str, ...]
+    selection: connect.DiscoveredCapability | None
     interactive_authorized_at: str | None
     automation_paused_at: str | None
     highest_provider_state: str
@@ -3179,9 +3188,13 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
             "INTEGER NOT NULL DEFAULT 0 CHECK (capability_authority_known IN (0, 1))"
         ),
         "capability_produces_json": (
-            "TEXT NOT NULL DEFAULT '[]' "
-            "CHECK (length(capability_produces_json) BETWEEN 2 AND 4096)"
+            "TEXT NOT NULL DEFAULT '[]' CHECK (length(capability_produces_json) BETWEEN 2 AND 4096)"
         ),
+        "required_manifest_features_json": (
+            "TEXT NOT NULL DEFAULT '[]' "
+            "CHECK (length(required_manifest_features_json) BETWEEN 2 AND 256)"
+        ),
+        "selection_json": "TEXT CHECK (length(selection_json) BETWEEN 2 AND 65536)",
         "interactive_authorized_at": "TEXT",
         "automation_paused_at": "TEXT",
     }.items():
@@ -3189,6 +3202,14 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE connect_job_dispatch ADD COLUMN {column} {definition}")
     if missing_capability_produces:
         db.execute("UPDATE connect_job_dispatch SET capability_authority_known = 0")
+    db.execute("""CREATE TRIGGER IF NOT EXISTS connect_dispatch_feature_identity_immutable
+        BEFORE UPDATE OF required_manifest_features_json, selection_json
+        ON connect_job_dispatch
+        WHEN NEW.required_manifest_features_json <> OLD.required_manifest_features_json
+          OR NEW.selection_json IS NOT OLD.selection_json
+        BEGIN
+            SELECT RAISE(ABORT, 'Connect feature identity is immutable');
+        END""")
     rows = db.execute(
         """SELECT job_id, status, created_at, updated_at
         FROM connect_attachment_jobs
@@ -4948,6 +4969,7 @@ def _v2_invocation_fingerprint(
     provider_app_id: str,
     provider_app_version: str,
     provider_instance_id: str,
+    required_manifest_features: tuple[str, ...] = (),
 ) -> str:
     capability = request.get("capability")
     inputs = request.get("inputs")
@@ -4989,6 +5011,9 @@ def _v2_invocation_fingerprint(
         },
         "parameters": _canonical_v2_parameters(request.get("parameters")),
     }
+    features = connect.validate_manifest_features(required_manifest_features)
+    if features:
+        identity["required_manifest_features"] = list(features)
     encoded = json.dumps(
         identity,
         separators=(",", ":"),
@@ -5013,6 +5038,7 @@ def _validate_v2_request_record(
     input_sha256: str,
     input_display_name: str,
     source_app_id: str,
+    required_manifest_features: tuple[str, ...] = (),
 ) -> str:
     request = _decode_v2_request(request_json)
     inputs = request.get("inputs")
@@ -5038,6 +5064,7 @@ def _validate_v2_request_record(
         provider_app_id=provider_app_id,
         provider_app_version=provider_app_version,
         provider_instance_id=provider_instance_id,
+        required_manifest_features=required_manifest_features,
     )
 
 
@@ -5050,8 +5077,12 @@ def _lookup_invocation_fingerprint(
     provider_app_version: str | None,
     provider_instance_id: str | None,
     request_json: bytes | None,
+    required_manifest_features: tuple[str, ...] = (),
 ) -> str:
+    required_manifest_features = connect.validate_manifest_features(required_manifest_features)
     if protocol_version == 1:
+        if required_manifest_features:
+            raise ValueError("Connect v1 lookup cannot use manifest features")
         if any(
             value is not None
             for value in (
@@ -5077,6 +5108,7 @@ def _lookup_invocation_fingerprint(
         provider_app_id=provider_app_id,
         provider_app_version=provider_app_version,
         provider_instance_id=provider_instance_id,
+        required_manifest_features=required_manifest_features,
     )
 
 
@@ -5637,6 +5669,15 @@ class Store:
                 """
                 + _AUTOMATION_TABLES_SQL
             )
+            db.execute("""CREATE TABLE IF NOT EXISTS automation_rule_selections (
+                rule_id TEXT NOT NULL, version INTEGER NOT NULL,
+                selection_json TEXT NOT NULL CHECK (length(selection_json) BETWEEN 2 AND 65536),
+                PRIMARY KEY (rule_id, version),
+                FOREIGN KEY (rule_id, version) REFERENCES automation_rule_versions(rule_id, version)
+            )""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS automation_rule_selection_immutable
+                BEFORE UPDATE ON automation_rule_selections BEGIN
+                    SELECT RAISE(ABORT, 'Rule selection is immutable'); END""")
             _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
             _ensure_connect_dispatch_schema(db)
@@ -7435,7 +7476,12 @@ class Store:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
-        return AutomationRuleDetail(summary=summary, definition=definition)
+        snapshot = row["selection_json"]
+        return AutomationRuleDetail(
+            summary=summary,
+            definition=definition,
+            selection=decode_selection(snapshot).public_dict() if snapshot is not None else None,
+        )
 
     @staticmethod
     def _next_automation_rules_revision(db: sqlite3.Connection) -> int:
@@ -7480,7 +7526,10 @@ class Store:
                 "SELECT revision FROM automation_rule_set WHERE id = 1"
             ).fetchone()
             rows = db.execute(
-                """SELECT r.*, v.kind, v.definition_json, v.definition_sha256,
+                """SELECT r.*,
+                    (SELECT selection_json FROM automation_rule_selections AS s
+                     WHERE s.rule_id = v.rule_id AND s.version = v.version) AS selection_json,
+                    v.kind, v.definition_json, v.definition_sha256,
                     v.scope_mailbox_identity_key, v.global_revision
                 FROM automation_rules AS r
                 JOIN automation_rule_versions AS v
@@ -7506,7 +7555,10 @@ class Store:
     def automation_rule(self, rule_id: str) -> AutomationRuleDetail:
         with self.connection() as db:
             row = db.execute(
-                """SELECT r.*, v.kind, v.definition_json, v.definition_sha256,
+                """SELECT r.*,
+                    (SELECT selection_json FROM automation_rule_selections AS s
+                     WHERE s.rule_id = v.rule_id AND s.version = v.version) AS selection_json,
+                    v.kind, v.definition_json, v.definition_sha256,
                     v.scope_mailbox_identity_key, v.global_revision
                 FROM automation_rules AS r
                 JOIN automation_rule_versions AS v
@@ -7525,6 +7577,7 @@ class Store:
         rule_id: str | None = None,
         expected_version: int | None = None,
         expected_account_identity: str | None = None,
+        selection: connect.DiscoveredCapability | None = None,
         now: datetime | None = None,
     ) -> AutomationRuleDetail:
         parsed = parse_rule_definition(
@@ -7599,6 +7652,12 @@ class Store:
                     stamp,
                 ),
             )
+            if selection is not None:
+                connect.validate_capability_parameters(selection, dict(parsed.action.parameters))
+                db.execute(
+                    "INSERT INTO automation_rule_selections VALUES (?, ?, ?)",
+                    (identity, version, encode_selection(selection)),
+                )
         return self.automation_rule(identity)
 
     def set_automation_rule_enabled(
@@ -7615,7 +7674,10 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT r.*, v.kind, v.definition_json, v.definition_sha256,
+                """SELECT r.*,
+                    (SELECT selection_json FROM automation_rule_selections AS s
+                     WHERE s.rule_id = v.rule_id AND s.version = v.version) AS selection_json,
+                    v.kind, v.definition_json, v.definition_sha256,
                     v.scope_mailbox_identity_key
                 FROM automation_rules AS r
                 JOIN automation_rule_versions AS v
@@ -7669,6 +7731,12 @@ class Store:
                     global_revision,
                     stamp,
                 ),
+            )
+            db.execute(
+                """INSERT INTO automation_rule_selections(rule_id, version, selection_json)
+                SELECT rule_id, ?, selection_json FROM automation_rule_selections
+                WHERE rule_id = ? AND version = ?""",
+                (version, rule_id, current_version),
             )
         return self.automation_rule(rule_id)
 
@@ -7801,6 +7869,17 @@ class Store:
                 (*normalized, limit),
             ).fetchall()
         return tuple(_automation_fire(row) for row in rows)
+
+    def automation_rule_selection(
+        self, rule_id: str, version: int
+    ) -> connect.DiscoveredCapability | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT selection_json FROM automation_rule_selections "
+                "WHERE rule_id = ? AND version = ?",
+                (rule_id, version),
+            ).fetchone()
+        return decode_selection(row["selection_json"]) if row is not None else None
 
     def automation_fire_definition(self, fire: AutomationFire) -> RuleDefinition:
         with self.connection() as db:
@@ -9542,6 +9621,13 @@ class Store:
         values["capability_produces"] = _decode_connect_capability_produces(
             values.pop("capability_produces_json")
         )
+        values["required_manifest_features"] = connect.validate_manifest_features(
+            json.loads(values.pop("required_manifest_features_json"))
+        )
+        encoded_selection = values.pop("selection_json")
+        values["selection"] = (
+            decode_selection(encoded_selection) if encoded_selection is not None else None
+        )
         return ConnectDispatch(**values)
 
     def connect_dispatch(self, job_id: str) -> ConnectDispatch | None:
@@ -9976,8 +10062,7 @@ class Store:
     def canonical_connect_parameters(value: object) -> dict[str, str | int | bool]:
         return _canonical_v2_parameters(value)
 
-    @staticmethod
-    def connect_job_parameters(job: ConnectJob) -> dict[str, str | int | bool]:
+    def connect_job_parameters(self, job: ConnectJob) -> dict[str, str | int | bool]:
         if (
             job.protocol_version != 2
             or job.provider_app_id is None
@@ -9989,6 +10074,9 @@ class Store:
         ):
             raise RuntimeError("Connect v2 job is missing its durable request")
         try:
+            dispatch = self.connect_dispatch(job.job_id)
+            if dispatch is None:
+                raise ValueError("Missing dispatch authority")
             fingerprint = _validate_v2_request_record(
                 job.request_json,
                 job_id=job.job_id,
@@ -10003,6 +10091,7 @@ class Store:
                 input_sha256=job.input_sha256,
                 input_display_name=job.input_display_name,
                 source_app_id=job.source_app_id,
+                required_manifest_features=dispatch.required_manifest_features,
             )
             request = _decode_v2_request(job.request_json)
             parameters = _canonical_v2_parameters(request.get("parameters"))
@@ -10024,6 +10113,7 @@ class Store:
         provider_app_version: str | None = None,
         provider_instance_id: str | None = None,
         request_json: bytes | None = None,
+        required_manifest_features: tuple[str, ...] = (),
     ) -> ConnectJob | None:
         invocation_fingerprint = _lookup_invocation_fingerprint(
             protocol_version=protocol_version,
@@ -10033,6 +10123,7 @@ class Store:
             provider_app_version=provider_app_version,
             provider_instance_id=provider_instance_id,
             request_json=request_json,
+            required_manifest_features=required_manifest_features,
         )
         with self.connection() as db:
             row = db.execute(
@@ -10066,6 +10157,7 @@ class Store:
         provider_app_version: str | None = None,
         provider_instance_id: str | None = None,
         request_json: bytes | None = None,
+        required_manifest_features: tuple[str, ...] = (),
     ) -> ConnectJob | None:
         invocation_fingerprint = _lookup_invocation_fingerprint(
             protocol_version=protocol_version,
@@ -10075,6 +10167,7 @@ class Store:
             provider_app_version=provider_app_version,
             provider_instance_id=provider_instance_id,
             request_json=request_json,
+            required_manifest_features=required_manifest_features,
         )
         with self.connection() as db:
             row = db.execute(
@@ -10115,11 +10208,20 @@ class Store:
         input_display_name: str | None = None,
         source_app_id: str | None = None,
         request_json: bytes | None = None,
+        required_manifest_features: tuple[str, ...] = (),
+        selection: connect.DiscoveredCapability | None = None,
         capability_produces: tuple[str, ...] = (),
         capability_external_effects: bool = False,
         capability_confirmation_required: bool = False,
         now: datetime | None = None,
     ) -> ConnectJob:
+        required_manifest_features = connect.validate_manifest_features(required_manifest_features)
+        if selection is not None and (
+            selection.acknowledged_manifest_features != required_manifest_features
+        ):
+            raise ValueError("Selection and feature requirement disagree")
+        features_json = json.dumps(list(required_manifest_features), separators=(",", ":"))
+        selection_json = encode_selection(selection) if selection is not None else None
         if protocol_version not in {1, 2}:
             raise ValueError("Connect protocol version is unsupported")
         if type(capability_external_effects) is not bool or type(
@@ -10129,6 +10231,8 @@ class Store:
         if protocol_version == 1:
             if (
                 request_json is not None
+                or required_manifest_features
+                or selection is not None
                 or capability_produces
                 or capability_external_effects
                 or capability_confirmation_required
@@ -10161,7 +10265,14 @@ class Store:
                 input_sha256=input_sha256,
                 input_display_name=input_display_name,
                 source_app_id=source_app_id,
+                required_manifest_features=required_manifest_features,
             )
+        if selection is not None:
+            parameters = _canonical_v2_parameters(
+                _decode_v2_request(request_json).get("parameters")
+            )
+            if connect.validate_capability_parameters(selection, parameters) != parameters:
+                raise ValueError("Selection does not match durable request")
         created_at = (now or datetime.now(UTC)).astimezone(UTC)
         stamp = created_at.isoformat()
         with self.connection() as db:
@@ -10247,16 +10358,19 @@ class Store:
                         job_id, state, admission_deadline, submission_possible,
                         source_available, capability_external_effects,
                         capability_confirmation_required, capability_authority_known,
-                        capability_produces_json,
+                        capability_produces_json, required_manifest_features_json,
+                        selection_json,
                         highest_provider_state,
                         created_at, updated_at
-                    ) VALUES (?, 'waiting', ?, 0, 1, ?, ?, 1, ?, 'requested', ?, ?)""",
+                    ) VALUES (?, 'waiting', ?, 0, 1, ?, ?, 1, ?, ?, ?, 'requested', ?, ?)""",
                     (
                         job_id,
                         (created_at + CONNECT_QUEUE_ADMISSION_WINDOW).isoformat(),
                         int(capability_external_effects),
                         int(capability_confirmation_required),
                         capability_produces_json,
+                        features_json,
+                        selection_json,
                         stamp,
                         stamp,
                     ),
@@ -13078,6 +13192,7 @@ class Store:
         ).fetchall()
         connect_rows = db.execute(
             f"""SELECT latest.*,
+                d.required_manifest_features_json AS dispatch_required_manifest_features_json,
                 d.state AS dispatch_state,
                 d.next_attempt_at AS dispatch_next_attempt_at,
                 d.last_error_code AS dispatch_error_code,
@@ -13229,6 +13344,11 @@ class Store:
                     "instance_id": str(row["provider_instance_id"]),
                 }
                 item["parameters"] = _canonical_v2_parameters(request.get("parameters"))
+                item["required_manifest_features"] = list(
+                    connect.validate_manifest_features(
+                        json.loads(row["dispatch_required_manifest_features_json"])
+                    )
+                )
                 item["dispatch_state"] = str(row["dispatch_state"])
                 item["queue_ahead"] = queue_positions.get(str(row["job_id"]), 0)
                 item["next_attempt_at"] = row["dispatch_next_attempt_at"]

@@ -14,6 +14,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -2313,6 +2314,7 @@ def _automation_rule_detail_data(detail: AutomationRuleDetail) -> dict[str, obje
     return {
         "summary": _automation_rule_summary_data(detail.summary),
         "definition": detail.definition,
+        "selection": detail.selection,
     }
 
 
@@ -2390,6 +2392,10 @@ def _automation_rules_prepare(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"definition"})
     try:
         definition = prepare_rule_definition(payload.get("definition"))
+        action = definition.action
+        _discover_selected_generic_capability(
+            action.provider.model_dump(), action.capability.model_dump(), dict(action.parameters)
+        )
         return {"definition": json.loads(canonical_rule_definition(definition))}
     except RuleValidationError as exc:
         raise ApiError("invalid_rule", exc.reason) from exc
@@ -2439,11 +2445,18 @@ def _automation_rules_put(
                 if current.summary.system:
                     raise AutomationRuleSystemProtected("system automation rule is protected")
             scope_identity = _automation_rule_scope_identity(runtime, definition)
+            action = definition.action
+            selection, _ = _discover_selected_generic_capability(
+                action.provider.model_dump(),
+                action.capability.model_dump(),
+                dict(action.parameters),
+            )
             rule = runtime.store.put_automation_rule(
                 payload["definition"],
                 rule_id=rule_id,
                 expected_version=expected_version,
                 expected_account_identity=scope_identity,
+                selection=selection,
             )
         except (MailboxIdentityChanged, RuleValidationError, ValueError) as exc:
             raise ApiError("invalid_rule", str(exc)) from exc
@@ -2913,7 +2926,9 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
 
 def _connect_catalog(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
-    return connect.discover_capabilities().public_result()
+    return connect.discover_capabilities(
+        required_manifest_features=("fixed-parameters-v1",),
+    ).public_result()
 
 
 def _connect_capabilities(request: dict[str, object]) -> dict[str, object]:
@@ -2940,7 +2955,9 @@ def _connect_attachment_capabilities(request: dict[str, object]) -> dict[str, ob
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
     source = _configured_message_source(runtime, message_id)
-    catalog = connect.discover_capabilities()
+    catalog = connect.discover_capabilities(
+        required_manifest_features=("fixed-parameters-v1",),
+    )
     items = (
         catalog.compatible(
             attachment.media_type,
@@ -3011,11 +3028,15 @@ def _discover_selected_generic_capability(
 
     instance_id = str(provider["instance_id"])
     if remaining_timeout is None:
-        catalog = connect.discover_capabilities(provider_instance_id=instance_id)
+        catalog = connect.discover_capabilities(
+            provider_instance_id=instance_id,
+            required_manifest_features=("fixed-parameters-v1",),
+        )
     else:
         catalog = connect.discover_capabilities(
             provider_instance_id=instance_id,
             remaining_timeout=remaining_timeout,
+            required_manifest_features=("fixed-parameters-v1",),
         )
     provider_items = tuple(
         item
@@ -3077,7 +3098,9 @@ def _tracked_job(job: ConnectJob, filename: str) -> connect.PreparedSummaryJob:
     )
 
 
-def _generic_connect_result(job: ConnectJob) -> dict[str, object]:
+def _generic_connect_result(
+    runtime: Runtime, job: ConnectJob, *, required_manifest_features: tuple[str, ...] | None = None
+) -> dict[str, object]:
     if (
         job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
         or job.status != "completed"
@@ -3089,7 +3112,13 @@ def _generic_connect_result(job: ConnectJob) -> dict[str, object]:
     ):
         raise RuntimeError("Completed Connect v2 job is missing its durable provenance")
     outputs = Store.completed_connect_outputs(job)
+    if required_manifest_features is None:
+        dispatch = runtime.store.connect_dispatch(job.job_id)
+        if dispatch is None:
+            raise RuntimeError("Connect result is missing its frozen feature identity")
+        required_manifest_features = dispatch.required_manifest_features
     return {
+        "required_manifest_features": list(required_manifest_features),
         "protocol_version": job.protocol_version,
         "job_id": job.job_id,
         "status": job.status,
@@ -3127,11 +3156,12 @@ def _generic_connect_active_result(runtime: Runtime, job: ConnectJob) -> dict[st
     if dispatch is None or dispatch.state == "terminal":
         current = runtime.store.connect_job(job.job_id)
         if current is not None and current.status == "completed":
-            return _generic_connect_result(current)
+            return _generic_connect_result(runtime, current)
         if current is not None and current.status == "failed":
             raise _stored_connect_failure(current)
         raise RuntimeError("Active Connect v2 job is missing its dispatch state")
     return {
+        "required_manifest_features": list(dispatch.required_manifest_features),
         "protocol_version": job.protocol_version,
         "job_id": job.job_id,
         "status": job.status,
@@ -3452,6 +3482,12 @@ def _query_connect_job(
         raise
 
 
+def _generic_submission_proves_refusal(error: connect.ConnectError) -> bool:
+    # A malformed response is not authoritative non-acceptance, even if its
+    # decoder classifies the error as nonretryable. Keep GET reconciliation.
+    return not error.retryable and error.code not in {"JOB_NOT_FOUND", "RESPONSE_INVALID"}
+
+
 def _run_generic_connect_job(
     runtime: Runtime,
     capability: connect.DiscoveredCapability | connect.RegisteredCapability,
@@ -3460,11 +3496,17 @@ def _run_generic_connect_job(
     *,
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    features = (
+        dispatch.required_manifest_features
+        if dispatch is not None
+        else capability.acknowledged_manifest_features
+    )
     client = connect.ConnectV2Client(capability)
     try:
         initial = client.submit(job, content) if content is not None else client.get(job)
     except connect.ConnectError as exc:
-        if content is not None and not exc.retryable and exc.code != "JOB_NOT_FOUND":
+        if content is not None and _generic_submission_proves_refusal(exc):
             _persist_connect_failure(runtime.store, job.job_id, capability, exc)
         raise
     persisted = _apply_connect_update(runtime.store, initial)
@@ -3475,6 +3517,7 @@ def _run_generic_connect_job(
         initial,
         persisted,
         wait_for_terminal=wait_for_terminal,
+        required_manifest_features=features,
     )
 
 
@@ -3486,9 +3529,12 @@ def _finish_generic_connect_job(
     persisted: ConnectJob,
     *,
     wait_for_terminal: bool = True,
+    required_manifest_features: tuple[str, ...],
 ) -> dict[str, object]:
     if persisted.status == "completed":
-        return _generic_connect_result(persisted)
+        return _generic_connect_result(
+            runtime, persisted, required_manifest_features=required_manifest_features
+        )
     if persisted.status == "failed":
         raise _stored_connect_failure(persisted)
     if not wait_for_terminal:
@@ -3516,7 +3562,9 @@ def _finish_generic_connect_job(
         raise RuntimeError("Connect v2 job completed without a result")
     if persisted.status != "completed":
         persisted = runtime.store.connect_job(job.job_id) or persisted
-    return _generic_connect_result(persisted)
+    return _generic_connect_result(
+        runtime, persisted, required_manifest_features=required_manifest_features
+    )
 
 
 def _connect_retry_delay(failure_count: int) -> int:
@@ -3843,7 +3891,7 @@ def _submit_generic_connect_job(
             try:
                 initial = client.submit(tracked, payload)
             except connect.ConnectError as exc:
-                if not exc.retryable and exc.code != "JOB_NOT_FOUND":
+                if _generic_submission_proves_refusal(exc):
                     _persist_connect_failure(runtime.store, tracked.job_id, capability, exc)
                 else:
                     _defer_generic_connect_error(
@@ -3880,6 +3928,7 @@ def _submit_generic_connect_job(
             initial,
             persisted,
             wait_for_terminal=wait_for_terminal,
+            required_manifest_features=dispatch.required_manifest_features,
         )
     except connect.ConnectError as exc:
         _defer_generic_connect_error(
@@ -3986,7 +4035,7 @@ def _run_claimed_generic_connect_job(
     if refreshed is None:
         raise RuntimeError("Connect v2 job disappeared during reconciliation")
     if refreshed.status == "completed":
-        return _generic_connect_result(refreshed)
+        return _generic_connect_result(runtime, refreshed)
     if refreshed.status == "failed":
         raise _stored_connect_failure(refreshed)
     current_dispatch = runtime.store.connect_dispatch(refreshed.job_id)
@@ -4052,7 +4101,7 @@ def _run_claimed_generic_connect_job(
     except RuntimeError as exc:
         concurrent = runtime.store.connect_job(tracked.job_id)
         if concurrent is not None and concurrent.status == "completed":
-            return _generic_connect_result(concurrent)
+            return _generic_connect_result(runtime, concurrent)
         if concurrent is not None and concurrent.status == "failed":
             raise _stored_connect_failure(concurrent) from exc
         raise ApiError(
@@ -4084,7 +4133,7 @@ def _run_claimed_generic_connect_job(
 
 def _resume_generic_connect_job(
     runtime: Runtime,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     active: ConnectJob,
     content: Callable[[], bytes],
     *,
@@ -4102,7 +4151,7 @@ def _resume_generic_connect_job(
             if claimed is None:
                 current = runtime.store.connect_job(active.job_id)
                 if current is not None and current.status == "completed":
-                    return _generic_connect_result(current)
+                    return _generic_connect_result(runtime, current)
                 if current is not None and current.status == "failed":
                     raise _stored_connect_failure(current)
                 if current is not None:
@@ -4172,6 +4221,7 @@ def _discover_persisted_generic_capability(
         )
     catalog = connect.discover_capabilities(
         provider_instance_id=job.provider_instance_id,
+        required_manifest_features=dispatch.required_manifest_features,
     )
     matches = tuple(
         item
@@ -4181,6 +4231,7 @@ def _discover_persisted_generic_capability(
         and item.instance_id == job.provider_instance_id
         and item.capability_id == job.capability_id
         and item.capability_version == job.capability_version
+        and set(dispatch.required_manifest_features).issubset(item.acknowledged_manifest_features)
     )
     if len(matches) == 1:
         return matches[0], None
@@ -4447,6 +4498,10 @@ def _reject_disallowed_effectful_join(
     if dispatch is None:
         raise RuntimeError("Connect v2 job is missing its durable dispatch authority")
     _require_persisted_capability_authority(runtime, job, dispatch, capability)
+    if dispatch.required_manifest_features != capability.acknowledged_manifest_features:
+        raise ApiError(
+            "request_id_conflict", "The invocation belongs to different feature requirements."
+        )
     if job.job_id == request_id:
         return
     if not join_effectful and (
@@ -4460,6 +4515,7 @@ def _reject_disallowed_effectful_join(
 
 
 def _validate_existing_invocation_identity(
+    runtime: Runtime,
     job: ConnectJob,
     *,
     message_id: str,
@@ -4486,7 +4542,19 @@ def _validate_existing_invocation_identity(
         requested_parameters = Store.canonical_connect_parameters(parameters)
     except ValueError as exc:
         raise ApiError("invalid_request", "parameters contain unsupported values") from exc
-    if Store.connect_job_parameters(job) != requested_parameters:
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    if dispatch is None:
+        raise RuntimeError("Connect job is missing frozen dispatch metadata")
+    if dispatch.selection is not None:
+        try:
+            requested_parameters = connect.validate_capability_parameters(
+                dispatch.selection, requested_parameters
+            )
+        except connect.ConnectError as exc:
+            raise ApiError(
+                "request_id_conflict", "The frozen invocation parameters differ."
+            ) from exc
+    if runtime.store.connect_job_parameters(job) != requested_parameters:
         raise ApiError(
             "request_id_conflict",
             "The capability request identity belongs to different parameters.",
@@ -4637,6 +4705,7 @@ def _prepare_or_create_generic_connect_job(
             "provider_app_version": capability.app_version,
             "provider_instance_id": capability.instance_id,
             "request_json": candidate.request_json,
+            "required_manifest_features": capability.acknowledged_manifest_features,
         }
         joined = runtime.store.active_connect_job(**lookup)
         if (
@@ -4681,6 +4750,8 @@ def _prepare_or_create_generic_connect_job(
                 input_display_name=candidate.display_name,
                 source_app_id=connect.SOURCE_APP_ID,
                 request_json=candidate.request_json,
+                required_manifest_features=capability.acknowledged_manifest_features,
+                selection=capability,
                 capability_produces=capability.produces,
                 capability_external_effects=capability.external_effects,
                 capability_confirmation_required=capability.confirmation_required,
@@ -4931,6 +5002,11 @@ def _dispatch_automation_fire(
         "version": action.capability.version,
     }
     requested_parameters: dict[str, object] = dict(action.parameters)
+    selection = runtime.store.automation_rule_selection(fire.rule_id, fire.rule_version)
+    if selection is not None:
+        requested_parameters = connect.validate_capability_parameters(
+            selection, requested_parameters
+        )
     attempt_rows = runtime.store.automation_fire_attempts(fire.fire_id)
     attempts = [
         attempt for attempt in attempt_rows if attempt.attempt_no == fire.current_attempt_no
@@ -4941,6 +5017,7 @@ def _dispatch_automation_fire(
     exact = runtime.store.connect_job(attempt.dispatch_request_id)
     if exact is not None and fire.job_id is None:
         _validate_existing_invocation_identity(
+            runtime,
             exact,
             message_id=fire.message_id,
             part_id=fire.part_id,
@@ -5051,6 +5128,19 @@ def _dispatch_automation_fire(
             requested_parameters,
             remaining_timeout=discovery_remaining_timeout,
         )
+        if (selection is None and any(item.has_fixed_value for item in capability.parameters)) or (
+            selection is not None
+            and not set(selection.acknowledged_manifest_features).issubset(
+                capability.acknowledged_manifest_features
+            )
+        ):
+            raise ApiError("rule_selection_changed", "Re-confirm the rule's capability selection.")
+        if selection is not None:
+            if parameters != requested_parameters:
+                raise ApiError("rule_selection_changed", "Re-confirm the rule's fixed parameters.")
+            capability = replace(
+                capability, acknowledged_manifest_features=selection.acknowledged_manifest_features
+            )
         confirmation_needed = (
             definition.confirm_each
             or capability.external_effects
@@ -5159,6 +5249,7 @@ def _dispatch_automation_fire(
             "effectful_job_active",
             "capability_authority_changed",
             "capability_authority_unknown",
+            "rule_selection_changed",
             "invalid_request",
         }:
             runtime.store.transition_automation_fire(
@@ -5260,6 +5351,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
     existing = runtime.store.connect_job(request_id)
     if existing is not None:
         _validate_existing_invocation_identity(
+            runtime,
             existing,
             message_id=message_id,
             part_id=part_id,
@@ -5268,7 +5360,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             parameters=requested_parameters,
         )
         if existing.status == "completed":
-            return _generic_connect_result(existing)
+            return _generic_connect_result(runtime, existing)
         if existing.status == "failed":
             raise _stored_connect_failure(existing)
 
@@ -5282,20 +5374,17 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
 
     connect.require_connect_entitlement()
 
-    capability, parameters = _discover_selected_generic_capability(
-        provider_ref,
-        capability_ref,
-        requested_parameters,
-    )
-
     if existing is not None:
-        _tracked_invocation_job(
+        dispatch = runtime.store.connect_dispatch(existing.job_id)
+        if dispatch is None:
+            raise RuntimeError("Connect job is missing frozen dispatch metadata")
+        capability, diagnostic = _discover_persisted_generic_capability(
             existing,
-            capability,
-            message_id=message_id,
-            part_id=part_id,
-            parameters=parameters,
+            dispatch,
+            require_entitlement=False,
         )
+        if capability is None:
+            return _generic_connect_active_result(runtime, existing)
         existing = runtime.store.authorize_connect_job_interactively(existing.job_id)
         return _resume_generic_connect_job(
             runtime,
@@ -5304,6 +5393,12 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             lambda: _generic_attachment_content(runtime, message_id, part_id),
             reconcile_first=True,
         )
+
+    capability, parameters = _discover_selected_generic_capability(
+        provider_ref,
+        capability_ref,
+        requested_parameters,
+    )
 
     candidate, created, collision, attachment_content = _prepare_or_create_generic_connect_job(
         runtime,
@@ -5317,7 +5412,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
     )
     assert created is not None
     if created.status == "completed":
-        return _generic_connect_result(created)
+        return _generic_connect_result(runtime, created)
     if created.status == "failed":
         raise _stored_connect_failure(created)
     if collision or created.job_id != candidate.job_id:

@@ -26,7 +26,7 @@ def test_setup_catalog_uses_shared_discovery_without_attachment(monkeypatch):
         confirmation_required=False,
     )
     catalog = connect.CapabilityCatalog((capability,))
-    monkeypatch.setattr(connect, "discover_capabilities", lambda: catalog)
+    monkeypatch.setattr(connect, "discover_capabilities", lambda **kwargs: catalog)
     result = engine_api._response({"protocol": 1, "operation": "connect.catalog", "payload": {}})
     assert result["ok"], result
     assert result["data"] == catalog.public_result()
@@ -37,7 +37,7 @@ def test_setup_catalog_uses_shared_discovery_without_attachment(monkeypatch):
 @pytest.mark.parametrize("diagnostic", [None, "ENTITLEMENT_REQUIRED", "NO_PROVIDERS"])
 def test_setup_catalog_preserves_empty_and_diagnostic(monkeypatch, diagnostic):
     catalog = connect.CapabilityCatalog((), diagnostic)
-    monkeypatch.setattr(connect, "discover_capabilities", lambda: catalog)
+    monkeypatch.setattr(connect, "discover_capabilities", lambda **kwargs: catalog)
     result = engine_api._response({"protocol": 1, "operation": "connect.catalog", "payload": {}})
     assert result["ok"], result
     assert result["data"] == catalog.public_result()

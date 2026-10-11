@@ -7717,6 +7717,17 @@ def test_main_converts_bounded_json_parse_failures_to_one_error(
     }
 
 
+def _install_rule_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    from test_connect_v2_engine_api import capability
+
+    items = tuple(capability(
+        app_id="invoice-processor", app_version="1.0.0",
+        instance_id="11111111-1111-4111-8111-111111111111", capability_id=capability_id,
+    ) for capability_id in ("invoice.extract", "certificate.extract"))
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog(items))
+
+
 def _automation_definition() -> dict[str, object]:
     return {
         "name": "Invoice PDFs",
@@ -7749,6 +7760,7 @@ def _automation_definition() -> dict[str, object]:
 def test_rule_entitlement_blocks_writes_before_lock_and_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, editing: bool,
 ) -> None:
+    _install_rule_catalog(monkeypatch)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
@@ -7856,6 +7868,7 @@ def test_automation_rule_operations_expose_one_cas_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_rule_catalog(monkeypatch)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
@@ -8176,6 +8189,7 @@ def test_account_scoped_rule_verification_and_commit_share_operation_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_rule_catalog(monkeypatch)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
@@ -8280,6 +8294,7 @@ def _desktop_rule_put_operation() -> str:
 def test_desktop_watched_save_uses_current_sender_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editing: bool, remove_sender: bool
 ) -> None:
+    _install_rule_catalog(monkeypatch)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
@@ -8331,6 +8346,7 @@ def test_desktop_watched_save_uses_current_sender_admission(
 def test_watched_save_rejects_missing_mixed_or_inactive_sender_without_changing_generic_put(
     tmp_path: Path, sender_conditions: list[dict[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _install_rule_catalog(monkeypatch)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)
@@ -8350,6 +8366,7 @@ def test_watched_save_rejects_missing_mixed_or_inactive_sender_without_changing_
 def test_watched_save_membership_and_commit_share_watchlist_mutation_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _install_rule_catalog(monkeypatch)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     config_path = tmp_path / "config.toml"
     write_config(config_path)

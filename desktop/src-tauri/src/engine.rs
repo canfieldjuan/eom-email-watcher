@@ -807,6 +807,8 @@ pub struct AutomationFireProjection {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AttachmentCapabilityResult {
     #[serde(default)]
+    pub required_manifest_features: Vec<String>,
+    #[serde(default)]
     pub job_id: Option<String>,
     pub capability_id: String,
     pub capability_version: String,
@@ -880,6 +882,8 @@ pub struct ConnectAcceptedArtifact {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConnectParameter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_value: Option<Value>,
     pub name: String,
     pub value_type: String,
     pub required: bool,
@@ -906,6 +910,8 @@ pub struct ConnectCapabilityDeclaration {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConnectCapability {
+    #[serde(default)]
+    pub acknowledged_manifest_features: Vec<String>,
     pub protocol_version: u32,
     pub provider: ConnectProvider,
     pub capability: ConnectCapabilityDeclaration,
@@ -999,6 +1005,8 @@ pub struct CalendarConsentStatus {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConnectInvocationResult {
+    #[serde(default)]
+    pub required_manifest_features: Vec<String>,
     pub protocol_version: u32,
     pub job_id: String,
     pub provider: ConnectProviderIdentity,
@@ -1106,6 +1114,8 @@ pub struct AutomationRuleSummary {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct AutomationRuleDetail {
+    #[serde(default)]
+    pub selection: Option<Value>,
     pub summary: AutomationRuleSummary,
     // Python's strict rule schema owns definition admission and canonicalization.
     pub definition: Option<Value>,
@@ -3661,6 +3671,62 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"inbox.query","data":{"items"
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn attachment_capabilities_roundtrip_preserves_fixed_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        for (value, value_type) in [
+            (json!(""), "string"),
+            (json!(0), "integer"),
+            (json!(false), "boolean"),
+        ] {
+            let response = json!({"protocol": 1, "ok": true,
+            "operation": "connect.attachment.capabilities", "data": {"diagnostic": null,
+            "items": [{"protocol_version": 2,
+                "acknowledged_manifest_features": ["fixed-parameters-v1"],
+                "provider": {"app_id": "fixture", "name": "Fixture", "version": "1.0.0",
+                    "instance_id": "11111111-1111-4111-8111-111111111111"},
+                "capability": {"id": "document.translate", "version": "1.0",
+                    "action": {"label": "Translate", "description": "Fixture"},
+                    "accepts": [], "produces": [],
+                    "parameters": [{"name": "pin", "value_type": value_type,
+                        "required": true, "label": "Pin", "description": "Fixture",
+                        "fixed_value": value}],
+                    "effects": {"external": false, "confirmation_required": false}}
+            }]}});
+            let path = directory.path().join("response.json");
+            fs::write(&path, serde_json::to_vec(&response).unwrap()).unwrap();
+            let engine = Engine::with_command(
+                "sh",
+                vec![
+                    OsString::from("-c"),
+                    OsString::from("cat >/dev/null; cat \"$1\""),
+                    OsString::from("fixture"),
+                    path.as_os_str().to_owned(),
+                ],
+                PathBuf::from("unused.toml"),
+            );
+            let result = engine
+                .attachment_capabilities("m".into(), "2".into())
+                .unwrap();
+            assert_eq!(serde_json::to_value(result).unwrap(), response["data"]);
+        }
+    }
+
+    #[test]
+    fn connect_parameter_roundtrip_preserves_fixed_values() {
+        for value in [json!(""), json!(0), json!(false)] {
+            let raw = json!({"name": "pin", "value_type": "string", "required": true,
+                "label": "Pin", "description": "Fixture", "fixed_value": value});
+            let parameter: ConnectParameter = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parameter).unwrap(), raw);
+        }
+        let legacy = json!({"name": "pin", "value_type": "string", "required": true,
+            "label": "Pin", "description": "Fixture"});
+        let parameter: ConnectParameter = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parameter).unwrap(), legacy);
+    }
+
     #[test]
     fn protocol_v2_capabilities_and_durable_results_are_typed() {
         let capabilities: ConnectCapabilities = serde_json::from_value(json!({
@@ -4353,6 +4419,60 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
                 let request: Value =
                     serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
                 assert_eq!(request["payload"], json!({"definition":definition}));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rule_detail_transport_preserves_frozen_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("response.json");
+        let definition = json!({"action": {"parameters": {}}});
+        let summary = json!({"rule_id":"saved", "version":7, "enabled":false,
+            "system":false, "valid":true, "name":"Saved", "invalid_reason":null,
+            "created_at":"now", "updated_at":"now"});
+        let snapshot = json!({"acknowledged_manifest_features":["fixed-parameters-v1"],
+            "capability":{"parameters":[
+                {"name":"off", "value_type":"boolean", "fixed_value":false},
+                {"name":"zero", "value_type":"integer", "fixed_value":0},
+                {"name":"empty", "value_type":"string", "fixed_value":""}]}});
+        for selection in [snapshot, Value::Null] {
+            for operation in [
+                "automation.rules.get",
+                "automation.rules.put_watched",
+                "automation.rules.set_enabled",
+            ] {
+                let rule =
+                    json!({"summary":summary, "definition":definition, "selection":selection});
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&json!({"protocol":1, "ok":true,
+                    "operation":operation, "data":{"rule":rule}}))
+                    .unwrap(),
+                )
+                .unwrap();
+                let engine = Engine::with_command(
+                    "sh",
+                    vec![
+                        OsString::from("-c"),
+                        OsString::from("cat >/dev/null; cat \"$1\""),
+                        OsString::from("fixture"),
+                        path.as_os_str().to_owned(),
+                    ],
+                    PathBuf::from("unused.toml"),
+                );
+                let result = match operation {
+                    "automation.rules.get" => engine.get_automation_rule("saved".into()),
+                    "automation.rules.put_watched" => engine.put_automation_rule(
+                        definition.clone(),
+                        Some("saved".into()),
+                        Some(7),
+                    ),
+                    _ => engine.set_automation_rule_enabled("saved".into(), 7, false),
+                }
+                .unwrap();
+                assert_eq!(serde_json::to_value(result.rule).unwrap(), rule);
             }
         }
     }

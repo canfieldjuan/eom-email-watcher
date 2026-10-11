@@ -1,8 +1,9 @@
+import { activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult } from "./connectIdentity";
+import { collectCapabilityParameters } from "./connectParameters";
 import { mountCoiSetup } from "./coiSetup";
 import type {
   ConnectProviderIdentity,
   ConnectCapabilityRef,
-  ConnectCapabilityDeclaration,
   ConnectCapability,
   ConnectOutputMetadata,
   ConnectCapabilities,
@@ -96,6 +97,7 @@ interface ConnectSummary {
 }
 
 interface AttachmentCapabilityResult {
+  required_manifest_features?: string[];
   job_id?: string;
   capability_id: string;
   capability_version: string;
@@ -114,6 +116,7 @@ interface AttachmentCapabilityResult {
 }
 
 interface ConnectInvocationResult {
+  required_manifest_features?: string[];
   protocol_version: 2;
   job_id: string;
   provider: ConnectProviderIdentity;
@@ -1372,33 +1375,6 @@ function attachmentKey(messageId: string, partId: string): string {
   return JSON.stringify([messageId, partId]);
 }
 
-function canonicalCapabilityParameters(
-  parameters: Record<string, string | number | boolean>,
-): string {
-  return JSON.stringify(
-    Object.entries(parameters).sort(([left], [right]) => left.localeCompare(right)),
-  );
-}
-
-function capabilityInvocationKey(
-  messageId: string,
-  partId: string,
-  provider: ConnectProviderIdentity,
-  capability: ConnectCapabilityRef,
-  parameters: Record<string, string | number | boolean>,
-): string {
-  return JSON.stringify([
-    messageId,
-    partId,
-    provider.app_id,
-    provider.version,
-    provider.instance_id,
-    capability.id,
-    capability.version,
-    canonicalCapabilityParameters(parameters),
-  ]);
-}
-
 function capabilityOutputKey(
   messageId: string,
   partId: string,
@@ -1455,70 +1431,6 @@ function capabilityGroups(
   return [...groups.values()];
 }
 
-function matchingCapabilityResult(
-  attachment: InboxAttachment,
-  selected: ConnectCapability,
-  parameters?: Record<string, string | number | boolean>,
-): AttachmentCapabilityResult | undefined {
-  const matches = (attachment.capability_results ?? []).filter(
-    (result) =>
-      result.protocol_version === 2 &&
-      result.provider?.app_id === selected.provider.app_id &&
-      result.provider.version === selected.provider.version &&
-      result.provider.instance_id === selected.provider.instance_id &&
-      result.capability_id === selected.capability.id &&
-      result.capability_version === selected.capability.version &&
-      (parameters === undefined ||
-        canonicalCapabilityParameters(result.parameters ?? {}) ===
-          canonicalCapabilityParameters(parameters)),
-  );
-  return matches.find(activeCapabilityResult) ?? matches[0];
-}
-
-function activeCapabilityResult(result: AttachmentCapabilityResult | undefined): boolean {
-  return ["requested", "accepted", "processing"].includes(result?.status ?? "");
-}
-
-function collectCapabilityParameters(
-  capability: ConnectCapabilityDeclaration,
-  initial: Record<string, string | number | boolean> = {},
-): Record<string, string | number | boolean> | null {
-  const values: Record<string, string | number | boolean> = {};
-  for (const parameter of capability.parameters) {
-    const omission = parameter.required
-      ? "Cancel stops this action."
-      : "Cancel leaves this optional value unset.";
-    const raw = window.prompt(
-      `${parameter.label}\n${parameter.description}\nExpected ${parameter.value_type}. ${omission}`,
-      parameter.name in initial ? String(initial[parameter.name]) : "",
-    );
-    if (raw === null) {
-      if (parameter.required) return null;
-      continue;
-    }
-    if (parameter.value_type === "string") {
-      values[parameter.name] = raw;
-      continue;
-    }
-    if (parameter.value_type === "integer") {
-      if (!/^-?(0|[1-9]\d*)$/.test(raw)) {
-        throw new Error(`${parameter.label} must be a whole number.`);
-      }
-      const value = Number(raw);
-      if (!Number.isSafeInteger(value)) {
-        throw new Error(`${parameter.label} is outside the supported number range.`);
-      }
-      values[parameter.name] = value;
-      continue;
-    }
-    const normalized = raw.trim().toLowerCase();
-    if (normalized !== "true" && normalized !== "false") {
-      throw new Error(`${parameter.label} must be true or false.`);
-    }
-    values[parameter.name] = normalized === "true";
-  }
-  return values;
-}
 
 function renderOutputPresentation(
   container: HTMLDivElement,
@@ -2061,6 +1973,7 @@ function renderInbox(items: InboxItem[]): void {
           result.provider,
           { id: result.capability_id, version: result.capability_version },
           result.parameters ?? {},
+          result.required_manifest_features ?? [],
         );
         if (activeCapabilityResult(result)) attachmentRequestIds.set(key, result.job_id);
         else attachmentRequestIds.delete(key);
@@ -2105,6 +2018,7 @@ function renderInbox(items: InboxItem[]): void {
             selected.provider,
             selected.capability,
             existing?.parameters ?? {},
+            selected.acknowledged_manifest_features ?? [],
           );
           const active = activeCapabilityResult(existing);
           const inFlight = attachmentInvocationsInFlight.has(key);
@@ -2155,6 +2069,7 @@ function renderInbox(items: InboxItem[]): void {
             capability.provider,
             capability.capability,
             parameters,
+            capability.acknowledged_manifest_features ?? [],
           );
           const active = matchingCapabilityResult(attachment, capability, parameters);
           const requestId =

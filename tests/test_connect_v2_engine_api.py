@@ -4662,6 +4662,10 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
+    monkeypatch.setattr(
+        connect, "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
+    )
     submissions: list[tuple[str, bytes]] = []
     queries: list[str] = []
     gmail_reads = 0
@@ -4674,7 +4678,7 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
 
     class RecoveringClient:
         def __init__(self, capability_value):
-            assert capability_value == selected
+            assert capability_value in (selected, registered_capability(selected))
 
         def submit(self, job, content):
             assert content == PDF
@@ -4992,7 +4996,7 @@ def test_queue_pump_advances_other_provider_lane_without_waiting_for_terminal(
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities_for_reconciliation",
-        lambda *, provider_instance_id: connect.CapabilityCatalog(
+        lambda *, provider_instance_id, **kwargs: connect.CapabilityCatalog(
             tuple(
                 candidate
                 for candidate in (first_capability, second_capability)
@@ -5003,7 +5007,7 @@ def test_queue_pump_advances_other_provider_lane_without_waiting_for_terminal(
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
-        lambda *, provider_instance_id: connect.CapabilityCatalog(
+        lambda *, provider_instance_id, **kwargs: connect.CapabilityCatalog(
             tuple(
                 candidate
                 for candidate in (first_capability, second_capability)
@@ -5812,6 +5816,10 @@ def test_nonterminal_get_error_preserves_reconciliation_lane(
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
+    monkeypatch.setattr(
+        connect, "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
+    )
     submissions = 0
     queries = 0
 
@@ -5821,7 +5829,7 @@ def test_nonterminal_get_error_preserves_reconciliation_lane(
 
     class InconclusiveClient:
         def __init__(self, capability_value):
-            assert capability_value == selected
+            assert capability_value in (selected, registered_capability(selected))
 
         def submit(self, job, content):
             nonlocal submissions
@@ -5941,6 +5949,10 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
+    monkeypatch.setattr(
+        connect, "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
+    )
     gmail_reads = 0
     submissions = 0
     queries = 0
@@ -5955,7 +5967,7 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
 
     class ReconcilingClient:
         def __init__(self, capability_value):
-            assert capability_value == selected
+            assert capability_value in (selected, registered_capability(selected))
 
         def submit(self, job, content):
             nonlocal submissions
@@ -6015,6 +6027,10 @@ def test_reconciliation_returns_a_terminal_row_won_by_another_poller(
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
+    monkeypatch.setattr(
+        connect, "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
+    )
     submitted: list[connect.PreparedCapabilityJob] = []
     wait_calls = 0
 
@@ -6024,7 +6040,7 @@ def test_reconciliation_returns_a_terminal_row_won_by_another_poller(
 
     class RacingClient:
         def __init__(self, capability_value):
-            assert capability_value == selected
+            assert capability_value in (selected, registered_capability(selected))
 
         def submit(self, job, content):
             assert content == PDF

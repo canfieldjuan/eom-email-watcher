@@ -125,3 +125,12 @@ test("mutation reserves before awaiting and requires a fresh snapshot after unce
   await gate.run(async () => { calls++; gate.refreshed(); }, true);
   assert.equal(calls, 2);
 });
+
+test("COI selection accepts required fixed parameters but still rejects editable requirements", () => {
+  for (const [fixed_value, value_type] of [["", "string"], [0, "integer"], [false, "boolean"]] as const) {
+    const parameter = { name: "pin", required: true, value_type, label: "Pin", description: "", fixed_value };
+    assert.equal(isCoiProvider({ ...capability, capability: { ...capability.capability, parameters: [parameter] } }), true);
+    const { fixed_value: _fixed, ...editable } = parameter;
+    assert.equal(isCoiProvider({ ...capability, capability: { ...capability.capability, parameters: [editable] } }), false);
+  }
+});
