@@ -136,7 +136,9 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
 
     runtime = SimpleNamespace(
         store=SimpleNamespace(
-            connect_dispatch=lambda _: SimpleNamespace(source_available=True),
+            connect_dispatch=lambda _: SimpleNamespace(
+                source_available=True, required_manifest_features=()
+            ),
         )
     )
     capability = SimpleNamespace()

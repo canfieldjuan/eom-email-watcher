@@ -5155,6 +5155,7 @@ def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -
             "instance_id": "11111111-1111-4111-8111-111111111111",
         },
         "parameters": {"target-language": "Spanish"},
+        "required_manifest_features": [],
         "dispatch_state": "terminal",
         "queue_ahead": 0,
         "next_attempt_at": None,

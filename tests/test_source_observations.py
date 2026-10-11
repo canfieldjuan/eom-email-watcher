@@ -307,7 +307,7 @@ def test_migration_is_conservative_and_rolls_back(tmp_path: Path, monkeypatch):
     store.initialize()
     assert _stamps(store, scope) == [None]
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert db.execute("PRAGMA user_version").fetchone()[0] == db_module.SCHEMA_VERSION
         assert (
             db.execute(
                 "SELECT count(*) FROM message_source_observations "

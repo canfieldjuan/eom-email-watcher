@@ -9,7 +9,7 @@ export interface RuleSummary {
   name: string | null;
   invalid_reason: string | null;
 }
-export interface RuleDetail { summary: RuleSummary; definition: unknown }
+export interface RuleDetail { summary: RuleSummary; definition: unknown; selection?: ConnectCapability | null }
 export interface RuleResult { rule: RuleDetail }
 export interface RuleList { revision: number; rules: RuleSummary[] }
 export function coiControlState(automationsActive: boolean, selectedRule: RuleSummary | null): {
@@ -42,7 +42,7 @@ export function isCoiProvider(item: ConnectCapability): boolean {
     && item.capability.accepts.some((a) => a.media_type === "application/pdf"
       && Number.isSafeInteger(a.max_bytes) && a.max_bytes > 0)
     && item.capability.produces.includes("application/vnd.local-connect.certificate+json")
-    && !item.capability.parameters.some((parameter) => parameter.required);
+    && !item.capability.parameters.some((parameter) => parameter.required && !Object.hasOwn(parameter, "fixed_value"));
 }
 
 // This only expresses the form. Python prepares text and validates the rule schema.

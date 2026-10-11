@@ -155,6 +155,9 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
     class EmptyCatalog:
         diagnostic_code = None
 
+        def __init__(self, *, required_manifest_features):
+            assert required_manifest_features == ("fixed-parameters-v1",)
+
         def compatible(self, _media_type: str, _byte_size: int) -> list[object]:
             nonlocal discovery_calls
             discovery_calls += 1

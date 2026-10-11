@@ -19,6 +19,7 @@ export interface ConnectParameter {
   required: boolean;
   label: string;
   description: string;
+  fixed_value?: string | number | boolean;
 }
 
 export interface ConnectCapabilityDeclaration extends ConnectCapabilityRef {
@@ -30,6 +31,7 @@ export interface ConnectCapabilityDeclaration extends ConnectCapabilityRef {
 }
 
 export interface ConnectCapability {
+  acknowledged_manifest_features?: string[];
   protocol_version: 2;
   provider: ConnectProvider;
   capability: ConnectCapabilityDeclaration;
