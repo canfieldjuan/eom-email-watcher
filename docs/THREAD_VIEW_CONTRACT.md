@@ -100,7 +100,7 @@ Each definition is the only place its rule is stated.
 - **Purge.**
   - A message outside a followed thread is purged once it is older than the cutoff, as today.
   - A followed thread is purged as one unit once its newest message is older than the cutoff (decision D1) and the account's coverage is current ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)), so a thread whose newer replies are still unfetched is kept.
-  - Purge takes all message-owned content and state, including bodies, claims, discrepancies, attempts, attachment inventory, classification evidence, operational status and reasons, and invoice records. The shared queue retains only the non-content reconciliation tombstone and lane ownership required by `docs/CONTRACTS.md` until an authoritative terminal outcome; it stores no late result content. Shared content-hash cache cleanup follows attachment inspection, I-cache. Deletes run with `PRAGMA secure_delete = ON`.
+  - Purge takes all message-owned content and state, including bodies, claims, discrepancies, attempts, attachment inventory, classification evidence, operational status and reasons, and invoice records. The shared queue retains only the non-content reconciliation tombstone and lane ownership required by `docs/CONTRACTS.md` until an authoritative terminal outcome; it stores no late result content. Shared classification cache cleanup follows attachment inspection, I-cache (full `ClassificationCacheKey`). Deletes run with `PRAGMA secure_delete = ON`.
 
 ### D-capture: what is stored, and its provenance
 
