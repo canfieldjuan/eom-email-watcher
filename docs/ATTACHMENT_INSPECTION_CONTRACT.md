@@ -1,6 +1,6 @@
 # Attachment inspection contract
 
-Status: **PROPOSED**, inspection pipeline only (#231), separate from the D5 claims amendment (#234). Contracts only. Before either is accepted, this contract and the document classifier contract in Invoice Processor must state the same result format (I-result). Nothing here is implemented.
+Status: **ACCEPTED**, inspection pipeline only (#231), separate from the D5 claims amendment (#234). Contracts only. Before either is accepted, this contract and the document classifier contract in Invoice Processor must state the same result format (I-result). Nothing here is implemented.
 
 ## Why
 
