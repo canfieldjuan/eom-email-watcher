@@ -1,6 +1,8 @@
 # Adopt the shared fixed-parameter runtime in Email Watcher
 
-Status: PROPOSED. Plan-only PR. Implementation requires operator acceptance
+Status: PROPOSED AMENDMENT. Operator acceptance of the earlier plan does not
+accept this consolidation. Implementation is paused pending fresh acceptance.
+Plan-only PR. Implementation requires operator acceptance
 of the reviewed plan. This does not authorize inspection, classification,
 claims, provider changes, deployment, or merging a subsequent implementation PR.
 
@@ -24,9 +26,11 @@ pass a recorded `required_manifest_features` requirement.
 parameter, including values a provider declares immutable.
 
 Required surface: dependency pin/lockfile, queue metadata and its migration,
-those discovery/preparation/restoration/join seams, interactive parameter
-collection/types, and their behavioral regressions. Shared parsing and wire
-policy remain shared owners; Watcher must not build its own header parser,
+those discovery/preparation/restoration/join seams, immutable rule-selection
+metadata and save/fire owners, inbox projection and desktop identity readers,
+interactive parameter collection/types, Rust catalog transport, and their
+behavioral regressions. Shared parsing and wire policy remain shared owners;
+Watcher must not build its own header parser,
 fixed-value comparator, or manifest negotiation policy.
 
 ## Validated upstream inventory and parity boundary
@@ -85,36 +89,85 @@ changes to the shared policy, provider wire schema, job identity or replay.
    shared parameter owner. Missing caller input receives the declaration's
    fixed value; a conflicting caller value follows the shared rejection.
    Preserve presence and primitive type, including false, zero and empty
-   string. Existing immutable rule definitions are not rewritten from later
-   catalogs; conflicting stored intent must fail rather than silently change.
+   string. Freeze the acknowledged feature requirement and shared-bound fixed
+   parameters when a rule revision is saved. Later fires consume that frozen
+   selection; they never rebind omitted fields from a newer catalog. A
+   conflicting declaration moves the fire to manual review. Legacy revisions
+   without frozen selection metadata require manual review when their
+   capability first declares fixed parameters. Re-confirming means saving an
+   explicit new revision; do not mutate an existing revision or reinterpret
+   its definition hash. Preserve legacy rules whose capabilities remain legacy.
+   Store the immutable selection snapshot with the revision in the same
+   transaction, after save-time discovery/shared validation. Enable/disable
+   revisions retain their underlying selection; enabling is not reselection.
+   If save-time discovery fails, do not save an unverified new selection.
 4. Add immutable, validated feature-requirement metadata to generic dispatch
    admission in the same transaction as the job. Use the shared feature
    validator and record exactly the selected capability's verified
    `acknowledged_manifest_features`: non-empty only on acknowledgment, empty
    on the legacy path, never inferred from the request header. This
-   plan explicitly permits an additive dispatch migration (baseline schema
-   version 31; allocate the next free version at implementation time).
+   plan explicitly permits additive dispatch and immutable rule-selection
+   metadata migrations (baseline schema version 31; allocate the next free
+   version at implementation time).
    Legacy rows receive an empty requirement, not an invented acknowledgment.
    Keep provider `request_json` unchanged. Extend Watcher's host-side
    invocation/join identity to distinguish requirements; preserve existing
-   legacy fingerprints and never rehash provider-owned requests.
+   legacy fingerprints and never rehash provider-owned requests. The host
+   fingerprint owner includes non-empty feature requirements, so inbox ranking
+   using that fingerprint keeps those jobs separate; the empty legacy input
+   retains its old fingerprint. Project the frozen requirement into result
+   DTOs and verified acknowledgment into catalog DTOs, including Rust and
+   TypeScript. Desktop result matching and request-ID caching consume those
+   fields, never infer acknowledgment from a fixed-value field.
 5. Pass the persisted requirement to shared discovery before every proven-new
    submission, including authoritative resubmission. A missing acknowledgment
    cannot downgrade an admitted feature request. Restoration/resubmission
    consumes the exact frozen request and values, without rebinding from a
-   rediscovered declaration. GET-only reconciliation remains available under
-   existing ownership/entitlement rules and never needs a new manifest merely
-   to observe a possibly accepted job. Reuse existing queue error/ownership
+   rediscovered declaration. Both interactive and automation crash recovery
+   normalize an omitted fixed input through shared parameter binding against
+   the persisted selection snapshot before comparing invocation identity.
+   Explicit conflicts remain rejected. Preserve the minimal fixed declaration
+   provenance needed by that shared owner at admission; never use a fresh
+   catalog or fill omitted editable inputs during recovery. GET-only
+   reconciliation remains available under existing ownership/entitlement rules
+   and never needs a new manifest merely to observe a possibly accepted job. Reuse existing queue error/ownership
    transitions; shared fixed refusals must not cause retry loops or release a
    possibly owned lane on malformed/ambiguous evidence.
 6. Update `desktop/src/connectTypes.ts` and parameter collection to consume
    fixed metadata. Factor collection into a directly testable helper if
    needed, without redesigning the UI or adding classifier controls. Prompt
    only for editable fields. The backend remains authoritative against forged
-   caller values. Audit Rust transport types if they mirror the declaration;
-   extend only an actual serialization boundary that would drop the metadata.
+   caller values. Extend `ConnectParameter` in the Rust transport to preserve
+   presence and primitive type of `fixed_value` when deserializing the engine
+   response and serializing to TypeScript. Extend catalog/result identity DTOs
+   at that actual serialization boundary as specified in the reader table.
 7. Run focused proof, source-owner mutations and required gates, then open a
    separate implementation PR. Record exact-head artifacts outside worktrees.
+
+## Consolidated owners and reader audit
+
+The earlier plan covered queue admission but missed rule-selection lifetime
+and readers of the same identity. This table is an implementation checklist,
+not a second definition of shared wire or fixed-parameter policy.
+
+| Owner / reader | Adopted form and regression |
+| --- | --- |
+| Shared discovery and parameter binder | Own negotiation, acknowledgment and typed fixed binding; Watcher consumes verified results and reuses the binder with persisted declarations on recovery |
+| `_automation_rules_prepare`, `_automation_rules_put`, `Store.put_automation_rule`, rule parser/canonicalizer | Save one immutable revision selection snapshot from verified discovery; expose the saved intent for review, preserve definition hashing and carry snapshot through enable/disable |
+| `_dispatch_automation_fire`, including exact-job crash recovery | New fires use the revision snapshot; recovered jobs use their admission snapshot; rotation/legacy missing snapshot produces manual review, not implicit reselection |
+| `_prepare_or_create_generic_connect_job`, `Store.create_connect_job`, dispatch migration | Atomically admit frozen request, verified requirement and fixed declaration provenance; legacy rows stay empty and do not gain invented acknowledgment |
+| `_validate_existing_invocation_identity`, interactive retry and automation recovery callers | Normalize only omitted fixed fields with the shared binder and persisted declarations, then compare durable intent; explicit conflicts and wrong types reject |
+| Host fingerprint owner, active/completed lookup, admission joins, effectful join guard | Include verified requirement in host identity; legacy empty requirement preserves its existing fingerprint; same-request-ID conflicts cannot bypass it |
+| `Store.inbox_page`, result projection, `_generic_connect_result`, `_generic_connect_active_result` and result serializers | Rank by the requirement-aware host fingerprint and expose the frozen requirement; prove both otherwise identical jobs remain visible |
+| `_tracked_generic_job`, `_discover_persisted_generic_capability`, submit/resume paths | Restore saved bytes; require frozen acknowledgment before new POST; GET-only reconciliation remains independent of fresh manifest availability |
+| Rust `ConnectParameter`, capability catalog and attachment/result DTOs, `Engine::attachment_capabilities` | Round-trip fixed fields and feature identity through the real typed engine transport, retaining false, zero and empty string, omitting absent legacy fields |
+| Desktop collector, `matchingCapabilityResult`, `capabilityInvocationKey`, request-ID cache call sites and result types | Consume fixed metadata without prompting; matching/cache identities use verified catalog versus frozen result requirements and never reuse a different-requirement job ID |
+
+Audit every reader and producer of parameters, invocation fingerprints,
+requirements, rule revisions and capability DTOs before pushing implementation.
+No private manifest parser/comparator or downstream identity special case is
+introduced. Where an existing policy must be factored to one owner, its callers
+are included in the same class fix.
 
 ## Verification and fail-first acceptance
 
@@ -133,9 +186,16 @@ changes to the shared policy, provider wire schema, job identity or replay.
   string/integer/boolean fields, both omitted and supplied identically. Verify
   actual submitted multipart request values. Conflicting and wrong-type
   values make no POST; probe false, zero, empty string and bool-as-integer.
-- Exercise a rule fire through the real preparation/queue path: its immutable
-  stored parameters are preserved, and shared fixed binding is applied only
-  to newly prepared intent, never as a rewrite of admitted request bytes.
+- Save a rule through the real discovery/save path, fire it, then rotate the
+  fixed declaration before a separate fire. Assert the revision's fixed
+  values and requirement remain frozen and the later conflict needs manual
+  review. Test legacy missing snapshots and enabling an old revision; neither
+  operation may silently adopt a current fixed value. Include save-time
+  discovery failure and explicit new-revision re-confirmation.
+- Replay the original omitted fixed inputs through the interactive API and
+  automation exact-job crash recovery after admission/restart. Assert the same
+  request identity is recovered without a fresh catalog; conflicting supplied
+  values still reject and omitted editable fields are not filled implicitly.
 - Queue, restart and rediscover the same provider with the feature absent or
   fixed declaration rotated. Verify the durable feature requirement survives
   restart, no downgraded POST occurs, GET reconciliation still works, and an
@@ -144,12 +204,16 @@ changes to the shared policy, provider wire schema, job identity or replay.
 - Two otherwise identical invocations with different feature requirements do
   not join. Identical requirements still deduplicate. Migrated legacy rows
   remain empty-requirement and retain their existing request/fingerprint.
+  Project both jobs through inbox ranking and the Rust result transport;
+  desktop matching/cache tests must select/resume each without a cross-join.
 - Exercise well-formed fixed refusal and malformed retryability/status
   variants through the queue; assert authoritative non-acceptance versus
   possible provider ownership without inventing a second error decoder.
 - Desktop fixed values do not prompt and preserve falsy values; editable
   legacy fields and cancellation still work. Forged frontend values reject
   at the backend. Test the production collector, not a mirrored algorithm.
+  Also round-trip declarations through `Engine::attachment_capabilities` with
+  false, zero and empty string; a collector-only test cannot prove delivery.
 - Existing Connect entitlement, Automations authority, confirmation, source
   deletion and effect-authority regressions remain passing. Issue238's
   pre-existing rule contract/source reconciliation stays a separate owner.
@@ -182,6 +246,7 @@ plan before expanding the implementation surface.
 
 ## Gap audit
 
-NOT DONE: this is a proposed adoption plan. No dependency, source, schema,
-tests or product behavior has changed, and no adoption/runtime proof is
-claimed. Review and operator acceptance precede implementation.
+NOT DONE: this PR changes only the proposed adoption plan. Partial
+implementation exists separately and is paused; no adoption/runtime proof or
+implementation acceptance is claimed here. Review and fresh operator
+acceptance of this consolidation precede further implementation and merge.
