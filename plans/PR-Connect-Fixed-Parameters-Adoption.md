@@ -74,7 +74,14 @@ changes to the shared policy, provider wire schema, job identity or replay.
    `uv.lock` with uv. Audit all transitive changes; unrelated dependency
    updates are out of scope. Verify the installed revision and packaged
    policy/fixture provenance match the published runtime.
-3. Bind fixed parameters once for each newly selected invocation using the
+3. For new-intent catalog browsing and capability selection, always request
+   `fixed-parameters-v1` through shared discovery's
+   `required_manifest_features=("fixed-parameters-v1",)` option. This covers
+   `_connect_catalog`, `_connect_attachment_capabilities` and
+   `_discover_selected_generic_capability`, including rule selection.
+   The shared consumer owner still admits an unacknowledged legacy response
+   on its legacy decoder path; requesting support is not evidence of support.
+   Bind fixed parameters once for each newly selected invocation using the
    shared parameter owner. Missing caller input receives the declaration's
    fixed value; a conflicting caller value follows the shared rejection.
    Preserve presence and primitive type, including false, zero and empty
@@ -82,7 +89,9 @@ changes to the shared policy, provider wire schema, job identity or replay.
    catalogs; conflicting stored intent must fail rather than silently change.
 4. Add immutable, validated feature-requirement metadata to generic dispatch
    admission in the same transaction as the job. Use the shared feature
-   validator and record the acknowledged requirement from selection. This
+   validator and record exactly the selected capability's verified
+   `acknowledged_manifest_features`: non-empty only on acknowledgment, empty
+   on the legacy path, never inferred from the request header. This
    plan explicitly permits an additive dispatch migration (baseline schema
    version 31; allocate the next free version at implementation time).
    Legacy rows receive an empty requirement, not an invented acknowledgment.
@@ -109,6 +118,14 @@ changes to the shared policy, provider wire schema, job identity or replay.
 
 ## Verification and fail-first acceptance
 
+- End-to-end negotiation: start with Watcher's real catalog/selection call,
+  assert the outgoing manifest feature header, return a correctly acknowledged
+  fixed declaration, select it with caller values omitted, admit the job,
+  restart the queue, and assert both the saved feature requirement and the
+  eventual POST's bound fixed value. Do not inject a pre-acknowledged
+  capability or mock discovery success. Repeat with a legacy provider that
+  ignores the feature request: it remains selectable, records an empty
+  requirement and submits its unchanged legacy parameters.
 - Legacy discovery without negotiated headers remains usable, while malformed
   present headers and wrong/unsolicited acknowledgment reject through the
   shared consumer owner. Negotiated discovery takes the shared strict path.
