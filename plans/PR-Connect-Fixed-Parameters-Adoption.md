@@ -163,6 +163,7 @@ not a second definition of shared wire or fixed-parameter policy.
 | `_tracked_generic_job`, `_discover_persisted_generic_capability`, submit/resume paths | Restore saved bytes; require frozen acknowledgment before new POST; GET-only reconciliation remains independent of fresh manifest availability |
 | Rust `ConnectParameter`, capability catalog and attachment/result DTOs, `Engine::attachment_capabilities` | Round-trip fixed fields and feature identity through the real typed engine transport, retaining false, zero and empty string, omitting absent legacy fields |
 | Desktop collector, `matchingCapabilityResult`, `capabilityInvocationKey`, request-ID cache call sites and result types | Consume fixed metadata without prompting; matching/cache identities use verified catalog versus frozen result requirements and never reuse a different-requirement job ID |
+| `isCoiProvider` (`desktop/src/coiRules.ts`), provider list and live pre-save recheck (`desktop/src/coiSetup.ts`) | Both callers consume the same fixed-aware provider eligibility owner; required declared values must not disappear at the rule-provider filter before selection or save |
 
 Audit every reader and producer of parameters, invocation fingerprints,
 requirements, rule revisions and capability DTOs before pushing implementation.
@@ -215,6 +216,11 @@ are included in the same class fix.
   at the backend. Test the production collector, not a mirrored algorithm.
   Also round-trip declarations through `Engine::attachment_capabilities` with
   false, zero and empty string; a collector-only test cannot prove delivery.
+- Exercise the rule-provider filter through both the production provider list
+  and live pre-save recheck: required fixed parameters are accepted, including
+  false, zero and empty string; required editable parameters are rejected.
+  Mixed fixed/editable requirements remain rejected; a provider rotation
+  between listing and save must be judged by the same `isCoiProvider` owner.
 - Exercise the rule-detail projection through real engine transport for
   get/put/set-enabled and no-op responses, then render the saved-rule review.
   Assert the frozen requirement and fixed declarations/values survive with
