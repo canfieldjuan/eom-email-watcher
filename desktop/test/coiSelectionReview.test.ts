@@ -76,7 +76,7 @@ test("saved rule review renders the frozen selection even when not editable", as
 
 
 test("required fixed COI parameters survive provider listing and the live pre-save recheck", async () => {
-  for (const fixed_value of ["", 0, false]) for (const rotatedToEditable of [false, true]) {
+  for (const fixed_value of ["", 0, false]) for (const liveState of ["fixed", "editable", "mixed-fixed-first", "mixed-editable-first"]) {
     const provider = { app_id: "invoice-processor", name: "Fixture", version: "1.0", instance_id: "saved" };
     const parameter = { name: "pin", value_type: typeof fixed_value === "boolean" ? "boolean" : typeof fixed_value === "number" ? "integer" : "string", required: true, fixed_value };
     const selected = { protocol_version: 2, provider, acknowledged_manifest_features: ["fixed-parameters-v1"],
@@ -93,7 +93,20 @@ test("required fixed COI parameters survive provider listing and the live pre-sa
         case "watchlist_list": return [{ email: "broker@example.com", admission_active: true }];
         case "connect_catalog": {
           const cap = structuredClone(selected);
-          if (++catalogs > 1 && rotatedToEditable) delete (cap.capability.parameters[0] as any).fixed_value;
+          const editable = { name: "user", value_type: "string", required: true };
+          if (++catalogs === 1) {
+            const mixedProviders = [true, false].map((fixedFirst) => ({
+              ...structuredClone(selected),
+              provider: { ...provider, instance_id: `mixed-${fixedFirst}` },
+              capability: { ...selected.capability, parameters: fixedFirst ? [parameter, editable] : [editable, parameter] },
+            }));
+            return { items: [cap, ...mixedProviders], diagnostic: null };
+          }
+          if (liveState === "editable") delete (cap.capability.parameters[0] as any).fixed_value;
+          if (liveState.startsWith("mixed")) {
+            (cap.capability.parameters as any[]) = liveState === "mixed-fixed-first"
+              ? [parameter, editable] : [editable, parameter];
+          }
           return { items: [cap], diagnostic: null };
         }
         case "automation_rules_list": return { rules: [], revision: 0 };
@@ -107,7 +120,7 @@ test("required fixed COI parameters survive provider listing and the live pre-sa
     const { elements, mounted } = mount(invoke);
     await mounted.refresh();
     const providers = elements.get('[data-field="provider"]')!;
-    assert.equal(providers.options.length, 2, "required fixed provider must be listed");
+    assert.equal(providers.options.length, 2, "only the required fixed provider must be listed; mixed providers must be excluded");
     providers.value = rules.providerKey(provider);
     elements.get('[data-field="mailbox"]')!.value = JSON.stringify(["gmail", "mailbox"]);
     elements.get('[data-field="sender"]')!.value = "broker@example.com";
@@ -117,7 +130,7 @@ test("required fixed COI parameters survive provider listing and the live pre-sa
     // Drain the production async mutation, without replacing its selection predicate.
     for (let tick = 0; tick < 10; tick++) await new Promise((resolve) => setImmediate(resolve));
     assert.ok(catalogs >= 2, "live pre-save catalog must be checked");
-    assert.equal(calls.includes("automation_rules_put"), !rotatedToEditable);
-    if (rotatedToEditable) assert.match(elements.get('[data-field="status"]')!.textContent, /provider is unavailable/);
+    assert.equal(calls.includes("automation_rules_put"), liveState === "fixed", `live ${liveState} must use the eligibility owner`);
+    if (liveState !== "fixed") assert.match(elements.get('[data-field="status"]')!.textContent, /provider is unavailable/);
   }
 });

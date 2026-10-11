@@ -132,5 +132,9 @@ test("COI selection accepts required fixed parameters but still rejects editable
     assert.equal(isCoiProvider({ ...capability, capability: { ...capability.capability, parameters: [parameter] } }), true);
     const { fixed_value: _fixed, ...editable } = parameter;
     assert.equal(isCoiProvider({ ...capability, capability: { ...capability.capability, parameters: [editable] } }), false);
+    const requiredEditable = { ...editable, name: "user" };
+    for (const parameters of [[parameter, requiredEditable], [requiredEditable, parameter]]) {
+      assert.equal(isCoiProvider({ ...capability, capability: { ...capability.capability, parameters } }), false);
+    }
   }
 });
