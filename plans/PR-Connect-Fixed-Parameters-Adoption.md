@@ -153,7 +153,8 @@ not a second definition of shared wire or fixed-parameter policy.
 | Owner / reader | Adopted form and regression |
 | --- | --- |
 | Shared discovery and parameter binder | Own negotiation, acknowledgment and typed fixed binding; Watcher consumes verified results and reuses the binder with persisted declarations on recovery |
-| `_automation_rules_prepare`, `_automation_rules_put`, `Store.put_automation_rule`, rule parser/canonicalizer | Save one immutable revision selection snapshot from verified discovery; expose the saved intent for review, preserve definition hashing and carry snapshot through enable/disable |
+| `_automation_rules_prepare`, `_automation_rules_put`, `Store.put_automation_rule`, rule parser/canonicalizer | Save one immutable revision selection snapshot from verified discovery; preserve definition hashing and carry snapshot through enable/disable |
+| `Store._automation_rule_detail`, `_automation_rule_detail_data`, Rust `AutomationRuleDetail` across get/put/set-enabled, TS `RuleDetail` (`coiRules.ts`), saved-rule review (`coiSetup.ts`) | Project that revision snapshot read-only: verified feature requirement and fixed declarations/values, preserving presence and primitive types, or explicit legacy/none. Render with `textContent` even when the rule is not editable; never derive review values from a fresh catalog or change definition bytes/hash |
 | `_dispatch_automation_fire`, including exact-job crash recovery | New fires use the revision snapshot; recovered jobs use their admission snapshot; rotation/legacy missing snapshot produces manual review, not implicit reselection |
 | `_prepare_or_create_generic_connect_job`, `Store.create_connect_job`, dispatch migration | Atomically admit frozen request, verified requirement and fixed declaration provenance; legacy rows stay empty and do not gain invented acknowledgment |
 | `_validate_existing_invocation_identity`, interactive retry and automation recovery callers | Normalize only omitted fixed fields with the shared binder and persisted declarations, then compare durable intent; explicit conflicts and wrong types reject |
@@ -214,6 +215,12 @@ are included in the same class fix.
   at the backend. Test the production collector, not a mirrored algorithm.
   Also round-trip declarations through `Engine::attachment_capabilities` with
   false, zero and empty string; a collector-only test cannot prove delivery.
+- Exercise the rule-detail projection through real engine transport for
+  get/put/set-enabled and no-op responses, then render the saved-rule review.
+  Assert the frozen requirement and fixed declarations/values survive with
+  false, zero and empty string; legacy/none remains explicit. Cover a rule
+  that is not editable, enable/disable preservation and unchanged definition
+  bytes/hash. Test the production readers, not a mirrored projection.
 - Existing Connect entitlement, Automations authority, confirmation, source
   deletion and effect-authority regressions remain passing. Issue238's
   pre-existing rule contract/source reconciliation stays a separate owner.
