@@ -2043,9 +2043,12 @@ function renderInbox(items: InboxItem[]): void {
           if (!capability) return;
           let parameters: Record<string, string | number | boolean> | null;
           try {
+            const previous = matchingCapabilityResult(attachment, capability);
             parameters = collectCapabilityParameters(
               capability.capability,
-              matchingCapabilityResult(attachment, capability)?.parameters,
+              previous?.parameters,
+              undefined,
+              previous?.status,
             );
           } catch (error) {
             inboxStatus.textContent = errorMessage(error);

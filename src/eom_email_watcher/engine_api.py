@@ -2392,10 +2392,6 @@ def _automation_rules_prepare(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"definition"})
     try:
         definition = prepare_rule_definition(payload.get("definition"))
-        action = definition.action
-        _discover_selected_generic_capability(
-            action.provider.model_dump(), action.capability.model_dump(), dict(action.parameters)
-        )
         return {"definition": json.loads(canonical_rule_definition(definition))}
     except RuleValidationError as exc:
         raise ApiError("invalid_rule", exc.reason) from exc

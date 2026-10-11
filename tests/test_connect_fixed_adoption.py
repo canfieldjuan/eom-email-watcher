@@ -643,13 +643,18 @@ def test_legacy_dispatch_migration_preserves_existing_authority():
         )
 
 
-def test_rule_prepare_preserves_omitted_fixed_definition(provider):
+def test_rule_prepare_preserves_omitted_fixed_definition(provider, monkeypatch):
     ref, declaration = selected(provider)
     cap, _ = engine_api._discover_selected_generic_capability(
         ref, {"id": declaration["id"], "version": declaration["version"]}, {}
     )
     definition = contract_rule_definition(cap)
     definition["action"]["parameters"] = {}
+    monkeypatch.setattr(
+        engine_api,
+        "_discover_selected_generic_capability",
+        lambda *args, **kwargs: pytest.fail("preparation must not discover providers"),
+    )
     prepared = engine_api._automation_rules_prepare({"payload": {"definition": definition}})
     assert prepared["definition"]["action"]["parameters"] == {}
 

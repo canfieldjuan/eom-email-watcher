@@ -1,14 +1,17 @@
+import { activeCapabilityResult } from "./connectIdentity.ts";
 import type { ConnectCapabilityDeclaration } from "./connectTypes.ts";
 
 export function collectCapabilityParameters(
   capability: ConnectCapabilityDeclaration,
   initial: Record<string, string | number | boolean> = {},
   prompt: (message: string, value: string) => string | null = (message, value) => window.prompt(message, value),
+  previousStatus?: string,
 ): Record<string, string | number | boolean> | null {
+  const resuming = activeCapabilityResult(previousStatus === undefined ? undefined : { status: previousStatus });
   const values: Record<string, string | number | boolean> = {};
   for (const parameter of capability.parameters) {
     if (Object.hasOwn(parameter, "fixed_value")) {
-      const fixed = Object.hasOwn(initial, parameter.name)
+      const fixed = resuming && Object.hasOwn(initial, parameter.name)
         ? initial[parameter.name]
         : parameter.fixed_value;
       if (fixed === undefined) throw new Error(`${parameter.label} has an invalid fixed value.`);
