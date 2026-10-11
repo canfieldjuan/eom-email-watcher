@@ -1045,7 +1045,13 @@ one instance may not.
 
 An active logical invocation is identified by the existing v2 invocation
 fingerprint together with its message, attachment, and `engine` flag (Job
-origin, below). That fingerprint binds
+origin, below). For engine jobs only, **EngineInvocationKey** additionally
+includes the immutable stage attempt id from I-order; that attempt binds the
+complete selected stage identity from I-version. Active lookup, insertion,
+uniqueness and same-invocation joining all consume this complete key. Distinct
+stage attempts never join through the generic fingerprint, even when its
+parameters are identical; identical-document cache joining remains I-cache's
+separate owner. Non-engine identity and joining are unchanged. That fingerprint binds
 the selected provider/version/instance, capability/version, trusted artifact
 identity, and canonical parameters; it excludes the caller-generated `job_id`.
 Enqueue performs active-fingerprint lookup and insertion in one immediate
