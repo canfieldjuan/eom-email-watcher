@@ -93,11 +93,11 @@ What a slice captures is what its capture decision admits at the time; mail that
 
 ### Source-header evidence prerequisite
 
-Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) proposes schema 31 for the source evidence required by D-identity. This amendment reserves the following schemas as 32 (M2.2), 33 (M2.3), and 34 (M2.4); it changes no milestone behavior or operator decision.
+Before M2.2, source-header evidence and fixed-parameter adoption precede the remaining migrations. Their allocation is owned by [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md); the steps below consume that allocation.
 
 ### M2.2 — Derived state and capture kinds
 
-8. **Derived storage (schema 32):**
+8. **Derived storage (schema 33):**
    - `message_derived(message_id, direction, vendor_id, match)`, the stored attribution of C/D-attribution, through `vendor_of` with its match (C/D-vendor);
    - `thread_follow(provider, account_id, mailbox_identity_key, thread_key, followed, owner_vendor_id)`, the C/D-follow cache;
    - `thread_watermarks(provider, account_id, mailbox_identity_key, thread_key, synced_through)`, for C/D-reconcile.
@@ -106,7 +106,7 @@ Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) propos
 9. **One recompute function, `_recompute_derived(db, changed)`, owns C/D-derived.**
    - It takes the changed inputs: message ids, thread keys, vendor addresses, identities, or (M4) the extractor version, whose change supersedes the previous key's claims as C/D-derived says. From them it finds the affected logical messages, then their threads.
    - It recomputes attribution, then the follow cache. It deletes the cache row of an empty thread (C/D-follow), the watermark of any thread that is not followed (C/D-reconcile), and the bodies a newly unfollowed thread may not keep (M2.4, C/D-body). A message that gains a location, or that polling reports in an admitted folder again (step 6), loses its unavailable reason (M2.4), `outside_folders` or `source_gone` alike: a copy that arrived or returned can supply the body, so stage (c) fetches it again.
-   - The schema-32 migration calls it over every retained message, so an upgraded database has its attribution and follow rows before anything changes.
+   - The schema-33 migration calls it over every retained message, so an upgraded database has its attribution and follow rows before anything changes.
    - Every writer of an input calls it in its own transaction:
      - capture and location recording;
      - `delete_message` and `clear_messages`;
@@ -133,9 +133,9 @@ Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) propos
     - `admission_kind` gains `vendor_address`, `vendor_domain`, `sent_to_vendor`, and `thread_follow`.
     - SQLite cannot change a CHECK in place, so `messages` is rebuilt by SQLite's documented procedure (create, copy, drop, rename, then recreate its indexes and triggers). Earlier migrations rebuilt `automation_fires` this way (`db.py:3484-3506`).
     - `PRAGMA foreign_key_check` and `integrity_check` run inside the migration transaction, which rolls back on any finding.
-    - **Backup (decision 3).** Before that transaction, the migration writes `VACUUM INTO` a private backup next to the database, mode 0600, at a fresh path per attempt: `<database>.pre-v32.<UTC timestamp>.bak`. `VACUUM INTO` refuses an existing file, so a fixed path would block every retry after a failure.
+    - **Backup (decision 3).** Before that transaction, the migration writes `VACUUM INTO` a private backup next to the database, mode 0600, at a fresh path per attempt: `<database>.pre-v33.<UTC timestamp>.bak`. `VACUUM INTO` refuses an existing file, so a fixed path would block every retry after a failure.
       - If the backup cannot be written (for example, the disk is full), the migration does not start, and the engine reports the error with the database unchanged.
-      - Once the migrated database has opened and its checks have passed, every `pre-v32` backup is deleted. If the migration fails, the newest backup is kept and older ones are removed, so the database can be restored by hand and the next start retries.
+      - Once the migrated database has opened and its checks have passed, every `pre-v33` backup is deleted. If the migration fails, the newest backup is kept and older ones are removed, so the database can be restored by hand and the next start retries.
     - The set's other owners widen together:
       - `_validate_admission_provenance` (`db.py:4164-4195`);
       - `AdmissionDecision.kind` (`service.py:127-141`);
@@ -145,7 +145,7 @@ Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) propos
 
 ### M2.3 — The reconcile pass
 
-13. **Storage (schema 33):**
+13. **Storage (schema 34):**
     - `coverage_generation(provider, account_id, mailbox_identity_key, generation, entitlement_active, retention_days, sent_folder)`, C/D-reconcile's counter and the last observed entitlement state, retention, and resolved Sent folder (its scope and, for IMAP, its folder key). One function, `_bump_coverage_generation`, increments it, and every input change calls it in its own transaction: each vendor mutation, for every configured account's row (vendor records are global, and an inactive account must find its coverage stale when it returns); `register_mail_account` and `update_mail_account_identity`, which change a verified identity; the check, when the entitlement state, `retention_days`, or resolved Sent folder it observes differs from the recorded ones (so an edited `config.toml` or `imap_sent_folder` counts, as does `SPECIAL-USE` resolving to another folder or Sent becoming available, and `settings.update` needs no bump of its own); a cursor expiry or recovery; and (M4) an extractor version change;
     - `reconcile_coverage(provider, account_id, mailbox_identity_key, generation, recorded_at)`, the reconciled generation;
     - `reconcile_progress(...)`, which holds the two values frozen when the pass started, the generation and the start time, plus the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields. Every bound a pass query uses derives from the frozen start (step 16), so nothing about a resumed query can move with the clock or the configuration. Progress belongs to the generation it froze: when the current generation differs, the check discards it and starts a fresh pass, so a page token is never reused against a changed query.
@@ -177,7 +177,7 @@ Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) propos
 
 ### M2.4 — Bodies and the followed-thread purge
 
-20. **Storage (schema 34):**
+20. **Storage (schema 35):**
     - `message_bodies(message_id, text, stored_chars, source_chars, fetched_at)`. The date context lives on the message (step 5).
     - `message_body_unavailable(message_id, reason)`, where `reason` is `source_gone` or `outside_folders`.
     - Both are tied to their message by step 5's delete trigger, extended to them, so `delete_message`, `clear_messages`, and the purge need nothing of their own, and no marker outlives its message to be inherited by a recapture.
@@ -216,7 +216,7 @@ Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) propos
 - **An IMAP server with neither SPECIAL-USE nor a configured Sent name** has no Sent scope, and health shows it.
 - **A body fetch whose source is gone** records `source_gone`, a completed state until a copy arrives or returns (step 9).
 - **A failed `messages` rebuild** rolls back the whole migration, so the previous binary still opens the database. Its pre-migration backup stays in place (step 11).
-- **No room for the backup:** the migration does not start, the engine reports the error, and the database stays at v31.
+- **No room for the backup:** the migration does not start, the engine reports the error, and the database stays at v32.
 
 ## Files touched
 
@@ -268,12 +268,12 @@ Before M2.2, [PR-Source-Header-Evidence.md](PR-Source-Header-Evidence.md) propos
 - **Gating.** With the gated class inactive, only today's kinds are captured.
 - **Thread purge.** From M2.2, a followed thread keeps every message through the purge, whatever its age, until M2.3's coverage-gated purge; a thread whose oldest message is past the cutoff and whose newest is not keeps both.
 - **The `messages` rebuild:**
-  - a v31 database keeps every row, index, trigger, and provenance value;
+  - a v32 database keeps every row, index, trigger, and provenance value;
   - `foreign_key_check` and `integrity_check` are clean;
-  - v31 code refuses v32;
+  - v32 code refuses v33;
   - the backup is written at mode 0600 and a fresh path before the rebuild, and every backup is deleted after a successful open;
-  - a rebuild failure injected after the backup keeps both the v31 database and its backup, and the next start retries with a new backup, keeping only the newest;
-  - a backup that cannot be written leaves the database at v31, unchanged.
+  - a rebuild failure injected after the backup keeps both the v32 database and its backup, and the next start retries with a new backup, keeping only the newest;
+  - a backup that cannot be written leaves the database at v32, unchanged.
 
 **M2.3**
 - **Staleness, one case each:** no record, a vendor address added, an address removed and re-added, a verified identity changed, raised retention through `settings.update` and through an edited `config.toml`, an entitlement lapse observed and then reactivation, an extractor change, a recovered cursor, a followed thread without a watermark, a message polled into a followed thread (pending derived work), and (M4) a retryable claim attempt whose deadline passed. Many polls with no change never make coverage stale.
