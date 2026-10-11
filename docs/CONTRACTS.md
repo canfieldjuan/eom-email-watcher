@@ -1075,16 +1075,20 @@ to `engine` jobs unchanged: lanes, the 25-job cap, first-in-first-out order,
 the admission deadline, reconciliation, source locks, and cleanup. The
 inspection contract (I-budget) owns when an `engine` job may be enqueued.
 
-For every `invoice.extract` handoff, regardless of job origin, the shared handoff
-owner records `automation_authorized` before POST, bound to that job and its
-immutable request. It is true only when the same verified entitlement decision
-satisfies both features required by D-ops' automation class at that handoff;
-otherwise it is false. The receipt belongs to the submission that produced the
-completion. GET-only reconciliation, a later licence change, or a joining caller
-cannot create or upgrade it; missing legacy provenance is not authorization.
+For every authoritative `invoice.extract` POST, regardless of job origin, the
+shared handoff owner records a separate `automation_authorized` receipt before
+sending, bound to that POST attempt, job and immutable request. This includes a
+same-identity resubmission after authoritative `JOB_NOT_FOUND` under Ambiguous
+outcome. Each POST uses its own verified entitlement decision: the receipt is
+true only when both features required by D-ops' automation class are satisfied
+at that POST; otherwise false. Receipts of earlier POSTs remain unchanged. The
+completion consumes only the receipt of the POST that authoritatively produced
+it; if that provenance cannot be established, adoption fails closed. GET-only
+reconciliation, a licence change without a POST, and joining callers cannot
+create or upgrade a receipt; missing legacy provenance is not authorization.
 This records authorization without widening an interactive job's existing
-invocation gate. I-records consumes this receipt; it never rechecks current
-entitlements or derives permission from the origin label alone.
+invocation gate. I-records consumes the receipt without rechecking current
+entitlements or deriving permission from the origin label alone.
 
 If a legacy database already contains multiple active rows for one fingerprint,
 migration preserves every identity as `reconciling` rather than discarding work
