@@ -220,9 +220,9 @@ Each definition is the only place its rule is stated.
     - Never gated, and never calls a provider or model.
   - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, body storage, reconcile, and claim extraction.
     - All need the paid entitlement `connect.capability_exchange` (decision D3, `require_connect_entitlement`).
-  - **automation:** inspecting explicitly selected attachments and producing invoice records (attachment inspection, I-selection and I-gate). Inspection and extraction require both `connect.capability_exchange` and `connect.automations` at handoff; an account being watched and a valid licence do not select artifacts. The shared queue owns the checks, as each operation requires (decision D5). Claims from a stored record are derived state, not an operation, and need no entitlement.
-  - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, and dismissing a suggestion.
-    - Never gated.
+  - **automation:** enabling new-mail inspection, granting a historical selection range, inspecting explicitly selected attachments, and producing invoice records (attachment inspection, I-selection and I-gate). Selection grants require both `connect.capability_exchange` and `connect.automations` when granted; inspection and extraction intended for invoice-record adoption require both at handoff; an account being watched and a valid licence do not select artifacts. The shared queue owns the checks, as each operation requires (decision D5). Claims from a stored record are derived state, not an operation, and need no entitlement.
+  - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, dismissing a suggestion, and disabling or revoking attachment-inspection selection.
+    - Never gated, and available regardless of entitlement or provider state.
 - **The desktop shows controls by class.**
   - Gated controls are hidden while the entitlement is inactive, under a "Connect required to update" notice.
   - Read and removal controls always show.

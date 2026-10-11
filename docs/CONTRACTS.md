@@ -1075,6 +1075,17 @@ to `engine` jobs unchanged: lanes, the 25-job cap, first-in-first-out order,
 the admission deadline, reconciliation, source locks, and cleanup. The
 inspection contract (I-budget) owns when an `engine` job may be enqueued.
 
+For every `invoice.extract` handoff, regardless of job origin, the shared handoff
+owner records `automation_authorized` before POST, bound to that job and its
+immutable request. It is true only when the same verified entitlement decision
+satisfies both features required by D-ops' automation class at that handoff;
+otherwise it is false. The receipt belongs to the submission that produced the
+completion. GET-only reconciliation, a later licence change, or a joining caller
+cannot create or upgrade it; missing legacy provenance is not authorization.
+This records authorization without widening an interactive job's existing
+invocation gate. I-records consumes this receipt; it never rechecks current
+entitlements or derives permission from the origin label alone.
+
 If a legacy database already contains multiple active rows for one fingerprint,
 migration preserves every identity as `reconciling` rather than discarding work
 that may have reached the provider. The immediate enqueue transaction prevents
