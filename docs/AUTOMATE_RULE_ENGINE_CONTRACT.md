@@ -34,7 +34,9 @@ split.
 - Persist the message's exact rule-set revision and all matched fires in that
   transaction.
 - Generate fires only from rule versions and attachments read by that
-  transaction; public callers do not submit fire identities.
+  transaction, or by the class-check resolution of
+  `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules); public callers do not
+  submit fire identities.
 - Stop at durable Connect fires. Dispatch and provider submission are later
   slices with separate contracts.
 
@@ -295,6 +297,7 @@ The closed matrix is:
 | `attachment.filename` | `glob` |
 | `attachment.byte_size` | `lte` |
 | `attachment.count` | `gte`, `lte` |
+| `attachment.document_class` | `equals`, `in` |
 
 Each admitted field/operator pair has one operand schema:
 
@@ -313,6 +316,8 @@ Each admitted field/operator pair has one operand schema:
 | `attachment.filename glob` | case-folded non-empty pattern, at most 512 characters, with no `/` or `\\` |
 | `attachment.byte_size lte` | strict integer from 0 through 104,857,600 |
 | `attachment.count gte/lte` | strict integer from 0 through 64 |
+| `attachment.document_class equals` | one of `invoice`, `quote`, `receipt`, `credit_note`, `statement`, `other`, `mixed`, `unknown` |
+| `attachment.document_class in` | 1..6 distinct members of that closed class set (the definition bound on `in`) |
 
 Booleans are not integers for numeric operands. `in` never accepts a scalar;
 `equals` never accepts a list. `attachment.count` is only a rule-threshold
@@ -329,6 +334,8 @@ value; the compatibility integer remains zero in that case. A numeric
 unknown-size descriptor never matches and a real zero-byte attachment matches
 only when the provider explicitly supplied verified integer zero. Other
 attachment predicates and `attachment.count` may still use that descriptor.
+
+`attachment.document_class` is a per-attachment condition whose value comes from attachment inspection, not from the message. The existing required `attachment.media_type` selector still applies. `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules) owns class-check creation and resolution, fan-out accounting, rule-version binding, identity fencing, and cancellation; this contract owns the condition's syntax only.
 
 Filename matching is platform-independent: replace `\\` with `/` in the
 persisted filename, take the final slash-delimited component, case-fold both it
@@ -476,7 +483,9 @@ rule-set revision, and existing scheduling admission with
 attempts, and never evaluates or commits a truncated descriptor/fire subset.
 Normal evaluation clears the nullable error field. Provider MIME traversal,
 attachment-name materialization, and descriptor persistence predate this engine
-and remain unchanged; bounding that shared ingestion path is explicitly deferred
+and remain unchanged, except that attachment inspection records each part's Content-ID and embedded
+status before descriptors are stored (`docs/ATTACHMENT_INSPECTION_CONTRACT.md`,
+I-scope); bounding that shared ingestion path is explicitly deferred
 rather than smuggled into the Automate core.
 
 `mark_analyzed` remains the single commit boundary:
@@ -494,7 +503,9 @@ rather than smuggled into the Automate core.
    Connect, calendar, or notification call.
 7. Update the message analysis and set `rules_revision_at_analysis` to the
    exact revision read in step 2.
-8. Insert every matched fire and its attempt-one identity.
+8. Insert every matched fire and its attempt-one identity, and every class
+   check (`docs/ATTACHMENT_INSPECTION_CONTRACT.md`, I-rules). Checks count with
+   fires toward `MAX_AUTOMATION_FIRES_PER_MESSAGE`, all or none.
 9. Run the existing scheduling-admission decision with the current message's
    mailbox key; only source identity plumbing changes.
 10. Commit.
@@ -937,3 +948,4 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 13 (2026-09-12):** required evidence before legacy marker
   binding, failed closed on ambiguous overlapping recovery, and separated
   transient mailbox-identity lookup failures from invalid rule definitions.
+- **Amendment (2026-10-10, proposed with #231):** added the per-attachment `attachment.document_class` condition (`equals`, `in` up to six) over attachment inspection's closed class set. A class check is committed in `mark_analyzed` and counted toward the fire limit, never decided there, and resolves in the pump, the one other place fires are created. `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules) owns that timing, so an email's category can never stop classification.

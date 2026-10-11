@@ -1044,7 +1044,14 @@ different durable provider instances may run concurrently. Two capabilities on
 one instance may not.
 
 An active logical invocation is identified by the existing v2 invocation
-fingerprint together with its message and attachment. That fingerprint binds
+fingerprint together with its message, attachment, and `engine` flag (Job
+origin, below). For engine jobs only, **EngineInvocationKey** additionally
+includes the immutable stage attempt id from I-order; that attempt binds the
+complete selected stage identity from I-version. Active lookup, insertion,
+uniqueness and same-invocation joining all consume this complete key. Distinct
+stage attempts never join through the generic fingerprint, even when its
+parameters are identical; identical-document cache joining remains I-cache's
+separate owner. Non-engine identity and joining are unchanged. That fingerprint binds
 the selected provider/version/instance, capability/version, trusted artifact
 identity, and canonical parameters; it excludes the caller-generated `job_id`.
 Enqueue performs active-fingerprint lookup and insertion in one immediate
@@ -1054,6 +1061,40 @@ the same active logical invocation, exactly one row wins and both callers
 receive that row's original stable `job_id`. A terminal failure permits a new
 explicit invocation; process-local click suppression is never the deduplication
 boundary.
+
+### Job origin
+
+Amended with `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (proposed in #231).
+Every v2 job is either an `engine` job (attachment inspection or extraction)
+or not, recorded immutably in the transaction that inserts its row. Every job
+created as today, and every job that exists when this amendment is installed,
+is not an `engine` job and keeps today's authorization and joining rules
+unchanged. An `engine` job is bound to its message, part, inspection attempt,
+capability identity and version, provider instance, and input SHA-256. Every
+POST of an `engine` job consumes the current explicit selection recorded by
+attachment inspection (I-selection), and revalidates both `connect.capability_exchange` and
+`connect.automations`; without either, a job proven not accepted fails with
+the existing `CONNECT_ENTITLEMENT_REQUIRED` error and no POST. If the selection is revoked or no longer covers the source, a job proven not accepted instead fails terminally with `connect_selection_inactive`; a changed verified mailbox identity fails with `connect_mailbox_identity_changed`. Both are truthful no-POST outcomes consumed by I-state, not entitlement errors. These refusals require authoritative non-acceptance; possibly provider-owned identities keep reconciliation and lane ownership, with no unauthorized new POST. The `engine`
+flag is part of the active-invocation identity, so an `engine` invocation
+never joins, and is never joined by, any other. Every other rule here applies
+to `engine` jobs unchanged: lanes, the 25-job cap, first-in-first-out order,
+the admission deadline, reconciliation, source locks, and cleanup. The
+inspection contract (I-budget) owns when an `engine` job may be enqueued.
+
+For every authoritative `invoice.extract` POST, regardless of job origin, the
+shared handoff owner records a separate `automation_authorized` receipt before
+sending, bound to that POST attempt, job and immutable request. This includes a
+same-identity resubmission after authoritative `JOB_NOT_FOUND` under Ambiguous
+outcome. Each POST uses its own verified entitlement decision: the receipt is
+true only when both features required by D-ops' automation class are satisfied
+at that POST; otherwise false. Receipts of earlier POSTs remain unchanged. The
+completion consumes only the receipt of the POST that authoritatively produced
+it; if that provenance cannot be established, adoption fails closed. GET-only
+reconciliation, a licence change without a POST, and joining callers cannot
+create or upgrade a receipt; missing legacy provenance is not authorization.
+This records authorization without widening an interactive job's existing
+invocation gate. I-records consumes the receipt without rechecking current
+entitlements or deriving permission from the origin label alone.
 
 If a legacy database already contains multiple active rows for one fingerprint,
 migration preserves every identity as `reconciling` rather than discarding work
