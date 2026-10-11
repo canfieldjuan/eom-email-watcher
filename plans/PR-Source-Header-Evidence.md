@@ -29,7 +29,7 @@ No timezone backfill, recipient replacement, extra provider fetch, admission cha
 
 Schema 30 has no reliable independent source-header fact. Existing confirmation timestamps can contain the demonstrated false positive; recipient rows and capture context cannot distinguish every fetched copy. The migration therefore conservatively discards confirmation once and reconstructs no header evidence. This can increase future discovery fetches within its existing bounds, but migration itself performs no network or model calls.
 
-Schema 31 is currently unimplemented but reserved by the accepted M2 plan. This prerequisite consumes 31; M2.2, M2.3, and M2.4 become 32, 33, and 34. M2.2's messages-rebuild backup becomes `pre-v32`, with source version 31. This renumbering changes no accepted milestone behavior or backup guarantees. The operator accepted this amendment before implementation.
+Source-header evidence uses schema 31. Fixed-parameter adoption uses schema 32. M2.2, M2.3, and M2.4 use schemas 33, 34, and 35 respectively. M2.2 upgrades source version 32 and writes its messages-rebuild backup as `<database>.pre-v33.<UTC timestamp>.bak`. This changes no milestone behavior, ordering, rollback checks, backup permissions, retention, or failure guarantees. The operator accepted this allocation amendment on 2026-10-11 before the adoption migration merges.
 
 ## Implementation plan
 
