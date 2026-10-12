@@ -1954,7 +1954,7 @@ class ImapGateway:
             return self._recover_folder(client, _folder_key(folder), since)
 
     def _require_sent_folder(self, client: imaplib.IMAP4) -> str:
-        """The selected Sent folder, else imap_sent_unavailable (contract D-scope).
+        """The selected Sent folder; distinguish absence from a failed read.
 
         One owner of "Sent is available": the resolved name is kept, a failure to
         select it is not, so each call probes again and a folder that comes back
@@ -1967,7 +1967,7 @@ class ImapGateway:
             self._ensure_selected(client, folder)
         except ImapError as exc:
             raise ImapError(
-                "imap_sent_unavailable", "Mail server Sent folder cannot be selected"
+                "imap_sent_unreadable", "Mail server Sent folder cannot be selected"
             ) from exc
         return folder
 
@@ -2013,6 +2013,7 @@ class ImapGateway:
                 for uid in candidates
             ),
             self._folder_cursor(folder_key, current_validity, next_uid),
+            drained=last_sequence == message_count,
         )
 
     def _recovery_page(
@@ -2068,6 +2069,7 @@ class ImapGateway:
                 _message_id(self._mailbox_id, uid_validity, uid, folder_key) for uid in candidates
             ),
             next_cursor,
+            drained=next_upper_uid <= 0,
         )
 
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:

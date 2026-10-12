@@ -819,7 +819,7 @@ app.innerHTML = `
           <span>Start Email Watcher when I sign in</span>
         </label>
         <p id="autostart-settings-note" class="settings-note">Checking start-on-login status…</p>
-        <p class="settings-note">Polling cadence changes apply after the app restarts. Retention changes remove expired local history immediately. Followed vendor threads are kept until their newest message is older than this. Source email is never deleted.</p>
+        <p class="settings-note">Polling cadence changes apply after the app restarts. Retention changes remove expired unfollowed local history immediately. Followed vendor threads are kept until their newest message is older than this. Their removal also waits for a completed check and current mailbox coverage. Source email is never deleted.</p>
         <button type="submit">Save settings</button>
       </form>
       <section id="gmail-label-settings" class="settings-form" hidden>

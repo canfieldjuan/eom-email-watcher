@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 from dataclasses import dataclass
+from email.message import Message
 from html.parser import HTMLParser
 from typing import Any
 
@@ -85,10 +86,13 @@ class AttachmentDescriptor:
     source_provider_message_id: str | None = None
 
 
-def _decode(data: str) -> str:
+def _decode(data: str, *, charset: str = "utf-8") -> str:
     try:
         raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-        return raw.decode("utf-8", errors="replace")
+        try:
+            return raw.decode(charset, errors="replace")
+        except (LookupError, UnicodeError):
+            return raw.decode("utf-8", errors="replace")
     except (ValueError, TypeError):
         return ""
 
@@ -211,7 +215,14 @@ def extract_stored_body(payload: dict[str, Any], *, load_text=None) -> tuple[str
             if load_text is None:
                 raise StoredBodyInvalid("Message text part was not retrieved")
             data = load_text(part)
-        text = _decode(data)
+        header = Message()
+        for item in part.get("headers") or []:
+            if (isinstance(item, dict)
+                    and str(item.get("name", "")).casefold() == "content-type"
+                    and isinstance(item.get("value"), str)):
+                header["Content-Type"] = item["value"]
+                break
+        text = _decode(data, charset=header.get_content_charset() or "utf-8")
         total += len(text)
         if total > MAX_STORED_BODY_INPUT_CHARS:
             raise StoredBodyInvalid("Message body exceeds the safe normalization input limit")

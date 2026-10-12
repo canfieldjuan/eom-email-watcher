@@ -2298,7 +2298,9 @@ def test_a_failed_select_is_probed_again_on_the_next_check() -> None:
     client = SentFolderImap(list_lines=SENT_LIST, reject={"Sent Messages"})
     gateway = _sent_gateway(client, credentials())
 
-    assert gateway.sent_scope() == "unavailable"
+    with pytest.raises(ImapError) as excinfo:
+        gateway.sent_scope()
+    assert excinfo.value.code == "imap_sent_unreadable"
     # The folder comes back: the next check resolves and selects it again.
     client.reject = set()
     assert gateway.sent_scope() == "available"
@@ -2326,15 +2328,17 @@ def test_an_advertised_sent_folder_wins_over_a_configured_fallback() -> None:
     assert '"Custom"' not in selects
 
 
-def test_a_configured_sent_folder_that_cannot_be_selected_is_unavailable() -> None:
+def test_a_configured_sent_folder_that_cannot_be_selected_is_retryable() -> None:
     values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Missing"})
     client = SentFolderImap(list_lines=NO_SENT_LIST, reject={"Missing"})
     gateway = _sent_gateway(client, values)
 
-    assert gateway.sent_scope() == "unavailable"
+    with pytest.raises(ImapError) as scope_error:
+        gateway.sent_scope()
+    assert scope_error.value.code == "imap_sent_unreadable"
     with pytest.raises(ImapError) as excinfo:
         gateway.sent_initial_cursor()
-    assert excinfo.value.code == "imap_sent_unavailable"
+    assert excinfo.value.code == "imap_sent_unreadable"
 
 
 @pytest.mark.parametrize(

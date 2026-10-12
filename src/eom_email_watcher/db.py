@@ -3861,16 +3861,20 @@ def _unit_rows(db: sqlite3.Connection, canonicals: Sequence[str]) -> list[str]:
     """Every row of the logical messages with these canonical ids (D-identity)."""
     if not canonicals:
         return []
-    placeholders = ", ".join("?" for _ in canonicals)
-    return [
-        str(row["message_id"])
-        for row in db.execute(
-            f"""SELECT message_id FROM messages
+    rows = set()
+    for offset in range(0, len(canonicals), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+        chunk = canonicals[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        rows.update(
+            str(row["message_id"])
+            for row in db.execute(
+                f"""SELECT message_id FROM messages
             WHERE message_id IN ({placeholders}) OR logical_of IN ({placeholders})
             ORDER BY message_id""",
-            (*canonicals, *canonicals),
-        ).fetchall()
-    ]
+                (*chunk, *chunk),
+            )
+        )
+    return sorted(rows)
 
 
 def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | None:
@@ -14034,6 +14038,13 @@ class Store:
                 AND f.thread_key=m.thread_key WHERE f.followed=1"""
             values = ()
             if scope is not None:
+                if len(keys) > SOURCE_CLEANUP_LOCK_BATCH_SIZE:
+                    grouped = {}
+                    for offset in range(0, len(keys), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+                        chunk = keys[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+                        for key, threads in members(db, scope=scope, keys=chunk).items():
+                            grouped.setdefault(key, {}).update(threads)
+                    return grouped
                 placeholders = ",".join("?" for _ in keys)
                 sql += (" AND f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?"
                         f" AND f.thread_key IN ({placeholders})")
@@ -14067,11 +14078,14 @@ class Store:
                 threads = members(db, scope=scope, keys=keys).get(scope, {})
                 ids = [m for unit in threads.values() for m in unit]
                 # The same expiry owner now scans only the candidate logical units.
-                current_sql, current_params = _logical_messages_past_cutoff_sql(
-                    (stamp-timedelta(days=retention_days)).timestamp(), stamp.timestamp(),
-                    canonical_ids=ids,
-                )
-                current_expired = {r[0] for r in db.execute(current_sql, current_params)}
+                current_expired = set()
+                for offset in range(0, len(ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+                    chunk = ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+                    current_sql, current_params = _logical_messages_past_cutoff_sql(
+                        (stamp-timedelta(days=retention_days)).timestamp(), stamp.timestamp(),
+                        canonical_ids=chunk,
+                    )
+                    current_expired.update(r[0] for r in db.execute(current_sql, current_params))
                 current = [m for unit in threads.values() if all(m in current_expired for m in unit)
                            for m in unit]
                 current_rows = _unit_rows(db, current)
