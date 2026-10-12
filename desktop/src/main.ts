@@ -1,3 +1,4 @@
+import { inboxAdmissionLabel, type InboxAdmissionKind } from "./inboxAdmission";
 import { activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult } from "./connectIdentity";
 import { collectCapabilityParameters } from "./connectParameters";
 import { mountCoiSetup } from "./coiSetup";
@@ -176,7 +177,7 @@ interface InboxItem {
 }
 
 interface InboxAdmission {
-  kind: "exact_sender" | "gmail_user_label";
+  kind: InboxAdmissionKind;
   selector_id: string;
   display_name: string | null;
   admitted_at: string;
@@ -1686,10 +1687,7 @@ function renderInbox(items: InboxItem[]): void {
     }
     if (item.admission !== null) {
       const admission = document.createElement("span");
-      admission.textContent =
-        item.admission.kind === "gmail_user_label"
-          ? `Admitted by Gmail label: ${item.admission.display_name || "selected label"}`
-          : `Admitted by watched sender: ${item.admission.display_name || item.sender}`;
+      admission.textContent = inboxAdmissionLabel(item.admission.kind, item.admission.display_name, item.sender);
       senderIdentity.append(admission);
     }
     const received = document.createElement("time");

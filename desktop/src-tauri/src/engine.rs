@@ -1148,6 +1148,10 @@ pub struct AutomationDecisionResult {
 #[serde(rename_all = "snake_case")]
 pub enum InboxAdmissionKind {
     ExactSender,
+    VendorAddress,
+    VendorDomain,
+    SentToVendor,
+    ThreadFollow,
     GmailUserLabel,
 }
 
@@ -3987,6 +3991,19 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"inbox.query","data":{"items"
         let encoded = serde_json::to_string(&admission).expect("serialize Inbox admission");
         assert!(encoded.contains("gmail_user_label"));
         assert!(!encoded.contains("mailbox_identity"));
+        for kind in [
+            "vendor_address",
+            "vendor_domain",
+            "sent_to_vendor",
+            "thread_follow",
+        ] {
+            let admission: InboxAdmission = serde_json::from_value(json!({
+                "kind": kind, "selector_id": "thread:fixed", "display_name": "Vendor",
+                "admitted_at": "2026-10-11T12:00:00+00:00"
+            }))
+            .expect("new admission kind round-trip");
+            assert_eq!(serde_json::to_value(admission).unwrap()["kind"], kind);
+        }
     }
 
     #[test]

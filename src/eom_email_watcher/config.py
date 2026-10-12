@@ -271,6 +271,22 @@ def exact_sender_selector_id(value: str) -> str:
     return selector_id
 
 
+THREAD_ADMISSION_SELECTOR_PREFIXES = {
+    "vendor_address": "vendor-address:",
+    "vendor_domain": "vendor-address:",
+    "sent_to_vendor": "vendor-recipient:",
+    "thread_follow": "thread:",
+}
+
+
+def thread_capture_selector_id(kind: str, value: str) -> str:
+    """Bounded provenance for vendor and thread admission, independent of key size."""
+    if kind not in THREAD_ADMISSION_SELECTOR_PREFIXES or not isinstance(value, str) or not value:
+        raise ValueError("unsupported thread admission selector")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return THREAD_ADMISSION_SELECTOR_PREFIXES[kind] + digest
+
+
 def _exact_sender_selector_id_or_none(value: str) -> str | None:
     try:
         return exact_sender_selector_id(value)

@@ -508,7 +508,9 @@ def test_delayed_initializer_does_not_repeat_header_invalidation(tmp_path: Path,
                 yield DelayedConnection(db)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        pending = executor.submit(DelayedStore(store.path).initialize)
+        # Probe the SQL transaction owner independently of the new outer upgrade
+        # lock, including contenders from a binary that does not know that lock.
+        pending = executor.submit(DelayedStore(store.path)._initialize_locked)
         try:
             assert before_lock.wait(timeout=15)
             store.initialize()
