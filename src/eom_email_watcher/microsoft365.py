@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 import httpx
 import msal
@@ -54,7 +54,7 @@ BUNDLED_MICROSOFT_OAUTH_CLIENT = Path("eom_email_watcher_data/microsoft-oauth-cl
 _INITIAL_CURSOR_PREFIX = "microsoft365-initial:"
 _DELTA_PATH = re.compile(
     r"\A/v1\.0/me/mailFolders"
-    r"(?:/[A-Za-z0-9_~.%=+-]+|\('[A-Za-z0-9_~.%=+-]+'\))"
+    r"(?:/(?P<slash>[A-Za-z0-9_~.%=+-]+)|\('(?P<quoted>[A-Za-z0-9_~.%=+-]+)'\))"
     r"/messages/delta\Z",
     re.IGNORECASE,
 )
@@ -675,10 +675,19 @@ class Microsoft365Gateway:
     def reconcile_sent_identity(self):
         return self._folder_id(SENT_FOLDER) or "unavailable"
 
+    def _reconcile_link(self, link, folder):
+        url = _safe_graph_url(link, delta_token="$skiptoken")
+        match = _DELTA_PATH.fullmatch(urlsplit(url).path)
+        identity = unquote(match.group("slash") or match.group("quoted"))
+        if identity.casefold() != folder and identity != self._folder_id(folder):
+            raise Microsoft365Error("Reconcile token names another folder")
+        return url
+
     def reconcile_page(self, unit, *, start, cutoff):
         from .reconcile import ReconcileItem, ReconcilePage, ReconcileTokenInvalid
 
         folder = SENT_FOLDER if unit["folder"] == "sent" else INBOX_FOLDER
+        since = max(cutoff, datetime.fromisoformat(unit["since"])) if unit.get("since") else cutoff
         prefix = f"{GRAPH_ROOT}/me/mailFolders/{folder}/messages/delta"
         token = unit.get("token")
         if token is None:
@@ -694,9 +703,7 @@ class Microsoft365Gateway:
                 )
             )
         else:
-            url = _safe_graph_url(token, delta_token="$skiptoken")
-            if urlsplit(url).path != urlsplit(prefix).path:
-                raise Microsoft365Error("Reconcile token names another folder")
+            url = self._reconcile_link(token, folder)
         try:
             response = self._request(url, cursor_request=token is not None)
         except StaleMailboxCursor as exc:
@@ -707,28 +714,25 @@ class Microsoft365Gateway:
             raise Microsoft365Error("Graph reconcile delta omitted bounded items")
         items = []
         for value in values:
-            if not isinstance(value, dict):
-                raise Microsoft365Error("Graph reconcile item is invalid")
-            if "@removed" in value:
+            if not isinstance(value, dict) or "@removed" in value:
                 continue
-            source = _graph_id(value.get("id"), "message id")
             try:
+                source = _graph_id(value.get("id"), "message id")
                 received = datetime.fromisoformat(value["receivedDateTime"].replace("Z", "+00:00"))
                 if received.tzinfo is None:
                     raise ValueError("missing timezone")
-            except (KeyError, TypeError, ValueError, AttributeError) as exc:
-                raise Microsoft365Error("Graph reconcile receive time is invalid") from exc
-            if not cutoff <= received < start:
+                native = value.get("conversationId")
+                if native is not None:
+                    native = _graph_id(native, "conversation id")
+            except (KeyError, TypeError, ValueError, AttributeError, Microsoft365Error):
+                logging.getLogger(__name__).warning("Skipping invalid Graph reconcile candidate")
                 continue
-            native = value.get("conversationId")
-            if native is not None:
-                native = _graph_id(native, "conversation id")
+            if not since <= received < start:
+                continue
             items.append(ReconcileItem(source, native, received.astimezone(UTC).isoformat()))
         next_link = doc.get("@odata.nextLink")
         if next_link is not None:
-            next_link = _safe_graph_url(next_link, delta_token="$skiptoken")
-            if urlsplit(next_link).path != urlsplit(prefix).path:
-                raise Microsoft365Error("Graph reconcile continuation names another folder")
+            next_link = self._reconcile_link(next_link, folder)
         return ReconcilePage(tuple(items), next_link)
 
     def sent_scope(self) -> str:

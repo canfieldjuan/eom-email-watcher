@@ -2,10 +2,7 @@
 
 import json
 import sqlite3
-from dataclasses import asdict
 from datetime import UTC, datetime
-
-from .mailbox import MessageMetadata
 
 Scope = tuple[str, str, str]
 KEY = "provider,account_id,mailbox_identity_key"
@@ -31,10 +28,15 @@ def ensure_schema(db: sqlite3.Connection) -> None:
         f"""CREATE TABLE IF NOT EXISTS reconcile_items ({scope},
             generation INTEGER NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('discovery','sync')),
             unit TEXT NOT NULL, source_id TEXT NOT NULL, native_thread_id TEXT,
-            received_at TEXT, metadata TEXT CHECK(metadata IS NULL OR json_valid(metadata)),
+            received_at TEXT,
             folder TEXT NOT NULL CHECK(folder IN ('inbox','sent','all')),
             done INTEGER NOT NULL DEFAULT 0 CHECK(done IN (0,1)),
             PRIMARY KEY({KEY},generation,phase,unit,source_id))""",
+        f"""CREATE TABLE IF NOT EXISTS reconcile_catchup ({scope},
+            generation INTEGER NOT NULL,thread_key TEXT NOT NULL,target TEXT NOT NULL,
+            PRIMARY KEY({KEY},generation,thread_key),
+            FOREIGN KEY({KEY},thread_key) REFERENCES thread_follow({KEY},thread_key)
+            ON DELETE CASCADE)""",
         """CREATE TRIGGER IF NOT EXISTS coverage_generation_monotonic
             BEFORE UPDATE ON coverage_generation WHEN NEW.generation<OLD.generation
             BEGIN SELECT RAISE(ABORT,'coverage generation cannot move backwards'); END""",
@@ -48,6 +50,22 @@ def ensure_schema(db: sqlite3.Connection) -> None:
         db.execute(statement)
     db.execute(f"""INSERT OR IGNORE INTO coverage_generation({KEY},generation)
         SELECT {KEY},0 FROM mail_accounts WHERE mailbox_identity_key IS NOT NULL""")
+
+
+def record_follow_transition(db, scope):
+    """Called only by D-derived, before the follow-input transaction commits."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='reconcile_catchup'").fetchone():
+        return
+    row = db.execute(
+        f"SELECT generation FROM reconcile_progress WHERE {WHERE}", scope[:3]
+    ).fetchone()
+    if row is not None:
+        db.execute(
+            f"""INSERT INTO reconcile_catchup({KEY},generation,thread_key,target)
+            VALUES (?,?,?,?,?,?) ON CONFLICT({KEY},generation,thread_key)
+            DO UPDATE SET target=MAX(target,excluded.target)""",
+            (*scope[:3], row[0], scope[3], datetime.now(UTC).isoformat()),
+        )
 
 
 def _bump_coverage_generation(db, scope: Scope, *, amount: int = 1, clear_watermarks=False):
@@ -107,7 +125,7 @@ class ReconcileState:
         self.store = store
         self.scope = scope
 
-    def observe(self, *, active: bool, retention_days: int, sent_folder: str, now=None):
+    def observe(self, *, active: bool, retention_days: int, sent_folder: str | None, now=None):
         with self.store.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
@@ -117,6 +135,8 @@ class ReconcileState:
             old = db.execute(
                 f"SELECT * FROM coverage_generation WHERE {WHERE}", self.scope
             ).fetchone()
+            if sent_folder is None:
+                sent_folder = old["sent_folder"]
             changed = (old["entitlement_active"], old["retention_days"], old["sent_folder"]) != (
                 int(active),
                 retention_days,
@@ -140,11 +160,14 @@ class ReconcileState:
                 # The same source-observation owner as polling; no stamp assignment here.
                 self.store._clear_location_stamps(db, *self.scope, now=now)
 
-    def gap(self, *, now=None):
-        with self.store.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+    def gap(self, *, now=None, db=None):
+        if db is not None:
             _bump_coverage_generation(db, self.scope, clear_watermarks=True)
             self.store._clear_location_stamps(db, *self.scope, now=now)
+            return
+        with self.store.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.gap(now=now, db=db)
 
     def generation(self):
         with self.store.connection() as db:
@@ -166,6 +189,11 @@ class ReconcileState:
                 or row["generation"] != row["reconciled"]
                 or bool(
                     db.execute(
+                        f"SELECT 1 FROM reconcile_progress WHERE {WHERE}", self.scope
+                    ).fetchone()
+                )
+                or bool(
+                    db.execute(
                         f"""SELECT 1 FROM thread_follow f LEFT JOIN thread_watermarks w
                 USING({KEY},thread_key) WHERE f.provider=? AND f.account_id=?
                 AND f.mailbox_identity_key=? AND f.followed=1 AND w.thread_key IS NULL LIMIT 1""",
@@ -173,6 +201,16 @@ class ReconcileState:
                     ).fetchone()
                 )
             )
+
+    def needs_discovery(self):
+        with self.store.connection() as db:
+            row = db.execute(
+                f"""SELECT g.generation,c.generation FROM coverage_generation g
+                LEFT JOIN reconcile_coverage c USING({KEY}) WHERE g.provider=?
+                AND g.account_id=? AND g.mailbox_identity_key=?""",
+                self.scope,
+            ).fetchone()
+            return row is None or row[0] != row[1]
 
     def load_or_start(self, now: datetime, retention_days: int, payload):
         with self.store.connection() as db:
@@ -186,10 +224,10 @@ class ReconcileState:
             if row is not None and row["generation"] != generation:
                 db.execute(f"DELETE FROM reconcile_progress WHERE {WHERE}", self.scope)
                 db.execute(f"DELETE FROM reconcile_items WHERE {WHERE}", self.scope)
+                db.execute(f"DELETE FROM reconcile_catchup WHERE {WHERE}", self.scope)
                 row = None
             if row is None:
-                # Query bounds have second precision; polling handles the tail.
-                stamp = now.astimezone(UTC).replace(microsecond=0).isoformat()
+                stamp = now.astimezone(UTC).isoformat()
                 db.execute(
                     f"""INSERT INTO reconcile_progress(
                     {KEY},generation,started_at,retention_days,payload)
@@ -263,31 +301,49 @@ class ReconcileState:
                 ),
             )
 
-    def metadata(self, progress, source_id, value=None):
+    def catchup_targets(self, progress, *, db=None):
+        if db is None:
+            with self.store.connection() as db:
+                return self.catchup_targets(progress, db=db)
+        return dict(
+            db.execute(
+                f"""SELECT c.thread_key,c.target FROM reconcile_catchup c
+            JOIN thread_follow f USING({KEY},thread_key)
+            WHERE c.provider=? AND c.account_id=? AND c.mailbox_identity_key=?
+            AND c.generation=? AND f.followed=1""",
+                (*self.scope, progress["generation"]),
+            )
+        )
+
+    def next_interval(self, progress, now, payload):
+        """Replace an exhausted interval without certifying its catch-up gap."""
         with self.store.connection() as db:
-            if value is not None:
-                data = asdict(value)
-                for key in ("labels", "locations", "reply_ids", "to", "cc"):
-                    data[key] = list(data[key])
-                db.execute(
-                    f"UPDATE reconcile_items SET metadata=? WHERE {WHERE} "
-                    "AND generation=? AND source_id=?",
-                    (json.dumps(data), *self.scope, progress["generation"], source_id),
-                )
-                return value
+            db.execute("BEGIN IMMEDIATE")
+            deleted = db.execute(
+                f"DELETE FROM reconcile_progress WHERE {WHERE} AND generation=? AND version=?",
+                (*self.scope, progress["generation"], progress["version"]),
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError("reconcile progress changed concurrently")
+            db.execute(f"DELETE FROM reconcile_items WHERE {WHERE}", self.scope)
+            db.execute(
+                f"""INSERT INTO reconcile_progress(
+                {KEY},generation,started_at,retention_days,payload)
+                VALUES (?,?,?,?,?,?,?)""",
+                (
+                    *self.scope,
+                    progress["generation"],
+                    now.astimezone(UTC).isoformat(),
+                    progress["retention_days"],
+                    json.dumps(payload),
+                ),
+            )
             row = db.execute(
-                f"SELECT metadata FROM reconcile_items WHERE {WHERE} "
-                "AND generation=? AND source_id=? AND metadata IS NOT NULL LIMIT 1",
-                (*self.scope, progress["generation"], source_id),
+                f"SELECT * FROM reconcile_progress WHERE {WHERE}", self.scope
             ).fetchone()
-            if row is None:
-                return None
-            data = json.loads(row[0])
-            for key in ("labels", "locations"):
-                data[key] = frozenset(data[key])
-            for key in ("reply_ids", "to", "cc"):
-                data[key] = tuple(data[key])
-            return MessageMetadata(**data)
+            result = dict(row)
+            result["payload"] = json.loads(result["payload"])
+            return result
 
     def sources(self, key):
         from .db import _effective_message_identity_sql
@@ -369,9 +425,27 @@ class ReconcileState:
             )
             return True
 
+    def catchup_pending(self, progress, *, db=None):
+        if db is None:
+            with self.store.connection() as db:
+                return self.catchup_pending(progress, db=db)
+        for key, target in self.catchup_targets(progress, db=db).items():
+            row = db.execute(
+                f"""SELECT w.synced_through FROM thread_follow f
+                LEFT JOIN thread_watermarks w USING({KEY},thread_key)
+                WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
+                AND f.thread_key=? AND f.followed=1""",
+                (*self.scope, key),
+            ).fetchone()
+            if row is not None and (row[0] is None or row[0] < target):
+                return True
+        return False
+
     def complete(self, progress):
         with self.store.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if self.catchup_pending(progress, db=db):
+                raise RuntimeError("reconcile catch-up remains pending")
             row = db.execute(
                 f" SELECT generation,version FROM reconcile_progress WHERE {WHERE}", self.scope
             ).fetchone()
@@ -386,6 +460,10 @@ class ReconcileState:
             )
             db.execute(
                 f"DELETE FROM reconcile_items WHERE {WHERE} AND generation=?",
+                (*self.scope, progress["generation"]),
+            )
+            db.execute(
+                f"DELETE FROM reconcile_catchup WHERE {WHERE} AND generation=?",
                 (*self.scope, progress["generation"]),
             )
             db.execute(

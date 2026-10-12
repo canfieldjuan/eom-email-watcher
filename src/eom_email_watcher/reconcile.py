@@ -60,6 +60,7 @@ def budget_session(gateway, budget):
     gateway._reconcile_budget = budget
     client = getattr(gateway, "_active_client", None)
     command = getattr(client, "_command", None)
+    complete = getattr(client, "_command_complete", None)
     timeout = None
     http_client = getattr(gateway, "_client", None)
     http_timeout = getattr(http_client, "timeout", None)
@@ -77,6 +78,15 @@ def budget_session(gateway, budget):
                 raise MailboxError("Mail server reconcile transport failed") from exc
 
         client._command = guarded_command
+    if callable(complete):
+
+        def guarded_complete(*args, **kwargs):
+            try:
+                return complete(*args, **kwargs)
+            except (OSError, imaplib.IMAP4.error) as exc:
+                raise MailboxError("Mail server reconcile transport failed") from exc
+
+        client._command_complete = guarded_complete
     try:
         yield
     finally:
@@ -88,6 +98,8 @@ def budget_session(gateway, budget):
             if sock is not None:
                 with suppress(OSError):
                     sock.settimeout(timeout)
+        if callable(complete):
+            client._command_complete = complete
 
 
 def _unit(name, folder="all", **kwargs):
@@ -100,7 +112,7 @@ def _unit(name, folder="all", **kwargs):
 
 def sent_identity(gateway, scope):
     if scope != "available":
-        return scope or "unknown"
+        return scope
     reader = getattr(gateway, "reconcile_sent_identity", None)
     return reader() if callable(reader) else scope
 
@@ -121,7 +133,7 @@ def observe(watcher, identity, active, sent_scope, now):
 def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snapshot=None):
     now = now or datetime.now(UTC)
     state = observe(watcher, identity, True, sent_scope, now)
-    if not state.stale():
+    if sent_scope is None or not state.stale():
         return 0
     provider = watcher.mailbox.provider
     folders = ["inbox", "sent"] if sent_scope == "available" else ["inbox"]
@@ -137,16 +149,33 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
         )
     else:
         units = [_unit(folder, folder, addresses=addresses) for folder in folders]
-    initial = dict(stage="discovery", units=units, folders=folders)
+    discovery = state.needs_discovery()
+    initial = dict(
+        stage="discovery" if discovery else "sync_init",
+        units=units if discovery else [],
+        folders=folders,
+        replay_discovery=discovery,
+    )
     if provider == "imap":
-        initial = dict(
+        initial.update(
             stage="snapshot",
             units=[_unit(folder, folder) for folder in folders],
-            discovery=units,
-            folders=folders,
+            next_stage="discovery" if discovery else "sync_init",
+            discovery=units if discovery else [],
             snapshots={},
         )
     progress = state.load_or_start(now, watcher.config.retention_days, initial)
+    if progress["payload"]["stage"] == "catchup_wait":
+        if now <= datetime.fromisoformat(progress["started_at"]):
+            return 0
+        initial.update(
+            replay_discovery=False,
+            stage="snapshot" if provider == "imap" else "sync_init",
+            units=[_unit(folder, folder) for folder in folders] if provider == "imap" else [],
+        )
+        if provider == "imap":
+            initial.update(next_stage="sync_init", discovery=[])
+        progress = state.next_interval(progress, now, initial)
     start = datetime.fromisoformat(progress["started_at"])
     cutoff = start - timedelta(days=progress["retention_days"])
 
@@ -159,11 +188,11 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
     budget = ReconcileBudget(allowed)
     added = 0
 
-    def fetch(item, *, gap=False):
+    def fetch(item, *, gap=False, since=cutoff):
         nonlocal added
         source = watcher.store.reconcile_source(*state.scope, item["source_id"])
         if source is not None:
-            if source["received_epoch"] is None or source["received_epoch"] < cutoff.timestamp():
+            if source["received_epoch"] is None or source["received_epoch"] < since.timestamp():
                 return
             if source["confirmed"] and not gap:
                 return
@@ -174,18 +203,21 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
             mailbox_identity_key=identity,
         ):
             return  # Suppression belongs to the existing source owner.
-        metadata = state.metadata(progress, item["source_id"])
-        if metadata is None and not getattr(watcher.gateway, "reconcile_transport_budget", False):
+        preflight = getattr(watcher.gateway, "reconcile_preflight", None)
+        if callable(preflight) and not preflight(item["source_id"], start=start, cutoff=since):
+            return
+        if not getattr(watcher.gateway, "reconcile_transport_budget", False):
             budget.before_call()
         # Graph's durable listing origin survives a process restart.
         if provider == "microsoft365":
             watcher.gateway._delta_folders[item["source_id"]] = (
                 "sentitems" if item["folder"] == "sent" else "inbox"
             )
-        if metadata is None:
-            metadata = watcher.gateway.metadata(item["source_id"])
+        metadata = watcher.gateway.metadata(item["source_id"])
         if metadata.message_id != item["source_id"]:
-            raise MailboxError("reconcile metadata identity mismatch")
+            raise MailboxMessageInvalid(
+                "invalid_message_id", "Reconcile metadata identity mismatch"
+            )
         try:
             received = datetime.fromisoformat(metadata.received_at)
             if received.tzinfo is None:
@@ -195,8 +227,7 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
             raise MailboxMessageInvalid(
                 "invalid_received_at", "Reconcile receive time is invalid"
             ) from exc
-        state.metadata(progress, item["source_id"], metadata)
-        if not cutoff <= received < start:
+        if not since <= received < start:
             return
         added += watcher._capture_metadata(
             metadata,
@@ -221,11 +252,22 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                 units = payload["units"]
                 if all(unit["done"] for unit in units):
                     if stage == "snapshot":
-                        payload.update(stage="discovery", units=payload.pop("discovery"))
+                        payload.update(
+                            stage=payload.get("next_stage", "discovery"),
+                            units=payload.pop("discovery"),
+                        )
                         state.save(progress)
                         continue
-                    if stage == "discovery":
+                    if stage in {"discovery", "sync_init"}:
                         threads = state.threads()
+                        if not payload["replay_discovery"] or stage == "sync_init":
+                            targets = state.catchup_targets(progress)
+                            threads = [
+                                t
+                                for t in threads
+                                if not t["watermark"]
+                                or (t["key"] in targets and t["watermark"] < targets[t["key"]])
+                            ]
                         payload.update(stage="sync", threads=threads, units=[])
                         # Every provider id, including a thread without a native id,
                         # must first appear in an admitted-folder listing.
@@ -242,6 +284,18 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                                 payload["units"].append(
                                     _unit("native", threads=threads, since=since.isoformat())
                                 )
+                        elif provider == "microsoft365" and not payload["replay_discovery"]:
+                            if threads:
+                                since = min(
+                                    max(cutoff, datetime.fromisoformat(t["watermark"]))
+                                    if t["watermark"]
+                                    else cutoff
+                                    for t in threads
+                                )
+                                payload["units"] = [
+                                    _unit(folder, folder, threads=threads, since=since.isoformat())
+                                    for folder in folders
+                                ]
                         else:
                             for thread in threads:
                                 since = (
@@ -259,7 +313,7 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                                         ids=thread["ids"],
                                     )
                                 )
-                        if provider == "microsoft365":
+                        if provider == "microsoft365" and payload["replay_discovery"]:
                             for unit in payload["units"]:
                                 if unit.get("stored"):
                                     continue
@@ -325,22 +379,15 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                             )
                         state.save(progress)
                         continue
-                    if provider == "imap":
-                        missing = [t for t in state.threads() if not t["watermark"]]
-                        if missing:
-                            payload["units"].extend(
-                                _unit(
-                                    t["key"] + ":" + str(t["aliases"]),
-                                    folder=folders[0],
-                                    threads=[t],
-                                    ids=t["ids"],
-                                    folder_index=0,
-                                    since=cutoff.isoformat(),
-                                )
-                                for t in missing
-                            )
-                            state.save(progress)
-                            continue
+                    missing = [t for t in state.threads() if not t["watermark"]]
+                    if missing:
+                        payload.update(stage="sync_init", units=[])
+                        state.save(progress)
+                        continue
+                    if state.catchup_pending(progress):
+                        payload["stage"] = "catchup_wait"
+                        state.save(progress)
+                        break
                     payload["stage"] = "derived"
                     state.save(progress)
                     # All body/claim work belongs to later milestones.
@@ -374,8 +421,9 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                         continue
                     if item is not None:
                         if (
-                            provider != "gmail"
-                            or phase == "discovery"
+                            phase == "discovery"
+                            or provider == "imap"
+                            or unit.get("gap")
                             or any(
                                 item["native_thread_id"] in t["native"]
                                 or item["source_id"] in t["sources"]
@@ -383,7 +431,13 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                             )
                         ):
                             try:
-                                fetch(item, gap=unit.get("gap", False))
+                                fetch(
+                                    item,
+                                    gap=unit.get("gap", False),
+                                    since=max(cutoff, datetime.fromisoformat(unit["since"]))
+                                    if unit.get("since")
+                                    else cutoff,
+                                )
                             except (MailboxMessageUnavailable, MailboxMessageInvalid):
                                 if unit.get("gap"):
                                     source = watcher.store.reconcile_source(
@@ -429,10 +483,17 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                                     )
                                     state.save(progress)
                                     continue
+                        unit["done"] = True
                         if phase == "sync":
                             for thread in unit.get("threads", ()):
-                                state.watermark(progress, thread)
-                        unit["done"] = True
+                                if all(
+                                    other["done"]
+                                    for other in units
+                                    if any(
+                                        t["key"] == thread["key"] for t in other.get("threads", ())
+                                    )
+                                ):
+                                    state.watermark(progress, thread)
                         state.save(progress)
                         continue
                     if not getattr(watcher.gateway, "reconcile_transport_budget", False):
@@ -457,11 +518,6 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                         state.gap(now=datetime.now(UTC))
                         break
                     unit.update(token=None, listed=False)
-                    state.save(progress)
-                except MailboxMessageUnavailable:
-                    for thread in unit.get("threads", ()):
-                        state.watermark(progress, thread)
-                    unit["done"] = True
                     state.save(progress)
                 except MailboxError:
                     unit["attempts"] += 1

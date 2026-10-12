@@ -9,7 +9,7 @@ import pytest
 from test_db import Store
 from test_service import FakeGmail, FakeModel, config
 
-from eom_email_watcher import reconcile, service
+from eom_email_watcher import reconcile, reconcile_state, service
 from eom_email_watcher.mailbox import (
     MailboxChanges,
     MailboxMessageUnavailable,
@@ -132,6 +132,27 @@ def test_imap_reconcile_uses_nested_search_and_internal_date_bound():
 
 NOW = datetime(2026, 10, 11, 12, tzinfo=UTC)
 KEY = "f" * 64
+
+
+@pytest.fixture(autouse=True)
+def reconcile_clock(monkeypatch):
+    """Freeze the transition clock together with each explicit test interval."""
+    class Clock(datetime):
+        current = NOW
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    original = reconcile.run
+
+    def at_test_time(*args, **kwargs):
+        Clock.current = kwargs.get("now") or datetime.now(UTC)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reconcile_state, "datetime", Clock)
+    monkeypatch.setattr(reconcile, "run", at_test_time)
+    return Clock
 
 
 def state_store(tmp_path, provider="gmail"):
@@ -315,7 +336,11 @@ def test_budget_resume_frozen_bounds_and_rejected_token_no_refetch(tmp_path, mon
             break
     assert not state.stale()
     assert gateway.fetches == ["vendor", "reply"]
-    assert all(call[2] == NOW and call[3] == NOW - timedelta(days=30) for call in gateway.calls)
+    # Discovery follows the vendor at the original frozen boundary. Its
+    # transactional target is covered by that interval despite later resumes.
+    assert all(call[2] == NOW for call in gateway.calls if call[0] == "0")
+    assert all(call[3] == call[2] - timedelta(days=30) for call in gateway.calls)
+    assert all(call[2] == NOW for call in gateway.calls if call[0] == "native")
     with watcher.store.connection() as db:
         assert (
             db.execute("SELECT synced_through FROM thread_watermarks").fetchone()[0]
@@ -324,12 +349,12 @@ def test_budget_resume_frozen_bounds_and_rejected_token_no_refetch(tmp_path, mon
         assert not db.execute("SELECT * FROM reconcile_progress").fetchall()
 
 
-def test_microsoft_late_follow_reuses_listing_and_headers(tmp_path, monkeypatch):
+def test_microsoft_late_follow_reuses_listing_without_rejected_headers(tmp_path, monkeypatch):
     gateway = Pages(provider="microsoft365", native="n" * 1000)
     watcher, state = runner(tmp_path, monkeypatch, gateway, "microsoft365")
     reconcile.run(watcher, KEY, "available", label_selectors=(), now=NOW)
     assert not state.stale()
-    assert gateway.fetches == ["a-reply", "z-vendor"]
+    assert gateway.fetches == ["a-reply", "z-vendor", "a-reply"]
     assert [c[0] for c in gateway.calls] == ["inbox", "sent"]
     with watcher.store.connection() as db:
         assert (

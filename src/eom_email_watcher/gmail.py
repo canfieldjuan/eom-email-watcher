@@ -515,7 +515,7 @@ def _received_at(message: dict[str, Any], headers: dict[str, str]) -> str:
     if millis:
         try:
             return datetime.fromtimestamp(int(millis) / 1000, tz=UTC).isoformat()
-        except (TypeError, ValueError, OSError):
+        except (OverflowError, TypeError, ValueError, OSError):
             pass
     try:
         parsed = parsedate_to_datetime(headers.get("date", ""))
@@ -1160,12 +1160,33 @@ class GmailGateway:
 
     reconcile_transport_budget = True
 
+    def reconcile_preflight(self, message_id, *, start, cutoff):
+        """Read no headers until the exact date and current folders are admitted."""
+        try:
+            request = self.service.users().messages().get(
+                userId="me", id=message_id, format="minimal", fields="id,internalDate,labelIds"
+            )
+            message = self._execute_request(request)
+        except HttpError as exc:
+            if getattr(exc.resp, "status", None) == 404:
+                raise MessageUnavailable("Gmail reconcile candidate disappeared") from exc
+            raise GmailError("Gmail reconcile preflight failed") from exc
+        if not isinstance(message, dict) or message.get("id") != message_id:
+            raise MailboxMessageInvalid("invalid_message_id", "Gmail reconcile identity is invalid")
+        received = _received_at(message, {})
+        if not received:
+            raise MailboxMessageInvalid("invalid_received_at", "Gmail reconcile date is invalid")
+        return (
+            cutoff <= datetime.fromisoformat(received) < start
+            and bool(locations_from_labels(_validated_label_ids(message)) & self.query_folders)
+        )
+
     def reconcile_page(self, unit, *, start, cutoff):
         from .reconcile import ReconcileItem, ReconcilePage, ReconcileTokenInvalid
 
         since = datetime.fromisoformat(unit["since"]) if unit.get("since") else cutoff
         query = (f"{recovery_folder_query(self.query_folders)} "
-                 f"after:{int(since.timestamp()) - 1} before:{int(start.timestamp())}")
+                 f"after:{int(since.timestamp()) - 1} before:{math.ceil(start.timestamp())}")
         addresses = unit.get("addresses")
         if addresses:
             terms = [

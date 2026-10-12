@@ -5709,6 +5709,10 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
     for scope, members in groups.items():
         winner = _follow_owner(members)
         owner = winner[2] if winner is not None else None
+        previous = db.execute(
+            "SELECT followed FROM thread_follow WHERE provider=? AND account_id=? "
+            "AND mailbox_identity_key=? AND thread_key=?", scope,
+        ).fetchone()
         db.execute(
             """INSERT INTO thread_follow VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider,account_id,mailbox_identity_key,thread_key)
@@ -5720,6 +5724,8 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
              winner[0] if winner else None, winner[1] if winner else None,
              min(member[1] for member in members)),
         )
+        if owner is not None and (previous is None or not previous[0]):
+            reconcile_state.record_follow_transition(db, scope)
     watermark_scope = "" if full else """(
         provider,account_id,mailbox_identity_key,thread_key) IN (
         SELECT provider,account_id,identity,thread_key FROM derived_changed_threads) AND """
@@ -7829,6 +7835,9 @@ class Store:
             )
             if deleted.rowcount != 1:
                 raise GmailLabelStoreError("not_found")
+            reconcile_state.ReconcileState(self, ("gmail", account_id, mailbox_identity_key)).gap(
+                now=now, db=db
+            )
         return state.replacement_history_cursor
 
     @staticmethod

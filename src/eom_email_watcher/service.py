@@ -1377,6 +1377,17 @@ def reconcile_mailbox_session_identity(
     return mailbox_identity_key
 
 
+def _has_capture_work(
+    *, senders: bool, labels: bool, pending: bool, sent_in_scope: bool,
+    vendor_records: bool, recovery: bool = False, coverage_stale: bool = False,
+) -> bool:
+    """One activity predicate for scheduled and direct mailbox checks."""
+    return bool(
+        senders or labels or pending or recovery
+        or vendor_records or sent_in_scope or coverage_stale
+    )
+
+
 class Watcher:
     def __init__(
         self,
@@ -1552,19 +1563,11 @@ class Watcher:
                 logger.warning("Sent folder position unread; the next check retries: %s", exc)
         return scope
 
-    def _has_capture_work(
-        self, *, labels: bool, pending: bool, sent_in_scope: bool,
-        vendor_records: bool, recovery: bool = False, coverage_stale: bool = False
-    ) -> bool:
-        return bool(
-            self.admission_sender_names or labels or pending or recovery
-            or vendor_records or sent_in_scope or coverage_stale
-        )
-
     def check(
-        self, *, dry_run: bool = False, deliver_notifications: bool = True
+        self, *, dry_run: bool = False, deliver_notifications: bool = True,
+        _gated_allowed: bool | None = None,
     ) -> dict[str, int | bool | str]:
-        gated_allowed = self._gated_class_allowed()
+        gated_allowed = self._gated_class_allowed() if _gated_allowed is None else _gated_allowed
         vendor_snapshot = self.store.vendor_index() if gated_allowed else None
         vendor_records = bool(vendor_snapshot and vendor_snapshot.vendor_ids)
         account = self.store.mail_account(self.mailbox.provider, self.mailbox.account_id)
@@ -1593,7 +1596,8 @@ class Watcher:
         gmail_watch_configured = self.mailbox.provider == "gmail" and (
             _gmail_label_watch_configured(self.store)
         )
-        if not self._has_capture_work(
+        if not _has_capture_work(
+            senders=bool(self.admission_sender_names),
             labels=gmail_watch_configured,
             pending=pending_current_identity,
             # Resolve the paid folder's actual availability inside its session
@@ -1651,7 +1655,8 @@ class Watcher:
                     if dry_run else observe(
                         self, mailbox_identity_key, True, sent_scope, datetime.now(UTC)))
                 coverage_stale = reconcile_state.stale()
-            if not self._has_capture_work(
+            if not _has_capture_work(
+                senders=bool(self.admission_sender_names),
                 coverage_stale=coverage_stale,
                 labels=bool(label_selectors),
                 pending=False,
@@ -2147,7 +2152,7 @@ class Watcher:
                 sent_scope,
                 label_selectors=reconcile_label_selectors,
                 vendor_snapshot=reconcile_vendor_snapshot,
-                now=checked_at,
+                now=datetime.now(UTC),
             )
         summarized, fallback = self._process_pending(
             scope=scope,
@@ -3139,10 +3144,13 @@ def run_watcher_check(
             "automation_processed": 0,
             "automation_review_required": 0,
         }
-    watch_configured = (
-        bool(config.allowlist)
-        or _gmail_label_watch_configured(store)
-        or _current_mailbox_pending_work(store)
+    gated_allowed = connect_entitlement_decision() is EntitlementDecision.ACTIVE
+    watch_configured = _has_capture_work(
+        senders=bool(config.allowlist),
+        labels=_gmail_label_watch_configured(store),
+        pending=_current_mailbox_pending_work(store),
+        sent_in_scope=gated_allowed,
+        vendor_records=False,
     )
     if dry_run:
         if not watch_configured:
@@ -3152,6 +3160,7 @@ def run_watcher_check(
             result = Watcher(config, store, mailbox, model).check(
                 dry_run=True,
                 deliver_notifications=deliver_notifications,
+                _gated_allowed=gated_allowed,
             )
         return {
             **result,
@@ -3167,6 +3176,7 @@ def run_watcher_check(
         result = Watcher(config, store, mailbox, model).check(
             dry_run=False,
             deliver_notifications=deliver_notifications,
+            _gated_allowed=gated_allowed,
         )
     else:
         result = Watcher.inactive_result(config, store, dry_run=False)

@@ -2075,7 +2075,7 @@ class ImapGateway:
             page = unit.setdefault("_page_state", {})
             if not page:
                 lower = int(unit["token"] or 0) + 1
-                upper = min(lower + 49, frozen["highest"])
+                upper = frozen["highest"]
                 if lower > upper:
                     unit.pop("_page_state", None)
                     return ReconcilePage((), None)
@@ -2143,10 +2143,25 @@ class ImapGateway:
                 status, response = client.uid("FETCH", str(uid), "(UID INTERNALDATE)")
                 if status != "OK":
                     raise ImapError("imap_protocol_error", "Mail server receive date fetch failed")
-                metadata = _response_metadata(response)
-                received = (
-                    _message_date(metadata, Message()) if _INTERNAL_DATE.search(metadata) else ""
-                )
+                # FETCH may include unsolicited updates for another UID. A missing
+                # or invalid requested candidate is not a failed folder listing.
+                metadata = b""
+                for raw in response or ():
+                    value = raw[0] if isinstance(raw, tuple) and raw else raw
+                    if not isinstance(value, bytes):
+                        continue
+                    match = _FETCH_UID.search(value)
+                    if match and int(match.group(1)) == uid and _INTERNAL_DATE.search(value):
+                        metadata = value
+                        break
+                received = ""
+                if match := _INTERNAL_DATE.search(metadata):
+                    try:
+                        parsed = parsedate_to_datetime(match.group(1).decode("ascii"))
+                        if parsed.tzinfo is not None:
+                            received = parsed.astimezone(UTC).isoformat()
+                    except (OverflowError, UnicodeError, ValueError, TypeError):
+                        pass
                 if received and since <= datetime.fromisoformat(received) < start:
                     matches = True
                     if page["fallback"] and unit.get("ids"):
