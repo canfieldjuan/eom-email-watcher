@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxActionState.ts";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
@@ -172,10 +174,59 @@ test("expansion survives renders and first-page reloads until query, delete, or 
 });
 
 test("collapsed row feeds only projected states and the render clock to one chip", () => {
-  const chip = source.match(/const actionState = inboxActionState\(([\s\S]*?)\n    \);/)?.[1];
-  assert.ok(chip, "collapsed row computes its action chip");
-  for (const field of ["fire?.state", "result?.status", "state:", "status:", "expires_at:", "renderStartedAt"]) assert.ok(chip.includes(field), field);
-  assert.doesNotMatch(chip, /reason|job_id|last_error|\.\.\./);
+  const detailsStart = source.indexOf('const details = document.createElement("div");');
+  const detailsEnd = source.indexOf("const deadlineValue =", detailsStart);
+  const chipStart = source.indexOf("const actionState = inboxActionState(");
+  const chipEnd = source.indexOf("toggle.append(", chipStart);
+  assert.ok(detailsStart >= 0 && detailsEnd > detailsStart && chipStart > detailsEnd && chipEnd > chipStart);
+  const renderStartedAt = Date.parse("2026-10-12T12:00:00Z");
+  const privateFields = { reason: "private reason", job_id: "private job", last_error: "private error" };
+  const cases = [
+    {
+      attachments: [
+        { automation_fires: [{ state: "awaiting_confirmation", ...privateFields }, { state: "completed", ...privateFields }], capability_results: [{ status: "processing", ...privateFields }] },
+        { automation_fires: [{ state: "failed", ...privateFields }, null] },
+        {},
+      ],
+      proposal: { state: "awaiting_confirmation", status: "accepted", expires_at: "2026-10-13T12:00:00Z", ...privateFields },
+      fires: ["awaiting_confirmation", "completed", "failed", undefined], results: ["processing"],
+    },
+    { attachments: [], proposal: null, fires: [], results: [] },
+    { attachments: [{}], proposal: { state: "awaiting_confirmation", status: "accepted", expires_at: null, ...privateFields }, fires: [], results: [] },
+  ];
+  for (const fixture of cases) {
+    let cueStates: readonly unknown[] | undefined;
+    let chipStates: readonly unknown[] | undefined;
+    let chipResults: readonly unknown[] | undefined;
+    let chipProposal: Record<string, unknown> | null | undefined;
+    let chipClock: number | undefined;
+    const chips: string[] = [];
+    runInNewContext(source.slice(detailsStart, detailsEnd) + source.slice(chipStart, chipEnd), {
+      item: { attachments: fixture.attachments, calendar_proposal: fixture.proposal, action_required: 0, suggested_action: "" },
+      renderStartedAt,
+      hasInboxAutomationConfirmation: (states: readonly unknown[]) => {
+        cueStates = states;
+        return hasInboxAutomationConfirmation(states);
+      },
+      inboxActionState: (states: readonly unknown[], results: readonly unknown[], proposal: Record<string, unknown> | null, clock: number) => {
+        chipStates = states; chipResults = results; chipProposal = proposal; chipClock = clock;
+        return inboxActionState(states, results, proposal, clock);
+      },
+      document: { createElement: () => ({ dataset: {}, textContent: "", append() {} }) },
+      rowBadges: { append: (node: { textContent: string }) => chips.push(node.textContent) },
+    });
+    assert.ok(cueStates && chipStates && chipResults);
+    assert.strictEqual(chipStates, cueStates, "cue and chip consume the same projected array");
+    assert.deepEqual(Array.from(chipStates), fixture.fires);
+    assert.deepEqual(Array.from(chipResults), fixture.results);
+    const expectedProposal = fixture.proposal ? {
+      state: fixture.proposal.state, status: fixture.proposal.status, expires_at: fixture.proposal.expires_at,
+    } : null;
+    assert.deepEqual(chipProposal ? { ...chipProposal } : null, expectedProposal);
+    assert.equal(chipClock, renderStartedAt);
+    const expectedChip = inboxActionState(fixture.fires, fixture.results, expectedProposal, renderStartedAt);
+    assert.deepEqual(chips, expectedChip === null ? [] : [expectedChip]);
+  }
   assert.match(source, /attachmentCount.textContent = `\$\{item.attachments.length\} attachment/);
   assert.match(source, /content.append\(\.\.\.Array.from\(card.childNodes\)\)/);
 });

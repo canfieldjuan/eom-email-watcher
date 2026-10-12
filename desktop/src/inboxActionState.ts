@@ -19,6 +19,10 @@ function stateRank(states: Record<string, number>, value: unknown): number {
   return typeof value === "string" && Object.hasOwn(states, value) ? states[value] : labels.length;
 }
 
+export function hasInboxAutomationConfirmation(fires: readonly unknown[]): boolean {
+  return fires.some((state) => stateRank(fireRanks, state) === fireRanks.awaiting_confirmation);
+}
+
 export function inboxActionState(
   fires: readonly unknown[],
   results: readonly unknown[],
