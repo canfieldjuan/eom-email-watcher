@@ -353,8 +353,12 @@ class ReconcileState:
                 r[0]
                 for r in db.execute(
                     f"""SELECT provider_message_id FROM logical_messages m
-                    WHERE m.provider=? AND m.account_id=?
-                    AND {_effective_message_identity_sql("m")}=? AND thread_key=?""",
+                    WHERE m.provider=?1 AND m.account_id=?2
+                    AND {_effective_message_identity_sql("m")}=?3 AND thread_key=?4
+                    UNION SELECT l.provider_message_id FROM message_locations l
+                    JOIN messages m USING(message_id)
+                    WHERE l.provider=?1 AND l.account_id=?2 AND l.mailbox_identity_key=?3
+                    AND m.thread_key=?4""",
                     (*self.scope, key),
                 )
             ]

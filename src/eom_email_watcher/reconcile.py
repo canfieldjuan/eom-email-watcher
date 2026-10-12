@@ -269,8 +269,8 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                                 or (t["key"] in targets and t["watermark"] < targets[t["key"]])
                             ]
                         payload.update(stage="sync", threads=threads, units=[])
-                        # Every provider id, including a thread without a native id,
-                        # must first appear in an admitted-folder listing.
+                        # Gmail/Graph candidates require admitted-folder listings;
+                        # IMAP source identities already bind folder and epoch.
                         for thread in threads:
                             thread["sources"] = state.sources(thread["key"])
                         if provider == "gmail":
@@ -311,6 +311,22 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                                         since=since.isoformat(),
                                         folder_index=0,
                                         ids=thread["ids"],
+                                        sources=[
+                                            source
+                                            for source in thread["sources"]
+                                            if (
+                                                stored := watcher.store.reconcile_source(
+                                                    *state.scope, source
+                                                )
+                                            )
+                                            is not None
+                                            and stored["received_epoch"] is not None
+                                            and since.timestamp()
+                                            <= stored["received_epoch"]
+                                            < start.timestamp()
+                                        ]
+                                        if provider == "imap" and not thread["ids"]
+                                        else [],
                                     )
                                 )
                         if provider == "microsoft365" and payload["replay_discovery"]:

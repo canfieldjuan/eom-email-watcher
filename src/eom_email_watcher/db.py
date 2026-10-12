@@ -4150,6 +4150,25 @@ def _apply_imap_component(
                 "AND mailbox_identity_key=? AND thread_key=?",
                 (*scope, key),
             )
+    if merged and db.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='reconcile_catchup'"
+    ).fetchone():
+        # Re-key obligations before D-derived removes the losing follow rows.
+        for old_key in merged:
+            db.execute(
+                """INSERT INTO reconcile_catchup(
+                provider,account_id,mailbox_identity_key,generation,thread_key,target)
+                SELECT provider,account_id,mailbox_identity_key,generation,?,target
+                FROM reconcile_catchup WHERE provider=? AND account_id=?
+                AND mailbox_identity_key=? AND thread_key=?
+                ON CONFLICT(provider,account_id,mailbox_identity_key,generation,thread_key)
+                DO UPDATE SET target=MAX(target,excluded.target)""",
+                (thread_key, *scope, old_key),
+            )
+            db.execute(
+                "DELETE FROM reconcile_catchup WHERE provider=? AND account_id=? "
+                "AND mailbox_identity_key=? AND thread_key=?", (*scope, old_key),
+            )
     for old_key in merged:
         # Keys are UUIDv4s, so provider, account, and key identify a component's
         # rows, including legacy messages stored without a mailbox identity.

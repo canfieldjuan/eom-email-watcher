@@ -541,7 +541,7 @@ def test_imap_unicode_literal_and_badcharset_bounded_fallback(badcharset):
                 return "OK", [b'1 (UID 1 INTERNALDATE "04-Sep-2026 10:16:00 -0500")']
             return super().uid(command, *args)
 
-    client = LiteralClient(uid_next=2)
+    client = LiteralClient(uid_next=2, raw_message="From: café@example.com\r\n\r\n".encode())
     gateway = ImapGateway(credentials())
     gateway._active_client = client
     unit = dict(folder="inbox", addresses=["caf\u00e9@example.com"], token=None)
@@ -554,7 +554,7 @@ def test_imap_unicode_literal_and_badcharset_bounded_fallback(badcharset):
     assert literal[-1] == "caf\u00e9@example.com".encode()
     if badcharset:
         assert ("uid", "SEARCH", None, "UID", "1:1", "SINCE", "02-Sep-2026", None) in client.calls
-    assert not any("HEADER" in str(c) for c in client.calls)
+    assert any("HEADER.FIELDS (FROM TO CC)" in str(c) for c in client.calls) is badcharset
 
 
 @pytest.mark.parametrize("operand", ["", "a\r\nb", "a\x00b"])

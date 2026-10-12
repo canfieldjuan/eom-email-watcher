@@ -43,6 +43,7 @@ from .mailbox import (
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
 from .text import within_utf8_bytes
+from .thread_state import VendorIndex
 
 IMAP_PROVIDER = "imap"
 IMAP_CONNECTION_METHOD = "server_credentials"
@@ -2102,8 +2103,18 @@ class ImapGateway:
                     groups.append(_search_or(batch))
                 else:
                     groups.extend(batch)
-            if not groups:
-                groups = [[]]
+            if not groups and "ids" in unit:
+                # An id-less component is only its recorded sources, never all mail.
+                for source in unit.get("sources", ()):
+                    mailbox, folder_key, validity, uid = _decode_any_message_id(source)
+                    if (
+                        mailbox == self._mailbox_id
+                        and folder_key == frozen["folder_key"]
+                        and validity == frozen["validity"]
+                        and page["lower"] <= uid <= page["upper"]
+                    ):
+                        page["uids"].append(uid)
+                page["uids"] = sorted(set(page["uids"]))
             while page["searched"] < len(groups):
                 base = [
                     "UID",
@@ -2194,6 +2205,45 @@ class ImapGateway:
                             matches = bool(set(ids) & set(unit["ids"]))
                         except MailboxMessageUnavailable:
                             matches = False
+                    if page["fallback"] and "addresses" in unit:
+                        status, response = client.uid(
+                            "FETCH",
+                            str(uid),
+                            f"(UID BODY.PEEK[HEADER.FIELDS (FROM TO CC)]<0.{MAX_HEADER_BYTES}>)",
+                        )
+                        if status != "OK":
+                            raise ImapError(
+                                "imap_protocol_error", "Mail server address header fetch failed"
+                            )
+                        matches = False
+                        selection = VendorIndex(addresses={a: (a, a) for a in unit["addresses"]})
+                        for raw in response or ():
+                            if not (
+                                isinstance(raw, tuple)
+                                and len(raw) == 2
+                                and isinstance(raw[0], bytes)
+                                and isinstance(raw[1], bytes)
+                            ):
+                                continue
+                            fetched = _FETCH_UID.search(raw[0])
+                            if not fetched or int(fetched.group(1)) != uid:
+                                continue
+                            header = _optional_headers(raw[1], MAX_HEADER_BYTES)
+                            if header is None:
+                                continue
+                            try:
+                                parsed = BytesParser(policy=policy.default).parsebytes(
+                                    header, headersonly=True
+                                )
+                                addresses = (
+                                    normalize_address(str(parsed.get("From", ""))),
+                                    *recipient_addresses(str(parsed.get("To", ""))),
+                                    *recipient_addresses(str(parsed.get("Cc", ""))),
+                                )
+                            except RecursionError:
+                                continue
+                            matches = any(selection.vendor_of(a) for a in addresses)
+                            break
                     if matches:
                         items.append(
                             ReconcileItem(
