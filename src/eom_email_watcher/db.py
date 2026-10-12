@@ -3606,7 +3606,8 @@ def _effective_cutoff_sql(alias: str, *, include_recovery: bool = True) -> str:
 
 
 def _logical_messages_past_cutoff_sql(
-    cutoff_epoch: float, stamp_epoch: float, *, include_recovery: bool = True
+    cutoff_epoch: float, stamp_epoch: float, *, include_recovery: bool = True,
+    canonical_ids: Iterable[str] | None = None,
 ) -> tuple[str, tuple[float, ...]]:
     """The logical messages whose received time is past the cutoff (contract D-scope).
 
@@ -3618,6 +3619,11 @@ def _logical_messages_past_cutoff_sql(
     them today; a purge that keeps more (a followed thread, contract D-scope)
     decides that separately and must not widen what is fetched.
     """
+    selected = tuple(canonical_ids) if canonical_ids is not None else ()
+    selection = (
+        "WHERE COALESCE(logical_of,message_id) IN (" + ",".join("?" for _ in selected) + ")"
+        if selected else ("WHERE 0" if canonical_ids is not None else "")
+    )
     row_expired = f"""aware_iso_epoch(received_at) IS NULL
         OR (
             aware_iso_epoch(received_at) > ?
@@ -3635,7 +3641,7 @@ def _logical_messages_past_cutoff_sql(
     sql = f"""SELECT canonical FROM (
             SELECT COALESCE(logical_of, message_id) AS canonical,
                    MIN(CASE WHEN ({row_expired}) THEN 1 ELSE 0 END) AS all_expired
-            FROM messages GROUP BY canonical
+            FROM messages {selection} GROUP BY canonical
         ) WHERE all_expired = 1
           AND NOT EXISTS (
               SELECT 1 FROM message_locations AS l
@@ -3644,14 +3650,8 @@ def _logical_messages_past_cutoff_sql(
                     {_effective_cutoff_sql("l", include_recovery=include_recovery)}
           )"""
     return sql, (
-        stamp_epoch,
-        cutoff_epoch,
-        stamp_epoch,
-        stamp_epoch,
-        cutoff_epoch,
-        cutoff_epoch,
-        cutoff_epoch,
-        cutoff_epoch,
+        stamp_epoch, cutoff_epoch, stamp_epoch, stamp_epoch, cutoff_epoch, cutoff_epoch,
+        *selected, cutoff_epoch, cutoff_epoch,
     )
 
 
@@ -14024,53 +14024,66 @@ class Store:
 
     def _purge_followed(self, retention_days, stamp, expired_units, parameters):
         deleted = reviews = 0
+
+        def members(db, *, scope=None, keys=None):
+            sql = f"""SELECT f.provider,f.account_id,f.mailbox_identity_key,
+                f.thread_key,m.message_id
+                FROM thread_follow f JOIN logical_messages m
+                ON f.provider=m.provider AND f.account_id=m.account_id
+                AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
+                AND f.thread_key=m.thread_key WHERE f.followed=1"""
+            values = ()
+            if scope is not None:
+                placeholders = ",".join("?" for _ in keys)
+                sql += (" AND f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?"
+                        f" AND f.thread_key IN ({placeholders})")
+                values = (*scope, *keys)
+            grouped = {}
+            for row in db.execute(sql, values):
+                grouped.setdefault(tuple(row[:3]), {}).setdefault(row[3], []).append(row[4])
+            return grouped
+
         with self.connection() as db:
-            scopes = [
-                tuple(r)
-                for r in db.execute(
-                    "SELECT provider,account_id,mailbox_identity_key,thread_key "
-                    "FROM thread_follow WHERE followed=1"
-                )
-            ]
-        for scope in scopes:
-
-            def candidates(db, scope):
+            db.execute("BEGIN")
+            grouped = members(db)
+            expired = {r[0] for r in db.execute(expired_units, parameters)}
+            candidates = {}
+            for scope, threads in grouped.items():
                 if not reconcile_state.coverage_current(
-                    db, scope[:3], now=stamp, retention_days=retention_days
+                    db, scope, now=stamp, retention_days=retention_days
                 ):
-                    return []
-                members = [
-                    r[0]
-                    for r in db.execute(
-                        f"""SELECT m.message_id FROM logical_messages m
-                    JOIN thread_follow f ON f.provider=m.provider AND f.account_id=m.account_id
-                    AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
-                    AND f.thread_key=m.thread_key
-                    WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
-                    AND f.thread_key=? AND f.followed=1""",
-                        scope,
-                    )
-                ]
-                expired = {r[0] for r in db.execute(expired_units, parameters)}
-                return members if members and all(m in expired for m in members) else []
-
-            with self.connection() as db:
-                ids = candidates(db, scope)
-                rows = _unit_rows(db, ids)
-            if not rows:
-                continue
+                    continue
+                keys = [key for key, ids in threads.items() if all(m in expired for m in ids)]
+                if keys:
+                    ids = [m for key in keys for m in threads[key]]
+                    candidates[scope] = (keys, _unit_rows(db, ids))
+        for scope, (keys, rows) in candidates.items():
             with self._source_cleanup_locks(rows), self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
-                current = candidates(db, scope)
-                # A source added while locks were being acquired must be locked too.
+                if not reconcile_state.coverage_current(
+                    db, scope, now=stamp, retention_days=retention_days
+                ):
+                    continue
+                threads = members(db, scope=scope, keys=keys).get(scope, {})
+                ids = [m for unit in threads.values() for m in unit]
+                # The same expiry owner now scans only the candidate logical units.
+                current_sql, current_params = _logical_messages_past_cutoff_sql(
+                    (stamp-timedelta(days=retention_days)).timestamp(), stamp.timestamp(),
+                    canonical_ids=ids,
+                )
+                current_expired = {r[0] for r in db.execute(current_sql, current_params)}
+                current = [m for unit in threads.values() if all(m in current_expired for m in unit)
+                           for m in unit]
                 current_rows = _unit_rows(db, current)
-                if not current_rows or set(current_rows) != set(rows):
+                if not current_rows or not set(current_rows) <= set(rows):
                     continue
                 reviews += _mark_automation_sources_unavailable(
                     db, current_rows, updated_at=stamp.isoformat()
                 )
-                placeholders = ",".join("?" for _ in current)
-                db.execute(f"DELETE FROM messages WHERE message_id IN ({placeholders})", current)
+                for offset in range(0, len(current), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+                    chunk = current[offset:offset+SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+                    placeholders = ",".join("?" for _ in chunk)
+                    db.execute(f"DELETE FROM messages WHERE message_id IN ({placeholders})", chunk)
                 deleted += len(current_rows)
         return PurgeOutcome(deleted, reviews)
 

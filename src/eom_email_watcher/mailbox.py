@@ -79,6 +79,8 @@ class MailboxChanges:
     # Per id, what the change record says about its folders. An id absent here
     # came with no folder information.
     locations: Mapping[str, FolderObservation] = field(default_factory=dict)
+    # A bounded poll can leave later events unread; it cannot authorize retention.
+    drained: bool = True
 
 
 @dataclass(frozen=True)

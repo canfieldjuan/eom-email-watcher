@@ -46,7 +46,7 @@ from .mailbox import (
     validate_content_scope,
     validate_operation_timeout,
 )
-from .mime import extract_body, extract_stored_body
+from .mime import MAX_STORED_BODY_INPUT_CHARS, StoredBodyInvalid, extract_body, extract_stored_body
 from .text import within_utf8_bytes
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
@@ -919,12 +919,12 @@ class GmailGateway:
             ) from exc
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
-        ids, newest, _locations = self._history_changes(start_history_id)
+        ids, newest, _locations, _drained = self._history_changes(start_history_id)
         return ids, newest
 
     def _history_changes(
         self, start_history_id: str
-    ) -> tuple[list[str], str, dict[str, FolderObservation]]:
+    ) -> tuple[list[str], str, dict[str, FolderObservation], bool]:
         """The changed ids, the newest cursor, and each record's admitted folders.
 
         A history record says which folders a message was added to, so a known
@@ -1007,6 +1007,7 @@ class GmailGateway:
                                     ids,
                                     _history_continuation_cursor(request_start_history_id, prefix),
                                     hints.snapshot(drained=False),
+                                    False,
                                 )
                             ids.append(message_id)
                 page_token = response.get("nextPageToken")
@@ -1030,11 +1031,11 @@ class GmailGateway:
         # Every id whose record this call saw keeps its observation, the replayed
         # prefix included: a later event for an id returned in an earlier batch
         # arrives here only, so it travels as an observation outside the batch.
-        return ids, newest, hints.snapshot(drained=True)
+        return ids, newest, hints.snapshot(drained=True), True
 
     def changes_since(self, cursor: str) -> MailboxChanges:
-        message_ids, newest, locations = self._history_changes(cursor)
-        return MailboxChanges(tuple(message_ids), newest, locations)
+        message_ids, newest, locations, drained = self._history_changes(cursor)
+        return MailboxChanges(tuple(message_ids), newest, locations, drained=drained)
 
     def metadata(
         self,
@@ -1086,7 +1087,10 @@ class GmailGateway:
     def _scoped_full_message(self, message_id: str, scope: frozenset[str]):
         scope = validate_content_scope(scope)
         message = self._full_message(message_id)
-        labels = _validated_label_ids(message, require_complete=True)
+        try:
+            labels = _validated_label_ids(message, require_complete=True)
+        except MailboxMessageInvalid as exc:
+            raise MessageUnavailable("Gmail body response has invalid folder evidence") from exc
         if not (locations_from_labels(labels) & scope):
             raise MailboxMessageOutsideScope(
                 f"Gmail message {message_id} is outside the active folder scope"
@@ -1095,15 +1099,38 @@ class GmailGateway:
 
     def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
         message = self._scoped_full_message(message_id, scope)
-        return extract_stored_body(message.get("payload") or {})
+
+        def load_text(part):
+            body = part["body"]
+            if isinstance(body.get("size"), int) and body["size"] > MAX_STORED_BODY_INPUT_CHARS:
+                raise StoredBodyInvalid("Gmail text part exceeds the safe input limit")
+            request = (
+                self.service.users()
+                .messages()
+                .attachments()
+                .get(userId="me", messageId=message_id, id=body["attachmentId"])
+            )
+            try:
+                response = self._execute_request(request)
+            except HttpError as exc:
+                raise GmailError("Gmail text part fetch failed") from exc
+            data = response.get("data")
+            if not isinstance(data, str):
+                raise GmailError("Gmail text part response did not contain data")
+            if len(data) > (MAX_STORED_BODY_INPUT_CHARS + 2) // 3 * 4:
+                raise StoredBodyInvalid("Gmail text part exceeds the safe input limit")
+            _decode_attachment_data(data)
+            return data
+
+        try:
+            return extract_stored_body(message.get("payload") or {}, load_text=load_text)
+        except StoredBodyInvalid as exc:
+            raise MailboxMessageInvalid("gmail_body_invalid", str(exc)) from exc
 
     def content(
         self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
     ) -> MessageContent:
-        try:
-            message = self._scoped_full_message(message_id, scope)
-        except MailboxMessageInvalid as exc:
-            raise MessageUnavailable("Gmail body response has invalid folder evidence") from exc
+        message = self._scoped_full_message(message_id, scope)
         body, attachment_names, attachments, body_source_chars = extract_body(
             message.get("payload") or {}, body_char_limit
         )

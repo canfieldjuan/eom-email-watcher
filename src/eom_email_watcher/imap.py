@@ -44,8 +44,10 @@ from .mailbox import (
 )
 from .mime import (
     AttachmentDescriptor,
+    StoredBodyInvalid,
     bounded_body_text,
     html_to_text,
+    select_stored_alternative,
     stored_body_text,
     stored_html_to_text,
 )
@@ -834,11 +836,16 @@ class _ImapAttachment:
 
 
 @dataclass(frozen=True)
+class _ImapBodyAlternative:
+    alternatives: tuple[tuple, ...]
+
+
+@dataclass(frozen=True)
 class _ImapCatalog:
     plain: tuple[_ImapBodyPart, ...]
     html: tuple[_ImapBodyPart, ...]
     attachments: tuple[_ImapAttachment, ...]
-    stored: tuple[_ImapBodyPart, ...]
+    stored: tuple[_ImapBodyPart | _ImapBodyAlternative, ...]
 
 
 class _ImapValueParser:
@@ -1218,7 +1225,7 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
             )
         )
 
-    def visit(value: list[_ImapValue], section: str, depth: int) -> list[_ImapBodyPart]:
+    def visit(value: list[_ImapValue], section: str, depth: int) -> list:
         nonlocal visited
         visited += 1
         if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH or not value:
@@ -1262,15 +1269,7 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
                 child_section = f"{section}.{index}" if section else str(index)
                 children.append(visit(child, child_section, depth + 1))
             if subtype == "alternative":
-                nonempty = [child for child in children if child]
-                return next(
-                    (
-                        child
-                        for child in nonempty
-                        if any(p.media_type == "text/html" for p in child)
-                    ),
-                    nonempty[0] if nonempty else [],
-                )
+                return [_ImapBodyAlternative(tuple(tuple(child) for child in children))]
             return [part for child in children for part in child]
 
         if len(value) < 7:
@@ -2438,7 +2437,10 @@ class ImapGateway:
         )
 
     def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
-        content = self._read_content(message_id, 0, scope=scope, stored=True)
+        try:
+            content = self._read_content(message_id, 0, scope=scope, stored=True)
+        except StoredBodyInvalid as exc:
+            raise MailboxMessageInvalid("imap_body_invalid", str(exc)) from exc
         return content.body, content.body_source_chars
 
     def content(
@@ -2455,32 +2457,53 @@ class ImapGateway:
         with self._mailbox() as client:
             uid = self._checked_uid(client, message_id)
             catalog = self._catalog(client, uid, self._refresh_operation_timeout)
-            selected_parts = (
-                catalog.stored if stored else (catalog.plain or catalog.html)
-            )
-            if sum(part.byte_size for part in selected_parts) > MAX_MESSAGE_BYTES:
+            choices = catalog.stored if stored else (catalog.plain or catalog.html)
+
+            def leaves(parts):
+                for part in parts:
+                    if isinstance(part, _ImapBodyAlternative):
+                        for alternative in part.alternatives:
+                            yield from leaves(alternative)
+                    else:
+                        yield part
+
+            if sum(part.byte_size for part in leaves(choices)) > MAX_MESSAGE_BYTES:
                 raise MailboxMessageInvalid(
                     "imap_message_too_large", "Message content exceeds the safe size limit"
                 )
-            rendered: list[str] = []
             remaining_bytes = MAX_MESSAGE_BYTES
-            for part in selected_parts:
-                section = self._section_bytes(
-                    client,
-                    uid,
-                    part,
-                    byte_limit=remaining_bytes,
-                    refresh_timeout=self._refresh_operation_timeout,
-                )
-                remaining_bytes -= len(section)
-                decoded = _decoded_section(section, part.transfer_encoding)
-                try:
-                    text = decoded.decode(part.charset or "utf-8", errors="replace")
-                except LookupError:
-                    text = decoded.decode("utf-8", errors="replace")
-                if part.media_type == "text/html":
-                    text = stored_html_to_text(text) if stored else html_to_text(text)
-                rendered.append(text)
+
+            def render(parts):
+                nonlocal remaining_bytes
+                rendered_parts = []
+                for part in parts:
+                    if isinstance(part, _ImapBodyAlternative):
+                        rendered_parts.extend(
+                            select_stored_alternative(
+                                [render(alternative) for alternative in part.alternatives]
+                            )
+                        )
+                        continue
+                    section = self._section_bytes(
+                        client,
+                        uid,
+                        part,
+                        byte_limit=remaining_bytes,
+                        refresh_timeout=self._refresh_operation_timeout,
+                    )
+                    remaining_bytes -= len(section)
+                    decoded = _decoded_section(section, part.transfer_encoding)
+                    try:
+                        text = decoded.decode(part.charset or "utf-8", errors="replace")
+                    except LookupError:
+                        text = decoded.decode("utf-8", errors="replace")
+                    rich = part.media_type == "text/html"
+                    if rich:
+                        text = stored_html_to_text(text) if stored else html_to_text(text)
+                    rendered_parts.append((text, rich))
+                return rendered_parts
+
+            rendered = [text for text, _ in render(choices)]
         selected = "\n\n".join(rendered)
         body, body_source_chars = (
             stored_body_text(selected, is_html=False)

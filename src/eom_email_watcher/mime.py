@@ -7,6 +7,12 @@ from html.parser import HTMLParser
 from typing import Any
 
 MAX_STORED_BODY_CHARS = 200_000
+MAX_STORED_BODY_INPUT_CHARS = 50 * 1024 * 1024
+
+
+class StoredBodyInvalid(ValueError):
+    """A storage source cannot be normalized safely or completely."""
+
 
 _HTML_LINE_BREAK_TAGS = frozenset(
     {
@@ -94,18 +100,22 @@ def bounded_body_text(selected: str, limit: int) -> tuple[str, int]:
 
 
 class _StoredTextExtractor(HTMLParser):
-    """Render container boundaries without retaining markup or quote ancestry."""
+    """Render quote boundaries with constant-time ancestry queries."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.stack: list[tuple[str, bool]] = []
+        self.stack = []
+        self.positions = {}
+        self.quote_depth = self.hidden_depth = self.pre_depth = 0
         self.parts: list[str] = []
         self.lines: list[str] = []
 
     def _line(self) -> None:
-        text = "".join(self.parts).strip()
-        if text:
-            self.lines.append(("> " if any(quoted for _, quoted in self.stack) else "") + text)
+        text = "".join(self.parts)
+        lines = text.splitlines() if self.pre_depth else [" ".join(text.split())]
+        for line in lines:
+            if line.strip():
+                self.lines.append(("> " if self.quote_depth else "") + line.strip())
         self.parts.clear()
 
     def handle_starttag(self, tag, attrs):
@@ -114,30 +124,46 @@ class _StoredTextExtractor(HTMLParser):
             self._line()
         attributes = dict(attrs)
         quoted = tag == "blockquote" or (
-            tag == "div" and (
+            tag == "div"
+            and (
                 "gmail_quote" in (attributes.get("class") or "").split()
                 or attributes.get("id") == "divRplyFwdMsg"
             )
         )
         if tag not in {"br", "hr", "img", "input", "meta", "link", "wbr"}:
-            self.stack.append((tag, quoted))
+            hidden, pre = tag in {"script", "style"}, tag == "pre"
+            self.positions.setdefault(tag, []).append(len(self.stack))
+            self.stack.append((tag, quoted, hidden, pre))
+            self.quote_depth += quoted
+            self.hidden_depth += hidden
+            self.pre_depth += pre
 
     def handle_endtag(self, tag):
         tag = tag.casefold()
         if tag in _HTML_LINE_BREAK_TAGS:
             self._line()
-        for i in range(len(self.stack) - 1, -1, -1):
-            if self.stack[i][0] == tag:
-                del self.stack[i:]
-                break
+        positions = self.positions.get(tag)
+        if positions:
+            target = positions[-1]
+            while len(self.stack) > target:
+                name, quoted, hidden, pre = self.stack.pop()
+                self.positions[name].pop()
+                self.quote_depth -= quoted
+                self.hidden_depth -= hidden
+                self.pre_depth -= pre
 
     def handle_data(self, data):
-        if any(tag in {"script", "style"} for tag, _ in self.stack):
-            return
-        self.parts.append(data)
+        if not self.hidden_depth:
+            self.parts.append(data)
+
+
+def _validate_stored_input(selected: str) -> None:
+    if len(selected) > MAX_STORED_BODY_INPUT_CHARS:
+        raise StoredBodyInvalid("Message body exceeds the safe normalization input limit")
 
 
 def stored_html_to_text(selected: str) -> str:
+    _validate_stored_input(selected)
     parser = _StoredTextExtractor()
     parser.feed(selected)
     parser.close()
@@ -146,32 +172,53 @@ def stored_html_to_text(selected: str) -> str:
 
 
 def stored_body_text(selected: str, *, is_html: bool) -> tuple[str, int]:
+    _validate_stored_input(selected)
     if is_html:
         selected = stored_html_to_text(selected)
     return bounded_body_text(selected, MAX_STORED_BODY_CHARS)
 
 
-def extract_stored_body(payload: dict[str, Any]) -> tuple[str, int]:
+def select_stored_alternative(alternatives):
+    """Only usable rendered text can win an HTML preference."""
+    usable = [[(text, rich) for text, rich in parts if text.strip()] for parts in alternatives]
+    usable = [parts for parts in usable if parts]
+    return next(
+        (parts for parts in usable if any(rich for _, rich in parts)),
+        usable[0] if usable else [],
+    )
+
+
+def extract_stored_body(payload: dict[str, Any], *, load_text=None) -> tuple[str, int]:
+    total = 0
+
     def walk(part):
+        nonlocal total
         if part.get("filename"):
             return []
         kind = str(part.get("mimeType", "")).casefold()
         children = [walk(child) for child in part.get("parts") or [] if isinstance(child, dict)]
         if kind == "multipart/alternative":
-            nonempty = [child for child in children if child]
-            return next(
-                (child for child in nonempty if any(html for _, html in child)),
-                nonempty[0] if nonempty else [],
-            )
+            return select_stored_alternative(children)
         if children:
             return [body for child in children for body in child]
-        data = (part.get("body") or {}).get("data")
-        if isinstance(data, str) and kind in {"text/plain", "text/html"}:
-            return [(_decode(data), kind == "text/html")]
-        return []
+        if kind not in {"text/plain", "text/html"}:
+            return []
+        body = part.get("body") or {}
+        data = body.get("data")
+        if not isinstance(data, str):
+            if not body.get("attachmentId"):
+                return []
+            if load_text is None:
+                raise StoredBodyInvalid("Message text part was not retrieved")
+            data = load_text(part)
+        text = _decode(data)
+        total += len(text)
+        if total > MAX_STORED_BODY_INPUT_CHARS:
+            raise StoredBodyInvalid("Message body exceeds the safe normalization input limit")
+        rich = kind == "text/html"
+        return [(stored_html_to_text(text) if rich else text, rich)]
 
-    rendered = [stored_html_to_text(text) if rich else text for text, rich in walk(payload)]
-    return stored_body_text("\n".join(rendered), is_html=False)
+    return stored_body_text("\n".join(text for text, _ in walk(payload)), is_html=False)
 
 
 def body_was_truncated(analyzed_chars: int | None, source_chars: int | None) -> bool | None:

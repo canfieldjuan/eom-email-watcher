@@ -30,6 +30,7 @@ from .mailbox import (
     FolderObservation,
     MailboxChanges,
     MailboxError,
+    MailboxMessageInvalid,
     MailboxMessageOutsideScope,
     MailboxMessageUnavailable,
     MessageContent,
@@ -40,7 +41,13 @@ from .mailbox import (
     validate_content_scope,
     validate_operation_timeout,
 )
-from .mime import AttachmentDescriptor, bounded_body_text, html_to_text, stored_body_text
+from .mime import (
+    AttachmentDescriptor,
+    StoredBodyInvalid,
+    bounded_body_text,
+    html_to_text,
+    stored_body_text,
+)
 
 MICROSOFT365_PROVIDER = "microsoft365"
 SCOPES = ("Mail.Read",)
@@ -898,10 +905,13 @@ class Microsoft365Gateway:
         body = document.get("body")
         if not isinstance(body, dict) or not isinstance(body.get("content"), str):
             raise Microsoft365Error("Microsoft message body response is invalid")
-        return stored_body_text(
-            body["content"],
-            is_html=str(body.get("contentType", "")).casefold() == "html",
-        )
+        try:
+            return stored_body_text(
+                body["content"],
+                is_html=str(body.get("contentType", "")).casefold() == "html",
+            )
+        except StoredBodyInvalid as exc:
+            raise MailboxMessageInvalid("microsoft_body_invalid", str(exc)) from exc
 
     def content(
         self, message_id: str, body_char_limit: int, *, scope: frozenset[str]

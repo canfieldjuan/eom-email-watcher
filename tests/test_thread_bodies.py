@@ -482,11 +482,11 @@ def test_recovery_retention_extension_does_not_widen_body_fetch_window(tmp_path,
         ]
 
 
-def test_gmail_invalid_folder_evidence_is_retryable_not_source_gone():
+def test_gmail_invalid_folder_evidence_is_terminal_on_both_body_paths():
     from types import SimpleNamespace
 
     from eom_email_watcher.gmail import GmailGateway
-    from eom_email_watcher.mailbox import MailboxMessageInvalid
+    from eom_email_watcher.mailbox import MailboxMessageUnavailable
 
     response = {"labelIds": None, "payload": {}}
     gateway = GmailGateway(
@@ -498,8 +498,10 @@ def test_gmail_invalid_folder_evidence_is_retryable_not_source_gone():
             )
         )
     )
-    with pytest.raises(MailboxMessageInvalid):
+    with pytest.raises(MailboxMessageUnavailable):
         gateway.stored_body("m", scope=frozenset({"inbox"}))
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content("m", 100, scope=frozenset({"inbox"}))
 
 
 def test_microsoft_invalid_body_is_a_retryable_provider_error():

@@ -58,6 +58,7 @@ from .mailbox import (
     SENT_LOCATION,
     SENT_SCOPE_AVAILABLE,
     SENT_SCOPE_NOT_POLLED,
+    SENT_SCOPE_UNAVAILABLE,
     FolderObservation,
     MailboxAccountUnavailable,
     MailboxChanges,
@@ -2150,6 +2151,7 @@ class Watcher:
         reconcile_label_selectors=(),
         reconcile_vendor_snapshot=None,
         sent_scope: str | None = None,
+        polling_complete: bool = False,
     ) -> dict[str, int | bool | str]:
         if not dry_run and reconcile_allowed:
             from .reconcile import run
@@ -2172,7 +2174,9 @@ class Watcher:
             mailbox_identity_key=mailbox_identity_key,
         )
         if not dry_run:
-            purged += self.store.purge(self.config.retention_days, now=checked_at, after_poll=True)
+            purged += self.store.purge(
+                self.config.retention_days, now=checked_at, after_poll=polling_complete
+            )
             from .body_state import checkpoint
 
             checkpoint(self.store)
@@ -2430,7 +2434,7 @@ class Watcher:
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             )
-        added += self._poll_sent_folder(
+        sent_added, sent_complete = self._poll_sent_folder(
             mailbox_identity_key=mailbox_identity_key,
             label_selectors=label_selectors,
             gated_allowed=gated_allowed,
@@ -2442,6 +2446,7 @@ class Watcher:
             dry_run=dry_run,
             dry_run_messages=dry_run_messages,
         )
+        added += sent_added
         return self._finish_active_result(
             scope=folders,
             added=added,
@@ -2457,6 +2462,7 @@ class Watcher:
             sent_scope=sent_scope,
             reconcile_label_selectors=label_selectors,
                     reconcile_vendor_snapshot=vendor_snapshot,
+            polling_complete=sent_complete and changes.drained and not recovery_incomplete,
             recovery_incomplete=recovery_incomplete,
             recovery_reason=recovery_reason,
         )
@@ -2745,15 +2751,17 @@ class Watcher:
         sent_scope: str | None,
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Poll the Sent folder this check's _settle_sent found available (D-scope).
 
         Gmail's one mailbox-wide cursor already carries SENT events, so only the other
         providers keep a Sent cursor of their own. A dry run previews Sent as it
         previews the Inbox: it reads, and moves no cursor.
         """
-        if sent_scope != SENT_SCOPE_AVAILABLE or self.mailbox.provider == "gmail":
-            return 0
+        if SENT_LOCATION not in folders or self.mailbox.provider == "gmail":
+            return 0, True
+        if sent_scope != SENT_SCOPE_AVAILABLE:
+            return 0, sent_scope == SENT_SCOPE_UNAVAILABLE
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
         folder_scope = {
@@ -2766,7 +2774,7 @@ class Watcher:
         if state is None:
             # No position yet: a dry run records none, and _settle_sent retries one
             # it could not read on the next check.
-            return 0
+            return 0, False
         # A Sent folder error never stops the Inbox check; the next check retries.
         try:
             try:
@@ -2794,10 +2802,10 @@ class Watcher:
             )
             if not dry_run:
                 self.store.set_folder_state(changes.cursor, at=checked_at, **folder_scope)
-            return added
+            return added, changes.drained
         except MailboxError as exc:
             logger.warning("Sent folder poll failed; the Inbox check is unaffected: %s", exc)
-            return 0
+            return 0, False
 
     def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender
@@ -3150,6 +3158,10 @@ def run_watcher_check(
 ) -> dict[str, int | bool | str]:
     recovery_backoff = _gmail_recovery_backoff_admission(store)
     if recovery_backoff is not None:
+        if not dry_run:
+            from .body_state import checkpoint
+
+            checkpoint(store)
         return {
             **Watcher.recovery_backoff_result(recovery_backoff),
             "automation_processed": 0,

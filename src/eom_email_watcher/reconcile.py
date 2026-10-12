@@ -194,6 +194,17 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
     budget = ReconcileBudget(allowed)
     added = 0
 
+    def resume_catchup():
+        if any(not t["watermark"] for t in state.threads()):
+            progress["payload"].update(stage="sync_init", units=[])
+            state.save(progress)
+            return True
+        if state.catchup_pending(progress):
+            progress["payload"]["stage"] = "catchup_wait"
+            state.save(progress)
+            return True
+        return False
+
     def fetch(item, *, gap=False, since=cutoff):
         nonlocal added
         source = watcher.store.reconcile_source(*state.scope, item["source_id"])
@@ -260,6 +271,10 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                     with watcher.store.connection() as db:
                         pending = body_state.pending(db, state.scope, cutoff=cutoff, now=start)
                     if not pending:
+                        if resume_catchup():
+                            if payload["stage"] == "catchup_wait":
+                                break
+                            continue
                         state.complete(progress)
                         break
                     retries = payload.setdefault("body_retries", {})
@@ -297,7 +312,7 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                                 break
                             except MailboxMessageOutsideScope:
                                 outside = True
-                            except MailboxMessageUnavailable:
+                            except (MailboxMessageUnavailable, MailboxMessageInvalid):
                                 pass
                             work["outside"] = outside
                             work["skipped"].append(copy)
@@ -470,15 +485,10 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                             )
                         state.save(progress)
                         continue
-                    missing = [t for t in state.threads() if not t["watermark"]]
-                    if missing:
-                        payload.update(stage="sync_init", units=[])
-                        state.save(progress)
+                    if resume_catchup():
+                        if payload["stage"] == "catchup_wait":
+                            break
                         continue
-                    if state.catchup_pending(progress):
-                        payload["stage"] = "catchup_wait"
-                        state.save(progress)
-                        break
                     payload["stage"] = "derived"
                     state.save(progress)
                     continue
