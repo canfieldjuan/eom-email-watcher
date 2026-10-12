@@ -6483,6 +6483,13 @@ def test_gmail_and_microsoft_thread_keys_are_the_provider_thread_ids(tmp_path: P
 def _reset_to_schema_29(store: Store) -> None:
     """Undo schema 30 (Sent capture) so a migration test can start from v29."""
     with store.connection() as db:
+        # Remove later derived storage before reconstructing the older schema.
+        for row in db.execute(
+            "SELECT name FROM sqlite_temp_master WHERE type='trigger' AND name LIKE 'derived_%'"
+        ).fetchall():
+            db.execute(f'DROP TRIGGER temp."{row[0]}"')
+        for table in ("thread_watermarks", "thread_follow", "message_derived"):
+            db.execute(f"DROP TABLE IF EXISTS {table}")
         for statement in (
             "DROP VIEW IF EXISTS logical_messages",
             "DROP TRIGGER messages_delete_recipients_and_locations",

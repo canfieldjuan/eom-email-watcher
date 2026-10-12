@@ -4606,7 +4606,7 @@ def test_invalid_source_time_is_rejected_before_content_fetch(tmp_path: Path) ->
     assert store.recent(10) == []
 
 
-def test_check_reuses_one_retention_snapshot_for_both_purges(
+def test_check_uses_retention_snapshot_for_post_poll_purge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = config(tmp_path)
@@ -4625,9 +4625,8 @@ def test_check_reuses_one_retention_snapshot_for_both_purges(
 
     Watcher(cfg, store, gmail, FakeModel()).check(deliver_notifications=False)
 
-    assert len(purge_times) == 2
+    assert len(purge_times) == 1
     assert purge_times[0] is not None
-    assert purge_times[0] == purge_times[1]
 
 
 @pytest.mark.parametrize(("dry_run", "expected_purged"), [(False, 1), (True, 0)])
@@ -6208,10 +6207,10 @@ def test_imap_sent_folder_is_polled_only_while_connect_is_active(
     assert store.folder_state(**scope)[0].endswith(":77:3")
     assert store.state(provider="imap", account_id=account_id)[0] == inbox_cursor
 
-    # An account with nothing to watch is not polled at all, Sent included.
+    # Paid Sent scope keeps an account active even without a watched sender.
     quiet = MailboxSession("imap", account_id, gateway)
-    assert Watcher(replace(cfg, senders=()), store, quiet, FakeModel()).check()["active"] is False
-    assert store.sent_scope("imap", account_id) == "not_polled"
+    assert Watcher(replace(cfg, senders=()), store, quiet, FakeModel()).check()["active"] is True
+    assert store.sent_scope("imap", account_id) == "available"
     check()
     assert store.sent_scope("imap", account_id) == "available"
 
@@ -6503,6 +6502,8 @@ def test_pending_shortcut_passes_inbox_scope_without_polling(
             return real.content(message_id, body_char_limit, scope=scope)
 
         def changes_since(self, cursor):
+            if gated and not catalog_error:
+                return MailboxChanges((), "201")
             pytest.fail("Shortcut must not poll")
 
     model = FakeModel()

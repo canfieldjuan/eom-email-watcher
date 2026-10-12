@@ -746,8 +746,7 @@ test("Gmail label UI explains bounded catch-up and renders admission provenance"
     source,
     /Applies on the next scheduled check and may include recent matching mail\. Adding a label does not start a full mailbox scan\./,
   );
-  assert.match(source, /Admitted by Gmail label:/);
-  assert.match(source, /Admitted by watched sender:/);
+  assert.match(source, /inboxAdmissionLabel\(item\.admission\.kind, item\.admission\.display_name, item\.sender\)/);
   assert.match(source, /item\.admission !== null/);
 });
 

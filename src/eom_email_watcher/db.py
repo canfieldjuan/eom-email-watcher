@@ -13,12 +13,14 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from connect_automate import connect
 from connect_automate.locking import connect_operation_lock, connect_source_lock_path
 
+from . import thread_migration
 from .automation.rules import (
     MAX_AUTOMATION_ATTACHMENTS,
     MAX_AUTOMATION_RULES,
@@ -33,6 +35,7 @@ from .automation.rules import (
 from .config import (
     EXACT_SENDER_SELECTOR_PREFIX,
     MAX_RETENTION_DAYS,
+    THREAD_ADMISSION_SELECTOR_PREFIXES,
     exact_sender_selector_id,
     normalize_validated_address,
 )
@@ -49,8 +52,9 @@ from .mailbox import (
 )
 from .mime import AttachmentDescriptor, body_was_truncated
 from .text import within_utf8_bytes
+from .thread_state import VendorIndex, vendor_index
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -4075,6 +4079,7 @@ def _imap_thread_key(
     *,
     scope: tuple[str, str, str],
     ids: tuple[str, ...],
+    cached_rank: bool = False,
 ) -> tuple[str, tuple[str, ...]]:
     """Return (thread key, components to merge into it) for an IMAP message's ids.
 
@@ -4097,6 +4102,13 @@ def _imap_thread_key(
         return str(uuid.uuid4()), ()
 
     def rank(key: str) -> tuple[int, str]:
+        if cached_rank:
+            row = db.execute(
+                "SELECT canonical_source_identity FROM thread_follow WHERE provider=? "
+                "AND account_id=? AND mailbox_identity_key=? AND thread_key=?",
+                (*scope, key),
+            ).fetchone()
+            return (0, str(row[0])) if row is not None else (1, key)
         # Canonical order (contract D-identity): a logical message sorts by the
         # smallest source identity across every recorded location.
         smallest = db.execute(
@@ -4125,6 +4137,16 @@ def _apply_imap_component(
     ids: tuple[str, ...],
 ) -> None:
     """Merge components into the survivor and register ids; the single re-key owner."""
+    if (
+        merged
+        and db.execute("SELECT 1 FROM sqlite_master WHERE name='thread_watermarks'").fetchone()
+    ):
+        for key in (thread_key, *merged):
+            db.execute(
+                "DELETE FROM thread_watermarks WHERE provider=? AND account_id=? "
+                "AND mailbox_identity_key=? AND thread_key=?",
+                (*scope, key),
+            )
     for old_key in merged:
         # Keys are UUIDv4s, so provider, account, and key identify a component's
         # rows, including legacy messages stored without a mailbox identity.
@@ -4887,7 +4909,7 @@ def _validate_admission_provenance(
     *,
     mailbox_identity_key: str,
 ) -> None:
-    if admission.kind not in {"exact_sender", "gmail_user_label"}:
+    if admission.kind not in thread_migration.ADMISSION_KINDS:
         raise ValueError("admission kind is invalid")
     _require_bounded_text(
         admission.selector_id,
@@ -4911,6 +4933,13 @@ def _validate_admission_provenance(
             raise ValueError("exact sender admission selector id is invalid") from exc
         if expected_selector_id != admission.selector_id:
             raise ValueError("exact sender admission selector id is invalid")
+    if admission.kind in THREAD_ADMISSION_SELECTOR_PREFIXES:
+        prefix = THREAD_ADMISSION_SELECTOR_PREFIXES[admission.kind]
+        if (
+            not admission.selector_id.startswith(prefix)
+            or re.fullmatch(r"[0-9a-f]{64}", admission.selector_id[len(prefix) :]) is None
+        ):
+            raise ValueError("vendor/thread admission selector id is invalid")
     if _require_mailbox_identity_key(admission.mailbox_identity_key) != mailbox_identity_key:
         raise MailboxIdentityChanged("mailbox identity changed")
     _validate_utc_timestamp(admission.admitted_at, field="admitted_at")
@@ -5434,6 +5463,306 @@ def _connect_job_requires_automation_entitlement(
     return row is not None
 
 
+DERIVED_INPUT_TABLES = frozenset(
+    {
+        "messages",
+        "message_locations",
+        "message_recipients",
+        "mail_accounts",
+        "vendors",
+        "vendor_addresses",
+        "vendor_domains",
+    }
+)
+
+DERIVED_MESSAGE_COLUMNS = frozenset(
+    {
+        "message_id",
+        "provider",
+        "account_id",
+        "provider_message_id",
+        "thread_id",
+        "thread_key",
+        "sender",
+        "received_at",
+        "discovered_at",
+        "logical_of",
+        "mailbox_identity_key",
+        "rfc_message_id",
+    }
+)
+
+THREAD_DERIVED_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS message_derived (
+        message_id TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+        direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+        vendor_id TEXT, match TEXT CHECK(match IN ('exact', 'domain')),
+        CHECK((vendor_id IS NULL) = (match IS NULL)))""",
+    """CREATE TABLE IF NOT EXISTS thread_follow (
+        provider TEXT NOT NULL, account_id TEXT NOT NULL,
+        mailbox_identity_key TEXT NOT NULL, thread_key TEXT NOT NULL,
+        followed INTEGER NOT NULL CHECK(followed IN (0, 1)), owner_vendor_id TEXT,
+        owner_received_epoch REAL, owner_source_identity TEXT,
+        canonical_source_identity TEXT NOT NULL,
+        PRIMARY KEY(provider, account_id, mailbox_identity_key, thread_key),
+        CHECK((followed = 0) = (owner_vendor_id IS NULL)))""",
+    """CREATE TABLE IF NOT EXISTS thread_watermarks (
+        provider TEXT NOT NULL, account_id TEXT NOT NULL,
+        mailbox_identity_key TEXT NOT NULL, thread_key TEXT NOT NULL,
+        synced_through TEXT NOT NULL,
+        PRIMARY KEY(provider, account_id, mailbox_identity_key, thread_key))""",
+)
+
+def _track_derived_rows(db: sqlite3.Connection) -> None:
+    """Connection-local row evidence; no extra persistent state or writer lists."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_derived'").fetchone():
+        return
+    db.execute("CREATE TEMP TABLE derived_changed_messages(message_id TEXT PRIMARY KEY)")
+    db.execute("""CREATE TEMP TABLE derived_changed_threads (
+        provider TEXT, account_id TEXT, identity TEXT, thread_key TEXT,
+        UNIQUE(provider, account_id, identity, thread_key))""")
+    db.execute("CREATE TEMP TABLE derived_changed_config(table_name TEXT PRIMARY KEY)")
+    global_inputs = DERIVED_INPUT_TABLES - {"messages", "message_locations", "message_recipients"}
+    for table in sorted(global_inputs):
+        if not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone():
+            continue
+        for event in ("INSERT", "DELETE", "UPDATE"):
+            db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
+                AFTER {event} ON main.{table} BEGIN
+                INSERT OR IGNORE INTO derived_changed_config VALUES ('{table}'); END""")
+    for table in ("messages", "message_locations", "message_recipients"):
+        for event, records in (
+            ("INSERT", ("NEW",)),
+            ("DELETE", ("OLD",)),
+            ("UPDATE", ("OLD", "NEW")),
+        ):
+            statements = []
+            for record in records:
+                statements.append(
+                    f"INSERT OR IGNORE INTO derived_changed_messages VALUES ({record}.message_id);"
+                )
+                if table == "messages":
+                    statements.append(f"""INSERT OR IGNORE INTO derived_changed_threads VALUES (
+                        {record}.provider, {record}.account_id,
+                        {_effective_message_identity_sql(record)}, {record}.thread_key);""")
+            update = (
+                " OF " + ",".join(sorted(DERIVED_MESSAGE_COLUMNS))
+                if event == "UPDATE" and table == "messages"
+                else ""
+            )
+            db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
+                AFTER {event}{update} ON main.{table} BEGIN {"".join(statements)} END""")
+
+def _thread_member(
+    db: sqlite3.Connection, row: sqlite3.Row, vendor: str | None
+) -> tuple[float, str, str | None]:
+    unit = _logical_unit(db, str(row["message_id"]))
+    assert unit is not None
+    timestamps = [_sqlite_aware_iso_epoch(source.received_at) for source in unit.sources]
+    # Malformed legacy dates have no received-time ordering, so valid dates lead.
+    newest = max((stamp for stamp in timestamps if stamp is not None), default=float("inf"))
+    return newest, min(source.provider_message_id for source in unit.sources), vendor
+
+def _follow_owner(
+    members: Iterable[tuple[float, str, str | None]],
+) -> tuple[float, str, str | None] | None:
+    return min((member for member in members if member[2] is not None), default=None)
+
+def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
+    """D-derived's sole owner: local work before the input transaction commits."""
+    if (
+        not changed
+        or not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='message_derived' AND type='table'"
+        ).fetchone()
+    ):
+        return
+    global_inputs = changed - {"messages", "message_locations", "message_recipients"}
+    tracked = db.execute(
+        "SELECT 1 FROM sqlite_temp_master WHERE name='derived_changed_messages'"
+    ).fetchone()
+    full = not tracked
+    if tracked:
+        full = bool(db.execute("SELECT 1 FROM derived_changed_config LIMIT 1").fetchone())
+        # A global table introduced during this transaction has no entry-time
+        # tracker. Conservatively backfill rather than losing its first write.
+        full = full or any(
+            not db.execute(
+                "SELECT 1 FROM sqlite_temp_master WHERE type='trigger' AND name=?",
+                (f"derived_{table}_INSERT",),
+            ).fetchone()
+            for table in global_inputs
+        )
+        if not full and not db.execute(
+            "SELECT 1 FROM derived_changed_messages LIMIT 1"
+        ).fetchone():
+            return
+    index = vendor_index(db)
+    scopes: set[tuple[str, str, str, str]] = set()
+    if tracked and not full:
+        # Locations and recipients name storage rows; resolve their canonical and
+        # include the complete affected thread so deletions can change its owner.
+        db.execute(f"""INSERT OR IGNORE INTO derived_changed_threads
+            SELECT m.provider, m.account_id, {_effective_message_identity_sql("m")}, m.thread_key
+            FROM messages m WHERE m.message_id IN (SELECT message_id FROM derived_changed_messages)
+               OR m.message_id IN (SELECT COALESCE(logical_of, message_id) FROM messages
+                   WHERE message_id IN (SELECT message_id FROM derived_changed_messages))""")
+        scopes = {
+            tuple(row)
+            for row in db.execute("SELECT * FROM derived_changed_threads")
+            if row[2] is not None
+        }
+        condition = f"""WHERE m.message_id IN (SELECT message_id FROM derived_changed_messages)
+            OR EXISTS (SELECT 1 FROM derived_changed_threads t WHERE t.provider=m.provider
+                AND t.account_id=m.account_id
+                AND t.identity IS {_effective_message_identity_sql("m")}
+                AND t.thread_key=m.thread_key)"""
+    else:
+        condition = ""
+    rows = db.execute(f"""SELECT m.*, {_effective_message_identity_sql("m")} AS identity
+        FROM logical_messages m {condition}""").fetchall()
+    if full:
+        db.execute(
+            "DELETE FROM message_derived WHERE message_id NOT IN "
+            "(SELECT message_id FROM logical_messages)"
+        )
+    else:
+        db.execute("""DELETE FROM message_derived WHERE
+            message_id IN (SELECT message_id FROM derived_changed_messages)
+            AND NOT EXISTS (SELECT 1 FROM logical_messages m
+                WHERE m.message_id=message_derived.message_id)""")
+    groups: dict[tuple[str, str, str, str], list[tuple[float, str, str | None]]] = {}
+    for row in rows:
+        message_id = str(row["message_id"])
+        unit = _logical_unit(db, message_id)
+        assert unit is not None
+        placeholders = ",".join("?" for _ in unit.rows)
+        outbound = (
+            db.execute(
+                f"SELECT 1 FROM message_locations WHERE message_id IN ({placeholders}) "
+                "AND location='sent' LIMIT 1",
+                unit.rows,
+            ).fetchone()
+            is not None
+        )
+        recipients = db.execute(
+            "SELECT field, address FROM message_recipients WHERE message_id=? "
+            "ORDER BY CASE field WHEN 'to' THEN 0 ELSE 1 END, position",
+            (message_id,),
+        ).fetchall()
+        match = index.attribute(
+            str(row["sender"]),
+            outbound=outbound,
+            to=tuple(str(r["address"]) for r in recipients if r["field"] == "to"),
+            cc=tuple(str(r["address"]) for r in recipients if r["field"] == "cc"),
+        )
+        db.execute(
+            """INSERT INTO message_derived VALUES (?, ?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET direction=excluded.direction,
+                vendor_id=excluded.vendor_id, match=excluded.match""",
+            (
+                message_id,
+                "outbound" if outbound else "inbound",
+                match[0] if match else None,
+                match[2] if match else None,
+            ),
+        )
+        if row["identity"] is None:
+            continue
+        scope = (
+            str(row["provider"]),
+            str(row["account_id"]),
+            str(row["identity"]),
+            str(row["thread_key"]),
+        )
+        groups.setdefault(scope, []).append(_thread_member(db, row, match[0] if match else None))
+    follow_source = "thread_follow f" if full else """derived_changed_threads t
+        CROSS JOIN thread_follow f
+        WHERE f.provider=t.provider AND f.account_id=t.account_id
+        AND f.mailbox_identity_key=t.identity AND f.thread_key=t.thread_key"""
+    old = [
+        tuple(row)
+        for row in db.execute(
+            "SELECT f.provider, f.account_id, f.mailbox_identity_key, f.thread_key FROM "
+            + follow_source
+        )
+    ]
+    for scope in old:
+        if scope not in groups and (full or not tracked or scope in scopes):
+            db.execute(
+                "DELETE FROM thread_follow WHERE provider=? AND account_id=? "
+                "AND mailbox_identity_key=? AND thread_key=?",
+                scope,
+            )
+    for scope, members in groups.items():
+        winner = _follow_owner(members)
+        owner = winner[2] if winner is not None else None
+        db.execute(
+            """INSERT INTO thread_follow VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider,account_id,mailbox_identity_key,thread_key)
+            DO UPDATE SET followed=excluded.followed, owner_vendor_id=excluded.owner_vendor_id,
+                owner_received_epoch=excluded.owner_received_epoch,
+                owner_source_identity=excluded.owner_source_identity,
+                canonical_source_identity=excluded.canonical_source_identity""",
+            (*scope, int(owner is not None), owner,
+             winner[0] if winner else None, winner[1] if winner else None,
+             min(member[1] for member in members)),
+        )
+    watermark_scope = "" if full else """(
+        provider,account_id,mailbox_identity_key,thread_key) IN (
+        SELECT provider,account_id,identity,thread_key FROM derived_changed_threads) AND """
+    db.execute("DELETE FROM thread_watermarks WHERE " + watermark_scope + """NOT EXISTS (
+        SELECT 1 FROM thread_follow f WHERE f.provider=thread_watermarks.provider
+        AND f.account_id=thread_watermarks.account_id
+        AND f.mailbox_identity_key=thread_watermarks.mailbox_identity_key
+        AND f.thread_key=thread_watermarks.thread_key AND f.followed=1)""")
+
+class _DerivedCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        self.connection._prepare_derived_write(sql, parameters)
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters):
+        items = iter(parameters)
+        try:
+            first = next(items)
+        except StopIteration:
+            return super().executemany(sql, ())
+        self.connection._prepare_derived_write(sql, first)
+        return super().executemany(sql, chain((first,), items))
+
+
+class _DerivedConnection(sqlite3.Connection):
+    _derived_enabled = False
+    _derived_ready = False
+    _derived_input_seen = False
+
+    def _prepare_derived_write(self, sql, parameters):
+        if not self._derived_enabled or self._derived_ready:
+            return
+        # EXPLAIN itself is read-only. For all other statements SQLite's own
+        # compiler/authorizer detects input writes, including CTEs and triggers.
+        if sql.lstrip().upper().startswith("EXPLAIN "):
+            return
+        probe = sqlite3.Connection.cursor(self)
+        probe.execute("EXPLAIN " + sql, parameters)
+        probe.close()
+        if self._derived_input_seen:
+            self._derived_ready = True
+            _track_derived_rows(self)
+
+    def cursor(self, factory=_DerivedCursor):
+        return super().cursor(factory)
+
+    def execute(self, sql, parameters=()):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, parameters):
+        return self.cursor().executemany(sql, parameters)
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -5441,7 +5770,7 @@ class Store:
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         with database_admission():
-            connection = sqlite3.connect(self.path)
+            connection = sqlite3.connect(self.path, factory=_DerivedConnection)
             try:
                 connection.execute("PRAGMA recursive_triggers = ON")
                 connection.row_factory = sqlite3.Row
@@ -5464,7 +5793,27 @@ class Store:
                     _message_suppression_key,
                     deterministic=True,
                 )
+                changed: set[str] = set()
+
+                def track_inputs(action, table, column, database, trigger):
+                    if (
+                        action
+                        in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE)
+                        and table in DERIVED_INPUT_TABLES
+                        and (
+                            table != "messages"
+                            or action != sqlite3.SQLITE_UPDATE
+                            or column in DERIVED_MESSAGE_COLUMNS
+                        )
+                    ):
+                        changed.add(table)
+                        connection._derived_input_seen = True
+                    return sqlite3.SQLITE_OK
+
+                connection.set_authorizer(track_inputs)
+                connection._derived_enabled = True
                 yield connection
+                _recompute_derived(connection, frozenset(changed))
             except Exception:
                 connection.rollback()
                 raise
@@ -5488,6 +5837,30 @@ class Store:
             yield
 
     def initialize(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Serialize backup plus migration across simultaneous desktop/scheduler
+        # starts. Version is also read inside BEGIN IMMEDIATE below.
+        with connect_operation_lock(
+            self.path.with_name(self.path.name + ".upgrade.lock"),
+            "The mailbox database is being upgraded",
+            timeout_seconds=-1,
+        ):
+            if self.path.exists():
+                with self.connection() as source:
+                    version = source.execute("PRAGMA user_version").fetchone()[0]
+                    retained = source.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
+                    ).fetchone()
+                    if retained is not None and version < 33:
+                        thread_migration.write_backup(self.path, source)
+            try:
+                self._initialize_locked()
+            except Exception:
+                thread_migration.cleanup_backups(self.path, success=False)
+                raise
+            thread_migration.cleanup_backups(self.path, success=True)
+
+    def _initialize_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         migration_observed_at = datetime.now(UTC).isoformat()
         with self.connection() as db:
@@ -5856,6 +6229,14 @@ class Store:
             if version < 31:
                 _migrate_source_observations(db, migration_observed_at)
             _refresh_logical_messages_view(db)
+            if version < 33:
+                thread_migration.rebuild_messages(db)
+            for statement in THREAD_DERIVED_SCHEMA:
+                db.execute(statement)
+            if version < 33:
+                _recompute_derived(db, DERIVED_INPUT_TABLES)
+            if version < 33:
+                thread_migration.check_database(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -9312,6 +9693,10 @@ class Store:
                 return item
         raise KeyError(vendor_id)
 
+    def vendor_index(self) -> VendorIndex:
+        with self.connection() as db:
+            return vendor_index(db)
+
     def vendor_for_address(self, address: str) -> dict[str, object] | None:
         with self.connection() as db:
             row = db.execute(
@@ -9320,6 +9705,48 @@ class Store:
                 (address,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def followed_thread_for_metadata(
+        self,
+        *,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str,
+        thread_id: str | None,
+        rfc_message_id: str | None = None,
+        reply_ids: tuple[str, ...] = (),
+    ) -> tuple[str, str] | None:
+        with self.connection() as db:
+            # Component lookup, source ranking and vendor names share one WAL
+            # snapshot; a concurrent removal cannot split this admission read.
+            db.execute("BEGIN")
+            scope = (provider, account_id, mailbox_identity_key)
+            if provider == "imap":
+                ids = tuple(dict.fromkeys(i for i in (rfc_message_id, *reply_ids) if i is not None))
+                key, merged = _imap_thread_key(db, scope=scope, ids=ids, cached_rank=True)
+                keys = (key, *merged)
+            elif thread_id is not None:
+                key = _provider_thread_key(thread_id)
+                keys = (key,)
+            else:
+                return None
+            marks = ",".join("?" for _ in keys)
+            rows = db.execute(
+                f"""SELECT f.owner_received_epoch, f.owner_source_identity,
+                    v.vendor_id, v.display_name FROM thread_follow f
+                    JOIN vendors v ON v.vendor_id=f.owner_vendor_id
+                    WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
+                    AND f.thread_key IN ({marks}) AND f.followed=1""",
+                (*scope, *keys),
+            ).fetchall()
+            winner = _follow_owner(
+                (row["owner_received_epoch"], row["owner_source_identity"], row["vendor_id"])
+                for row in rows
+            )
+            if winner is None:
+                return None
+            name = next(row["display_name"] for row in rows if row["vendor_id"] == winner[2])
+            return (key, str(name))
 
     def create_vendor(self, display_name: str, *, now: datetime | None = None) -> str:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
@@ -13471,6 +13898,12 @@ class Store:
         expired_units, expiry_parameters = _logical_messages_past_cutoff_sql(
             cutoff_epoch, stamp_epoch
         )
+        expired_units = f"""SELECT canonical FROM ({expired_units}) WHERE NOT EXISTS (
+            SELECT 1 FROM messages m JOIN thread_follow f
+                ON f.provider=m.provider AND f.account_id=m.account_id
+                AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
+                AND f.thread_key=m.thread_key
+            WHERE m.message_id=canonical AND f.followed=1)"""
         with self.connection() as db:
             expired_ids = [
                 str(row["canonical"])
