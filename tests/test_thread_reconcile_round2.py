@@ -276,3 +276,22 @@ def test_address_fallback_ignores_unsolicited_header_uid():
     gateway, unit = gateway_unit(Mixed(uid_next=2), addresses=["café@example.com"])
     page = gateway.reconcile_page(unit, start=NOW, cutoff=NOW - timedelta(days=30))
     assert len(page.items) == 1
+
+
+def test_component_sources_include_recorded_copies_only_in_its_scope(tmp_path, monkeypatch):
+    watcher, state = runner(tmp_path, monkeypatch, object(), "imap")
+    seed(watcher.store, "primary", provider="imap", rfc_message_id="root@example.com")
+    thread = state.threads()[0]
+    with watcher.store.connection() as db:
+        message = db.execute(
+            "SELECT message_id FROM messages WHERE provider_message_id='primary'"
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO message_locations VALUES (?,?,?,?,?,?,?,?)",
+            (message, *state.scope, "sent-copy", "sent", None, NOW.isoformat()),
+        )
+        db.execute(
+            "INSERT INTO message_locations VALUES (?,?,?,?,?,?,?,?)",
+            (message, "imap", "mailbox", "0" * 64, "other-identity", "sent", None, NOW.isoformat()),
+        )
+    assert set(state.sources(thread["key"])) == {"primary", "sent-copy"}
