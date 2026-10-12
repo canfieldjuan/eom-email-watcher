@@ -12,14 +12,43 @@ from eom_email_watcher import imap
 from eom_email_watcher.mailbox import MailboxMessageInvalid
 
 
+def _inject_quote_header_failure(monkeypatch, field):
+    """Keep the lazy-parser failure deterministic across stdlib patch releases."""
+    original_parser = imap.BytesParser
+    marker = f'{field}: "'.encode()
+
+    class QuoteFailure:
+        def __init__(self, parsed):
+            self.parsed = parsed
+
+        def get(self, name, default=None):
+            if name.casefold() == field.casefold():
+                raise IndexError("injected lazy quote-header failure")
+            return self.parsed.get(name, default)
+
+    class Parser:
+        def __init__(self, **options):
+            self.parser = original_parser(**options)
+
+        def parsebytes(self, payload, **options):
+            parsed = self.parser.parsebytes(payload, **options)
+            return QuoteFailure(parsed) if marker in payload.splitlines() else parsed
+
+    monkeypatch.setattr(imap, "BytesParser", Parser)
+
+
+@pytest.mark.parametrize("inject_error", [False, True])
 @pytest.mark.parametrize("field", ["From", "To", "Cc"])
-def test_lone_quote_fallback_skips_bad_and_processes_next_uid(field):
+def test_quote_fallback_containment_and_restart(field, inject_error, monkeypatch):
+    if inject_error:
+        _inject_quote_header_failure(monkeypatch, field)
+
     class Mixed(Dates):
         def uid(self, command, *args):
             if command == "FETCH" and "HEADER.FIELDS" in str(args[-1]):
                 self.raw_message = (
                     (
-                        ("" if field == "From" else "From: café@example.com\r\n")
+                        ("From: café@example.com\r\n" if inject_error and field != "From" else "")
                         + f'{field}: "\r\n\r\n'
                     ).encode()
                     if args[0] == "1"
@@ -41,14 +70,25 @@ def test_lone_quote_fallback_skips_bad_and_processes_next_uid(field):
     assert all(call[2] == "2" for call in client.calls if call[:2] == ("uid", "FETCH"))
 
 
+@pytest.mark.parametrize("inject_error", [False, True])
 @pytest.mark.parametrize("field", ["From", "To", "Cc"])
-def test_lone_quote_metadata_is_item_failure(field):
+def test_quote_metadata_containment(field, inject_error, monkeypatch):
+    if inject_error:
+        _inject_quote_header_failure(monkeypatch, field)
     gateway = imap.ImapGateway(
         credentials(), lambda *_: FakeImap(raw_message=f'{field}: "\r\n\r\n'.encode())
     )
-    with pytest.raises(MailboxMessageInvalid) as raised:
-        gateway.metadata(message_id())
-    assert raised.value.code == "imap_message_invalid"
+    try:
+        metadata = gateway.metadata(message_id())
+    except MailboxMessageInvalid as error:
+        assert error.code == "imap_message_invalid"
+    else:
+        # Newer stdlib parsers recover this syntax. They must not invent an
+        # address, while the injected error always requires item-level failure.
+        assert not inject_error
+        assert metadata.sender == ""
+        assert metadata.to == ()
+        assert metadata.cc == ()
 
 
 ERRORS = [IndexError, ValueError, TypeError, HeaderParseError, RecursionError, UnicodeError]
