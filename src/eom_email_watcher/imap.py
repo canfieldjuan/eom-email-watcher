@@ -43,6 +43,7 @@ from .mailbox import (
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
 from .text import within_utf8_bytes
+from .thread_state import VendorIndex
 
 IMAP_PROVIDER = "imap"
 IMAP_CONNECTION_METHOD = "server_credentials"
@@ -753,6 +754,30 @@ def _optional_headers(payload: bytes | None, bound: int) -> bytes | None:
     return payload
 
 
+@contextlib.contextmanager
+def _message_parse_boundary(
+    *,
+    complexity_code: Literal[
+        "imap_headers_too_complex", "imap_mime_too_complex", "imap_message_invalid"
+    ] = "imap_headers_too_complex",
+) -> Iterator[None]:
+    """Translate malformed-message errors across parsing and lazy header access.
+
+    Parsing alone is insufficient: the email package also parses on get/str,
+    MIME traversal and serialization. Keep those reads inside this boundary.
+    """
+    try:
+        yield
+    except RecursionError as exc:
+        raise MailboxMessageInvalid(
+            complexity_code, "Message exceeds the safe complexity limit"
+        ) from exc
+    except (HeaderParseError, IndexError, TypeError, UnicodeError, ValueError) as exc:
+        raise MailboxMessageInvalid(
+            "imap_message_invalid", "Message headers or content are invalid"
+        ) from exc
+
+
 def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
     """Return In-Reply-To then oldest-first References ids; empty if unusable.
 
@@ -761,9 +786,10 @@ def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
     if payload is None:
         return ()
     try:
-        parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
-        return reply_ids_from_headers(parsed.get("In-Reply-To"), parsed.get("References"))
-    except (RecursionError, ValueError, TypeError, IndexError):
+        with _message_parse_boundary():
+            parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
+            return reply_ids_from_headers(parsed.get("In-Reply-To"), parsed.get("References"))
+    except MailboxMessageInvalid:
         return ()
 
 
@@ -1296,11 +1322,9 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
 
 def _decoded_section(payload: bytes, transfer_encoding: str) -> bytes:
     synthetic = f"Content-Transfer-Encoding: {transfer_encoding}\r\n\r\n".encode("ascii") + payload
-    try:
+    with _message_parse_boundary(complexity_code="imap_message_invalid"):
         parsed = BytesParser(policy=policy.default).parsebytes(synthetic)
         decoded = parsed.get_payload(decode=True)
-    except (RecursionError, TypeError, ValueError) as exc:
-        raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid") from exc
     if not isinstance(decoded, bytes):
         raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid")
     return decoded
@@ -1308,14 +1332,10 @@ def _decoded_section(payload: bytes, transfer_encoding: str) -> bytes:
 
 def _multipart_attachment_prefix(headers: bytes, expected_media_type: str) -> bytes:
     normalized = headers.rstrip(b"\r\n") + b"\r\n\r\n"
-    try:
+    with _message_parse_boundary(complexity_code="imap_message_invalid"):
         parsed = BytesParser(policy=policy.default).parsebytes(normalized, headersonly=True)
         content_type = parsed.get_content_type().casefold()
         boundary = parsed.get_boundary()
-    except (HeaderParseError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
-        raise MailboxMessageInvalid(
-            "imap_message_invalid", "Message attachment headers are invalid"
-        ) from exc
     if content_type != expected_media_type or not boundary:
         raise MailboxMessageInvalid(
             "imap_message_invalid", "Message attachment headers are invalid"
@@ -1352,19 +1372,15 @@ def _part_text(part: Message) -> str:
 
 
 def _attachment_payload(part: Message) -> bytes:
-    decoded = part.get_payload(decode=True)
-    if isinstance(decoded, bytes):
-        return decoded
-    nested = part.get_payload()
-    if isinstance(nested, list):
-        try:
+    with _message_parse_boundary(complexity_code="imap_mime_too_complex"):
+        decoded = part.get_payload(decode=True)
+        if isinstance(decoded, bytes):
+            return decoded
+        nested = part.get_payload()
+        if isinstance(nested, list):
             if part.get_content_maintype() == "multipart":
                 return part.as_bytes(policy=policy.default)
             return b"\r\n".join(item.as_bytes(policy=policy.default) for item in nested)
-        except RecursionError as exc:
-            raise MailboxMessageInvalid(
-                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
-            ) from exc
     return b""
 
 
@@ -1392,7 +1408,7 @@ def _content_and_attachment_payloads(
     attachment_payloads: list[bytes] = []
     attachment_filename_bytes = 0
 
-    try:
+    with _message_parse_boundary(complexity_code="imap_mime_too_complex"):
         _validate_mime_tree(message)
         pending: list[tuple[Message, int, bool]] = [(message, 0, True)]
         visited = 0
@@ -1441,10 +1457,6 @@ def _content_and_attachment_payloads(
                 plain.append(_part_text(part))
             elif part.get_content_type() == "text/html":
                 html.append(html_to_text(_part_text(part)))
-    except RecursionError as exc:
-        raise MailboxMessageInvalid(
-            "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
-        ) from exc
     selected = "\n\n".join(plain if plain else html)
     body, body_source_chars = bounded_body_text(selected, body_char_limit)
     names = tuple(dict.fromkeys(item.filename for item in attachments))
@@ -1472,6 +1484,26 @@ def _format_recovery_search_day(search_date: date) -> str:
 
 def _recovery_search_date(since: datetime) -> str:
     return _format_recovery_search_day(_recovery_search_day(since))
+
+
+def _search_operand(value: str) -> str | bytes:
+    """One SEARCH operand encoder; Unicode uses IMAP's literal channel."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > MAX_HEADER_BYTES
+        or any(c in value for c in "\r\n\x00")
+    ):
+        raise ImapError("imap_protocol_error", "Unsafe mail search operand")
+    if value.isascii():
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value.encode("utf-8")
+
+
+def _search_or(terms):
+    if len(terms) == 1:
+        return terms[0]
+    return ["OR", *terms[0], *_search_or(terms[1:])]
 
 
 class ImapGateway:
@@ -2026,6 +2058,223 @@ class ImapGateway:
             self._ensure_selected(client, INBOX_FOLDER)
             return self._recover_folder(client, None, since)
 
+    reconcile_transport_budget = True
+
+    def reconcile_sent_identity(self):
+        return _folder_key(self._sent_folder) if self._sent_folder else "unavailable"
+
+    def reconcile_snapshot(self, folder):
+        with self._mailbox() as client:
+            resolved = self._require_sent_folder(client) if folder == "sent" else INBOX_FOLDER
+            self._ensure_selected(client, resolved)
+            validity, highest = self._snapshot(client)
+            return dict(
+                validity=validity,
+                highest=highest,
+                folder_key=_folder_key(resolved) if folder == "sent" else None,
+            )
+
+    def reconcile_page(self, unit, *, start, cutoff):
+        from .reconcile import ReconcileItem, ReconcilePage, ReconcileTokenInvalid
+
+        frozen = unit["snapshot"]
+        since = datetime.fromisoformat(unit["since"]) if unit.get("since") else cutoff
+        with self._mailbox() as client:
+            folder = self._require_sent_folder(client) if unit["folder"] == "sent" else INBOX_FOLDER
+            self._ensure_selected(client, folder)
+            if _selected_uid_validity(client) != frozen["validity"]:
+                raise ReconcileTokenInvalid("Mail server folder epoch changed")
+            page = unit.setdefault("_page_state", {})
+            if not page:
+                lower = int(unit["token"] or 0) + 1
+                upper = frozen["highest"]
+                if lower > upper:
+                    unit.pop("_page_state", None)
+                    return ReconcilePage((), None)
+                page.update(lower=lower, upper=upper, searched=0, uids=[], dated=0, fallback=False)
+            terms = []
+            if "addresses" in unit:
+                terms = [
+                    [field, _search_operand(address)]
+                    for address in unit["addresses"]
+                    for field in ("FROM", "TO", "CC")
+                ]
+            elif unit.get("ids"):
+                terms = [
+                    ["HEADER", field, _search_operand(rfc_id)]
+                    for rfc_id in unit["ids"]
+                    for field in ("Message-ID", "In-Reply-To", "References")
+                ]
+            # imaplib has one literal channel. ASCII keys nest OR exactly; literal
+            # keys run individually and their UID sets are unioned in durable state.
+            groups = []
+            for offset in range(0, len(terms), 24):
+                batch = terms[offset : offset + 24]
+                if all(isinstance(t[-1], str) for t in batch):
+                    groups.append(_search_or(batch))
+                else:
+                    groups.extend(batch)
+            if not groups and "ids" in unit:
+                # An id-less component is only its recorded sources, never all mail.
+                for source in unit.get("sources", ()):
+                    mailbox, folder_key, validity, uid = _decode_any_message_id(source)
+                    if (
+                        mailbox == self._mailbox_id
+                        and folder_key == frozen["folder_key"]
+                        and validity == frozen["validity"]
+                        and page["lower"] <= uid <= page["upper"]
+                    ):
+                        page["uids"].append(uid)
+                page["uids"] = sorted(set(page["uids"]))
+            while page["searched"] < len(groups):
+                base = [
+                    "UID",
+                    f"{page['lower']}:{page['upper']}",
+                    "SINCE",
+                    _recovery_search_date(since),
+                ]
+                group = [] if page["fallback"] else groups[page["searched"]]
+                literal = group[-1] if group and isinstance(group[-1], bytes) else None
+                if literal is not None:
+                    client.literal = literal
+                try:
+                    args = (
+                        ["CHARSET", "UTF-8", *base, *group[:-1]]
+                        if literal is not None
+                        else base + group
+                    )
+                    status, response = client.uid("SEARCH", None, *args)
+                finally:
+                    if literal is not None:
+                        client.literal = None
+                if status == "NO" and b"BADCHARSET" in _response_metadata(response).upper():
+                    page.update(fallback=True, searched=0, uids=[])
+                    continue
+                if status != "OK":
+                    raise ImapError("imap_protocol_error", "Mail server reconcile search failed")
+                uids = _uids(response)
+                if any(uid < page["lower"] or uid > page["upper"] for uid in uids):
+                    raise ImapError(
+                        "imap_protocol_error", "Mail server search exceeded frozen bounds"
+                    )
+                page["uids"] = sorted(set(page["uids"]) | set(uids))
+                page["searched"] = len(groups) if page["fallback"] else page["searched"] + 1
+            items = []
+            if page["dated"] < len(page["uids"]):
+                uid = page["uids"][page["dated"]]
+                status, response = client.uid("FETCH", str(uid), "(UID INTERNALDATE)")
+                if status != "OK":
+                    raise ImapError("imap_protocol_error", "Mail server receive date fetch failed")
+                # FETCH may include unsolicited updates for another UID. A missing
+                # or invalid requested candidate is not a failed folder listing.
+                metadata = b""
+                for raw in response or ():
+                    value = raw[0] if isinstance(raw, tuple) and raw else raw
+                    if not isinstance(value, bytes):
+                        continue
+                    match = _FETCH_UID.search(value)
+                    if match and int(match.group(1)) == uid and _INTERNAL_DATE.search(value):
+                        metadata = value
+                        break
+                received = ""
+                if match := _INTERNAL_DATE.search(metadata):
+                    try:
+                        parsed = parsedate_to_datetime(match.group(1).decode("ascii"))
+                        if parsed.tzinfo is not None:
+                            received = parsed.astimezone(UTC).isoformat()
+                    except (OverflowError, UnicodeError, ValueError, TypeError):
+                        pass
+                if received and since <= datetime.fromisoformat(received) < start:
+                    matches = True
+                    if page["fallback"] and unit.get("ids"):
+                        status, response = client.uid(
+                            "FETCH",
+                            str(uid),
+                            f"(UID BODY.PEEK[HEADER.FIELDS ({CORE_HEADER_FIELDS})]"
+                            f"<0.{MAX_HEADER_BYTES}> "
+                            f"BODY.PEEK[HEADER.FIELDS ({REPLY_HEADER_FIELDS})]"
+                            f"<0.{MAX_REPLY_HEADER_BYTES}>)",
+                        )
+                        if status != "OK":
+                            raise ImapError(
+                                "imap_protocol_error", "Mail server reply header fetch failed"
+                            )
+                        try:
+                            with _message_parse_boundary():
+                                _, headers = _header_literals(response)
+                                core = _optional_headers(
+                                    headers[CORE_HEADER_FIELDS], MAX_HEADER_BYTES
+                                )
+                                parsed = BytesParser(policy=policy.default).parsebytes(
+                                    core or b"", headersonly=True
+                                )
+                                ids = (
+                                    normalize_message_id(str(parsed.get("Message-ID", ""))),
+                                    *_reply_ids(
+                                        _optional_headers(
+                                            headers.get(REPLY_HEADER_FIELDS), MAX_REPLY_HEADER_BYTES
+                                        )
+                                    ),
+                                )
+                                matches = bool(set(ids) & set(unit["ids"]))
+                        except (MailboxMessageUnavailable, MailboxMessageInvalid):
+                            matches = False
+                    if page["fallback"] and "addresses" in unit:
+                        status, response = client.uid(
+                            "FETCH",
+                            str(uid),
+                            f"(UID BODY.PEEK[HEADER.FIELDS (FROM TO CC)]<0.{MAX_HEADER_BYTES}>)",
+                        )
+                        if status != "OK":
+                            raise ImapError(
+                                "imap_protocol_error", "Mail server address header fetch failed"
+                            )
+                        matches = False
+                        selection = VendorIndex(addresses={a: (a, a) for a in unit["addresses"]})
+                        for raw in response or ():
+                            if not (
+                                isinstance(raw, tuple)
+                                and len(raw) == 2
+                                and isinstance(raw[0], bytes)
+                                and isinstance(raw[1], bytes)
+                            ):
+                                continue
+                            fetched = _FETCH_UID.search(raw[0])
+                            if not fetched or int(fetched.group(1)) != uid:
+                                continue
+                            header = _optional_headers(raw[1], MAX_HEADER_BYTES)
+                            if header is None:
+                                continue
+                            try:
+                                with _message_parse_boundary():
+                                    parsed = BytesParser(policy=policy.default).parsebytes(
+                                        header, headersonly=True
+                                    )
+                                    addresses = (
+                                        normalize_address(str(parsed.get("From", ""))),
+                                        *recipient_addresses(str(parsed.get("To", ""))),
+                                        *recipient_addresses(str(parsed.get("Cc", ""))),
+                                    )
+                            except MailboxMessageInvalid:
+                                continue
+                            matches = any(selection.vendor_of(a) for a in addresses)
+                            break
+                    if matches:
+                        items.append(
+                            ReconcileItem(
+                                _message_id(
+                                    self._mailbox_id, frozen["validity"], uid, frozen["folder_key"]
+                                ),
+                                received_at=received,
+                            )
+                        )
+                page["dated"] += 1
+            if page["dated"] < len(page["uids"]):
+                return ReconcilePage(tuple(items), unit.get("token") or 0)
+            upper = page["upper"]
+            unit.pop("_page_state", None)
+            return ReconcilePage(tuple(items), upper if upper < frozen["highest"] else None)
+
     def metadata(self, message_id: str) -> MessageMetadata:
         with self._mailbox() as client:
             uid = self._checked_uid(client, message_id)
@@ -2051,7 +2300,7 @@ class ImapGateway:
             reply_payload = _optional_headers(
                 items.get(REPLY_HEADER_FIELDS), MAX_REPLY_HEADER_BYTES
             )
-        try:
+        with _message_parse_boundary():
             parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
             raw_from = str(parsed.get("From", ""))
             sender_name, _address = parseaddr(raw_from)
@@ -2063,25 +2312,21 @@ class ImapGateway:
                 if recipient_payload is not None
                 else None
             )
-        except RecursionError as exc:
-            raise MailboxMessageInvalid(
-                "imap_headers_too_complex", "Message headers exceed the safe complexity limit"
-            ) from exc
-        sent_copy = message_id.startswith(SENT_MESSAGE_ID_PREFIX)
-        return MessageMetadata(
-            message_id=message_id,
-            thread_id=thread_id,
-            sender=normalize_address(raw_from),
-            sender_name=sender_name.strip() or None,
-            subject=subject,
-            received_at=_message_date(metadata, parsed),
-            labels=frozenset() if sent_copy else frozenset({"INBOX"}),
-            rfc_message_id=normalize_message_id(thread_id),
-            reply_ids=reply_ids,
-            to=recipient_addresses(str(recipients.get("To", "")) if recipients else ""),
-            cc=recipient_addresses(str(recipients.get("Cc", "")) if recipients else ""),
-            locations=frozenset({SENT_LOCATION if sent_copy else INBOX_LOCATION}),
-        )
+            sent_copy = message_id.startswith(SENT_MESSAGE_ID_PREFIX)
+            return MessageMetadata(
+                message_id=message_id,
+                thread_id=thread_id,
+                sender=normalize_address(raw_from),
+                sender_name=sender_name.strip() or None,
+                subject=subject,
+                received_at=_message_date(metadata, parsed),
+                labels=frozenset() if sent_copy else frozenset({"INBOX"}),
+                rfc_message_id=normalize_message_id(thread_id),
+                reply_ids=reply_ids,
+                to=recipient_addresses(str(recipients.get("To", "")) if recipients else ""),
+                cc=recipient_addresses(str(recipients.get("Cc", "")) if recipients else ""),
+                locations=frozenset({SENT_LOCATION if sent_copy else INBOX_LOCATION}),
+            )
 
     @staticmethod
     def _catalog(

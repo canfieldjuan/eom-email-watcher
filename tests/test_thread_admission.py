@@ -160,10 +160,25 @@ def test_vendor_only_check_uses_one_entitlement_decision(tmp_path, monkeypatch, 
     vendor = store.create_vendor("Vendor")
     store.add_vendor_address(vendor, "billing@vendor.com" if sent else "trusted@example.com")
     gateway = LabelledGmail(frozenset({"SENT" if sent else "INBOX"}))
+    from eom_email_watcher.reconcile import ReconcileBudget
+
     calls = []
+    budget_calls = []
+    in_budget = False
+    check_budget = ReconcileBudget.check
+
+    def budget_check(self):
+        nonlocal in_budget
+        in_budget = True
+        try:
+            return check_budget(self)
+        finally:
+            in_budget = False
+
+    monkeypatch.setattr(ReconcileBudget, "check", budget_check)
 
     def entitlement():
-        calls.append(True)
+        (budget_calls if in_budget else calls).append(True)
         return (
             service_module.EntitlementDecision.ACTIVE
             if paid
@@ -173,6 +188,7 @@ def test_vendor_only_check_uses_one_entitlement_decision(tmp_path, monkeypatch, 
     monkeypatch.setattr(service_module, "connect_entitlement_decision", entitlement)
     result = service_module.Watcher(cfg, store, gateway, FakeModel()).check()
     assert calls == [True]
+    assert bool(budget_calls) is paid
     assert result["active"] is paid
     assert result["summarized"] == (1 if paid else 0)
     with store.connection() as db:
@@ -285,6 +301,11 @@ def test_paid_unavailable_sent_requires_vendor_work(tmp_path, monkeypatch, has_v
         store.create_vendor("Vendor with no addresses")
     gateway = SentPollingGateway(credential, identity, cursor, scope="unavailable")
     monkeypatch.setattr(service_module.Watcher, "_gated_class_allowed", staticmethod(lambda: True))
+    result = service_module.Watcher(
+        cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()
+    ).check()
+    assert result["active"] is True  # Missing coverage is work even without a vendor.
+    gateway.sent_calls.clear()
     result = service_module.Watcher(
         cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()
     ).check()

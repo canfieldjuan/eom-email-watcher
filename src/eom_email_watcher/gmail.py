@@ -515,7 +515,7 @@ def _received_at(message: dict[str, Any], headers: dict[str, str]) -> str:
     if millis:
         try:
             return datetime.fromtimestamp(int(millis) / 1000, tz=UTC).isoformat()
-        except (TypeError, ValueError, OSError):
+        except (OverflowError, TypeError, ValueError, OSError):
             pass
     try:
         parsed = parsedate_to_datetime(headers.get("date", ""))
@@ -616,6 +616,12 @@ class GmailGateway:
         *,
         timeout_seconds: float | None = None,
     ) -> Any:
+        budget = getattr(self, "_reconcile_budget", None)
+        if budget is not None:
+            remaining = budget.before_call()
+            timeout_seconds = (
+                min(timeout_seconds, remaining) if timeout_seconds is not None else remaining
+            )
         try:
             if timeout_seconds is None:
                 return request.execute()
@@ -633,6 +639,10 @@ class GmailGateway:
                 http=httplib2.Http(timeout=float(timeout_seconds)),
             )
             return request.execute(http=transport)
+        except (OSError, httplib2.HttpLib2Error) as exc:
+            if budget is not None:
+                raise GmailError("Gmail reconcile transport failed") from exc
+            raise
         except RefreshError as exc:
             if _classify_refresh_error(exc) == "rejected":
                 raise GmailAuthorizationRejected(
@@ -1147,6 +1157,97 @@ class GmailGateway:
 
     def scope_folders(self, folders: frozenset[str]) -> None:
         self.query_folders = folders
+
+    reconcile_transport_budget = True
+
+    def reconcile_preflight(self, message_id, *, start, cutoff):
+        """Read no headers until the exact date and current folders are admitted."""
+        try:
+            request = self.service.users().messages().get(
+                userId="me", id=message_id, format="minimal", fields="id,internalDate,labelIds"
+            )
+            message = self._execute_request(request)
+        except HttpError as exc:
+            if getattr(exc.resp, "status", None) == 404:
+                raise MessageUnavailable("Gmail reconcile candidate disappeared") from exc
+            raise GmailError("Gmail reconcile preflight failed") from exc
+        if not isinstance(message, dict) or message.get("id") != message_id:
+            raise MailboxMessageInvalid("invalid_message_id", "Gmail reconcile identity is invalid")
+        received = _received_at(message, {})
+        if not received:
+            raise MailboxMessageInvalid("invalid_received_at", "Gmail reconcile date is invalid")
+        return (
+            cutoff <= datetime.fromisoformat(received) < start
+            and bool(locations_from_labels(_validated_label_ids(message)) & self.query_folders)
+        )
+
+    def reconcile_page(self, unit, *, start, cutoff):
+        from .reconcile import ReconcileItem, ReconcilePage, ReconcileTokenInvalid
+
+        since = datetime.fromisoformat(unit["since"]) if unit.get("since") else cutoff
+        query = (f"{recovery_folder_query(self.query_folders)} "
+                 f"after:{int(since.timestamp()) - 1} before:{math.ceil(start.timestamp())}")
+        addresses = unit.get("addresses")
+        if addresses:
+            terms = [
+                f"{kind}:{json.dumps(address, ensure_ascii=False)}"
+                for address in addresses
+                for kind in ("from", "to", "cc")
+            ]
+            query += " (" + " OR ".join(terms) + ")"
+        token = unit.get("token")
+        if token is not None:
+            _bounded_text(
+                token,
+                maximum_bytes=MAX_GMAIL_PAGE_TOKEN_BYTES,
+                field="reconcile token",
+                error_type=GmailError,
+            )
+        try:
+            request = (
+                self.service.users()
+                .messages()
+                .list(userId="me", q=query, pageToken=token, maxResults=200)
+            )
+            response = self._execute_request(request)
+        except HttpError as exc:
+            if token is not None and getattr(exc.resp, "status", None) == 400:
+                raise ReconcileTokenInvalid("Gmail rejected reconcile page token") from exc
+            raise GmailError("Gmail reconcile listing failed") from exc
+        except (OSError, TimeoutError, httplib2.HttpLib2Error) as exc:
+            raise GmailError("Gmail reconcile transport failed") from exc
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get("messages", []), list)
+            or len(response.get("messages", [])) > 200
+        ):
+            raise GmailError("Invalid Gmail reconcile page")
+        items = []
+        for value in response.get("messages", []):
+            source = _bounded_text(
+                value.get("id") if isinstance(value, dict) else None,
+                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                field="reconcile message id",
+                error_type=GmailError,
+            )
+            native = value.get("threadId")
+            if native is not None:
+                native = _bounded_text(
+                    native,
+                    maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                    field="reconcile thread id",
+                    error_type=GmailError,
+                )
+            items.append(ReconcileItem(source, native))
+        token = response.get("nextPageToken")
+        if token is not None:
+            token = _bounded_text(
+                token,
+                maximum_bytes=MAX_GMAIL_PAGE_TOKEN_BYTES,
+                field="reconcile next token",
+                error_type=GmailError,
+            )
+        return ReconcilePage(tuple(items), token)
 
     def recovery_page(
         self,
