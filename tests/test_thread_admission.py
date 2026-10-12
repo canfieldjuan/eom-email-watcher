@@ -240,3 +240,54 @@ def test_gmail_recovery_preview_keeps_legacy_admission(tmp_path, monkeypatch):
     assert result["stale_cursor_recovered"] is True
     assert result["discovered"] == 0
     assert store.recent(5) == []
+
+
+def test_watched_capture_does_not_resolve_follow_and_snapshots_vendors_once(tmp_path, monkeypatch):
+    class BatchGmail(LabelledGmail):
+        def history_message_ids(self, cursor):
+            return ["allowed", "second"], "200"
+
+        def metadata(self, message_id, **kwargs):
+            return replace(super().metadata("allowed", **kwargs), message_id=message_id)
+
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", NOW)
+    gateway = BatchGmail(frozenset({"INBOX"}))
+    monkeypatch.setattr(service_module.Watcher, "_gated_class_allowed", staticmethod(lambda: True))
+    calls = []
+    index = store.vendor_index
+
+    def snapshot():
+        calls.append(True)
+        return index()
+
+    def unnecessary(**kwargs):
+        pytest.fail("exact sender must not resolve followed thread")
+
+    monkeypatch.setattr(store, "vendor_index", snapshot)
+    monkeypatch.setattr(store, "followed_thread_for_metadata", unnecessary)
+    result = service_module.Watcher(cfg, store, gateway, FakeModel()).check()
+    assert result["discovered"] == 2
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("has_vendor", [False, True])
+def test_paid_unavailable_sent_requires_vendor_work(tmp_path, monkeypatch, has_vendor):
+    from test_service import SentPollingGateway, _imap_sent_scaffold
+
+    from eom_email_watcher.mailbox import MailboxSession
+
+    cfg, store, account_id, credential, identity, cursor = _imap_sent_scaffold(tmp_path)
+    cfg = replace(cfg, senders=())
+    if has_vendor:
+        store.create_vendor("Vendor with no addresses")
+    gateway = SentPollingGateway(credential, identity, cursor, scope="unavailable")
+    monkeypatch.setattr(service_module.Watcher, "_gated_class_allowed", staticmethod(lambda: True))
+    result = service_module.Watcher(
+        cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()
+    ).check()
+    assert result["active"] is has_vendor
+    assert gateway.sent_calls == ["scope"]
+    assert store.sent_scope("imap", account_id) == "unavailable"

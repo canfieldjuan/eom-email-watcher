@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
@@ -123,6 +123,7 @@ from .scheduling import (
 from .thread_state import VendorIndex
 
 logger = logging.getLogger(__name__)
+_UNRESOLVED_SENT_SCOPE = object()
 
 
 class LegacyMailboxIdentityUnverified(MailboxError):
@@ -234,6 +235,7 @@ def match_mailbox_admission(
     folders: frozenset[str] = MESSAGE_LOCATIONS,
     vendor_index: VendorIndex | None = None,
     followed_thread: tuple[str, str] | None = None,
+    followed_thread_lookup: Callable[[], tuple[str, str] | None] | None = None,
     gated_allowed: bool = False,
 ) -> AdmissionDecision | None:
     """Return the one deterministic admission grant for mailbox metadata."""
@@ -278,6 +280,8 @@ def match_mailbox_admission(
                 mailbox_identity_key=mailbox_identity_key,
                 admitted_at=admitted_at_text,
             )
+        if followed_thread_lookup is not None:
+            followed_thread = followed_thread_lookup()
         if followed_thread is not None:
             return AdmissionDecision(
                 kind="thread_follow",
@@ -1495,6 +1499,7 @@ class Watcher:
         mailbox_identity_key: str | None,
         dry_run: bool,
         now: datetime | None = None,
+        resolved_scope: str | None | object = _UNRESOLVED_SENT_SCOPE,
     ) -> str | None:
         """Decide Sent once per check, before any Inbox work (contract D-scope, D-ops).
 
@@ -1508,7 +1513,12 @@ class Watcher:
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
         checked_at = now or datetime.now(UTC)
-        if SENT_LOCATION not in folders:
+        if resolved_scope is not _UNRESOLVED_SENT_SCOPE:
+            scope = resolved_scope
+            if scope is None:
+                return None
+            assert isinstance(scope, str)
+        elif SENT_LOCATION not in folders:
             scope = SENT_SCOPE_NOT_POLLED
         elif provider == "gmail":
             # Gmail's one mailbox-wide history carries SENT events: no Sent cursor.
@@ -1543,14 +1553,20 @@ class Watcher:
         return scope
 
     def _has_capture_work(
-        self, *, labels: bool, pending: bool, gated_allowed: bool, recovery: bool = False
+        self, *, labels: bool, pending: bool, sent_in_scope: bool,
+        vendor_records: bool, recovery: bool = False
     ) -> bool:
-        return bool(self.admission_sender_names or labels or pending or recovery or gated_allowed)
+        return bool(
+            self.admission_sender_names or labels or pending or recovery
+            or vendor_records or sent_in_scope
+        )
 
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
     ) -> dict[str, int | bool | str]:
         gated_allowed = self._gated_class_allowed()
+        vendor_snapshot = self.store.vendor_index() if gated_allowed else None
+        vendor_records = bool(vendor_snapshot and vendor_snapshot.vendor_ids)
         account = self.store.mail_account(self.mailbox.provider, self.mailbox.account_id)
         recorded_identity = account.mailbox_identity_key if account is not None else None
         if self.mailbox.provider == "gmail" and dry_run:
@@ -1576,7 +1592,10 @@ class Watcher:
         if not self._has_capture_work(
             labels=gmail_watch_configured,
             pending=pending_current_identity,
-            gated_allowed=gated_allowed,
+            # Resolve the paid folder's actual availability inside its session
+            # below before initializing cursors or polling either folder.
+            sent_in_scope=gated_allowed,
+            vendor_records=vendor_records,
         ):
             self._settle_sent(folders=frozenset(), mailbox_identity_key=None, dry_run=dry_run)
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
@@ -1590,6 +1609,9 @@ class Watcher:
                 self.store.gmail_recovery_state(self.mailbox.account_id)
                 if self.mailbox.provider == "gmail"
                 else None
+            )
+            sent_scope = self._settle_sent(
+                folders=_folders_in_scope(gated_allowed), mailbox_identity_key=None, dry_run=dry_run
             )
             try:
                 label_selectors = (
@@ -1618,12 +1640,11 @@ class Watcher:
                 labels=bool(label_selectors),
                 pending=False,
                 recovery=recovery_state is not None,
-                gated_allowed=gated_allowed,
+                sent_in_scope=gated_allowed and sent_scope == SENT_SCOPE_AVAILABLE,
+                vendor_records=vendor_records,
             ):
-                # Nothing is polled on this path, Sent included.
-                self._settle_sent(
-                    folders=frozenset(), mailbox_identity_key=None, dry_run=dry_run
-                )
+                # Nothing is polled on this path, Sent included. Its resolved
+                # availability was recorded above even when no work remains.
                 pending_current_identity = self.store.has_current_pending_mailbox_work(
                     self.mailbox.provider,
                     self.mailbox.account_id,
@@ -1680,6 +1701,8 @@ class Watcher:
                 mailbox_identity_key=mailbox_identity_key,
                 label_selectors=label_selectors,
                 gated_allowed=gated_allowed,
+                vendor_snapshot=vendor_snapshot,
+                sent_scope=sent_scope,
             )
 
     @staticmethod
@@ -2134,7 +2157,9 @@ class Watcher:
         deliver_notifications: bool,
         mailbox_identity_key: str,
         label_selectors: tuple[GmailLabelSelectorLike, ...],
+        sent_scope: str | None,
         gated_allowed: bool,
+        vendor_snapshot: VendorIndex | None,
     ) -> dict[str, int | bool | str]:
         checked_at = datetime.now(UTC)
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
@@ -2145,6 +2170,7 @@ class Watcher:
             mailbox_identity_key=mailbox_identity_key,
             dry_run=dry_run,
             now=checked_at,
+            resolved_scope=sent_scope,
         )
         self._preview_identities: set[tuple[str, str, str, str]] = set()
         # Poll first: a newly admitted vendor reply can follow older retained mail.
@@ -2329,6 +2355,7 @@ class Watcher:
             mailbox_identity_key=mailbox_identity_key,
             label_selectors=label_selectors,
             gated_allowed=gated_allowed and not (recovered and self.mailbox.provider == "gmail"),
+            vendor_snapshot=vendor_snapshot,
             checked_at=checked_at,
             retention_cutoff=retention_cutoff,
             folders=folders,
@@ -2348,6 +2375,7 @@ class Watcher:
             mailbox_identity_key=mailbox_identity_key,
             label_selectors=label_selectors,
             gated_allowed=gated_allowed,
+            vendor_snapshot=vendor_snapshot,
             checked_at=checked_at,
             retention_cutoff=retention_cutoff,
             folders=folders,
@@ -2382,6 +2410,7 @@ class Watcher:
         mailbox_identity_key: str,
         label_selectors: tuple[GmailLabelSelectorLike, ...],
         gated_allowed: bool,
+        vendor_snapshot: VendorIndex | None,
         checked_at: datetime,
         retention_cutoff: datetime,
         folders: frozenset[str],
@@ -2451,14 +2480,16 @@ class Watcher:
                 admitted_at=checked_at,
                 folders=folders,
                 gated_allowed=gated_allowed,
-                vendor_index=self.store.vendor_index() if gated_allowed else None,
-                followed_thread=self.store.followed_thread_for_metadata(
-                    provider=self.mailbox.provider,
-                    account_id=self.mailbox.account_id,
-                    mailbox_identity_key=mailbox_identity_key,
-                    thread_id=metadata.thread_id,
-                    rfc_message_id=metadata.rfc_message_id,
-                    reply_ids=metadata.reply_ids,
+                vendor_index=vendor_snapshot,
+                followed_thread_lookup=(
+                    lambda metadata=metadata: self.store.followed_thread_for_metadata(
+                        provider=self.mailbox.provider,
+                        account_id=self.mailbox.account_id,
+                        mailbox_identity_key=mailbox_identity_key,
+                        thread_id=metadata.thread_id,
+                        rfc_message_id=metadata.rfc_message_id,
+                        reply_ids=metadata.reply_ids,
+                    )
                 )
                 if gated_allowed
                 else None,
@@ -2581,6 +2612,7 @@ class Watcher:
         mailbox_identity_key: str,
         label_selectors: tuple[GmailLabelSelectorLike, ...],
         gated_allowed: bool,
+        vendor_snapshot: VendorIndex | None,
         checked_at: datetime,
         retention_cutoff: datetime,
         folders: frozenset[str],
@@ -2626,6 +2658,7 @@ class Watcher:
                 mailbox_identity_key=mailbox_identity_key,
                 label_selectors=label_selectors,
                 gated_allowed=gated_allowed,
+                vendor_snapshot=vendor_snapshot,
                 checked_at=checked_at,
                 retention_cutoff=retention_cutoff,
                 folders=folders,

@@ -10,6 +10,7 @@ class VendorIndex:
     addresses: Mapping[str, tuple[str, str]] = field(default_factory=dict)
     domains: Mapping[str, tuple[str, str]] = field(default_factory=dict)
     identities: frozenset[str] = frozenset()
+    vendor_ids: frozenset[str] = frozenset()
 
     def vendor_of(self, address: str) -> tuple[str, str, str, str] | None:
         if address in self.identities:
@@ -57,4 +58,9 @@ def vendor_index(db: sqlite3.Connection) -> VendorIndex:
                 "vendors v ON v.vendor_id=d.vendor_id"
             )
         }
-    return VendorIndex(addresses=addresses, domains=domains, identities=identities)
+    return VendorIndex(
+        addresses=addresses,
+        domains=domains,
+        identities=identities,
+        vendor_ids=frozenset(str(row[0]) for row in db.execute("SELECT vendor_id FROM vendors")),
+    )

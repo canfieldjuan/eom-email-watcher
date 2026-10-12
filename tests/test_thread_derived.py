@@ -394,3 +394,73 @@ def test_reopen_without_input_changes_does_not_rederive(tmp_path, monkeypatch):
     store.initialize()
     assert touched == []
     assert len(follow(store)) == 1
+
+
+def test_partial_recompute_materializes_only_changed_follow_rows(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import contextmanager
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    for i in range(8):
+        seed(store, f"m{i}", thread_id=f"t{i}")
+    connection = store.connection
+    materialized = []
+
+    @contextmanager
+    def observe():
+        with connection() as db:
+
+            def row_factory(cursor, values):
+                if tuple(c[0] for c in cursor.description) == (
+                    "provider",
+                    "account_id",
+                    "mailbox_identity_key",
+                    "thread_key",
+                ):
+                    materialized.append(values)
+                return sqlite3.Row(cursor, values)
+
+            db.row_factory = row_factory
+            yield db
+
+    monkeypatch.setattr(store, "connection", observe)
+    seed(store, "new", thread_id="t0")
+    assert len(materialized) == 1
+
+
+def test_follow_lookup_survives_concurrent_vendor_delete(tmp_path, monkeypatch):
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    seed(store)
+    source = store.message_source("m")
+    original = db_module._thread_member
+    deleted = []
+
+    def delete_between_reads(db, row, owner):
+        result = original(db, row, owner)
+        if not deleted:
+            deleted.append(True)
+            Store(store.path).delete_vendor(vendor)
+        return result
+
+    monkeypatch.setattr(db_module, "_thread_member", delete_between_reads)
+    lookup = store.followed_thread_for_metadata(
+        provider="gmail",
+        account_id="mailbox",
+        mailbox_identity_key=source.mailbox_identity_key,
+        thread_id="thread",
+    )
+    assert lookup == ("thread", "Vendor")
+    assert deleted == [True]
+    assert (
+        store.followed_thread_for_metadata(
+            provider="gmail",
+            account_id="mailbox",
+            mailbox_identity_key=source.mailbox_identity_key,
+            thread_id="thread",
+        )
+        is None
+    )

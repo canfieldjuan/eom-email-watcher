@@ -5660,10 +5660,15 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
             str(row["thread_key"]),
         )
         groups.setdefault(scope, []).append(_thread_member(db, row, match[0] if match else None))
+    follow_source = "thread_follow f" if full else """derived_changed_threads t
+        CROSS JOIN thread_follow f
+        WHERE f.provider=t.provider AND f.account_id=t.account_id
+        AND f.mailbox_identity_key=t.identity AND f.thread_key=t.thread_key"""
     old = [
         tuple(row)
         for row in db.execute(
-            "SELECT provider, account_id, mailbox_identity_key, thread_key FROM thread_follow"
+            "SELECT f.provider, f.account_id, f.mailbox_identity_key, f.thread_key FROM "
+            + follow_source
         )
     ]
     for scope in old:
@@ -9640,6 +9645,9 @@ class Store:
         reply_ids: tuple[str, ...] = (),
     ) -> tuple[str, str] | None:
         with self.connection() as db:
+            # Component lookup, source ranking and vendor names share one WAL
+            # snapshot; a concurrent removal cannot split this admission read.
+            db.execute("BEGIN")
             scope = (provider, account_id, mailbox_identity_key)
             if provider == "imap":
                 ids = tuple(dict.fromkeys(i for i in (rfc_message_id, *reply_ids) if i is not None))
@@ -9652,8 +9660,10 @@ class Store:
                 return None
             marks = ",".join("?" for _ in keys)
             rows = db.execute(
-                f"""SELECT m.*, d.vendor_id FROM logical_messages m
+                f"""SELECT m.*, v.vendor_id, v.display_name AS vendor_display_name
+                    FROM logical_messages m
                     JOIN message_derived d ON d.message_id=m.message_id
+                    LEFT JOIN vendors v ON v.vendor_id=d.vendor_id
                     WHERE m.provider=? AND m.account_id=?
                     AND {_effective_message_identity_sql("m")}=?
                     AND m.thread_key IN ({marks})""",
@@ -9662,10 +9672,8 @@ class Store:
             owner = _follow_owner(_thread_member(db, row, row["vendor_id"]) for row in rows)
             if owner is None:
                 return None
-            name = db.execute(
-                "SELECT display_name FROM vendors WHERE vendor_id=?", (owner,)
-            ).fetchone()
-            return (key, str(name[0]))
+            name = next(row["vendor_display_name"] for row in rows if row["vendor_id"] == owner)
+            return (key, str(name))
 
     def create_vendor(self, display_name: str, *, now: datetime | None = None) -> str:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
