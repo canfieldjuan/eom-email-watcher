@@ -267,7 +267,7 @@ Before M2.2, source-header evidence and fixed-parameter adoption precede the rem
 - **Thread caches** of two mailbox identities under one account never mix.
 - **Selector bounds.** A `thread_follow` capture on a 512-byte thread key succeeds, and the inbox labels each new kind by name.
 - **Gating.** With the gated class inactive, only today's kinds are captured.
-- **Thread purge.** From M2.2, a followed thread keeps every message through the purge, whatever its age, until M2.3's coverage-gated purge; a thread whose oldest message is past the cutoff and whose newest is not keeps both.
+- **Thread purge.** From M2.2, a followed thread keeps every message through the purge, whatever its age, until M2.4's coverage-gated purge; a thread whose oldest message is past the cutoff and whose newest is not keeps both.
 - **The `messages` rebuild:**
   - a v32 database keeps every row, index, trigger, and provenance value;
   - `foreign_key_check` and `integrity_check` are clean;
