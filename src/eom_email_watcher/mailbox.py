@@ -34,6 +34,10 @@ class MailboxMessageUnavailable(MailboxError):
     """A source message disappeared after it was discovered."""
 
 
+class MailboxMessageOutsideScope(MailboxMessageUnavailable):
+    """The source exists, but its response is outside admitted folders."""
+
+
 class MailboxMessageInvalid(MailboxError):
     """A source message cannot be processed and must not retry forever."""
 
@@ -290,6 +294,8 @@ class MailboxGateway(Protocol):
     def content(
         self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
     ) -> MessageContent: ...
+
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]: ...
 
     def attachment_bytes(
         self, message_id: str, part_id: str, attachment_id: str | None

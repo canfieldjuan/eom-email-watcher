@@ -29,8 +29,10 @@ discarded after each local inference request.
   capability at runtime. For a compatible PDF, an explicit Summarize action fetches only that
   attachment and streams its bytes to the selected authenticated exact-loopback provider. It does
   not transfer mailbox paths, sender, subject, message ID, email body, or mailbox credentials.
-- Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
-  are never stored.
+- Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days.
+  With paid Connect, followed vendor threads also store normalized bodies locally. Followed vendor
+  threads are kept until their newest message is older than this. Their purge waits for current
+  mailbox coverage. Email bodies never go to a cloud service.
 - Deduplicates by mail provider, local account, and provider message ID. Existing single-account
   Gmail history retains its original local identifiers during the offline schema migration.
 - Recovers an expired provider cursor beginning five minutes before the last successful check,

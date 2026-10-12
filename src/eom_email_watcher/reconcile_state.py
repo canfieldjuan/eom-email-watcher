@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 Scope = tuple[str, str, str]
 KEY = "provider,account_id,mailbox_identity_key"
@@ -178,29 +178,8 @@ class ReconcileState:
 
     def stale(self):
         with self.store.connection() as db:
-            row = db.execute(
-                f"""SELECT g.generation,c.generation AS reconciled
-                FROM coverage_generation g LEFT JOIN reconcile_coverage c USING({KEY})
-                WHERE g.provider=? AND g.account_id=? AND g.mailbox_identity_key=?""",
-                self.scope,
-            ).fetchone()
-            return (
-                row is None
-                or row["generation"] != row["reconciled"]
-                or bool(
-                    db.execute(
-                        f"SELECT 1 FROM reconcile_progress WHERE {WHERE}", self.scope
-                    ).fetchone()
-                )
-                or bool(
-                    db.execute(
-                        f"""SELECT 1 FROM thread_follow f LEFT JOIN thread_watermarks w
-                USING({KEY},thread_key) WHERE f.provider=? AND f.account_id=?
-                AND f.mailbox_identity_key=? AND f.followed=1 AND w.thread_key IS NULL LIMIT 1""",
-                        self.scope,
-                    ).fetchone()
-                )
-            )
+            db.execute("BEGIN")
+            return not coverage_current(db, self.scope, now=datetime.now(UTC))
 
     def needs_discovery(self):
         with self.store.connection() as db:
@@ -455,6 +434,13 @@ class ReconcileState:
             ).fetchone()
             if row is None or tuple(row) != (progress["generation"], progress["version"]):
                 raise RuntimeError("reconcile progress changed concurrently")
+            from . import body_state
+
+            start = datetime.fromisoformat(progress["started_at"])
+            if body_state.pending(
+                db, self.scope, cutoff=start - timedelta(days=progress["retention_days"]), now=start
+            ):
+                raise RuntimeError("reconcile body work remains pending")
             db.execute(
                 f"""INSERT INTO reconcile_coverage({KEY},generation,recorded_at) VALUES (?,?,?,?,?)
                 ON CONFLICT({KEY}) DO UPDATE SET generation=excluded.generation,
@@ -474,3 +460,28 @@ class ReconcileState:
                 f"DELETE FROM reconcile_progress WHERE {WHERE} AND generation=? AND version=?",
                 (*self.scope, progress["generation"], progress["version"]),
             )
+
+
+def coverage_current(db, scope, *, now, retention_days=None):
+    """The single current-coverage predicate, shared with destructive retention."""
+    from . import body_state
+
+    row = db.execute(
+        f"""SELECT g.generation,c.generation AS reconciled,g.retention_days
+        FROM coverage_generation g LEFT JOIN reconcile_coverage c USING({KEY})
+        WHERE g.provider=? AND g.account_id=? AND g.mailbox_identity_key=?""",
+        scope,
+    ).fetchone()
+    if row is None or row["generation"] != row["reconciled"]:
+        return False
+    if db.execute(f"SELECT 1 FROM reconcile_progress WHERE {WHERE}", scope).fetchone():
+        return False
+    if db.execute(
+        f"""SELECT 1 FROM thread_follow f LEFT JOIN thread_watermarks w
+        USING({KEY},thread_key) WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
+        AND f.followed=1 AND w.thread_key IS NULL LIMIT 1""",
+        scope,
+    ).fetchone():
+        return False
+    days = retention_days if retention_days is not None else row["retention_days"]
+    return not body_state.pending(db, scope, cutoff=now - timedelta(days=days), now=now)

@@ -72,7 +72,7 @@ def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatc
     monkeypatch.setattr(thread_migration, "rebuild_messages", inspect_backup)
     store.initialize()
     after = snapshot(store.path)
-    assert after[0] == 34
+    assert after[0] == 35
     assert after[1:4] == before[1:4]
     assert set(before[4]) <= set(after[4])
     assert observed == [True]
@@ -135,7 +135,7 @@ def test_simultaneous_initializers_rebuild_once(tmp_path, monkeypatch):
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _: Store(store.path).initialize(), range(2)))
     assert observed == [True]
-    assert snapshot(store.path)[0] == 34
+    assert snapshot(store.path)[0] == 35
     assert derived(store)["vendor_id"] is not None
 
 

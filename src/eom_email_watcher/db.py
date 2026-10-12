@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from connect_automate import connect
 from connect_automate.locking import connect_operation_lock, connect_source_lock_path
 
-from . import reconcile_state, thread_migration
+from . import body_state, reconcile_state, thread_migration
 from .automation.rules import (
     MAX_AUTOMATION_ATTACHMENTS,
     MAX_AUTOMATION_RULES,
@@ -54,7 +54,7 @@ from .mime import AttachmentDescriptor, body_was_truncated
 from .text import within_utf8_bytes
 from .thread_state import VendorIndex, vendor_index
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -3407,6 +3407,8 @@ AFTER DELETE ON messages
 BEGIN
     DELETE FROM message_recipients WHERE message_id = OLD.message_id;
     DELETE FROM message_locations WHERE message_id = OLD.message_id;
+    DELETE FROM message_bodies WHERE message_id = OLD.message_id;
+    DELETE FROM message_body_unavailable WHERE message_id = OLD.message_id;
     -- Rows that are the same logical message go with their canonical row, on
     -- every deletion path (recursive triggers are on).
     DELETE FROM messages WHERE logical_of = OLD.message_id;
@@ -3438,6 +3440,7 @@ END;
 
 def _reparent_logical_sources(db: sqlite3.Connection, old: str, new: str) -> None:
     """Move logical-owned sources, preserving all per-row historical payloads."""
+    body_state.reparent(db, old, new)
     for table in ("message_locations", "message_source_observations"):
         db.execute(f"UPDATE {table} SET message_id = ? WHERE message_id = ?", (new, old))
     recipients = db.execute(
@@ -3587,10 +3590,12 @@ _RUN_OF_A_CHILD_ROW = """EXISTS (
 )"""
 
 
-def _effective_cutoff_sql(alias: str) -> str:
+def _effective_cutoff_sql(alias: str, *, include_recovery: bool = True) -> str:
     """The cutoff for a copy under `alias`: an account under Gmail recovery keeps
     the recovery's frozen cutoff when it is earlier. Takes two parameters, both the
     cutoff epoch."""
+    if not include_recovery:
+        return "MIN(?, ?)"
     return f"""MIN(?, COALESCE((
         SELECT aware_iso_epoch(recovery.retention_cutoff)
         FROM gmail_recovery_state AS recovery
@@ -3601,7 +3606,7 @@ def _effective_cutoff_sql(alias: str) -> str:
 
 
 def _logical_messages_past_cutoff_sql(
-    cutoff_epoch: float, stamp_epoch: float
+    cutoff_epoch: float, stamp_epoch: float, *, include_recovery: bool = True
 ) -> tuple[str, tuple[float, ...]]:
     """The logical messages whose received time is past the cutoff (contract D-scope).
 
@@ -3624,7 +3629,8 @@ def _logical_messages_past_cutoff_sql(
         )
         OR (
             aware_iso_epoch(received_at) <= ?
-            AND aware_iso_epoch(received_at) < {_effective_cutoff_sql("messages")}
+            AND aware_iso_epoch(received_at) <
+                {_effective_cutoff_sql("messages", include_recovery=include_recovery)}
         )"""
     sql = f"""SELECT canonical FROM (
             SELECT COALESCE(logical_of, message_id) AS canonical,
@@ -3634,7 +3640,8 @@ def _logical_messages_past_cutoff_sql(
           AND NOT EXISTS (
               SELECT 1 FROM message_locations AS l
               WHERE l.message_id = canonical AND l.received_at IS NOT NULL
-                AND aware_iso_epoch(l.received_at) >= {_effective_cutoff_sql("l")}
+                AND aware_iso_epoch(l.received_at) >=
+                    {_effective_cutoff_sql("l", include_recovery=include_recovery)}
           )"""
     return sql, (
         stamp_epoch,
@@ -3715,6 +3722,8 @@ def _record_locations(
 ) -> int:
     """One transactional source-observation owner (contract D-identity)."""
     locations = frozenset(locations)
+    if locations:
+        body_state.note_returned_source(db, message_id)
     if not locations <= MESSAGE_LOCATIONS:
         raise ValueError("unknown message location")
     if headers_observed and not locations:
@@ -5754,6 +5763,8 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
         AND f.mailbox_identity_key=thread_watermarks.mailbox_identity_key
         AND f.thread_key=thread_watermarks.thread_key AND f.followed=1)""")
 
+    body_state.recompute(db)
+
 class _DerivedCursor(sqlite3.Cursor):
     def execute(self, sql, parameters=()):
         self.connection._prepare_derived_write(sql, parameters)
@@ -5808,6 +5819,7 @@ class Store:
             connection = sqlite3.connect(self.path, factory=_DerivedConnection)
             try:
                 connection.execute("PRAGMA recursive_triggers = ON")
+                connection.execute("PRAGMA secure_delete = ON")
                 connection.row_factory = sqlite3.Row
                 connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
                 connection.create_function(
@@ -6257,6 +6269,8 @@ class Store:
                 END;
                 """,
             )
+            body_state.ensure_schema(db)
+            db.execute("DROP TRIGGER IF EXISTS messages_delete_recipients_and_locations")
             _ensure_sent_capture_tables(db)
             _execute_transactional_script(db, SOURCE_OBSERVATION_SCHEMA)
             _migrate_thread_identity(db)
@@ -6273,6 +6287,8 @@ class Store:
             if version < 33:
                 thread_migration.check_database(db)
             reconcile_state.ensure_schema(db)
+            if version < 35:
+                db.execute("DELETE FROM reconcile_coverage")
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -14006,11 +14022,64 @@ class Store:
             item["calendar_proposal"] = proposal_by_message.get(message_id)
         return items
 
+    def _purge_followed(self, retention_days, stamp, expired_units, parameters):
+        deleted = reviews = 0
+        with self.connection() as db:
+            scopes = [
+                tuple(r)
+                for r in db.execute(
+                    "SELECT provider,account_id,mailbox_identity_key,thread_key "
+                    "FROM thread_follow WHERE followed=1"
+                )
+            ]
+        for scope in scopes:
+
+            def candidates(db, scope):
+                if not reconcile_state.coverage_current(
+                    db, scope[:3], now=stamp, retention_days=retention_days
+                ):
+                    return []
+                members = [
+                    r[0]
+                    for r in db.execute(
+                        f"""SELECT m.message_id FROM logical_messages m
+                    JOIN thread_follow f ON f.provider=m.provider AND f.account_id=m.account_id
+                    AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
+                    AND f.thread_key=m.thread_key
+                    WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
+                    AND f.thread_key=? AND f.followed=1""",
+                        scope,
+                    )
+                ]
+                expired = {r[0] for r in db.execute(expired_units, parameters)}
+                return members if members and all(m in expired for m in members) else []
+
+            with self.connection() as db:
+                ids = candidates(db, scope)
+                rows = _unit_rows(db, ids)
+            if not rows:
+                continue
+            with self._source_cleanup_locks(rows), self.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = candidates(db, scope)
+                # A source added while locks were being acquired must be locked too.
+                current_rows = _unit_rows(db, current)
+                if not current_rows or set(current_rows) != set(rows):
+                    continue
+                reviews += _mark_automation_sources_unavailable(
+                    db, current_rows, updated_at=stamp.isoformat()
+                )
+                placeholders = ",".join("?" for _ in current)
+                db.execute(f"DELETE FROM messages WHERE message_id IN ({placeholders})", current)
+                deleted += len(current_rows)
+        return PurgeOutcome(deleted, reviews)
+
     def purge_with_outcome(
         self,
         retention_days: int,
         *,
         now: datetime | None = None,
+        after_poll: bool = False,
     ) -> PurgeOutcome:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         cutoff = stamp - timedelta(days=retention_days)
@@ -14022,6 +14091,7 @@ class Store:
         expired_units, expiry_parameters = _logical_messages_past_cutoff_sql(
             cutoff_epoch, stamp_epoch
         )
+        followed_expired_units = expired_units
         expired_units = f"""SELECT canonical FROM ({expired_units}) WHERE NOT EXISTS (
             SELECT 1 FROM messages m JOIN thread_follow f
                 ON f.provider=m.provider AND f.account_id=m.account_id
@@ -14035,8 +14105,12 @@ class Store:
                     f"{expired_units} ORDER BY canonical", expiry_parameters
                 ).fetchall()
             ]
-        deleted = 0
-        automation_review_required = 0
+        followed = (
+            self._purge_followed(retention_days, stamp, followed_expired_units, expiry_parameters)
+            if after_poll else PurgeOutcome(0, 0)
+        )
+        deleted = followed.messages
+        automation_review_required = followed.automation_review_required
         for offset in range(0, len(expired_ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
             chunk = expired_ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
             with self.connection() as db:
@@ -14088,8 +14162,10 @@ class Store:
             )
         return PurgeOutcome(deleted, automation_review_required)
 
-    def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
-        return self.purge_with_outcome(retention_days, now=now).messages
+    def purge(
+        self, retention_days: int, *, now: datetime | None = None, after_poll: bool = False
+    ) -> int:
+        return self.purge_with_outcome(retention_days, now=now, after_poll=after_poll).messages
 
     def logical_messages_within_cutoff(
         self, message_ids: Iterable[str], *, cutoff: datetime, now: datetime

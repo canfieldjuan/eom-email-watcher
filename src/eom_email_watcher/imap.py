@@ -31,6 +31,7 @@ from .mailbox import (
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
+    MailboxMessageOutsideScope,
     MailboxMessageUnavailable,
     MessageContent,
     MessageMetadata,
@@ -41,7 +42,13 @@ from .mailbox import (
     validate_content_scope,
     validate_operation_timeout,
 )
-from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
+from .mime import (
+    AttachmentDescriptor,
+    bounded_body_text,
+    html_to_text,
+    stored_body_text,
+    stored_html_to_text,
+)
 from .text import within_utf8_bytes
 from .thread_state import VendorIndex
 
@@ -831,6 +838,7 @@ class _ImapCatalog:
     plain: tuple[_ImapBodyPart, ...]
     html: tuple[_ImapBodyPart, ...]
     attachments: tuple[_ImapAttachment, ...]
+    stored: tuple[_ImapBodyPart, ...]
 
 
 class _ImapValueParser:
@@ -1210,7 +1218,7 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
             )
         )
 
-    def visit(value: list[_ImapValue], section: str, depth: int) -> None:
+    def visit(value: list[_ImapValue], section: str, depth: int) -> list[_ImapBodyPart]:
         nonlocal visited
         visited += 1
         if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH or not value:
@@ -1246,13 +1254,24 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
                     filename=filename,
                     is_multipart=True,
                 )
-                return
+                return []
+            children = []
             for index, child in enumerate(value[:child_count], start=1):
                 if not isinstance(child, list):
                     raise ValueError("IMAP multipart child is invalid")
                 child_section = f"{section}.{index}" if section else str(index)
-                visit(child, child_section, depth + 1)
-            return
+                children.append(visit(child, child_section, depth + 1))
+            if subtype == "alternative":
+                nonempty = [child for child in children if child]
+                return next(
+                    (
+                        child
+                        for child in nonempty
+                        if any(p.media_type == "text/html" for p in child)
+                    ),
+                    nonempty[0] if nonempty else [],
+                )
+            return [part for child in children for part in child]
 
         if len(value) < 7:
             raise ValueError("IMAP single-part structure is incomplete")
@@ -1289,16 +1308,15 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
                 byte_size=byte_size,
                 filename=filename,
             )
-            return
+            return []
         if maintype == "message" and subtype == "rfc822":
             if len(value) < 10 or not isinstance(value[8], list):
                 raise ValueError("IMAP message body structure is invalid")
             nested = value[8]
             nested_section = section if nested and isinstance(nested[0], list) else f"{section}.1"
-            visit(nested, nested_section, depth + 1)
-            return
+            return visit(nested, nested_section, depth + 1)
         if maintype != "text" or subtype not in {"plain", "html"}:
-            return
+            return []
         part = _ImapBodyPart(
             section=section,
             media_type=media_type,
@@ -1307,17 +1325,18 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
             byte_size=byte_size,
         )
         (plain if subtype == "plain" else html).append(part)
+        return [part]
 
     try:
         root_section = "" if structure and isinstance(structure[0], list) else "1"
-        visit(structure, root_section, 0)
+        stored = visit(structure, root_section, 0)
     except MailboxMessageInvalid:
         raise
     except (RecursionError, TypeError, ValueError) as exc:
         raise MailboxMessageInvalid(
             "imap_bodystructure_invalid", "Message MIME metadata is invalid"
         ) from exc
-    return _ImapCatalog(tuple(plain), tuple(html), tuple(attachments))
+    return _ImapCatalog(tuple(plain), tuple(html), tuple(attachments), tuple(stored))
 
 
 def _decoded_section(payload: bytes, transfer_encoding: str) -> bytes:
@@ -2418,18 +2437,27 @@ class ImapGateway:
             refresh_timeout,
         )
 
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
+        content = self._read_content(message_id, 0, scope=scope, stored=True)
+        return content.body, content.body_source_chars
+
     def content(
         self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
     ) -> MessageContent:
+        return self._read_content(message_id, body_char_limit, scope=scope, stored=False)
+
+    def _read_content(self, message_id, body_char_limit, *, scope, stored):
         scope = validate_content_scope(scope)
         _identity, folder_key, _validity, _uid = _decode_any_message_id(message_id)
         location = INBOX_LOCATION if folder_key is None else SENT_LOCATION
         if location not in scope:
-            raise MailboxMessageUnavailable("IMAP message is outside the active folder scope")
+            raise MailboxMessageOutsideScope("IMAP message is outside the active folder scope")
         with self._mailbox() as client:
             uid = self._checked_uid(client, message_id)
             catalog = self._catalog(client, uid, self._refresh_operation_timeout)
-            selected_parts = catalog.plain if catalog.plain else catalog.html
+            selected_parts = (
+                catalog.stored if stored else (catalog.plain or catalog.html)
+            )
             if sum(part.byte_size for part in selected_parts) > MAX_MESSAGE_BYTES:
                 raise MailboxMessageInvalid(
                     "imap_message_too_large", "Message content exceeds the safe size limit"
@@ -2450,9 +2478,15 @@ class ImapGateway:
                     text = decoded.decode(part.charset or "utf-8", errors="replace")
                 except LookupError:
                     text = decoded.decode("utf-8", errors="replace")
-                rendered.append(html_to_text(text) if part.media_type == "text/html" else text)
+                if part.media_type == "text/html":
+                    text = stored_html_to_text(text) if stored else html_to_text(text)
+                rendered.append(text)
         selected = "\n\n".join(rendered)
-        body, body_source_chars = bounded_body_text(selected, body_char_limit)
+        body, body_source_chars = (
+            stored_body_text(selected, is_html=False)
+            if stored
+            else bounded_body_text(selected, body_char_limit)
+        )
         descriptors = tuple(attachment.descriptor for attachment in catalog.attachments)
         names = tuple(dict.fromkeys(item.filename for item in descriptors))
         return MessageContent(body, names, descriptors, body_source_chars)

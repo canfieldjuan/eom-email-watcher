@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
 
+MAX_STORED_BODY_CHARS = 200_000
+
 _HTML_LINE_BREAK_TAGS = frozenset(
     {
         "article",
@@ -89,6 +91,87 @@ def bounded_body_text(selected: str, limit: int) -> tuple[str, int]:
     """Return the normalized body cut to ``limit`` characters and its pre-cut length."""
     normalized = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
     return normalized[:limit], len(normalized)
+
+
+class _StoredTextExtractor(HTMLParser):
+    """Render container boundaries without retaining markup or quote ancestry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stack: list[tuple[str, bool]] = []
+        self.parts: list[str] = []
+        self.lines: list[str] = []
+
+    def _line(self) -> None:
+        text = "".join(self.parts).strip()
+        if text:
+            self.lines.append(("> " if any(quoted for _, quoted in self.stack) else "") + text)
+        self.parts.clear()
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.casefold()
+        if tag in _HTML_LINE_BREAK_TAGS:
+            self._line()
+        attributes = dict(attrs)
+        quoted = tag == "blockquote" or (
+            tag == "div" and (
+                "gmail_quote" in (attributes.get("class") or "").split()
+                or attributes.get("id") == "divRplyFwdMsg"
+            )
+        )
+        if tag not in {"br", "hr", "img", "input", "meta", "link", "wbr"}:
+            self.stack.append((tag, quoted))
+
+    def handle_endtag(self, tag):
+        tag = tag.casefold()
+        if tag in _HTML_LINE_BREAK_TAGS:
+            self._line()
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                del self.stack[i:]
+                break
+
+    def handle_data(self, data):
+        if any(tag in {"script", "style"} for tag, _ in self.stack):
+            return
+        self.parts.append(data)
+
+
+def stored_html_to_text(selected: str) -> str:
+    parser = _StoredTextExtractor()
+    parser.feed(selected)
+    parser.close()
+    parser._line()
+    return "\n".join(parser.lines)
+
+
+def stored_body_text(selected: str, *, is_html: bool) -> tuple[str, int]:
+    if is_html:
+        selected = stored_html_to_text(selected)
+    return bounded_body_text(selected, MAX_STORED_BODY_CHARS)
+
+
+def extract_stored_body(payload: dict[str, Any]) -> tuple[str, int]:
+    def walk(part):
+        if part.get("filename"):
+            return []
+        kind = str(part.get("mimeType", "")).casefold()
+        children = [walk(child) for child in part.get("parts") or [] if isinstance(child, dict)]
+        if kind == "multipart/alternative":
+            nonempty = [child for child in children if child]
+            return next(
+                (child for child in nonempty if any(html for _, html in child)),
+                nonempty[0] if nonempty else [],
+            )
+        if children:
+            return [body for child in children for body in child]
+        data = (part.get("body") or {}).get("data")
+        if isinstance(data, str) and kind in {"text/plain", "text/html"}:
+            return [(_decode(data), kind == "text/html")]
+        return []
+
+    rendered = [stored_html_to_text(text) if rich else text for text, rich in walk(payload)]
+    return stored_body_text("\n".join(rendered), is_html=False)
 
 
 def body_was_truncated(analyzed_chars: int | None, source_chars: int | None) -> bool | None:

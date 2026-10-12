@@ -1471,6 +1471,10 @@ class Watcher:
         reason: str | None = None,
     ) -> dict[str, int | bool | str]:
         purged = 0 if dry_run else store.purge(config.retention_days)
+        if not dry_run:
+            from .body_state import checkpoint
+
+            checkpoint(store)
         result: dict[str, int | bool | str] = {
             "active": False,
             "discovered": 0,
@@ -1567,6 +1571,10 @@ class Watcher:
         self, *, dry_run: bool = False, deliver_notifications: bool = True,
         _gated_allowed: bool | None = None,
     ) -> dict[str, int | bool | str]:
+        if not dry_run:
+            from .body_state import checkpoint
+
+            checkpoint(self.store)
         gated_allowed = self._gated_class_allowed() if _gated_allowed is None else _gated_allowed
         vendor_snapshot = self.store.vendor_index() if gated_allowed else None
         vendor_records = bool(vendor_snapshot and vendor_snapshot.vendor_ids)
@@ -2164,7 +2172,10 @@ class Watcher:
             mailbox_identity_key=mailbox_identity_key,
         )
         if not dry_run:
-            purged += self.store.purge(self.config.retention_days, now=checked_at)
+            purged += self.store.purge(self.config.retention_days, now=checked_at, after_poll=True)
+            from .body_state import checkpoint
+
+            checkpoint(self.store)
         result: dict[str, int | bool | str] = {
             "active": True,
             "discovered": added,

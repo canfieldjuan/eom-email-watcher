@@ -35,6 +35,7 @@ from .mailbox import (
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
+    MailboxMessageOutsideScope,
     MailboxMessageUnavailable,
     MessageContent,
     MessageMetadata,
@@ -45,7 +46,7 @@ from .mailbox import (
     validate_content_scope,
     validate_operation_timeout,
 )
-from .mime import extract_body
+from .mime import extract_body, extract_stored_body
 from .text import within_utf8_bytes
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
@@ -527,9 +528,11 @@ def _received_at(message: dict[str, Any], headers: dict[str, str]) -> str:
         return ""
 
 
-def _validated_label_ids(message: dict[str, Any]) -> frozenset[str]:
+def _validated_label_ids(
+    message: dict[str, Any], *, require_complete: bool = False
+) -> frozenset[str]:
     raw_labels = message.get("labelIds")
-    if raw_labels is None:
+    if raw_labels is None and not require_complete:
         raw_labels = []
     if not isinstance(raw_labels, list) or len(raw_labels) > MAX_GMAIL_LABEL_COUNT:
         raise MailboxMessageInvalid(
@@ -1063,12 +1066,12 @@ class GmailGateway:
 
     def _full_message(self, message_id: str) -> dict[str, Any]:
         try:
-            message = (
+            request = (
                 self.service.users()
                 .messages()
                 .get(userId="me", id=message_id, format="full")
-                .execute()
             )
+            message = self._execute_request(request)
         except HttpError as exc:
             if getattr(exc.resp, "status", None) == 404:
                 raise MessageUnavailable(
@@ -1080,19 +1083,27 @@ class GmailGateway:
     def full_payload(self, message_id: str) -> dict[str, Any]:
         return self._full_message(message_id).get("payload") or {}
 
+    def _scoped_full_message(self, message_id: str, scope: frozenset[str]):
+        scope = validate_content_scope(scope)
+        message = self._full_message(message_id)
+        labels = _validated_label_ids(message, require_complete=True)
+        if not (locations_from_labels(labels) & scope):
+            raise MailboxMessageOutsideScope(
+                f"Gmail message {message_id} is outside the active folder scope"
+            )
+        return message
+
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
+        message = self._scoped_full_message(message_id, scope)
+        return extract_stored_body(message.get("payload") or {})
+
     def content(
         self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
     ) -> MessageContent:
-        scope = validate_content_scope(scope)
-        message = self._full_message(message_id)
         try:
-            labels = _validated_label_ids(message)
+            message = self._scoped_full_message(message_id, scope)
         except MailboxMessageInvalid as exc:
             raise MessageUnavailable("Gmail body response has invalid folder evidence") from exc
-        if not (locations_from_labels(labels) & scope):
-            raise MessageUnavailable(
-                f"Gmail message {message_id} is outside the active folder scope"
-            )
         body, attachment_names, attachments, body_source_chars = extract_body(
             message.get("payload") or {}, body_char_limit
         )

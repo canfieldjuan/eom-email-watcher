@@ -144,6 +144,11 @@ class FakeGmail:
         self.full_payload_calls += 1
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
 
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
+        from eom_email_watcher.mime import extract_stored_body
+
+        return extract_stored_body(self.full_payload(message_id))
+
     def content(
         self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
     ) -> MessageContent:
@@ -4617,9 +4622,12 @@ def test_check_uses_retention_snapshot_for_post_poll_purge(
     purge_times: list[datetime | None] = []
     real_purge = store.purge
 
-    def record_purge(retention_days: int, *, now: datetime | None = None) -> int:
+    def record_purge(
+        retention_days: int, *, now: datetime | None = None, after_poll: bool = False
+    ) -> int:
+        assert after_poll
         purge_times.append(now)
-        return real_purge(retention_days, now=now)
+        return real_purge(retention_days, now=now, after_poll=after_poll)
 
     monkeypatch.setattr(store, "purge", record_purge)
 

@@ -199,6 +199,9 @@ def test_idless_real_runner_uses_only_its_source(tmp_path, monkeypatch):
     seed(watcher.store, source, provider="imap", rfc_message_id=None)
     state.observe(active=True, retention_days=30, sent_folder="unavailable", now=NOW)
     progress = state.load_or_start(NOW, 30, {"units": []})
+    from eom_email_watcher import body_state
+
+    body_state.record(watcher.store, source, ("existing", 8), fetched_at=NOW)
     state.complete(progress)
     client.calls.clear()
     reconcile.run(watcher, KEY, "unavailable", label_selectors=(), now=NOW)
@@ -224,6 +227,9 @@ def test_idless_known_sources_respect_window_before_provider_read(
     )
     state.observe(active=True, retention_days=30, sent_folder="unavailable", now=NOW)
     progress = state.load_or_start(NOW, 30, {"units": []})
+    from eom_email_watcher import body_state
+
+    body_state.record(watcher.store, source, ("existing", 8), fetched_at=NOW)
     state.complete(progress)
     client.calls.clear()
     reconcile.run(watcher, KEY, "unavailable", label_selectors=(), now=NOW)

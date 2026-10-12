@@ -30,6 +30,7 @@ from .mailbox import (
     FolderObservation,
     MailboxChanges,
     MailboxError,
+    MailboxMessageOutsideScope,
     MailboxMessageUnavailable,
     MessageContent,
     MessageMetadata,
@@ -39,7 +40,7 @@ from .mailbox import (
     validate_content_scope,
     validate_operation_timeout,
 )
-from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
+from .mime import AttachmentDescriptor, bounded_body_text, html_to_text, stored_body_text
 
 MICROSOFT365_PROVIDER = "microsoft365"
 SCOPES = ("Mail.Read",)
@@ -876,22 +877,36 @@ class Microsoft365Gateway:
                 return tuple(descriptors)
             current = _safe_graph_url(next_link)
 
-    def content(
-        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
-    ) -> MessageContent:
+    def _content_document(self, message_id, scope, *, prefer_text):
         scope = validate_content_scope(scope)
         encoded_id = quote(_graph_id(message_id, "message id"), safe="")
         query = urlencode({"$select": "body,hasAttachments,parentFolderId"})
         response = self._request(
             f"{GRAPH_ROOT}/me/messages/{encoded_id}?{query}",
-            prefer_text=True,
+            prefer_text=prefer_text,
             missing_is_message=True,
         )
         document = _response_document(response, "message content")
         if not self._locations(document.get("parentFolderId"), scope=scope):
-            raise MailboxMessageUnavailable(
+            raise MailboxMessageOutsideScope(
                 f"Microsoft message {message_id} is outside the active folder scope"
             )
+        return document
+
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
+        document = self._content_document(message_id, scope, prefer_text=False)
+        body = document.get("body")
+        if not isinstance(body, dict) or not isinstance(body.get("content"), str):
+            raise Microsoft365Error("Microsoft message body response is invalid")
+        return stored_body_text(
+            body["content"],
+            is_html=str(body.get("contentType", "")).casefold() == "html",
+        )
+
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
+        document = self._content_document(message_id, scope, prefer_text=True)
         attachments = (
             self._attachments(message_id) if document.get("hasAttachments") is True else ()
         )
