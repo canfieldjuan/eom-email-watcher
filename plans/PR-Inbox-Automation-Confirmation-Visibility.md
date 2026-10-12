@@ -147,3 +147,11 @@ durable temporary directory: the machine's `/tmp/.git` marker makes default
 Cold audit must show only this contract and existing test changing in the round.
 Earlier extraction parity/build evidence still applies if production source
 remains byte-identical. CI and independent exact-head review remain pending.
+
+Review-fix verification: focused state/filter tests passed 29 tests. Full desktop
+suite passed 185 tests, zero failures, using the external TMPDIR as specified.
+`git diff 68f8c94 --name-only` contains only this contract and the replaced
+`inboxFilters.test.ts` assertion; production source remains byte-identical.
+No build/model/parity rerun is needed for this test/documentation-only round;
+their prior evidence remains tied to unchanged production sources. Independent
+review and CI of the next published head remain pending.
