@@ -122,3 +122,28 @@ exact-head review and required CI remain merge gates.
 - Cold diff audit found only the contract, existing state owner, details render
   and its behavioral tests. Independent exact-head review and required CI are
   pending before merge. This is source work, with no installed product update.
+
+## Review-fix contract: shared projection test
+
+Claude and Codex confirmed one defect class on `68f8c94`: hoisting the fire
+projection invalidated `inboxFilters.test.ts`'s inline-expression assertion.
+The behavior is correct; the test incorrectly equates a textual call shape with
+projected-value provenance. `git log -L` identifies my hoist in `68f8c94`; the
+older shape assertion originated in `680f5d25`. Required desktop CI fails on
+`AssertionError: fire?.state`, reproduced in the focused test before edits.
+
+Required surface: replace that one source-shape test with execution of the
+production projection/details and chip segments. Spy on the real state owner
+functions to verify both receive the same fire-state array by identity, only
+projected state/status values and bounded proposal fields reach the chip, and
+the render clock is forwarded unchanged. Keep the unrelated attachment-count
+and expanded-content checks. No production, ranking, consent or model change.
+
+Verification: the reproduced stale test passes after replacement; include mixed
+attachments, missing fire/result lists and no fires/proposal. Run the full
+desktop suite requested by Claude. Its COI fixture evidence must use an external
+durable temporary directory: the machine's `/tmp/.git` marker makes default
+`/tmp` invalid under the existing evidence guard. Preserve that guard and marker.
+Cold audit must show only this contract and existing test changing in the round.
+Earlier extraction parity/build evidence still applies if production source
+remains byte-identical. CI and independent exact-head review remain pending.
