@@ -554,8 +554,13 @@ class Microsoft365Gateway:
         cursor_request: bool = False,
         missing_is_message: bool = False,
     ) -> httpx.Response:
+        budget = getattr(self, "_reconcile_budget", None)
+        if budget is not None:
+            self.set_operation_timeout(budget.before_call())
         safe_url = _safe_graph_url(url)
         preferences = ['IdType="ImmutableId"']
+        if budget is not None:
+            preferences.append("odata.maxpagesize=200")
         if prefer_text:
             preferences.append('outlook.body-content-type="text"')
         try:
@@ -664,6 +669,67 @@ class Microsoft365Gateway:
         return self._delta_round(
             _delta_url(since, SENT_FOLDER), continuation=False, folder=SENT_FOLDER
         )
+
+    reconcile_transport_budget = True
+
+    def reconcile_sent_identity(self):
+        return self._folder_id(SENT_FOLDER) or "unavailable"
+
+    def reconcile_page(self, unit, *, start, cutoff):
+        from .reconcile import ReconcileItem, ReconcilePage, ReconcileTokenInvalid
+
+        folder = SENT_FOLDER if unit["folder"] == "sent" else INBOX_FOLDER
+        prefix = f"{GRAPH_ROOT}/me/mailFolders/{folder}/messages/delta"
+        token = unit.get("token")
+        if token is None:
+            url = (
+                prefix
+                + "?"
+                + urlencode(
+                    {
+                        "$select": "id,receivedDateTime,conversationId",
+                        "changeType": "created",
+                        "$top": 200,
+                    }
+                )
+            )
+        else:
+            url = _safe_graph_url(token, delta_token="$skiptoken")
+            if urlsplit(url).path != urlsplit(prefix).path:
+                raise Microsoft365Error("Reconcile token names another folder")
+        try:
+            response = self._request(url, cursor_request=token is not None)
+        except StaleMailboxCursor as exc:
+            raise ReconcileTokenInvalid("Graph rejected reconcile page token") from exc
+        doc = _response_document(response, "reconcile delta")
+        values = doc.get("value")
+        if not isinstance(values, list) or len(values) > 200:
+            raise Microsoft365Error("Graph reconcile delta omitted bounded items")
+        items = []
+        for value in values:
+            if not isinstance(value, dict):
+                raise Microsoft365Error("Graph reconcile item is invalid")
+            if "@removed" in value:
+                continue
+            source = _graph_id(value.get("id"), "message id")
+            try:
+                received = datetime.fromisoformat(value["receivedDateTime"].replace("Z", "+00:00"))
+                if received.tzinfo is None:
+                    raise ValueError("missing timezone")
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise Microsoft365Error("Graph reconcile receive time is invalid") from exc
+            if not cutoff <= received < start:
+                continue
+            native = value.get("conversationId")
+            if native is not None:
+                native = _graph_id(native, "conversation id")
+            items.append(ReconcileItem(source, native, received.astimezone(UTC).isoformat()))
+        next_link = doc.get("@odata.nextLink")
+        if next_link is not None:
+            next_link = _safe_graph_url(next_link, delta_token="$skiptoken")
+            if urlsplit(next_link).path != urlsplit(prefix).path:
+                raise Microsoft365Error("Graph reconcile continuation names another folder")
+        return ReconcilePage(tuple(items), next_link)
 
     def sent_scope(self) -> str:
         """Whether Sent Items is reachable (contract D-scope)."""

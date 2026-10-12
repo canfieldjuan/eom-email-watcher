@@ -6141,6 +6141,21 @@ class SentPollingGateway(ImapGateway):
         self.sent_calls.append(("recover", since))
         return MailboxChanges(self.sent_ids, f"eom-imap-v2:{self.credential_identity}:77:3")
 
+    # This test double overrides the transport rather than initializing imaplib.
+    # Reconcile therefore uses the same empty fake mailbox as polling.
+    reconcile_transport_budget = False
+
+    def reconcile_sent_identity(self):
+        return "a" * 64
+
+    def reconcile_snapshot(self, folder):
+        return dict(validity=44 if folder == "inbox" else 77, highest=0,
+                    folder_key=None if folder == "inbox" else "a" * 64)
+
+    def reconcile_page(self, unit, **bounds):
+        from eom_email_watcher.reconcile import ReconcilePage
+        return ReconcilePage((), None)
+
     def metadata(self, message_id: str) -> MessageMetadata:
         return MessageMetadata(
             message_id,

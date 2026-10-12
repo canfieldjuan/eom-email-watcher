@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from connect_automate import connect
 from connect_automate.locking import connect_operation_lock, connect_source_lock_path
 
-from . import thread_migration
+from . import reconcile_state, thread_migration
 from .automation.rules import (
     MAX_AUTOMATION_ATTACHMENTS,
     MAX_AUTOMATION_RULES,
@@ -54,7 +54,7 @@ from .mime import AttachmentDescriptor, body_was_truncated
 from .text import within_utf8_bytes
 from .thread_state import VendorIndex, vendor_index
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -4080,6 +4080,7 @@ def _imap_thread_key(
     scope: tuple[str, str, str],
     ids: tuple[str, ...],
     cached_rank: bool = False,
+    existing_thread_key: str | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """Return (thread key, components to merge into it) for an IMAP message's ids.
 
@@ -4087,7 +4088,7 @@ def _imap_thread_key(
     order (source identity in byte order), sorts first (contract D-identity).
     """
     if not ids:
-        return str(uuid.uuid4()), ()
+        return existing_thread_key or str(uuid.uuid4()), ()
     placeholders = ", ".join("?" for _ in ids)
     keys = [
         str(row["thread_key"])
@@ -4098,6 +4099,8 @@ def _imap_thread_key(
             (*scope, *ids),
         ).fetchall()
     ]
+    if existing_thread_key is not None and existing_thread_key not in keys:
+        keys.append(existing_thread_key)
     if not keys:
         return str(uuid.uuid4()), ()
 
@@ -5513,6 +5516,7 @@ THREAD_DERIVED_SCHEMA = (
         PRIMARY KEY(provider, account_id, mailbox_identity_key, thread_key))""",
 )
 
+
 def _track_derived_rows(db: sqlite3.Connection) -> None:
     """Connection-local row evidence; no extra persistent state or writer lists."""
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_derived'").fetchone():
@@ -5522,6 +5526,7 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
         provider TEXT, account_id TEXT, identity TEXT, thread_key TEXT,
         UNIQUE(provider, account_id, identity, thread_key))""")
     db.execute("CREATE TEMP TABLE derived_changed_config(table_name TEXT PRIMARY KEY)")
+    coverage = reconcile_state.track_coverage_inputs(db)
     global_inputs = DERIVED_INPUT_TABLES - {"messages", "message_locations", "message_recipients"}
     for table in sorted(global_inputs):
         if not db.execute(
@@ -5529,9 +5534,10 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
         ).fetchone():
             continue
         for event in ("INSERT", "DELETE", "UPDATE"):
+            evidence = reconcile_state.coverage_input_sql(table, event) if coverage else ""
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
                 AFTER {event} ON main.{table} BEGIN
-                INSERT OR IGNORE INTO derived_changed_config VALUES ('{table}'); END""")
+                INSERT OR IGNORE INTO derived_changed_config VALUES ('{table}'); {evidence} END""")
     for table in ("messages", "message_locations", "message_recipients"):
         for event, records in (
             ("INSERT", ("NEW",)),
@@ -5555,6 +5561,7 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
                 AFTER {event}{update} ON main.{table} BEGIN {"".join(statements)} END""")
 
+
 def _thread_member(
     db: sqlite3.Connection, row: sqlite3.Row, vendor: str | None
 ) -> tuple[float, str, str | None]:
@@ -5565,10 +5572,12 @@ def _thread_member(
     newest = max((stamp for stamp in timestamps if stamp is not None), default=float("inf"))
     return newest, min(source.provider_message_id for source in unit.sources), vendor
 
+
 def _follow_owner(
     members: Iterable[tuple[float, str, str | None]],
 ) -> tuple[float, str, str | None] | None:
     return min((member for member in members if member[2] is not None), default=None)
+
 
 def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
     """D-derived's sole owner: local work before the input transaction commits."""
@@ -5579,6 +5588,7 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
         ).fetchone()
     ):
         return
+    reconcile_state.flush_coverage_inputs(db)
     global_inputs = changed - {"messages", "message_locations", "message_recipients"}
     tracked = db.execute(
         "SELECT 1 FROM sqlite_temp_master WHERE name='derived_changed_messages'"
@@ -6040,7 +6050,7 @@ class Store:
                     last_error TEXT
                 );
                 """
-                + _AUTOMATION_TABLES_SQL
+                + _AUTOMATION_TABLES_SQL,
             )
             db.execute("""CREATE TABLE IF NOT EXISTS automation_rule_selections (
                 rule_id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -6237,6 +6247,7 @@ class Store:
                 _recompute_derived(db, DERIVED_INPUT_TABLES)
             if version < 33:
                 thread_migration.check_database(db)
+            reconcile_state.ensure_schema(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -9169,6 +9180,86 @@ class Store:
                 other_than=other_than,
             )
 
+    def reconcile_source(self, provider, account_id, mailbox_identity_key, source_id):
+        with self.connection() as db:
+            db.execute("BEGIN")
+            row = db.execute(
+                _stored_source_membership_sql() + " LIMIT 1",
+                (provider, account_id, mailbox_identity_key, source_id),
+            ).fetchone()
+            if row is None:
+                return None
+            unit = _logical_unit(db, row["logical_id"])
+            dates = [_sqlite_aware_iso_epoch(source.received_at) for source in unit.sources]
+            dates = [stamp for stamp in dates if stamp is not None]
+            locations = db.execute(
+                """SELECT recorded_at FROM message_locations WHERE
+                provider=? AND account_id=? AND mailbox_identity_key=? AND provider_message_id=?""",
+                (provider, account_id, mailbox_identity_key, source_id),
+            ).fetchall()
+            return dict(
+                message_id=row["logical_id"],
+                received_epoch=max(dates) if dates else None,
+                confirmed=bool(locations) and all(r[0] is not None for r in locations),
+            )
+
+    def record_reconcile_headers(
+        self,
+        provider,
+        account_id,
+        mailbox_identity_key,
+        metadata,
+        *,
+        locations,
+        observed_at,
+        scope_complete,
+    ):
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                _stored_source_membership_sql() + " LIMIT 1",
+                (provider, account_id, mailbox_identity_key, metadata.message_id),
+            ).fetchone()
+            if row is None:
+                return
+            logical_id = row["logical_id"]
+            _record_locations(
+                db,
+                message_id=logical_id,
+                provider=provider,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=metadata.message_id,
+                locations=locations,
+                observed_at=observed_at.isoformat(),
+                scope_complete=scope_complete,
+                headers_observed=True,
+                received_at=metadata.received_at,
+            )
+            _record_recipients(db, message_id=logical_id, to=metadata.to, cc=metadata.cc)
+            if provider == "imap":
+                ids = tuple(
+                    dict.fromkeys(i for i in (metadata.rfc_message_id, *metadata.reply_ids) if i)
+                )
+                existing = db.execute(
+                    "SELECT thread_key FROM messages WHERE message_id=?", (logical_id,)
+                ).fetchone()[0]
+                key, merged = _imap_thread_key(
+                    db,
+                    scope=(provider, account_id, mailbox_identity_key),
+                    ids=ids,
+                    existing_thread_key=existing,
+                )
+                _apply_imap_component(
+                    db,
+                    scope=(provider, account_id, mailbox_identity_key),
+                    thread_key=key,
+                    merged=merged,
+                    ids=ids,
+                )
+                db.execute("DELETE FROM imap_reply_header_gaps WHERE message_id=?", (logical_id,))
+            _requeue_if_skipped(db, logical_id)
+
     def clear_location_stamps(
         self,
         provider: str,
@@ -9178,27 +9269,32 @@ class Store:
         now: datetime | None = None,
     ) -> None:
         """Record an account's polling gap through the source-observation owner."""
+        reconcile_state.ReconcileState(self, (provider, account_id, mailbox_identity_key)).gap(
+            now=now
+        )
+
+    @staticmethod
+    def _clear_location_stamps(db, provider, account_id, mailbox_identity_key, *, now=None):
+        """The source-observation gap owner, within its caller's transaction."""
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            rows = db.execute(
-                """SELECT DISTINCT message_id, provider_message_id FROM message_locations
-                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?""",
-                (provider, account_id, mailbox_identity_key),
-            ).fetchall()
-            for row in rows:
-                _record_locations(
-                    db,
-                    message_id=row["message_id"],
-                    provider=provider,
-                    account_id=account_id,
-                    mailbox_identity_key=mailbox_identity_key,
-                    provider_message_id=row["provider_message_id"],
-                    locations=(),
-                    observed_at=stamp,
-                    scope_complete=False,
-                    headers_observed=False,
-                )
+        rows = db.execute(
+            """SELECT DISTINCT message_id, provider_message_id FROM message_locations
+            WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?""",
+            (provider, account_id, mailbox_identity_key),
+        ).fetchall()
+        for row in rows:
+            _record_locations(
+                db,
+                message_id=row["message_id"],
+                provider=provider,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=row["provider_message_id"],
+                locations=(),
+                observed_at=stamp,
+                scope_complete=False,
+                headers_observed=False,
+            )
 
     def message_sources(self, message_id: str) -> tuple[MessageSource, ...]:
         """Every source identity a logical message can be read from (contract D-identity).

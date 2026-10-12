@@ -1474,6 +1474,26 @@ def _recovery_search_date(since: datetime) -> str:
     return _format_recovery_search_day(_recovery_search_day(since))
 
 
+def _search_operand(value: str) -> str | bytes:
+    """One SEARCH operand encoder; Unicode uses IMAP's literal channel."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > MAX_HEADER_BYTES
+        or any(c in value for c in "\r\n\x00")
+    ):
+        raise ImapError("imap_protocol_error", "Unsafe mail search operand")
+    if value.isascii():
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value.encode("utf-8")
+
+
+def _search_or(terms):
+    if len(terms) == 1:
+        return terms[0]
+    return ["OR", *terms[0], *_search_or(terms[1:])]
+
+
 class ImapGateway:
     def __init__(
         self,
@@ -2025,6 +2045,155 @@ class ImapGateway:
         with self._mailbox() as client:
             self._ensure_selected(client, INBOX_FOLDER)
             return self._recover_folder(client, None, since)
+
+    reconcile_transport_budget = True
+
+    def reconcile_sent_identity(self):
+        return _folder_key(self._sent_folder) if self._sent_folder else "unavailable"
+
+    def reconcile_snapshot(self, folder):
+        with self._mailbox() as client:
+            resolved = self._require_sent_folder(client) if folder == "sent" else INBOX_FOLDER
+            self._ensure_selected(client, resolved)
+            validity, highest = self._snapshot(client)
+            return dict(
+                validity=validity,
+                highest=highest,
+                folder_key=_folder_key(resolved) if folder == "sent" else None,
+            )
+
+    def reconcile_page(self, unit, *, start, cutoff):
+        from .reconcile import ReconcileItem, ReconcilePage, ReconcileTokenInvalid
+
+        frozen = unit["snapshot"]
+        since = datetime.fromisoformat(unit["since"]) if unit.get("since") else cutoff
+        with self._mailbox() as client:
+            folder = self._require_sent_folder(client) if unit["folder"] == "sent" else INBOX_FOLDER
+            self._ensure_selected(client, folder)
+            if _selected_uid_validity(client) != frozen["validity"]:
+                raise ReconcileTokenInvalid("Mail server folder epoch changed")
+            page = unit.setdefault("_page_state", {})
+            if not page:
+                lower = int(unit["token"] or 0) + 1
+                upper = min(lower + 49, frozen["highest"])
+                if lower > upper:
+                    unit.pop("_page_state", None)
+                    return ReconcilePage((), None)
+                page.update(lower=lower, upper=upper, searched=0, uids=[], dated=0, fallback=False)
+            terms = []
+            if "addresses" in unit:
+                terms = [
+                    [field, _search_operand(address)]
+                    for address in unit["addresses"]
+                    for field in ("FROM", "TO", "CC")
+                ]
+            elif unit.get("ids"):
+                terms = [
+                    ["HEADER", field, _search_operand(rfc_id)]
+                    for rfc_id in unit["ids"]
+                    for field in ("Message-ID", "In-Reply-To", "References")
+                ]
+            # imaplib has one literal channel. ASCII keys nest OR exactly; literal
+            # keys run individually and their UID sets are unioned in durable state.
+            groups = []
+            for offset in range(0, len(terms), 24):
+                batch = terms[offset : offset + 24]
+                if all(isinstance(t[-1], str) for t in batch):
+                    groups.append(_search_or(batch))
+                else:
+                    groups.extend(batch)
+            if not groups:
+                groups = [[]]
+            while page["searched"] < len(groups):
+                base = [
+                    "UID",
+                    f"{page['lower']}:{page['upper']}",
+                    "SINCE",
+                    _recovery_search_date(since),
+                ]
+                group = [] if page["fallback"] else groups[page["searched"]]
+                literal = group[-1] if group and isinstance(group[-1], bytes) else None
+                if literal is not None:
+                    client.literal = literal
+                try:
+                    args = (
+                        ["CHARSET", "UTF-8", *base, *group[:-1]]
+                        if literal is not None
+                        else base + group
+                    )
+                    status, response = client.uid("SEARCH", None, *args)
+                finally:
+                    if literal is not None:
+                        client.literal = None
+                if status == "NO" and b"BADCHARSET" in _response_metadata(response).upper():
+                    page.update(fallback=True, searched=0, uids=[])
+                    continue
+                if status != "OK":
+                    raise ImapError("imap_protocol_error", "Mail server reconcile search failed")
+                uids = _uids(response)
+                if any(uid < page["lower"] or uid > page["upper"] for uid in uids):
+                    raise ImapError(
+                        "imap_protocol_error", "Mail server search exceeded frozen bounds"
+                    )
+                page["uids"] = sorted(set(page["uids"]) | set(uids))
+                page["searched"] = len(groups) if page["fallback"] else page["searched"] + 1
+            items = []
+            if page["dated"] < len(page["uids"]):
+                uid = page["uids"][page["dated"]]
+                status, response = client.uid("FETCH", str(uid), "(UID INTERNALDATE)")
+                if status != "OK":
+                    raise ImapError("imap_protocol_error", "Mail server receive date fetch failed")
+                metadata = _response_metadata(response)
+                received = (
+                    _message_date(metadata, Message()) if _INTERNAL_DATE.search(metadata) else ""
+                )
+                if received and since <= datetime.fromisoformat(received) < start:
+                    matches = True
+                    if page["fallback"] and unit.get("ids"):
+                        status, response = client.uid(
+                            "FETCH",
+                            str(uid),
+                            f"(UID BODY.PEEK[HEADER.FIELDS ({CORE_HEADER_FIELDS})]"
+                            f"<0.{MAX_HEADER_BYTES}> "
+                            f"BODY.PEEK[HEADER.FIELDS ({REPLY_HEADER_FIELDS})]"
+                            f"<0.{MAX_REPLY_HEADER_BYTES}>)",
+                        )
+                        if status != "OK":
+                            raise ImapError(
+                                "imap_protocol_error", "Mail server reply header fetch failed"
+                            )
+                        try:
+                            _, headers = _header_literals(response)
+                            core = _optional_headers(headers[CORE_HEADER_FIELDS], MAX_HEADER_BYTES)
+                            parsed = BytesParser(policy=policy.default).parsebytes(
+                                core or b"", headersonly=True
+                            )
+                            ids = (
+                                normalize_message_id(str(parsed.get("Message-ID", ""))),
+                                *_reply_ids(
+                                    _optional_headers(
+                                        headers.get(REPLY_HEADER_FIELDS), MAX_REPLY_HEADER_BYTES
+                                    )
+                                ),
+                            )
+                            matches = bool(set(ids) & set(unit["ids"]))
+                        except MailboxMessageUnavailable:
+                            matches = False
+                    if matches:
+                        items.append(
+                            ReconcileItem(
+                                _message_id(
+                                    self._mailbox_id, frozen["validity"], uid, frozen["folder_key"]
+                                ),
+                                received_at=received,
+                            )
+                        )
+                page["dated"] += 1
+            if page["dated"] < len(page["uids"]):
+                return ReconcilePage(tuple(items), unit.get("token") or 0)
+            upper = page["upper"]
+            unit.pop("_page_state", None)
+            return ReconcilePage(tuple(items), upper if upper < frozen["highest"] else None)
 
     def metadata(self, message_id: str) -> MessageMetadata:
         with self._mailbox() as client:

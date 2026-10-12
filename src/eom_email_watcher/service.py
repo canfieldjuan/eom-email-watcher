@@ -1554,11 +1554,11 @@ class Watcher:
 
     def _has_capture_work(
         self, *, labels: bool, pending: bool, sent_in_scope: bool,
-        vendor_records: bool, recovery: bool = False
+        vendor_records: bool, recovery: bool = False, coverage_stale: bool = False
     ) -> bool:
         return bool(
             self.admission_sender_names or labels or pending or recovery
-            or vendor_records or sent_in_scope
+            or vendor_records or sent_in_scope or coverage_stale
         )
 
     def check(
@@ -1578,6 +1578,10 @@ class Watcher:
                 and not self._retry_due(recovery_state.next_retry_at, checked_at)
             ):
                 return self.recovery_backoff_result(recovery_state)
+        if not dry_run and not gated_allowed and recorded_identity is not None:
+            from .reconcile import observe
+
+            observe(self, recorded_identity, False, "not_polled", datetime.now(UTC))
         pending_current_identity = (
             recorded_identity is not None
             and self.store.has_current_pending_mailbox_work(
@@ -1636,7 +1640,19 @@ class Watcher:
                 except GmailError:
                     raise catalog_error from None
                 raise
+            coverage_stale = False
+            if gated_allowed:
+                from .reconcile import observe
+                from .reconcile_state import ReconcileState
+
+                reconcile_state = (
+                    ReconcileState(self.store, (
+                        self.mailbox.provider, self.mailbox.account_id, mailbox_identity_key))
+                    if dry_run else observe(
+                        self, mailbox_identity_key, True, sent_scope, datetime.now(UTC)))
+                coverage_stale = reconcile_state.stale()
             if not self._has_capture_work(
+                coverage_stale=coverage_stale,
                 labels=bool(label_selectors),
                 pending=False,
                 recovery=recovery_state is not None,
@@ -2117,7 +2133,22 @@ class Watcher:
         recovery_incomplete: bool = False,
         recovery_reason: str | None = None,
         recovery_status: GmailRecoveryState | None = None,
+        reconcile_allowed: bool = False,
+        reconcile_label_selectors=(),
+        reconcile_vendor_snapshot=None,
+        sent_scope: str | None = None,
     ) -> dict[str, int | bool | str]:
+        if not dry_run and reconcile_allowed:
+            from .reconcile import run
+
+            added += run(
+                self,
+                mailbox_identity_key,
+                sent_scope,
+                label_selectors=reconcile_label_selectors,
+                vendor_snapshot=reconcile_vendor_snapshot,
+                now=checked_at,
+            )
         summarized, fallback = self._process_pending(
             scope=scope,
             dry_run=dry_run,
@@ -2172,6 +2203,10 @@ class Watcher:
             now=checked_at,
             resolved_scope=sent_scope,
         )
+        if not dry_run:
+            from .reconcile import observe
+
+            observe(self, mailbox_identity_key, gated_allowed, sent_scope, checked_at)
         self._preview_identities: set[tuple[str, str, str, str]] = set()
         # Poll first: a newly admitted vendor reply can follow older retained mail.
         purged = 0
@@ -2216,6 +2251,10 @@ class Watcher:
                     retention_cutoff=recovery_retention_cutoff,
                     mailbox_identity_key=mailbox_identity_key,
                     recovery_status=pending_recovery,
+                    reconcile_allowed=gated_allowed,
+                    sent_scope=sent_scope,
+                    reconcile_label_selectors=label_selectors,
+            reconcile_vendor_snapshot=vendor_snapshot,
                 )
         if self.mailbox.provider == "gmail" and dry_run:
             recovery_state = self.store.gmail_recovery_state(self.mailbox.account_id)
@@ -2345,6 +2384,10 @@ class Watcher:
                     retention_cutoff=retention_cutoff,
                     mailbox_identity_key=mailbox_identity_key,
                     recovery_status=pending_recovery,
+                    reconcile_allowed=gated_allowed,
+                    sent_scope=sent_scope,
+                    reconcile_label_selectors=label_selectors,
+                    reconcile_vendor_snapshot=vendor_snapshot,
                 )
             else:
                 changes = self.gateway.recover_since(self.config.allowlist, since)
@@ -2394,6 +2437,10 @@ class Watcher:
             retention_cutoff=retention_cutoff,
             mailbox_identity_key=mailbox_identity_key,
             dry_run_messages=dry_run_messages,
+            reconcile_allowed=gated_allowed,
+            sent_scope=sent_scope,
+            reconcile_label_selectors=label_selectors,
+                    reconcile_vendor_snapshot=vendor_snapshot,
             recovery_incomplete=recovery_incomplete,
             recovery_reason=recovery_reason,
         )
@@ -2470,76 +2517,139 @@ class Watcher:
                 continue
             if metadata.message_id != provider_message_id:
                 raise RuntimeError("Mailbox metadata identity did not match the change record")
-            admission = match_mailbox_admission(
-                metadata=metadata,
-                provider=self.mailbox.provider,
-                account_id=self.mailbox.account_id,
+            added += self._capture_metadata(
+                metadata,
                 mailbox_identity_key=mailbox_identity_key,
-                exact_senders=self.admission_sender_names,
                 label_selectors=label_selectors,
-                admitted_at=checked_at,
-                folders=folders,
                 gated_allowed=gated_allowed,
-                vendor_index=vendor_snapshot,
-                followed_thread_lookup=(
-                    lambda metadata=metadata: self.store.followed_thread_for_metadata(
-                        provider=self.mailbox.provider,
-                        account_id=self.mailbox.account_id,
-                        mailbox_identity_key=mailbox_identity_key,
-                        thread_id=metadata.thread_id,
-                        rfc_message_id=metadata.rfc_message_id,
-                        reply_ids=metadata.reply_ids,
-                    )
-                )
-                if gated_allowed
-                else None,
+                vendor_snapshot=vendor_snapshot,
+                checked_at=checked_at,
+                retention_cutoff=retention_cutoff,
+                folders=folders,
+                dry_run=dry_run,
+                dry_run_messages=dry_run_messages,
+                metadata_observed_at=metadata_observed_at,
             )
-            if admission is None:
-                continue
-            received_at = _copy_received_within_cutoff(
-                metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
+        return added
+
+    def _capture_metadata(
+        self,
+        metadata,
+        *,
+        mailbox_identity_key,
+        label_selectors,
+        gated_allowed,
+        vendor_snapshot,
+        checked_at,
+        retention_cutoff,
+        folders,
+        dry_run=False,
+        dry_run_messages=None,
+        refresh_known=False,
+        metadata_observed_at=None,
+    ):
+        """Common admission/capture owner for polling and reconcile metadata."""
+        provider_message_id = metadata.message_id
+        metadata_observed_at = metadata_observed_at or datetime.now(UTC)
+        dry_run_messages = dry_run_messages if dry_run_messages is not None else []
+        added = 0
+        if (
+            refresh_known
+            and self.store.reconcile_source(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                provider_message_id,
             )
-            if received_at is None:
-                logger.info(
-                    "Skipping message %s outside the configured retention window",
-                    provider_message_id,
+            is not None
+        ):
+            locations = _admitted_locations(metadata, metadata.labels, folders)
+            if (
+                not locations
+                or _copy_received_within_cutoff(
+                    metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
                 )
-                continue
-            values = {
-                "message_id": scoped_message_id(
-                    self.mailbox.provider,
-                    self.mailbox.account_id,
-                    metadata.message_id,
-                    mailbox_identity_key,
-                ),
-                "provider": self.mailbox.provider,
-                "account_id": self.mailbox.account_id,
-                "provider_message_id": metadata.message_id,
-                "thread_id": metadata.thread_id,
-                "sender": metadata.sender,
-                "sender_name": metadata.sender_name or self.sender_names.get(metadata.sender),
-                "subject": metadata.subject,
-                "received_at": received_at.isoformat(),
-                "mailbox_identity_key": mailbox_identity_key,
-            }
-            if dry_run:
-                if self._preview_candidate(
-                    metadata, values, mailbox_identity_key, dry_run_messages
-                ):
-                    added += 1
-            elif self.store.add_message(
-                **values,
-                admission=admission.provenance(),
-                rfc_message_id=metadata.rfc_message_id,
-                reply_ids=metadata.reply_ids,
-                to=metadata.to,
-                cc=metadata.cc,
-                locations=_admitted_locations(metadata, metadata.labels, folders),
-                capture_timezone=self.config.timezone,
+                is None
+            ):
+                return 0
+            self.store.record_reconcile_headers(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                metadata,
+                locations=locations,
                 observed_at=metadata_observed_at,
                 scope_complete=_scope_complete(folders),
-            ):
+            )
+            return 0
+        admission = match_mailbox_admission(
+            metadata=metadata,
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
+            mailbox_identity_key=mailbox_identity_key,
+            exact_senders=self.admission_sender_names,
+            label_selectors=label_selectors,
+            admitted_at=checked_at,
+            folders=folders,
+            gated_allowed=gated_allowed,
+            vendor_index=vendor_snapshot,
+            followed_thread_lookup=(
+                lambda metadata=metadata: self.store.followed_thread_for_metadata(
+                    provider=self.mailbox.provider,
+                    account_id=self.mailbox.account_id,
+                    mailbox_identity_key=mailbox_identity_key,
+                    thread_id=metadata.thread_id,
+                    rfc_message_id=metadata.rfc_message_id,
+                    reply_ids=metadata.reply_ids,
+                )
+            )
+            if gated_allowed
+            else None,
+        )
+        if admission is None:
+            return 0
+        received_at = _copy_received_within_cutoff(
+            metadata, checked_at=checked_at, retention_cutoff=retention_cutoff
+        )
+        if received_at is None:
+            logger.info(
+                "Skipping message %s outside the configured retention window",
+                provider_message_id,
+            )
+            return 0
+        values = {
+            "message_id": scoped_message_id(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                metadata.message_id,
+                mailbox_identity_key,
+            ),
+            "provider": self.mailbox.provider,
+            "account_id": self.mailbox.account_id,
+            "provider_message_id": metadata.message_id,
+            "thread_id": metadata.thread_id,
+            "sender": metadata.sender,
+            "sender_name": metadata.sender_name or self.sender_names.get(metadata.sender),
+            "subject": metadata.subject,
+            "received_at": received_at.isoformat(),
+            "mailbox_identity_key": mailbox_identity_key,
+        }
+        if dry_run:
+            if self._preview_candidate(metadata, values, mailbox_identity_key, dry_run_messages):
                 added += 1
+        elif self.store.add_message(
+            **values,
+            admission=admission.provenance(),
+            rfc_message_id=metadata.rfc_message_id,
+            reply_ids=metadata.reply_ids,
+            to=metadata.to,
+            cc=metadata.cc,
+            locations=_admitted_locations(metadata, metadata.labels, folders),
+            capture_timezone=self.config.timezone,
+            observed_at=metadata_observed_at,
+            scope_complete=_scope_complete(folders),
+        ):
+            added += 1
         return added
 
     def _preview_candidate(
