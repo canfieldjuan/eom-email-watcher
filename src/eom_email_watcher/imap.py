@@ -754,6 +754,30 @@ def _optional_headers(payload: bytes | None, bound: int) -> bytes | None:
     return payload
 
 
+@contextlib.contextmanager
+def _message_parse_boundary(
+    *,
+    complexity_code: Literal[
+        "imap_headers_too_complex", "imap_mime_too_complex", "imap_message_invalid"
+    ] = "imap_headers_too_complex",
+) -> Iterator[None]:
+    """Translate malformed-message errors across parsing and lazy header access.
+
+    Parsing alone is insufficient: the email package also parses on get/str,
+    MIME traversal and serialization. Keep those reads inside this boundary.
+    """
+    try:
+        yield
+    except RecursionError as exc:
+        raise MailboxMessageInvalid(
+            complexity_code, "Message exceeds the safe complexity limit"
+        ) from exc
+    except (HeaderParseError, IndexError, TypeError, UnicodeError, ValueError) as exc:
+        raise MailboxMessageInvalid(
+            "imap_message_invalid", "Message headers or content are invalid"
+        ) from exc
+
+
 def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
     """Return In-Reply-To then oldest-first References ids; empty if unusable.
 
@@ -762,9 +786,10 @@ def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
     if payload is None:
         return ()
     try:
-        parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
-        return reply_ids_from_headers(parsed.get("In-Reply-To"), parsed.get("References"))
-    except (RecursionError, ValueError, TypeError, IndexError):
+        with _message_parse_boundary():
+            parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
+            return reply_ids_from_headers(parsed.get("In-Reply-To"), parsed.get("References"))
+    except MailboxMessageInvalid:
         return ()
 
 
@@ -1297,11 +1322,9 @@ def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
 
 def _decoded_section(payload: bytes, transfer_encoding: str) -> bytes:
     synthetic = f"Content-Transfer-Encoding: {transfer_encoding}\r\n\r\n".encode("ascii") + payload
-    try:
+    with _message_parse_boundary(complexity_code="imap_message_invalid"):
         parsed = BytesParser(policy=policy.default).parsebytes(synthetic)
         decoded = parsed.get_payload(decode=True)
-    except (RecursionError, TypeError, ValueError) as exc:
-        raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid") from exc
     if not isinstance(decoded, bytes):
         raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid")
     return decoded
@@ -1309,14 +1332,10 @@ def _decoded_section(payload: bytes, transfer_encoding: str) -> bytes:
 
 def _multipart_attachment_prefix(headers: bytes, expected_media_type: str) -> bytes:
     normalized = headers.rstrip(b"\r\n") + b"\r\n\r\n"
-    try:
+    with _message_parse_boundary(complexity_code="imap_message_invalid"):
         parsed = BytesParser(policy=policy.default).parsebytes(normalized, headersonly=True)
         content_type = parsed.get_content_type().casefold()
         boundary = parsed.get_boundary()
-    except (HeaderParseError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
-        raise MailboxMessageInvalid(
-            "imap_message_invalid", "Message attachment headers are invalid"
-        ) from exc
     if content_type != expected_media_type or not boundary:
         raise MailboxMessageInvalid(
             "imap_message_invalid", "Message attachment headers are invalid"
@@ -1353,19 +1372,15 @@ def _part_text(part: Message) -> str:
 
 
 def _attachment_payload(part: Message) -> bytes:
-    decoded = part.get_payload(decode=True)
-    if isinstance(decoded, bytes):
-        return decoded
-    nested = part.get_payload()
-    if isinstance(nested, list):
-        try:
+    with _message_parse_boundary(complexity_code="imap_mime_too_complex"):
+        decoded = part.get_payload(decode=True)
+        if isinstance(decoded, bytes):
+            return decoded
+        nested = part.get_payload()
+        if isinstance(nested, list):
             if part.get_content_maintype() == "multipart":
                 return part.as_bytes(policy=policy.default)
             return b"\r\n".join(item.as_bytes(policy=policy.default) for item in nested)
-        except RecursionError as exc:
-            raise MailboxMessageInvalid(
-                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
-            ) from exc
     return b""
 
 
@@ -1393,7 +1408,7 @@ def _content_and_attachment_payloads(
     attachment_payloads: list[bytes] = []
     attachment_filename_bytes = 0
 
-    try:
+    with _message_parse_boundary(complexity_code="imap_mime_too_complex"):
         _validate_mime_tree(message)
         pending: list[tuple[Message, int, bool]] = [(message, 0, True)]
         visited = 0
@@ -1442,10 +1457,6 @@ def _content_and_attachment_payloads(
                 plain.append(_part_text(part))
             elif part.get_content_type() == "text/html":
                 html.append(html_to_text(_part_text(part)))
-    except RecursionError as exc:
-        raise MailboxMessageInvalid(
-            "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
-        ) from exc
     selected = "\n\n".join(plain if plain else html)
     body, body_source_chars = bounded_body_text(selected, body_char_limit)
     names = tuple(dict.fromkeys(item.filename for item in attachments))
@@ -2189,21 +2200,24 @@ class ImapGateway:
                                 "imap_protocol_error", "Mail server reply header fetch failed"
                             )
                         try:
-                            _, headers = _header_literals(response)
-                            core = _optional_headers(headers[CORE_HEADER_FIELDS], MAX_HEADER_BYTES)
-                            parsed = BytesParser(policy=policy.default).parsebytes(
-                                core or b"", headersonly=True
-                            )
-                            ids = (
-                                normalize_message_id(str(parsed.get("Message-ID", ""))),
-                                *_reply_ids(
-                                    _optional_headers(
-                                        headers.get(REPLY_HEADER_FIELDS), MAX_REPLY_HEADER_BYTES
-                                    )
-                                ),
-                            )
-                            matches = bool(set(ids) & set(unit["ids"]))
-                        except MailboxMessageUnavailable:
+                            with _message_parse_boundary():
+                                _, headers = _header_literals(response)
+                                core = _optional_headers(
+                                    headers[CORE_HEADER_FIELDS], MAX_HEADER_BYTES
+                                )
+                                parsed = BytesParser(policy=policy.default).parsebytes(
+                                    core or b"", headersonly=True
+                                )
+                                ids = (
+                                    normalize_message_id(str(parsed.get("Message-ID", ""))),
+                                    *_reply_ids(
+                                        _optional_headers(
+                                            headers.get(REPLY_HEADER_FIELDS), MAX_REPLY_HEADER_BYTES
+                                        )
+                                    ),
+                                )
+                                matches = bool(set(ids) & set(unit["ids"]))
+                        except (MailboxMessageUnavailable, MailboxMessageInvalid):
                             matches = False
                     if page["fallback"] and "addresses" in unit:
                         status, response = client.uid(
@@ -2232,15 +2246,16 @@ class ImapGateway:
                             if header is None:
                                 continue
                             try:
-                                parsed = BytesParser(policy=policy.default).parsebytes(
-                                    header, headersonly=True
-                                )
-                                addresses = (
-                                    normalize_address(str(parsed.get("From", ""))),
-                                    *recipient_addresses(str(parsed.get("To", ""))),
-                                    *recipient_addresses(str(parsed.get("Cc", ""))),
-                                )
-                            except RecursionError:
+                                with _message_parse_boundary():
+                                    parsed = BytesParser(policy=policy.default).parsebytes(
+                                        header, headersonly=True
+                                    )
+                                    addresses = (
+                                        normalize_address(str(parsed.get("From", ""))),
+                                        *recipient_addresses(str(parsed.get("To", ""))),
+                                        *recipient_addresses(str(parsed.get("Cc", ""))),
+                                    )
+                            except MailboxMessageInvalid:
                                 continue
                             matches = any(selection.vendor_of(a) for a in addresses)
                             break
@@ -2285,7 +2300,7 @@ class ImapGateway:
             reply_payload = _optional_headers(
                 items.get(REPLY_HEADER_FIELDS), MAX_REPLY_HEADER_BYTES
             )
-        try:
+        with _message_parse_boundary():
             parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
             raw_from = str(parsed.get("From", ""))
             sender_name, _address = parseaddr(raw_from)
@@ -2297,25 +2312,21 @@ class ImapGateway:
                 if recipient_payload is not None
                 else None
             )
-        except RecursionError as exc:
-            raise MailboxMessageInvalid(
-                "imap_headers_too_complex", "Message headers exceed the safe complexity limit"
-            ) from exc
-        sent_copy = message_id.startswith(SENT_MESSAGE_ID_PREFIX)
-        return MessageMetadata(
-            message_id=message_id,
-            thread_id=thread_id,
-            sender=normalize_address(raw_from),
-            sender_name=sender_name.strip() or None,
-            subject=subject,
-            received_at=_message_date(metadata, parsed),
-            labels=frozenset() if sent_copy else frozenset({"INBOX"}),
-            rfc_message_id=normalize_message_id(thread_id),
-            reply_ids=reply_ids,
-            to=recipient_addresses(str(recipients.get("To", "")) if recipients else ""),
-            cc=recipient_addresses(str(recipients.get("Cc", "")) if recipients else ""),
-            locations=frozenset({SENT_LOCATION if sent_copy else INBOX_LOCATION}),
-        )
+            sent_copy = message_id.startswith(SENT_MESSAGE_ID_PREFIX)
+            return MessageMetadata(
+                message_id=message_id,
+                thread_id=thread_id,
+                sender=normalize_address(raw_from),
+                sender_name=sender_name.strip() or None,
+                subject=subject,
+                received_at=_message_date(metadata, parsed),
+                labels=frozenset() if sent_copy else frozenset({"INBOX"}),
+                rfc_message_id=normalize_message_id(thread_id),
+                reply_ids=reply_ids,
+                to=recipient_addresses(str(recipients.get("To", "")) if recipients else ""),
+                cc=recipient_addresses(str(recipients.get("Cc", "")) if recipients else ""),
+                locations=frozenset({SENT_LOCATION if sent_copy else INBOX_LOCATION}),
+            )
 
     @staticmethod
     def _catalog(
