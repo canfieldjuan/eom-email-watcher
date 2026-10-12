@@ -19,7 +19,7 @@ import {
   type AutomationDecisionResult,
 } from "./automationDecision";
 import { automationOutcomeIdentity, automationOutcomeStatus } from "./automationOutcome";
-import { inboxActionState } from "./inboxActionState";
+import { hasInboxAutomationConfirmation, inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import { mailAccountDetail } from "./mailAccountDetail";
@@ -1707,13 +1707,21 @@ function renderInbox(items: InboxItem[]): void {
 
     const details = document.createElement("div");
     details.className = "message-details";
+    const automationStates = item.attachments.flatMap((attachment) => (attachment.automation_fires ?? []).map((fire) => fire?.state));
+    const awaitingAutomationConfirmation = hasInboxAutomationConfirmation(automationStates);
+    if (awaitingAutomationConfirmation) {
+      const confirmation = document.createElement("p");
+      confirmation.textContent = "Confirmation required. Review the attachment details below.";
+      confirmation.dataset.label = "Automation";
+      details.append(confirmation);
+    }
     if (item.action_required !== null) {
       const action = document.createElement("p");
       action.textContent =
         item.action_required === 1
           ? item.suggested_action || "Review this message."
           : "No action required.";
-      action.dataset.label = "Action required";
+      action.dataset.label = awaitingAutomationConfirmation ? "Email action" : "Action required";
       details.append(action);
     }
     const deadlineValue = item.deadline_text || item.deadline_iso;
@@ -2348,7 +2356,7 @@ function renderInbox(items: InboxItem[]): void {
       rowBadges.append(partial);
     }
     const actionState = inboxActionState(
-      item.attachments.flatMap((attachment) => (attachment.automation_fires ?? []).map((fire) => fire?.state)),
+      automationStates,
       item.attachments.flatMap((attachment) => (attachment.capability_results ?? []).map((result) => result?.status)),
       item.calendar_proposal ? {
         state: item.calendar_proposal.state,

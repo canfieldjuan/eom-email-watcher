@@ -102,3 +102,23 @@ exact-head review and required CI remain merge gates.
   at desktop and narrow widths. This is source presentation verification,
   not a new installed/native-IPC proof.
 - Cold diff and gap audits; CI and independent review of the published head.
+
+## Implementation verification
+
+- Contract-only commit: `8615ac5`; production code was still unchanged.
+- Fail-first production rendering test: failed with missing Automation cue and
+  original Action required label, exactly the expected assertion failure.
+- Origin fix: the existing `inboxActionState.ts` fire ranking now exposes the
+  attachment-only pending predicate. The details and header consume one derived
+  attachment state list. No downstream consent or queue patch was added.
+- Focused action-state, decision and admission tests: 25 passed, zero failed.
+  These execute the actual details-rendering segment with a minimal DOM.
+- `pnpm --dir desktop build`: TypeScript and Vite passed.
+- Source preview generated with the real state owner, details segment and CSS.
+  Browser screenshot check was blocked by the browser URL security policy for
+  local files; no workaround attempted. Desktop/narrow layout is unverified.
+- Python/Rust broad suites left to required CI; this diff changes no engine,
+  native code, dependencies, schemas or runtime configuration.
+- Cold diff audit found only the contract, existing state owner, details render
+  and its behavioral tests. Independent exact-head review and required CI are
+  pending before merge. This is source work, with no installed product update.
