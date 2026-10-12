@@ -436,17 +436,28 @@ def test_follow_lookup_survives_concurrent_vendor_delete(tmp_path, monkeypatch):
     store.add_vendor_address(vendor, "vendor@example.com")
     seed(store)
     source = store.message_source("m")
-    original = db_module._thread_member
+    import sqlite3
+    from contextlib import contextmanager
+
+    connection = store.connection
     deleted = []
 
-    def delete_between_reads(db, row, owner):
-        result = original(db, row, owner)
-        if not deleted:
-            deleted.append(True)
-            Store(store.path).delete_vendor(vendor)
-        return result
+    @contextmanager
+    def observe():
+        with connection() as db:
 
-    monkeypatch.setattr(db_module, "_thread_member", delete_between_reads)
+            def row_factory(cursor, values):
+                row = sqlite3.Row(cursor, values)
+                columns = {c[0] for c in cursor.description}
+                if "display_name" in columns and "vendor_id" in columns and not deleted:
+                    deleted.append(True)
+                    Store(store.path).delete_vendor(vendor)
+                return row
+
+            db.row_factory = row_factory
+            yield db
+
+    monkeypatch.setattr(store, "connection", observe)
     lookup = store.followed_thread_for_metadata(
         provider="gmail",
         account_id="mailbox",
@@ -464,3 +475,118 @@ def test_follow_lookup_survives_concurrent_vendor_delete(tmp_path, monkeypatch):
         )
         is None
     )
+
+
+@pytest.mark.parametrize("table", ["message_derived", "thread_watermarks"])
+def test_partial_cleanup_has_bounded_sqlite_work(tmp_path, monkeypatch, table):
+    from contextlib import contextmanager
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    for i in range(80):
+        seed(store, f"m{i}", thread_id=f"t{i}")
+    with store.connection() as db:
+        db.execute(
+            "INSERT INTO thread_watermarks SELECT provider,account_id,"
+            "mailbox_identity_key,thread_key,? FROM thread_follow",
+            (STAMP,),
+        )
+    connection = store.connection
+    steps = []
+
+    @contextmanager
+    def observe():
+        with connection() as db:
+            active = False
+
+            def count():
+                if active:
+                    steps.append(True)
+                return 0
+
+            def trace(sql):
+                nonlocal active
+                active = sql.lstrip().startswith(f"DELETE FROM {table} WHERE")
+
+            db.set_progress_handler(count, 1)
+            db.set_trace_callback(trace)
+            yield db
+
+    monkeypatch.setattr(store, "connection", observe)
+    seed(store, "new", thread_id="t0")
+    assert len(steps) < 200, f"{table}: {len(steps)} SQLite steps"
+
+
+def test_read_only_connection_creates_no_temp_tracking_objects(tmp_path):
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    seed(store)
+    with store.connection() as db:
+        assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM sqlite_temp_master").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("provider", ["gmail", "microsoft365", "imap"])
+def test_follow_lookup_reads_cache_without_materializing_messages(tmp_path, monkeypatch, provider):
+    import sqlite3
+    from contextlib import contextmanager
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    for i in range(12):
+        seed(store, f"m{i}", provider=provider, rfc_message_id="root@example.com")
+    source = store.message_source("m0")
+    connection = store.connection
+    messages = []
+
+    @contextmanager
+    def observe():
+        with connection() as db:
+
+            def row_factory(cursor, values):
+                if "message_id" in [c[0] for c in cursor.description]:
+                    messages.append(values)
+                return sqlite3.Row(cursor, values)
+
+            db.row_factory = row_factory
+            yield db
+
+    monkeypatch.setattr(store, "connection", observe)
+    lookup = store.followed_thread_for_metadata(
+        provider=provider,
+        account_id="mailbox",
+        mailbox_identity_key=source.mailbox_identity_key,
+        thread_id="thread",
+        rfc_message_id="reply@example.com",
+        reply_ids=("root@example.com",),
+    )
+    assert lookup is not None and lookup[1] == "Vendor"
+    assert messages == [], f"materialized {len(messages)} message rows"
+
+
+@pytest.mark.parametrize("through_cursor", [False, True])
+def test_lazy_trackers_cover_commented_cte_and_executemany_writes(tmp_path, through_cursor):
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    seed(store)
+    with store.connection() as db:
+        writer = db.cursor() if through_cursor else db
+        writer.execute(
+            "-- input write behind a CTE\nWITH selected AS (SELECT 'm' AS id) "
+            "UPDATE messages SET sender='unknown@example.com' "
+            "WHERE message_id IN (SELECT id FROM selected)"
+        )
+    assert derived(store)["vendor_id"] is None
+    with store.connection() as db:
+        writer = db.cursor() if through_cursor else db
+        writer.executemany(
+            "UPDATE messages SET sender=? WHERE message_id=?", iter((("vendor@example.com", "m"),))
+        )
+    assert derived(store)["vendor_id"] == vendor
+    assert follow(store)[0]["followed"] == 1

@@ -13,6 +13,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -4078,6 +4079,7 @@ def _imap_thread_key(
     *,
     scope: tuple[str, str, str],
     ids: tuple[str, ...],
+    cached_rank: bool = False,
 ) -> tuple[str, tuple[str, ...]]:
     """Return (thread key, components to merge into it) for an IMAP message's ids.
 
@@ -4100,6 +4102,13 @@ def _imap_thread_key(
         return str(uuid.uuid4()), ()
 
     def rank(key: str) -> tuple[int, str]:
+        if cached_rank:
+            row = db.execute(
+                "SELECT canonical_source_identity FROM thread_follow WHERE provider=? "
+                "AND account_id=? AND mailbox_identity_key=? AND thread_key=?",
+                (*scope, key),
+            ).fetchone()
+            return (0, str(row[0])) if row is not None else (1, key)
         # Canonical order (contract D-identity): a logical message sorts by the
         # smallest source identity across every recorded location.
         smallest = db.execute(
@@ -5493,6 +5502,8 @@ THREAD_DERIVED_SCHEMA = (
         provider TEXT NOT NULL, account_id TEXT NOT NULL,
         mailbox_identity_key TEXT NOT NULL, thread_key TEXT NOT NULL,
         followed INTEGER NOT NULL CHECK(followed IN (0, 1)), owner_vendor_id TEXT,
+        owner_received_epoch REAL, owner_source_identity TEXT,
+        canonical_source_identity TEXT NOT NULL,
         PRIMARY KEY(provider, account_id, mailbox_identity_key, thread_key),
         CHECK((followed = 0) = (owner_vendor_id IS NULL)))""",
     """CREATE TABLE IF NOT EXISTS thread_watermarks (
@@ -5554,9 +5565,10 @@ def _thread_member(
     newest = max((stamp for stamp in timestamps if stamp is not None), default=float("inf"))
     return newest, min(source.provider_message_id for source in unit.sources), vendor
 
-def _follow_owner(members: Iterable[tuple[float, str, str | None]]) -> str | None:
-    attributed = sorted(member for member in members if member[2] is not None)
-    return attributed[0][2] if attributed else None
+def _follow_owner(
+    members: Iterable[tuple[float, str, str | None]],
+) -> tuple[float, str, str | None] | None:
+    return min((member for member in members if member[2] is not None), default=None)
 
 def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
     """D-derived's sole owner: local work before the input transaction commits."""
@@ -5611,10 +5623,16 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
         condition = ""
     rows = db.execute(f"""SELECT m.*, {_effective_message_identity_sql("m")} AS identity
         FROM logical_messages m {condition}""").fetchall()
-    db.execute(
-        "DELETE FROM message_derived WHERE message_id NOT IN "
-        "(SELECT message_id FROM logical_messages)"
-    )
+    if full:
+        db.execute(
+            "DELETE FROM message_derived WHERE message_id NOT IN "
+            "(SELECT message_id FROM logical_messages)"
+        )
+    else:
+        db.execute("""DELETE FROM message_derived WHERE
+            message_id IN (SELECT message_id FROM derived_changed_messages)
+            AND NOT EXISTS (SELECT 1 FROM logical_messages m
+                WHERE m.message_id=message_derived.message_id)""")
     groups: dict[tuple[str, str, str, str], list[tuple[float, str, str | None]]] = {}
     for row in rows:
         message_id = str(row["message_id"])
@@ -5679,18 +5697,71 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
                 scope,
             )
     for scope, members in groups.items():
-        owner = _follow_owner(members)
+        winner = _follow_owner(members)
+        owner = winner[2] if winner is not None else None
         db.execute(
-            """INSERT INTO thread_follow VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO thread_follow VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider,account_id,mailbox_identity_key,thread_key)
-            DO UPDATE SET followed=excluded.followed, owner_vendor_id=excluded.owner_vendor_id""",
-            (*scope, int(owner is not None), owner),
+            DO UPDATE SET followed=excluded.followed, owner_vendor_id=excluded.owner_vendor_id,
+                owner_received_epoch=excluded.owner_received_epoch,
+                owner_source_identity=excluded.owner_source_identity,
+                canonical_source_identity=excluded.canonical_source_identity""",
+            (*scope, int(owner is not None), owner,
+             winner[0] if winner else None, winner[1] if winner else None,
+             min(member[1] for member in members)),
         )
-    db.execute("""DELETE FROM thread_watermarks WHERE NOT EXISTS (
+    watermark_scope = "" if full else """(
+        provider,account_id,mailbox_identity_key,thread_key) IN (
+        SELECT provider,account_id,identity,thread_key FROM derived_changed_threads) AND """
+    db.execute("DELETE FROM thread_watermarks WHERE " + watermark_scope + """NOT EXISTS (
         SELECT 1 FROM thread_follow f WHERE f.provider=thread_watermarks.provider
         AND f.account_id=thread_watermarks.account_id
         AND f.mailbox_identity_key=thread_watermarks.mailbox_identity_key
         AND f.thread_key=thread_watermarks.thread_key AND f.followed=1)""")
+
+class _DerivedCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        self.connection._prepare_derived_write(sql, parameters)
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters):
+        items = iter(parameters)
+        try:
+            first = next(items)
+        except StopIteration:
+            return super().executemany(sql, ())
+        self.connection._prepare_derived_write(sql, first)
+        return super().executemany(sql, chain((first,), items))
+
+
+class _DerivedConnection(sqlite3.Connection):
+    _derived_enabled = False
+    _derived_ready = False
+    _derived_input_seen = False
+
+    def _prepare_derived_write(self, sql, parameters):
+        if not self._derived_enabled or self._derived_ready:
+            return
+        # EXPLAIN itself is read-only. For all other statements SQLite's own
+        # compiler/authorizer detects input writes, including CTEs and triggers.
+        if sql.lstrip().upper().startswith("EXPLAIN "):
+            return
+        probe = sqlite3.Connection.cursor(self)
+        probe.execute("EXPLAIN " + sql, parameters)
+        probe.close()
+        if self._derived_input_seen:
+            self._derived_ready = True
+            _track_derived_rows(self)
+
+    def cursor(self, factory=_DerivedCursor):
+        return super().cursor(factory)
+
+    def execute(self, sql, parameters=()):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, parameters):
+        return self.cursor().executemany(sql, parameters)
+
 
 class Store:
     def __init__(self, path: Path):
@@ -5699,7 +5770,7 @@ class Store:
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         with database_admission():
-            connection = sqlite3.connect(self.path)
+            connection = sqlite3.connect(self.path, factory=_DerivedConnection)
             try:
                 connection.execute("PRAGMA recursive_triggers = ON")
                 connection.row_factory = sqlite3.Row
@@ -5722,7 +5793,6 @@ class Store:
                     _message_suppression_key,
                     deterministic=True,
                 )
-                _track_derived_rows(connection)
                 changed: set[str] = set()
 
                 def track_inputs(action, table, column, database, trigger):
@@ -5737,9 +5807,11 @@ class Store:
                         )
                     ):
                         changed.add(table)
+                        connection._derived_input_seen = True
                     return sqlite3.SQLITE_OK
 
                 connection.set_authorizer(track_inputs)
+                connection._derived_enabled = True
                 yield connection
                 _recompute_derived(connection, frozenset(changed))
             except Exception:
@@ -9651,7 +9723,7 @@ class Store:
             scope = (provider, account_id, mailbox_identity_key)
             if provider == "imap":
                 ids = tuple(dict.fromkeys(i for i in (rfc_message_id, *reply_ids) if i is not None))
-                key, merged = _imap_thread_key(db, scope=scope, ids=ids)
+                key, merged = _imap_thread_key(db, scope=scope, ids=ids, cached_rank=True)
                 keys = (key, *merged)
             elif thread_id is not None:
                 key = _provider_thread_key(thread_id)
@@ -9660,19 +9732,20 @@ class Store:
                 return None
             marks = ",".join("?" for _ in keys)
             rows = db.execute(
-                f"""SELECT m.*, v.vendor_id, v.display_name AS vendor_display_name
-                    FROM logical_messages m
-                    JOIN message_derived d ON d.message_id=m.message_id
-                    LEFT JOIN vendors v ON v.vendor_id=d.vendor_id
-                    WHERE m.provider=? AND m.account_id=?
-                    AND {_effective_message_identity_sql("m")}=?
-                    AND m.thread_key IN ({marks})""",
+                f"""SELECT f.owner_received_epoch, f.owner_source_identity,
+                    v.vendor_id, v.display_name FROM thread_follow f
+                    JOIN vendors v ON v.vendor_id=f.owner_vendor_id
+                    WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
+                    AND f.thread_key IN ({marks}) AND f.followed=1""",
                 (*scope, *keys),
             ).fetchall()
-            owner = _follow_owner(_thread_member(db, row, row["vendor_id"]) for row in rows)
-            if owner is None:
+            winner = _follow_owner(
+                (row["owner_received_epoch"], row["owner_source_identity"], row["vendor_id"])
+                for row in rows
+            )
+            if winner is None:
                 return None
-            name = next(row["vendor_display_name"] for row in rows if row["vendor_id"] == owner)
+            name = next(row["display_name"] for row in rows if row["vendor_id"] == winner[2])
             return (key, str(name))
 
     def create_vendor(self, display_name: str, *, now: datetime | None = None) -> str:

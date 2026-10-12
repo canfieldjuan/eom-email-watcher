@@ -148,7 +148,7 @@ def test_connection_close_precedes_lease_release(paired_deployment, monkeypatch,
         def close(self):
             events.append("close")
 
-    monkeypatch.setattr(db.sqlite3, "connect", lambda _: Connection())
+    monkeypatch.setattr(db.sqlite3, "connect", lambda _, **kwargs: Connection())
     original = deployment.deployment_lease
     from contextlib import contextmanager
 
