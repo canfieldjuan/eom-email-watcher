@@ -17,6 +17,8 @@ SOURCES = (
     "desktop/src-tauri/windows/cutover.ps1",
     "scripts/build_desktop_sidecar.py",
     "packaging/engine_entry.py",
+    "scripts/windows_installer_template.py",
+    "desktop/src-tauri/tauri.windows.conf.json",
 )
 
 

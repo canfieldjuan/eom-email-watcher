@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][ValidateSet('Name','Pre','Post','Restore')][string]$Phase,
     [Parameter(Mandatory=$true)][string]$InstallRoot,
     [int]$InstallerPid = 0,
-    [long]$InstallerStarted = 0
+    [long]$InstallerStarted = 0,
+    [string]$ProgramCatalog = ''
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
@@ -29,9 +30,75 @@ $receipt = Join-Path $root 'windows-source-cutover-v1.json'
 $pending = Join-Path $root 'windows-cutover-pending-v1.json'
 $restoreScript = Join-Path $root 'windows-cutover-restore-v1.ps1'
 $restoreReady = Join-Path $root 'windows-cutover-restore-ready-v1'
+$installedCatalog = Join-Path $root 'windows-package-files-v1.txt'
+function Resolve-ExecutablePath([string]$path, [string]$context = 'path') {
+    try {
+        if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+        $value = [Environment]::ExpandEnvironmentVariables($path.Trim())
+        if ($value.StartsWith('"') -and $value.EndsWith('"')) {
+            $value = $value.Substring(1, $value.Length - 2).Trim()
+        }
+        if (![IO.Path]::IsPathRooted($value) -or $value -match '%[^%]+%') {
+            throw 'Unresolved executable path'
+        }
+        return [IO.Path]::GetFullPath($value)
+    } catch { Write-Warning ("Ignoring unresolvable $context path '$path': " + $_.Exception.Message); return $null }
+}
 function Is-InstalledPath([string]$path) {
-    if (!$path) { return $false }
-    return [IO.Path]::GetFullPath($path).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    return $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+}
+function Read-PackagePrograms([string]$catalog) {
+    if (!(Test-Path -LiteralPath $catalog -PathType Leaf) -or
+        ((Get-Item -LiteralPath $catalog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Package program catalog is missing or unsafe'
+    }
+    $lines = [IO.File]::ReadAllLines($catalog, [Text.Encoding]::Unicode)
+    if (!$lines.Length -or $lines[0] -ne 'EW-PACKAGE-FILES-V1') { throw 'Invalid package program catalog' }
+    foreach ($entry in $lines | Select-Object -Skip 1) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        if ([IO.Path]::IsPathRooted($entry)) { throw 'Package path must be relative' }
+        $full = [IO.Path]::GetFullPath((Join-Path $root $entry))
+        if (!(Is-InstalledPath $full)) { throw 'Package path escapes installation' }
+        if ([IO.Path]::GetExtension($full) -ieq '.exe') { $full }
+    }
+}
+function Load-OwnedPrograms {
+    $set = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in @(Read-PackagePrograms $ProgramCatalog)) { $set.Add($path) | Out-Null }
+    if (!$set.Count) { throw 'Package has no executable programs' }
+    # Keep previously shipped programs during an update, bound to the last receipt.
+    if ((Test-Path -LiteralPath $installedCatalog) -and (Test-Path -LiteralPath $receipt)) {
+        $previous = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+        if ($previous.program_catalog_sha256 -and
+            (Get-FileHash -LiteralPath $installedCatalog -Algorithm SHA256).Hash -ieq $previous.program_catalog_sha256) {
+            foreach ($path in @(Read-PackagePrograms $installedCatalog)) { $set.Add($path) | Out-Null }
+        }
+    }
+    return ,$set
+}
+function Assert-OwnedImage([string]$path) {
+    if (!(Is-InstalledPath $path) -or !$ownedPrograms.Contains($path)) {
+        throw ("Unknown installation image: " + $path)
+    }
+}
+function Task-Enabled($task) {
+    $scheduler = New-Object -ComObject Schedule.Service
+    $scheduler.Connect()
+    return [bool]$scheduler.GetFolder($task.TaskPath).GetTask($task.TaskName).Enabled
+}
+function Start-RestorationOwner {
+    if ($InstallerPid -le 0) { throw 'An installer handle is required to restore scheduled tasks' }
+    $installer = Get-Process -Id $InstallerPid
+    $started = $installer.StartTime.ToUniversalTime().Ticks
+    Copy-Item -LiteralPath $PSCommandPath -Destination $restoreScript -Force
+    if (Test-Path -LiteralPath $restoreReady) { Remove-Item -LiteralPath $restoreReady }
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "' + $restoreScript + '" -Phase Restore -InstallRoot "' + $root + '" -InstallerPid ' + $InstallerPid + ' -InstallerStarted ' + $started
+    $worker = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (!(Test-Path -LiteralPath $restoreReady)) {
+        if ($worker.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw 'Task-restoration owner did not become ready' }
+        Start-Sleep -Milliseconds 50
+    }
 }
 function Restore-Tasks {
     if (Test-Path -LiteralPath $pending) {
@@ -97,70 +164,74 @@ public static class CutoverProcess {
 function Installed-Processes {
     foreach ($process in Get-CimInstance Win32_Process) {
         if ($process.ProcessId -eq $InstallerPid) { continue }
-        if (Is-InstalledPath $process.ExecutablePath) { $process }
-        elseif (!$process.ExecutablePath -and $process.Name -in @('eom-mail-engine.exe','eom-email-watcher-desktop.exe')) {
+        $path = Resolve-ExecutablePath $process.ExecutablePath ('process ' + $process.ProcessId)
+        if (Is-InstalledPath $path) { Assert-OwnedImage $path; $process }
+        elseif (!$process.ExecutablePath -and @($ownedPrograms | Where-Object { [IO.Path]::GetFileName($_) -ieq $process.Name }).Count) {
             throw 'Cannot establish the identity of a running Email Watcher process'
         }
     }
 }
 if ($Phase -eq 'Pre') {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
-    foreach ($slot in @($root,$receipt,$pending,$restoreScript,$restoreReady,(Join-Path $root 'windows-source-cutover-v1.tmp'))) {
+    foreach ($slot in @($root,$receipt,$pending,$restoreScript,$restoreReady,$installedCatalog,(Join-Path $root 'windows-source-cutover-v1.tmp'))) {
         if (Test-Path -LiteralPath $slot) {
             $item = Get-Item -LiteralPath $slot -Force
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Installer state cannot be a reparse point' }
         }
     }
+    $ownedPrograms = Load-OwnedPrograms
     Restore-Tasks
     if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt }
     $saved = @()
+    $stage = 'scheduled-task-selection'
+    $targetProcess = 0
     try {
         Write-Output 'Cutover stage=scheduled-task-selection'
+        $selected = @()
         foreach ($task in Get-ScheduledTask) {
-            if (@($task.Actions | Where-Object { Is-InstalledPath $_.Execute }).Count) {
-                foreach ($action in @($task.Actions | Where-Object { Is-InstalledPath $_.Execute })) {
-                    if ([IO.Path]::GetFileName($action.Execute) -notin @('eom-mail-engine.exe','eom-email-watcher-desktop.exe') -or
-                        [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($action.Execute)) -ne $root) {
-                        throw 'A scheduled task points to an unsupported old installation image'
-                    }
+            $matched = $false
+            foreach ($action in $task.Actions) {
+                $path = Resolve-ExecutablePath $action.Execute ('task ' + $task.TaskPath + $task.TaskName)
+                if (Is-InstalledPath $path) {
+                    Assert-OwnedImage $path
+                    $matched = $true
                 }
-                $saved += [pscustomobject]@{TaskName=$task.TaskName;TaskPath=$task.TaskPath;Enabled=($task.State -ne 'Disabled')}
-                # Persist each addition before changing the task, so rollback is durable.
-                ConvertTo-Json -InputObject $saved -Compress | Set-Content -LiteralPath $pending -Encoding UTF8
+            }
+            if ($matched) {
+                $selected += $task
+                $saved += [pscustomobject]@{TaskName=$task.TaskName;TaskPath=$task.TaskPath;Enabled=(Task-Enabled $task)}
+            }
+        }
+        if ($selected.Count) {
+            ConvertTo-Json -InputObject $saved -Compress | Set-Content -LiteralPath $pending -Encoding UTF8
+            Start-RestorationOwner
+            foreach ($task in $selected) {
                 Disable-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName | Out-Null
                 Stop-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName
                 Write-Output ('Cutover disabled task=' + $task.TaskPath + $task.TaskName)
             }
         }
-        if ($saved.Count) {
-            if ($InstallerPid -le 0) { throw 'An installer handle is required to restore scheduled tasks' }
-            $installer = Get-Process -Id $InstallerPid
-            $started = $installer.StartTime.ToUniversalTime().Ticks
-            Copy-Item -LiteralPath $PSCommandPath -Destination $restoreScript -Force
-            if (Test-Path -LiteralPath $restoreReady) { Remove-Item -LiteralPath $restoreReady }
-            $arguments = '-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "' + $restoreScript + '" -Phase Restore -InstallRoot "' + $root + '" -InstallerPid ' + $InstallerPid + ' -InstallerStarted ' + $started
-            $worker = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
-            $deadline = [DateTime]::UtcNow.AddSeconds(10)
-            while (!(Test-Path -LiteralPath $restoreReady)) {
-                if ($worker.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw 'Task-restoration owner did not become ready' }
-                Start-Sleep -Milliseconds 50
-            }
-        }
+        $stage = 'process-stop'
         foreach ($process in @(Installed-Processes)) {
             Write-Output ('Cutover stopping process=' + $process.ProcessId)
+            $targetProcess = $process.ProcessId
             $live = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
             if ($live) {
                 # Open the process handle and validate its live image before Kill;
                 # a recycled PID must never authorize killing an unrelated process.
                 try {
                     $handle = $live.Handle
-                    if (!(Is-InstalledPath ([CutoverProcess]::Image($handle)))) { continue }
+                    $image = Resolve-ExecutablePath ([CutoverProcess]::Image($handle)) 'held process'
+                    if (!(Is-InstalledPath $image)) { continue }
+                    Assert-OwnedImage $image
                     [CutoverProcess]::Stop($handle)
                 } finally { $live.Dispose() }
             }
         }
         if (@(Installed-Processes).Count) { throw 'An old installation is still running' }
     } catch {
+        $failure = $_.Exception.GetBaseException()
+        Write-Output ("Cutover failure-stage=$stage process=$targetProcess code=" + $failure.NativeErrorCode)
         Write-Output ('Cutover failure=' + $_.Exception.Message)
         Restore-Tasks
         Write-Output 'Cutover stage=tasks-restored-after-failure'
@@ -170,10 +241,12 @@ if ($Phase -eq 'Pre') {
 }
 # NSIS executes Post only after every replacement has succeeded. Before then,
 # disabled tasks and stopped desktop producers cannot restart the old image.
+$ownedPrograms = Load-OwnedPrograms
 if (@(Installed-Processes).Count) { throw 'Publication cannot qualify while an installation owner is running' }
 $engine = Join-Path $root 'eom-mail-engine.exe'
 if (!(Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'The installed engine is missing' }
-$record = [ordered]@{version=1;protocol='source-stripe-v1';engine_sha256=(Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()}
+Copy-Item -LiteralPath $ProgramCatalog -Destination $installedCatalog -Force
+$record = [ordered]@{version=1;protocol='source-stripe-v1';engine_sha256=(Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant();program_catalog_sha256=(Get-FileHash -LiteralPath $installedCatalog -Algorithm SHA256).Hash.ToLowerInvariant()}
 $temp = Join-Path $root 'windows-source-cutover-v1.tmp'
 ConvertTo-Json -InputObject $record -Compress | Set-Content -LiteralPath $temp -Encoding UTF8
 Move-Item -LiteralPath $temp -Destination $receipt -Force

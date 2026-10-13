@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from smoke_packaged_engine import _request
+from windows_cutover_parity import installer_manifest
 from windows_cutover_process_fixture import deny_termination
 
 PREDECESSOR = "43a850d8b00cddfdad2a767b7b27fc792707b010"
@@ -223,6 +224,33 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             assert late.returncode != 0 and "newer than supported" in late.stderr
             assert not late_ready.exists() and not posts
         if case == "old-then-new":
+            unknown_image = installation / "not-from-package.exe"
+            shutil.copy2(old_actor, unknown_image)
+            unknown_ready = folder / "unknown.ready"
+            unknown = subprocess.Popen(
+                command(unknown_image, unknown_ready, "idle"), env=environment
+            )
+            try:
+                wait_file(unknown_ready, unknown)
+                refusal = subprocess.run(
+                    [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
+                    capture_output=True,
+                    timeout=240,
+                    env=installer_environment,
+                )
+                (folder / "installer.unknown.stdout").write_bytes(refusal.stdout)
+                (folder / "installer.unknown.stderr").write_bytes(refusal.stderr)
+                assert refusal.returncode != 0, "Unknown image was admitted"
+                assert unknown.poll() is None and first.poll() is None
+                transcripts = "\n".join(
+                    p.read_text(encoding="utf-8-sig", errors="replace")
+                    for p in folder.glob("cutover-*-Pre-*.txt")
+                )
+                assert "Unknown installation image: " + str(unknown_image) in transcripts
+            finally:
+                if unknown.poll() is None:
+                    subprocess.run(["taskkill", "/PID", str(unknown.pid), "/T", "/F"], check=True)
+                unknown.wait(timeout=10)
             # A real installed owner survives the stop attempt. Refusal must
             # leave bytes intact; restoring permissions admits the same update.
             prior_digest = hashlib.sha256(engine.read_bytes()).hexdigest()
@@ -249,6 +277,13 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 }
                 (folder / "installer.refusal.state.json").write_text(json.dumps(observed, indent=2))
                 print("REFUSAL_OBSERVED", json.dumps(observed), flush=True)
+                transcripts = "\n".join(
+                    p.read_text(encoding="utf-8-sig", errors="replace")
+                    for p in folder.glob("cutover-*-Pre-*.txt")
+                )
+                assert f"failure-stage=process-stop process={first.pid} code=5" in transcripts, (
+                    "Refusal was not caused by the protected owner's access-denied stop"
+                )
                 assert refusal.returncode != 0, "Installer accepted an unquiesced owner"
                 assert first.poll() is None, "Protected old owner did not survive"
                 assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
@@ -276,6 +311,36 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             (installation / "windows-source-cutover-v1.json").read_text(encoding="utf-8-sig")
         )
         assert receipt["engine_sha256"] == hashlib.sha256(engine.read_bytes()).hexdigest()
+        installed_catalog = installation / "windows-package-files-v1.txt"
+        assert (
+            receipt["program_catalog_sha256"]
+            == hashlib.sha256(installed_catalog.read_bytes()).hexdigest()
+        )
+        payload = installer_manifest(installer, folder / "package-payload")
+        packaged_programs = {
+            name.replace("\\", "/").casefold()
+            for name in payload
+            if name.casefold().endswith(".exe") and not name.startswith("$PLUGINSDIR/")
+        }
+        catalog_lines = installed_catalog.read_text(encoding="utf-16").splitlines()
+        assert catalog_lines[0] == "EW-PACKAGE-FILES-V1"
+        catalog_programs = {
+            name.replace("\\", "/").casefold()
+            for name in catalog_lines[1:]
+            if name.casefold().endswith(".exe")
+        }
+        (folder / "package-programs.json").write_text(
+            json.dumps(
+                {
+                    "package": sorted(packaged_programs),
+                    "catalog": sorted(catalog_programs),
+                },
+                indent=2,
+            )
+        )
+        assert catalog_programs == packaged_programs, (
+            "Owned programs differ from the actual installer payload"
+        )
         view = _request(
             engine,
             config_path=config,

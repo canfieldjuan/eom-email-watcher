@@ -29,6 +29,7 @@ Var EW_SOURCE_CUTOVER_LOG
   IfFileExists "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" 0 +2
     StrCpy $EW_SOURCE_CUTOVER_PS "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
   !if "${PHASE}" == "Pre"
+    !insertmacro EW_PREPARE_PACKAGE_CATALOG
     ; One name owner in cutover.ps1, shared with the restoration worker.
     nsExec::ExecToStack /TIMEOUT=10000 '"$EW_SOURCE_CUTOVER_PS" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase Name -InstallRoot "$INSTDIR"'
     Pop $0
@@ -50,7 +51,7 @@ Var EW_SOURCE_CUTOVER_LOG
     ${EndIf}
   !endif
   System::Call 'kernel32::GetCurrentProcessId() i.r9'
-  nsExec::ExecToStack /TIMEOUT=120000 '"$EW_SOURCE_CUTOVER_PS" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase ${PHASE} -InstallRoot "$INSTDIR" -InstallerPid $9'
+  nsExec::ExecToStack /TIMEOUT=120000 '"$EW_SOURCE_CUTOVER_PS" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase ${PHASE} -InstallRoot "$INSTDIR" -InstallerPid $9 -ProgramCatalog "$EW_PACKAGE_PROGRAM_CATALOG"'
   Pop $0
   Pop $1
   !insertmacro EW_SOURCE_CUTOVER_RECORD "phase=${PHASE} exit=$0 output=$1"

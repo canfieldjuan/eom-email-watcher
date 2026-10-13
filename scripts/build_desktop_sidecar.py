@@ -394,6 +394,10 @@ def _package_sidecar(
 def main() -> None:
     try:
         output_path = build_sidecar()
+        if sys.platform == "win32":
+            from windows_installer_template import prepare
+
+            prepare(PROJECT_DIRECTORY, BUILD_DIRECTORY)
     except SidecarBuildError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2) from exc

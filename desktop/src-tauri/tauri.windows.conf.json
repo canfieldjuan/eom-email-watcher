@@ -9,7 +9,8 @@
     ],
     "windows": {
       "nsis": {
-        "installerHooks": "windows/hooks.nsh"
+        "installerHooks": "windows/hooks.nsh",
+        "template": "../../.sidecar-build/nsis/installer.nsi"
       }
     }
   }

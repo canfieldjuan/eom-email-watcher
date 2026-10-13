@@ -150,6 +150,7 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/*/*.log
             ${{ runner.temp }}/ew-source-cutover/*/installer.*
             ${{ runner.temp }}/ew-source-cutover/*/cutover-*.txt
+            ${{ runner.temp }}/ew-source-cutover/*/package-programs.json
             ${{ runner.temp }}/ew-source-cutover/native-integration.xml
             ${{ runner.temp }}/ew-source-cutover/full/build-inventory.json
             ${{ runner.temp }}/ew-source-cutover/full/release-sources.json

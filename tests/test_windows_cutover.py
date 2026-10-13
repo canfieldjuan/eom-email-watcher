@@ -11,6 +11,147 @@ from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
 
 
+def test_cutover_normalizes_paths_and_prepares_recovery_before_mutation():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    ).read_text()
+    assert "ExpandEnvironmentVariables" in source, "Raw task paths still reach GetFullPath"
+    pre = source[source.index("if ($Phase -eq 'Pre')") :]
+    assert pre.index("Start-RestorationOwner") < pre.index("Disable-ScheduledTask")
+    assert "$task.State -ne 'Disabled'" not in source
+    assert ".GetTask($task.TaskName).Enabled" in source
+    assert "Assert-OwnedImage" in source
+    assert "failure-stage=" in source
+
+
+def test_installer_catalog_follows_file_entries_including_new_programs():
+    from windows_installer_template import catalog_macro
+
+    template = """Section Install
+  ; Copy main executable
+  File "${MAINBINARYSRCPATH}"
+  {{#each resources}}
+    File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
+  {{/each}}
+  {{#each binaries}}
+    File /a "/oname={{this}}" "{{no-escape @key}}"
+  {{/each}}
+  ; Create file associations
+  File /a "/oname=additional-shipped-helper.exe" "helper.exe"
+  WriteUninstaller "$INSTDIR\\uninstall.exe"
+SectionEnd
+"""
+    macro = catalog_macro(template)
+    assert "${MAINBINARYSRCPATH}" in macro
+    assert "{{#each resources}}" in macro and "{{this.[1]}}" in macro
+    assert "{{#each binaries}}" in macro and "{{this}}" in macro
+    assert "additional-shipped-helper.exe" in macro
+    assert "uninstall.exe" in macro
+    assert "eom-mail-engine.exe" not in macro
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows path/catalog/task boundaries")
+def test_native_cutover_path_and_package_ownership_boundaries(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    root = tmp_path / "installation"
+    root.mkdir()
+    shipped = root / "new-shipped-helper.exe"
+    shipped.write_bytes(b"public package program")
+    catalog = tmp_path / "package.txt"
+    catalog.write_text("EW-PACKAGE-FILES-V1\n" + shipped.name + "\n", encoding="utf-16")
+    code = r"""
+$ErrorActionPreference='Stop'
+$source=Get-Content -LiteralPath $env:EW_SCRIPT -Raw
+$prefixSource=$source.Substring(0,$source.IndexOf('function Installed-Processes'))
+. ([scriptblock]::Create($prefixSource)) -Phase Pre -InstallRoot $env:EW_ROOT `
+    -ProgramCatalog $env:EW_CATALOG
+$ownedPrograms=Load-OwnedPrograms
+$env:EW_PUBLIC_ROOT=$env:EW_ROOT
+$expected=Join-Path $env:EW_ROOT 'new-shipped-helper.exe'
+foreach ($raw in @($expected,('  "'+$expected+'"  '),'"%EW_PUBLIC_ROOT%\new-shipped-helper.exe"')) {
+    $p=Resolve-ExecutablePath $raw 'public matrix'
+    if ($p -cne $expected -or !(Is-InstalledPath $p)) { throw 'Valid path rejected' }
+    Assert-OwnedImage $p
+}
+foreach ($raw in @('', '"', 'C:\bad|path.exe', '%EW_MISSING_VARIABLE%\x.exe','relative.exe')) {
+    if (Resolve-ExecutablePath $raw 'invalid matrix') { throw 'Invalid path accepted' }
+}
+if (Is-InstalledPath ($env:EW_ROOT+'-adjacent\x.exe')) { throw 'Adjacent root admitted' }
+$unknowns=@((Join-Path $env:EW_ROOT 'unknown.exe'),
+            (Join-Path $env:EW_ROOT 'sub\new-shipped-helper.exe'))
+foreach ($p in $unknowns) {
+    $rejected=$false
+    try { Assert-OwnedImage $p } catch { $rejected=$true }
+    if (!$rejected) { throw 'Unshipped program admitted' }
+}
+'PACKAGE_PATH_BOUNDARIES'
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
+        env=dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(root), EW_CATALOG=str(catalog)),
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PACKAGE_PATH_BOUNDARIES" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native registered task enablement")
+def test_native_task_enablement_does_not_use_stale_running_state(tmp_path):
+    import subprocess
+    import uuid
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    code = r"""
+$ErrorActionPreference='Stop'
+$source=Get-Content -LiteralPath $env:EW_SCRIPT -Raw
+$prefixSource=$source.Substring(0,$source.IndexOf('function Installed-Processes'))
+. ([scriptblock]::Create($prefixSource)) -Phase Pre -InstallRoot $env:EW_ROOT
+$arguments='-NoProfile -Command Start-Sleep -Seconds 60'
+$a=New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument $arguments
+$t=New-ScheduledTaskTrigger -Once -At (Get-Date).AddDays(1)
+Register-ScheduledTask -TaskName $env:EW_TASK -Action $a -Trigger $t | Out-Null
+try {
+    Start-ScheduledTask -TaskName $env:EW_TASK
+    $deadline=[DateTime]::UtcNow.AddSeconds(20)
+    do {
+        $task=Get-ScheduledTask -TaskName $env:EW_TASK
+        if ([DateTime]::UtcNow -ge $deadline) { throw 'Task never ran' }
+        Start-Sleep -Milliseconds 50
+    } while ($task.State -ne 'Running')
+    if (!(Task-Enabled $task)) { throw 'Enabled control rejected' }
+    Disable-ScheduledTask -TaskName $env:EW_TASK | Out-Null
+    # Keep the real pre-disable Running observation while querying registered settings.
+    if (Task-Enabled $task) { throw 'Runtime state overrode disabled configuration' }
+    'REGISTERED_ENABLED_PRESERVED'
+} finally {
+    Stop-ScheduledTask -TaskName $env:EW_TASK
+    Unregister-ScheduledTask -TaskName $env:EW_TASK -Confirm:$false
+}
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
+        env=dict(
+            os.environ,
+            EW_SCRIPT=str(script),
+            EW_ROOT=str(tmp_path / "installation"),
+            EW_TASK="EW-Enablement-" + uuid.uuid4().hex,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REGISTERED_ENABLED_PRESERVED" in result.stdout.splitlines()
+
+
 def test_cutover_sets_trusted_compiler_context_before_add_type():
     from pathlib import Path
 
@@ -338,8 +479,12 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
     script = Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
     root = tmp_path / "installation"
     root.mkdir()
+    catalog = tmp_path / "package.txt"
+    catalog.write_text("EW-PACKAGE-FILES-V1\neom-mail-engine.exe\n", encoding="utf-16")
     task = "EW-Cutover-Abort-" + uuid.uuid4().hex
-    environment = dict(os.environ, EW_ROOT=str(root), EW_TASK=task, EW_SCRIPT=str(script))
+    environment = dict(
+        os.environ, EW_ROOT=str(root), EW_TASK=task, EW_SCRIPT=str(script), EW_CATALOG=str(catalog)
+    )
 
     def powershell(code, *, expected=0):
         result = subprocess.run(
@@ -360,15 +505,22 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
     )
     try:
         # Real process lifetime and native named mutex, not a mocked platform:
-        # the installer exits after Pre, so its restoration worker must recover.
+        # The Pre child exits immediately after its first real disable. Recovery
+        # must already have an owner, not one launched by a later statement.
         powershell(
             "$ErrorActionPreference='Stop'; "
             "$name= & $env:EW_SCRIPT -Phase Name -InstallRoot $env:EW_ROOT; "
             "$m=[Threading.Mutex]::new($false,$name); "
             "if (!$m.WaitOne(10000)) { throw 'Fixture installer busy' }; "
-            "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned "
-            "-File $env:EW_SCRIPT -Phase Pre -InstallRoot $env:EW_ROOT -InstallerPid $PID; "
-            "if ($LASTEXITCODE -ne 0) { throw 'Pre failed' }; "
+            "$env:EW_INSTALLER=$PID; "
+            "$child='function Disable-ScheduledTask { param($TaskPath,$TaskName); "
+            r"ScheduledTasks\Disable-ScheduledTask -TaskPath $TaskPath "
+            "-TaskName $TaskName | Out-Null; "
+            "exit 7 }; & $env:EW_SCRIPT -Phase Pre -InstallRoot $env:EW_ROOT "
+            "-InstallerPid $env:EW_INSTALLER -ProgramCatalog $env:EW_CATALOG'; "
+            "& powershell.exe -NoProfile -NonInteractive "
+            "-ExecutionPolicy RemoteSigned -Command $child; "
+            "if ($LASTEXITCODE -ne 7) { throw 'Pre did not abort at the first mutation' }; "
             "if ((Get-ScheduledTask -TaskName $env:EW_TASK).State -ne 'Disabled') "
             "{ throw 'Pre did not disable task' }; exit 7",
             expected=7,
