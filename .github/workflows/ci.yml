@@ -108,6 +108,31 @@ jobs:
           tests/test_connect_v2_engine_api.py::test_automation_submission_requires_connect_entitlement_before_provider_post
           tests/test_connect_v2_engine_api.py::test_connect_entitlement_is_rechecked_after_source_fetch_before_provider_post
           --junitxml=${{ runner.temp }}/ew-source-cutover/native-integration.xml
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Prepare separately labelled fixture-authority qualification build
+        shell: pwsh
+        run: |
+          $triple = (rustc --print host-tuple).Trim()
+          $setup = @(Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if ($setup.Count -ne 1) { throw 'Expected one production-authority setup' }
+          uv run python scripts/build_windows_cutover_qualification.py "$env:RUNNER_TEMP/ew-source-cutover/full" "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" $setup[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Bundle test-only authority with the same NSIS hooks and desktop
+        shell: pwsh
+        run: |
+          pnpm --dir desktop tauri build --bundles nsis --config "$env:RUNNER_TEMP/ew-source-cutover/full/qualification-config.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Qualify populated upgrade through installed receipt-gated engine
+        shell: pwsh
+        run: |
+          $triple = (rustc --print host-tuple).Trim()
+          $setup = @(Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if ($setup.Count -ne 1) { throw 'Expected one test-only qualification setup' }
+          uv run python scripts/prove_windows_cutover_full.py $setup[0].FullName "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" cutover-predecessor "$env:RUNNER_TEMP/ew-source-cutover/full"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native cutover qualification evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -118,6 +143,12 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/*/*.log
             ${{ runner.temp }}/ew-source-cutover/*/installer.*
             ${{ runner.temp }}/ew-source-cutover/native-integration.xml
+            ${{ runner.temp }}/ew-source-cutover/full/build-inventory.json
+            ${{ runner.temp }}/ew-source-cutover/full/qualification.json
+            ${{ runner.temp }}/ew-source-cutover/full/operations.jsonl
+            ${{ runner.temp }}/ew-source-cutover/full/greenmail.log
+            ${{ runner.temp }}/ew-source-cutover/full/java-version.txt
+            ${{ runner.temp }}/ew-source-cutover/full/installer.*
           if-no-files-found: error
       - name: Verify Windows engine process-tree lifecycle
         run: >-
@@ -126,12 +157,11 @@ jobs:
       - name: Re-run packaged engine acceptance smoke
         shell: pwsh
         run: |
-          $triple = (rustc --print host-tuple).Trim()
-          uv run --project . python scripts/smoke_packaged_engine.py "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" --expected-entitlement-state missing
+          uv run --project . python scripts/smoke_packaged_engine.py "$env:RUNNER_TEMP/ew-source-cutover/full/release-engine.exe" --expected-entitlement-state missing
       - uses: actions/upload-artifact@v7
         with:
           name: email-watcher-windows-nsis
-          path: desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          path: ${{ runner.temp }}/ew-source-cutover/full/release-installer.exe
           if-no-files-found: error
 
   desktop:

@@ -1,32 +1,46 @@
 Var EW_SOURCE_CUTOVER_MUTEX
+Var EW_SOURCE_CUTOVER_PS
 !define EW_HOOK_DIR "${__FILEDIR__}"
 !macro EW_SOURCE_CUTOVER PHASE
   Push $0
   Push $1
   Push $8
   Push $9
-  !if "${PHASE}" == "Pre"
-    System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\EomEmailWatcherSourceCutoverV1") p.r0'
-    StrCpy $EW_SOURCE_CUTOVER_MUTEX $0
-    System::Call 'kernel32::WaitForSingleObject(p r0, i 0) i.r1'
-    ${If} $1 != 0
-    ${AndIf} $1 != 128
-      MessageBox MB_OK|MB_ICONSTOP "Another Email Watcher update is already running."
-      Abort
-    ${EndIf}
-  !endif
   StrCpy $8 "$OUTDIR"
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=ew-source-cutover.ps1 "${EW_HOOK_DIR}\cutover.ps1"
+  ; NSIS is x86: Sysnative crosses WOW64 redirection to native PowerShell.
+  StrCpy $EW_SOURCE_CUTOVER_PS "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+  IfFileExists "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" 0 +2
+    StrCpy $EW_SOURCE_CUTOVER_PS "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+  !if "${PHASE}" == "Pre"
+    ; One name owner in cutover.ps1, shared with the restoration worker.
+    nsExec::ExecToStack /TIMEOUT=10000 '"$EW_SOURCE_CUTOVER_PS" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase Name -InstallRoot "$INSTDIR"'
+    Pop $0
+    Pop $1
+    ${If} $0 != 0
+      SetOutPath "$8"
+      Abort
+    ${EndIf}
+    System::Call 'kernel32::CreateMutexW(p 0, i 0, w r1) p.r0'
+    StrCpy $EW_SOURCE_CUTOVER_MUTEX $0
+    System::Call 'kernel32::WaitForSingleObject(p r0, i 0) i.r1'
+    ${If} $1 != 0
+    ${AndIf} $1 != 128
+      SetOutPath "$8"
+      MessageBox MB_OK|MB_ICONSTOP "Another Email Watcher update is already running." /SD IDOK
+      Abort
+    ${EndIf}
+  !endif
   System::Call 'kernel32::GetCurrentProcessId() i.r9'
-  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase ${PHASE} -InstallRoot "$INSTDIR" -InstallerPid $9'
+  nsExec::ExecToStack /TIMEOUT=120000 '"$EW_SOURCE_CUTOVER_PS" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase ${PHASE} -InstallRoot "$INSTDIR" -InstallerPid $9'
   Pop $0
   Pop $1
   SetOutPath "$8"
   ${If} $0 != 0
     DetailPrint "Email Watcher source-lock update could not qualify: $1"
-    MessageBox MB_OK|MB_ICONSTOP "Email Watcher could not stop and qualify its previous installation. The update was stopped."
+    MessageBox MB_OK|MB_ICONSTOP "Email Watcher could not qualify this update. Close its running processes and retry the installer." /SD IDOK
     Abort
   ${EndIf}
   !if "${PHASE}" == "Post"

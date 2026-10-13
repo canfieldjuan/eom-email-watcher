@@ -11,6 +11,91 @@ from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
 
 
+def test_predecessor_actor_setup_reuses_seeded_account(tmp_path, monkeypatch):
+    import windows_cutover_legacy_actor as actor
+
+    from eom_email_watcher.db import Store
+
+    database = tmp_path / "existing.db"
+    # This probes fixture setup with real Store, not predecessor schema parity.
+    # The native qualification freezes this same script against schema 34.
+    monkeypatch.setattr(actor, "SCHEMA_VERSION", 34)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "actor",
+            str(database),
+            str(tmp_path / "ready"),
+            str(tmp_path / "trigger"),
+            "http://127.0.0.1:9",
+            "seed",
+        ],
+    )
+    actor.main()
+    store = Store(database)
+    before = store.mail_account("gmail", "public-fixture")
+    actor.main()
+    assert store.mail_account("gmail", "public-fixture") == before
+    assert len([a for a in store.mail_accounts() if a.account_id == "public-fixture"]) == 1
+
+
+def test_fixture_authority_signs_tests_and_is_rejected_for_release(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from build_desktop_sidecar import SidecarBuildError, validate_entitlement_keyring
+    from connect_automate.entitlement import EntitlementDecision, EntitlementGate
+    from windows_cutover_fixture import fixture_authority
+
+    keyring, licence = fixture_authority(tmp_path)
+    now = datetime.now(UTC)
+    gate = EntitlementGate.for_test(licence, keyring.read_bytes(), now)
+    assert gate.decision() is EntitlementDecision.ACTIVE
+    assert gate.features_active(("connect.capability_exchange", "connect.automations"))
+    expired = EntitlementGate.for_test(licence, keyring.read_bytes(), now + timedelta(days=2))
+    assert expired.decision() is EntitlementDecision.EXPIRED
+    missing = EntitlementGate.for_test(tmp_path / "missing", keyring.read_bytes(), now)
+    assert missing.decision() is EntitlementDecision.MISSING
+    with pytest.raises(SidecarBuildError, match="non-production key ID"):
+        validate_entitlement_keyring(keyring)
+
+
+def test_public_model_peer_exercises_real_analysis_client():
+    import threading
+    from datetime import UTC, datetime
+    from http.server import ThreadingHTTPServer
+
+    from windows_cutover_fixture import ModelHandler
+
+    from eom_email_watcher.model import LocalModel
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = LocalModel(
+            f"http://127.0.0.1:{server.server_port}/v1",
+            "cutover-fixture",
+            timeout=5,
+            require_auth=False,
+        )
+        assert client.health()[0]
+        result = client.analyze(
+            sender="vendor@example.test",
+            subject="Public quote",
+            received_at="2026-10-13T12:00:00+00:00",
+            body="Promised public price is 100.",
+            attachment_names=(),
+            current_local_time=datetime(2026, 10, 13, 12, tzinfo=UTC),
+        )
+        assert result.category == "informational"
+        assert result.summary == "Public cutover fixture analysed locally."
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
 @pytest.mark.parametrize(
     "change",
     [{}, {"version": True}, {"protocol": "other"}, {"engine_sha256": "0" * 64}],
@@ -34,6 +119,72 @@ def test_receipt_binds_exact_engine_and_protocol(tmp_path, monkeypatch, change):
         binary.write_bytes(b"replacement-engine-fixture")
         with pytest.raises(SourceProtocolUnavailable, match="installer update"):
             windows_cutover.verify_installation()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows private evidence writer")
+def test_native_evidence_writer_accepts_empty_installer_logs(tmp_path):
+    from windows_cutover_fixture import write_private
+
+    log = tmp_path / "installer.stdout"
+    for content in (b"", b"public installer output", b""):
+        write_private(log, content)
+        assert log.read_bytes() == content
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows global installer namespace")
+def test_native_installer_mutex_is_root_keyed_in_global_kernel_namespace(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    code = r"""
+$ErrorActionPreference='Stop'
+$name = & $env:EW_SCRIPT -Phase Name -InstallRoot $env:EW_ROOT
+$same = & $env:EW_SCRIPT -Phase Name -InstallRoot ($env:EW_ROOT.ToUpperInvariant())
+$other = & $env:EW_SCRIPT -Phase Name -InstallRoot ($env:EW_ROOT + '-other')
+if ($name -cne $same -or $name -ceq $other) { throw 'Install identity is not canonical' }
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class KernelMutexName {
+    [DllImport("ntdll.dll")]
+    static extern int NtQueryObject(IntPtr h, int kind, IntPtr data, int size, ref int needed);
+    public static string Read(IntPtr h) {
+        int size=0; NtQueryObject(h,1,IntPtr.Zero,0,ref size);
+        IntPtr buffer=Marshal.AllocHGlobal(size);
+        try {
+            if (NtQueryObject(h,1,buffer,size,ref size)!=0) throw new Exception("Query failed");
+            return Marshal.PtrToStringUni(Marshal.ReadIntPtr(buffer,IntPtr.Size==8 ? 8:4),
+                                         (ushort)Marshal.ReadInt16(buffer)/2);
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+}
+'@
+$m=[Threading.Mutex]::new($false,$name)
+try {
+    if (!$m.WaitOne(0)) { throw 'Fixture mutex busy' }
+    $actual=[KernelMutexName]::Read($m.SafeWaitHandle.DangerousGetHandle())
+    if (!$actual.StartsWith('\BaseNamedObjects\') -or $actual.Contains('\Sessions\')) {
+        throw ('Session-local kernel object: ' + $actual)
+    }
+    $env:EW_MUTEX=$name
+    $out = & powershell.exe -NoProfile -NonInteractive -Command '
+        $m=[Threading.Mutex]::OpenExisting($env:EW_MUTEX)
+        try { if ($m.WaitOne(0)) { $m.ReleaseMutex(); throw "Concurrent admission" }; "BUSY" }
+        finally { $m.Dispose() }'
+    if ($LASTEXITCODE -ne 0 -or $out -ne 'BUSY') { throw 'Concurrent admission was not excluded' }
+    'GLOBAL_KERNEL_EXCLUSION'
+} finally { $m.ReleaseMutex(); $m.Dispose() }
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
+        env=dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation")),
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "GLOBAL_KERNEL_EXCLUSION"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows regular-file receipt reader")
@@ -95,7 +246,8 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
         # the installer exits after Pre, so its restoration worker must recover.
         powershell(
             "$ErrorActionPreference='Stop'; "
-            "$m=[Threading.Mutex]::new($false,'Local\\EomEmailWatcherSourceCutoverV1'); "
+            "$name= & $env:EW_SCRIPT -Phase Name -InstallRoot $env:EW_ROOT; "
+            "$m=[Threading.Mutex]::new($false,$name); "
             "if (!$m.WaitOne(10000)) { throw 'Fixture installer busy' }; "
             "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned "
             "-File $env:EW_SCRIPT -Phase Pre -InstallRoot $env:EW_ROOT -InstallerPid $PID; "

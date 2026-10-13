@@ -1,6 +1,7 @@
 """Frozen schema-34 actor. Built against the pinned predecessor, never shipped."""
 
 import argparse
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -8,9 +9,14 @@ from pathlib import Path
 from connect_automate.locking import connect_operation_lock, connect_source_lock_path
 
 from eom_email_watcher.db import SCHEMA_VERSION, Store
+from eom_email_watcher.deployment import main as engine_main
 
 
 def main():
+    if len(sys.argv) == 1:
+        # Exercise the pinned predecessor's production IPC/dispatch owners.
+        engine_main()
+        return
     parser = argparse.ArgumentParser()
     parser.add_argument("database", type=Path)
     parser.add_argument("ready", type=Path)
@@ -21,7 +27,8 @@ def main():
     assert SCHEMA_VERSION == 34, SCHEMA_VERSION
     store = Store(args.database)
     store.initialize()
-    store.register_mail_account("gmail", "public-fixture", display_name="Public fixture")
+    if store.mail_account("gmail", "public-fixture") is None:
+        store.register_mail_account("gmail", "public-fixture", display_name="Public fixture")
     with store.connection() as db:
         db.execute("CREATE TABLE IF NOT EXISTS cutover_probe_outcomes(value TEXT)")
     if args.mode == "seed":

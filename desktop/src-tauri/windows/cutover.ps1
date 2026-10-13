@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('Pre','Post','Restore')][string]$Phase,
+    [Parameter(Mandatory=$true)][ValidateSet('Name','Pre','Post','Restore')][string]$Phase,
     [Parameter(Mandatory=$true)][string]$InstallRoot,
     [int]$InstallerPid = 0,
     [long]$InstallerStarted = 0
@@ -8,6 +8,16 @@ $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 if ($root -eq [IO.Path]::GetPathRoot($root).TrimEnd('\')) { throw 'Installation root cannot be a drive root' }
 $prefix = $root + '\'
+function Installer-MutexName {
+    # Kernel Global namespace spans sessions; the canonical root separates installs.
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($root.ToUpperInvariant())
+        $digest = [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+        return 'Global\EomEmailWatcherSourceCutoverV1-' + $digest
+    } finally { $hash.Dispose() }
+}
+if ($Phase -eq 'Name') { [Console]::Write((Installer-MutexName)); exit 0 }
 $receipt = Join-Path $root 'windows-source-cutover-v1.json'
 $pending = Join-Path $root 'windows-cutover-pending-v1.json'
 $restoreScript = Join-Path $root 'windows-cutover-restore-v1.ps1'
@@ -34,7 +44,7 @@ if ($Phase -eq 'Restore') {
     }
     # Serialize restoration with every installer transaction. An older worker
     # cannot re-enable a task while the next update is stopping its owners.
-    $mutex = [Threading.Mutex]::new($false, 'Local\EomEmailWatcherSourceCutoverV1')
+    $mutex = [Threading.Mutex]::new($false, (Installer-MutexName))
     $owned = $false
     try {
         try { $owned = $mutex.WaitOne(90000) }
@@ -48,6 +58,30 @@ if ($Phase -eq 'Restore') {
     }
     exit 0
 }
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class CutoverProcess {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder path, ref int size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool TerminateProcess(IntPtr h, uint code);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint WaitForSingleObject(IntPtr h, uint timeout);
+    public static string Image(IntPtr h) {
+        var path = new StringBuilder(32768); int size = path.Capacity;
+        if (!QueryFullProcessImageName(h, 0, path, ref size))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return path.ToString();
+    }
+    public static void Stop(IntPtr h) {
+        if (!TerminateProcess(h, 1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (WaitForSingleObject(h, 10000) != 0) throw new TimeoutException("An old engine did not exit");
+    }
+}
+'@
 function Installed-Processes {
     foreach ($process in Get-CimInstance Win32_Process) {
         if ($process.ProcessId -eq $InstallerPid) { continue }
@@ -103,10 +137,11 @@ if ($Phase -eq 'Pre') {
             if ($live) {
                 # Open the process handle and validate its live image before Kill;
                 # a recycled PID must never authorize killing an unrelated process.
-                $handle = $live.Handle
-                if (!(Is-InstalledPath $live.Path)) { continue }
-                $live.Kill()
-                if (!$live.WaitForExit(10000)) { throw 'An old engine did not exit' }
+                try {
+                    $handle = $live.Handle
+                    if (!(Is-InstalledPath ([CutoverProcess]::Image($handle)))) { continue }
+                    [CutoverProcess]::Stop($handle)
+                } finally { $live.Dispose() }
             }
         }
         if (@(Installed-Processes).Count) { throw 'An old installation is still running' }

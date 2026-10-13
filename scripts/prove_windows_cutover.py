@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from smoke_packaged_engine import _request
+from windows_cutover_process_fixture import deny_termination
 
 PREDECESSOR = "43a850d8b00cddfdad2a767b7b27fc792707b010"
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +60,7 @@ def isolated_environment(root: Path):
     return environment
 
 
-def build_old_actor(predecessor: Path, output: Path):
+def build_old_actor(predecessor: Path, output: Path, keyring: Path | None = None):
     actual = subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
         cwd=predecessor,
@@ -69,29 +70,43 @@ def build_old_actor(predecessor: Path, output: Path):
         raise RuntimeError("The predecessor checkout is not the frozen schema-34 revision")
     build = output / "build"
     environment = dict(os.environ, PYTHONPATH=str(predecessor / "src"))
+    command = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "--noconfirm",
+        "--onefile",
+        "--name",
+        "legacy-source-owner",
+        "--collect-all",
+        "tzdata",
+        "--paths",
+        str(predecessor / "src"),
+        "--distpath",
+        str(build / "dist"),
+        "--workpath",
+        str(build / "work"),
+        "--specpath",
+        str(build),
+    ]
+    if keyring is not None:
+        canonical = output / "connect-entitlement-keyring.json"
+        shutil.copy2(keyring, canonical)
+        command.extend(["--add-data", f"{canonical}{os.pathsep}connect_automate_data"])
+    command.append(str(ROOT / "scripts/windows_cutover_legacy_actor.py"))
     subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "PyInstaller",
-            "--noconfirm",
-            "--onefile",
-            "--name",
-            "legacy-source-owner",
-            "--paths",
-            str(predecessor / "src"),
-            "--distpath",
-            str(build / "dist"),
-            "--workpath",
-            str(build / "work"),
-            "--specpath",
-            str(build),
-            str(ROOT / "scripts/windows_cutover_legacy_actor.py"),
-        ],
+        command,
         env=environment,
         check=True,
     )
-    return build / "dist/legacy-source-owner.exe"
+    binary = build / "dist/legacy-source-owner.exe"
+    content = binary.read_bytes()
+    pe_offset = int.from_bytes(content[60:64], "little")
+    assert content[pe_offset : pe_offset + 4] == b"PE\0\0"
+    assert int.from_bytes(content[pe_offset + 4 : pe_offset + 6], "little") == 0x8664, (
+        "Installer proof requires running x64 predecessor images"
+    )
+    return binary
 
 
 def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, case: str):
@@ -206,6 +221,26 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             )
             assert late.returncode != 0 and "newer than supported" in late.stderr
             assert not late_ready.exists() and not posts
+        if case == "old-then-new":
+            # A real installed owner survives the stop attempt. Refusal must
+            # leave bytes intact; restoring permissions admits the same update.
+            prior_digest = hashlib.sha256(engine.read_bytes()).hexdigest()
+            with deny_termination(first):
+                refusal = subprocess.run(
+                    [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
+                    capture_output=True,
+                    timeout=240,
+                )
+                (folder / "installer.refusal.stdout").write_bytes(refusal.stdout)
+                (folder / "installer.refusal.stderr").write_bytes(refusal.stderr)
+                assert refusal.returncode != 0, "Installer accepted an unquiesced owner"
+                assert first.poll() is None, "Protected old owner did not survive"
+                assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
+                assert not (installation / "windows-source-cutover-v1.json").exists()
+                assert (
+                    powershell("(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task)
+                    == "Ready"
+                )
         install = subprocess.run(
             [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
             capture_output=True,
@@ -267,6 +302,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             "pre_cutover_posts": len(posts),
             "task_restored": task_state,
             "installed_sha256": receipt["engine_sha256"],
+            "installer_refusal_then_retry": case == "old-then-new",
         }
     finally:
         if registered:
