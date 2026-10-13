@@ -3378,6 +3378,27 @@ CREATE TABLE IF NOT EXISTS mailbox_sent_scope (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (provider, account_id)
 );
+CREATE TABLE IF NOT EXISTS mailbox_sent_poll_failures (
+    provider TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    mailbox_identity_key TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason = 'unreadable'),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (provider, account_id)
+);
+CREATE TRIGGER IF NOT EXISTS mail_accounts_clear_sent_poll_failure
+AFTER UPDATE OF mailbox_identity_key, active ON mail_accounts
+WHEN NEW.mailbox_identity_key IS NOT OLD.mailbox_identity_key OR NEW.active = 0
+BEGIN
+    DELETE FROM mailbox_sent_poll_failures
+    WHERE provider = OLD.provider AND account_id = OLD.account_id;
+END;
+CREATE TRIGGER IF NOT EXISTS mail_accounts_delete_sent_poll_failure
+AFTER DELETE ON mail_accounts
+BEGIN
+    DELETE FROM mailbox_sent_poll_failures
+    WHERE provider = OLD.provider AND account_id = OLD.account_id;
+END;
 CREATE TABLE IF NOT EXISTS message_recipients (
     message_id TEXT NOT NULL,
     field TEXT NOT NULL CHECK (field IN ('to', 'cc')),
@@ -9728,6 +9749,46 @@ class Store:
             ).fetchone()
         return str(row["scope"]) if row else SENT_SCOPE_NOT_POLLED
 
+    def sent_poll_failure(self, provider: str, account_id: str) -> str | None:
+        """Read only a failure belonging to the active, verified mailbox."""
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT f.reason FROM mailbox_sent_poll_failures f
+                JOIN mail_accounts a USING(provider, account_id)
+                WHERE f.provider=? AND f.account_id=? AND a.active=1
+                    AND a.mailbox_identity_key=f.mailbox_identity_key""",
+                (provider, account_id),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def record_sent_poll_failure(
+        self,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str | None,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT mailbox_identity_key,active FROM mail_accounts "
+                "WHERE provider=? AND account_id=?",
+                (provider, account_id),
+            ).fetchone()
+            if current is None or not current["active"] or mailbox_identity_key is None:
+                return
+            if current["mailbox_identity_key"] != mailbox_identity_key:
+                raise MailboxIdentityChanged("mailbox identity changed")
+            db.execute(
+                """INSERT INTO mailbox_sent_poll_failures VALUES (?,?,?,'unreadable',?)
+                ON CONFLICT(provider,account_id) DO UPDATE SET
+                    mailbox_identity_key=excluded.mailbox_identity_key,
+                    reason=excluded.reason,updated_at=excluded.updated_at""",
+                (provider, account_id, mailbox_identity_key, stamp),
+            )
+
     def set_sent_scope(
         self, provider: str, account_id: str, scope: str, *, now: datetime | None = None
     ) -> None:
@@ -9739,6 +9800,10 @@ class Store:
         """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
+            db.execute(
+                "DELETE FROM mailbox_sent_poll_failures WHERE provider=? AND account_id=?",
+                (provider, account_id),
+            )
             if scope == SENT_SCOPE_NOT_POLLED:
                 db.execute(
                     "DELETE FROM mailbox_sent_scope WHERE provider = ? AND account_id = ?",

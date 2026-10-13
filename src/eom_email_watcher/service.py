@@ -1508,6 +1508,28 @@ class Watcher:
             result["recovery_next_retry_at"] = state.next_retry_at
         return result
 
+    def _record_sent_poll_outcome(
+        self,
+        scope: str | None,
+        *,
+        mailbox_identity_key: str | None,
+        dry_run: bool,
+        checked_at: datetime,
+    ) -> None:
+        if dry_run:
+            return
+        if scope is None:
+            self.store.record_sent_poll_failure(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                now=checked_at,
+            )
+        else:
+            self.store.set_sent_scope(
+                self.mailbox.provider, self.mailbox.account_id, scope, now=checked_at
+            )
+
     def _settle_sent(
         self,
         *,
@@ -1524,7 +1546,8 @@ class Watcher:
         the folder's current position: taken before the Inbox poll, so mail sent while
         the Inbox is polled is after it and reaches this check's Sent poll. Returns
         the scope, or None when Sent could not be read: a Sent error never stops the
-        Inbox check, and the scope stays as last recorded. A dry run records nothing.
+        Inbox check. Failure is recorded separately from the last confirmed scope.
+        A dry run records nothing.
         """
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
@@ -1532,6 +1555,12 @@ class Watcher:
         if resolved_scope is not _UNRESOLVED_SENT_SCOPE:
             scope = resolved_scope
             if scope is None:
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
                 return None
             assert isinstance(scope, str)
         elif SENT_LOCATION not in folders:
@@ -1542,15 +1571,32 @@ class Watcher:
         else:
             scope_reader = getattr(self.gateway, "sent_scope", None)
             if not callable(scope_reader):
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
                 return None
             try:
                 scope = scope_reader()
             except MailboxError as exc:
                 logger.warning("Sent folder could not be read; the Inbox goes on: %s", exc)
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
                 return None
         if dry_run:
             return scope
-        self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
+        self._record_sent_poll_outcome(
+            scope,
+            mailbox_identity_key=mailbox_identity_key,
+            dry_run=dry_run,
+            checked_at=checked_at,
+        )
         if scope != SENT_SCOPE_AVAILABLE or provider == "gmail" or mailbox_identity_key is None:
             return scope
         folder_scope = {
@@ -1566,6 +1612,13 @@ class Watcher:
                 )
             except MailboxError as exc:
                 logger.warning("Sent folder position unread; the next check retries: %s", exc)
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
+                return None
         return scope
 
     def check(
@@ -2805,6 +2858,12 @@ class Watcher:
             return added, changes.drained
         except MailboxError as exc:
             logger.warning("Sent folder poll failed; the Inbox check is unaffected: %s", exc)
+            self._record_sent_poll_outcome(
+                None,
+                mailbox_identity_key=mailbox_identity_key,
+                dry_run=dry_run,
+                checked_at=checked_at,
+            )
             return 0, False
 
     def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:

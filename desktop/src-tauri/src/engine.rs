@@ -1312,6 +1312,8 @@ pub struct MailAccountStatus {
     /// or `not_polled` (thread view contract, D-scope). Absent from older engines.
     #[serde(default)]
     pub sent_scope: Option<String>,
+    #[serde(default)]
+    pub sent_poll_failure: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3013,6 +3015,28 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_account_sent_failure_transport_preserves_and_clears_reason() {
+        let mut input = json!({
+            "provider": "imap", "account_id": "account", "display_name": "IMAP",
+            "address": null, "active": true, "connected": true, "last_check": null,
+            "sent_scope": "available", "sent_poll_failure": "unreadable"
+        });
+        let status: MailAccountStatus = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(status.sent_poll_failure.as_deref(), Some("unreadable"));
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["sent_poll_failure"],
+            "unreadable"
+        );
+        input["sent_poll_failure"] = serde_json::Value::Null;
+        let recovered: MailAccountStatus = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(recovered.sent_poll_failure, None);
+        input.as_object_mut().unwrap().remove("sent_poll_failure");
+        let legacy: MailAccountStatus = serde_json::from_value(input).unwrap();
+        assert_eq!(legacy.sent_poll_failure, None);
+    }
+
     use std::fs;
     #[cfg(windows)]
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

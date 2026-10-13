@@ -307,6 +307,7 @@ interface MailAccountStatus {
   active: boolean;
   last_check: string | null;
   sent_scope?: "available" | "unavailable" | "not_polled" | null;
+  sent_poll_failure?: "unreadable" | null;
 }
 
 interface GmailLabelCatalogItem {

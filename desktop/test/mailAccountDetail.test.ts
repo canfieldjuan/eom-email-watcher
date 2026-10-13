@@ -17,3 +17,18 @@ test("the account line names an unavailable Sent folder and nothing else about i
     "IMAP · Retained · Disconnected",
   );
 });
+
+test("an unreadable Sent folder shows the recorded pause before stale scope", async () => {
+  const { mailAccountDetail } = await import("../src/mailAccountDetail.ts");
+  const base = { display_name: "IMAP", active: true, connected: true };
+  for (const sent_scope of ["available", "unavailable", "not_polled"] as const) {
+    assert.equal(
+      mailAccountDetail({ ...base, sent_scope, sent_poll_failure: "unreadable" }),
+      "IMAP · Active · Connected · Sent folder can't be opened; thread history is paused",
+    );
+  }
+  assert.equal(
+    mailAccountDetail({ ...base, sent_scope: "available", sent_poll_failure: null }),
+    "IMAP · Active · Connected",
+  );
+});
