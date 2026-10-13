@@ -226,6 +226,80 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class CutoverProcess {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Luid { public uint Low; public int High; }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    static extern uint GetCurrentProcessId();
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr buffer, int length, out int needed);
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool LookupPrivilegeValue(string system, string name, out Luid luid);
+    [DllImport("advapi32.dll")]
+    static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+    [DllImport("advapi32.dll")]
+    static extern IntPtr GetSidSubAuthority(IntPtr sid, uint index);
+    static IntPtr TokenBuffer(IntPtr token, int kind) {
+        int needed;
+        GetTokenInformation(token, kind, IntPtr.Zero, 0, out needed);
+        if (needed <= 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var buffer = Marshal.AllocHGlobal(needed);
+        if (!GetTokenInformation(token, kind, buffer, needed, out needed)) {
+            int error = Marshal.GetLastWin32Error();
+            Marshal.FreeHGlobal(buffer);
+            throw new Win32Exception(error);
+        }
+        return buffer;
+    }
+    // Query-only: no token mutation or policy input. No user SID is emitted.
+    public static string Token(uint pid) {
+        bool own = pid == GetCurrentProcessId();
+        IntPtr process = own ? GetCurrentProcess() : OpenProcess(0x1000, false, pid);
+        if (process == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        IntPtr token = IntPtr.Zero, elevation = IntPtr.Zero, integrity = IntPtr.Zero,
+            privileges = IntPtr.Zero;
+        try {
+            if (!OpenProcessToken(process, 0x0008, out token))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            elevation = TokenBuffer(token, 20);
+            integrity = TokenBuffer(token, 25);
+            privileges = TokenBuffer(token, 3);
+            bool elevated = Marshal.ReadInt32(elevation) != 0;
+            IntPtr sid = Marshal.ReadIntPtr(integrity);
+            byte count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
+            int rid = Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
+            Luid debug;
+            if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out debug))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            bool present = false, enabled = false;
+            int entries = Marshal.ReadInt32(privileges);
+            for (int i = 0; i < entries; ++i) {
+                int offset = 4 + i * 12;
+                if ((uint)Marshal.ReadInt32(privileges, offset) == debug.Low &&
+                    Marshal.ReadInt32(privileges, offset + 4) == debug.High) {
+                    present = true;
+                    enabled = (Marshal.ReadInt32(privileges, offset + 8) & 2) != 0;
+                }
+            }
+            return String.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "{{\"pid\":{0},\"elevated\":{1},\"integrity_rid\":{2},\"debug_present\":{3},\"debug_enabled\":{4}}}",
+                pid, elevated.ToString().ToLowerInvariant(), rid,
+                present.ToString().ToLowerInvariant(), enabled.ToString().ToLowerInvariant());
+        } finally {
+            if (privileges != IntPtr.Zero) Marshal.FreeHGlobal(privileges);
+            if (integrity != IntPtr.Zero) Marshal.FreeHGlobal(integrity);
+            if (elevation != IntPtr.Zero) Marshal.FreeHGlobal(elevation);
+            if (token != IntPtr.Zero) CloseHandle(token);
+            if (!own) CloseHandle(process);
+        }
+    }
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder path, ref int size);
     [DllImport("kernel32.dll", SetLastError=true)]
@@ -244,6 +318,12 @@ public static class CutoverProcess {
     }
 }
 '@
+function Write-CutoverToken([int]$processId, [string]$role) {
+    try { Write-Output ("Cutover token role=$role data=" + [CutoverProcess]::Token($processId)) }
+    catch { Write-Warning ("Token diagnostic unavailable role=$role process=" + $processId + ": " + $_.Exception.Message) }
+}
+Write-CutoverToken $PID 'stop-host-entry'
+if ($InstallerPid -gt 0) { Write-CutoverToken $InstallerPid 'installer' }
 function Installed-Processes {
     foreach ($process in Get-CimInstance Win32_Process) {
         if ($process.ProcessId -eq $InstallerPid) { continue }
@@ -299,6 +379,8 @@ if ($Phase -eq 'Pre') {
         $operation = 'process-enumeration'
         foreach ($process in @(Installed-Processes)) {
             Write-Output ('Cutover stopping process=' + $process.ProcessId)
+            Write-CutoverToken $PID 'stop-host-before-get-process'
+            Write-CutoverToken $process.ProcessId 'actor-before-stop'
             $targetProcess = $process.ProcessId
             $live = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
             if ($live) {
@@ -307,12 +389,15 @@ if ($Phase -eq 'Pre') {
                 $processFailure = $null
                 try {
                     $operation = 'process-handle'
+                    Write-CutoverToken $PID 'stop-host-before-handle'
                     $handle = $live.Handle
+                    Write-CutoverToken $PID 'stop-host-after-handle'
                     $operation = 'held-image'
                     $image = Resolve-ExecutablePath ([CutoverProcess]::Image($handle)) 'held process'
                     if (!(Is-InstalledPath $image)) { continue }
                     Assert-OwnedImage $image
                     $operation = 'process-termination'
+                    Write-CutoverToken $PID 'stop-host-before-terminate'
                     [CutoverProcess]::Stop($handle)
                 } catch {
                     $processFailure = $_

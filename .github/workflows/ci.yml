@@ -88,6 +88,11 @@ jobs:
         with:
           ref: 43a850d8b00cddfdad2a767b7b27fc792707b010
           path: cutover-predecessor
+      - name: Probe native token context and transcript exit controls
+        shell: pwsh
+        run: |
+          uv run python scripts/probe_windows_cutover_context.py "$env:RUNNER_TEMP/ew-source-cutover/context"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Qualify native existing-database NSIS cutover and startup races
         shell: pwsh
         run: |
@@ -101,6 +106,7 @@ jobs:
           uv run pytest -v
           tests/test_windows_cutover.py
           tests/test_windows_cutover_round9.py
+          tests/test_windows_context_probe.py
           tests/test_gmail_recovery_retention.py
           tests/test_thread_bodies_round4.py
           tests/test_thread_bodies.py
@@ -149,6 +155,10 @@ jobs:
           name: email-watcher-windows-source-cutover
           path: |
             ${{ runner.temp }}/ew-source-cutover/qualification.json
+            ${{ runner.temp }}/ew-source-cutover/context/**/*.json
+            ${{ runner.temp }}/ew-source-cutover/context/**/*.ps1
+            ${{ runner.temp }}/ew-source-cutover/context/**/*.txt
+            ${{ runner.temp }}/ew-source-cutover/**/tokens.json
             ${{ runner.temp }}/ew-source-cutover/**/*.log
             ${{ runner.temp }}/ew-source-cutover/**/installer.*
             ${{ runner.temp }}/ew-source-cutover/**/cutover-*.txt

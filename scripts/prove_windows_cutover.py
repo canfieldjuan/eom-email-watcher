@@ -20,6 +20,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from probe_windows_cutover_context import parse_tokens, token_profile
 from smoke_packaged_engine import _request
 from windows_cutover_parity import installer_manifest
 from windows_cutover_process_fixture import deny_termination
@@ -287,6 +288,9 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             # leave bytes intact; restoring permissions admits the same update.
             prior_digest = hashlib.sha256(engine.read_bytes()).hexdigest()
             with deny_termination(first):
+                actor_profile = token_profile(
+                    [os.getpid(), first.pid], folder / "protected-actor-profile"
+                )
                 refusal, attempt = run_installer(
                     installer, installation, folder, "protected-refusal"
                 )
@@ -298,6 +302,8 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 pending = installation / "windows-cutover-pending-v1.json"
                 observed = {
                     "installer_exit": refusal.returncode,
+                    "protected_pid": first.pid,
+                    "protected_actor_profile": actor_profile,
                     "task_state": task_state,
                     "pending": pending.read_text(encoding="utf-8-sig")
                     if pending.exists()
@@ -310,6 +316,14 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                     p.read_text(encoding="utf-8-sig", errors="replace")
                     for p in attempt.glob("cutover-*-Pre-*.txt")
                 )
+                observed["stopping_pids"] = [
+                    int(value)
+                    for value in re.findall(r"Cutover stopping process=(\d+)", transcripts)
+                ]
+                observed["protected_pid_selected"] = first.pid in observed["stopping_pids"]
+                observed["stop_tokens"] = parse_tokens(transcripts)
+                (folder / "installer.refusal.state.json").write_text(json.dumps(observed, indent=2))
+                print("REFUSAL_CONTEXT", json.dumps(observed), flush=True)
                 assert f"failure-stage=process-stop process={first.pid} code=5" in transcripts, (
                     "Refusal was not caused by the protected owner's access-denied stop"
                 )
