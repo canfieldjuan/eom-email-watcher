@@ -251,7 +251,9 @@ def test_all_message_deletions_schedule_checkpoint_without_marker_inheritance(tm
         store.clear_messages()
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
-        assert db.execute("SELECT 1 FROM maintenance_state").fetchone()
+        assert db.execute(
+            "SELECT 1 FROM maintenance_state WHERE key='checkpoint_pending'"
+        ).fetchone()
     seed(store)
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
@@ -271,12 +273,16 @@ def test_busy_checkpoint_remains_pending_until_reader_finishes(tmp_path):
         store.delete_message("m")
         assert not body_state.checkpoint(store)
         with store.connection() as db:
-            assert db.execute("SELECT value FROM maintenance_state").fetchone()
+            assert db.execute(
+                "SELECT value FROM maintenance_state WHERE key='checkpoint_pending'"
+            ).fetchone()
     finally:
         reader.close()
     assert body_state.checkpoint(store)
     with store.connection() as db:
-        assert not db.execute("SELECT 1 FROM maintenance_state").fetchone()
+        assert not db.execute(
+            "SELECT 1 FROM maintenance_state WHERE key='checkpoint_pending'"
+        ).fetchone()
 
 
 def test_gmail_storage_prefers_html_and_preserves_scope_and_transport_budget():
@@ -638,10 +644,14 @@ def test_checkpoint_never_clears_a_newer_deletion(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "connection", connection)
     body_state.checkpoint(store)
     with original() as db:
-        assert db.execute("SELECT value FROM maintenance_state").fetchone()
+        assert db.execute(
+            "SELECT value FROM maintenance_state WHERE key='checkpoint_pending'"
+        ).fetchone()
     assert body_state.checkpoint(store)
     with original() as db:
-        assert not db.execute("SELECT 1 FROM maintenance_state").fetchone()
+        assert not db.execute(
+            "SELECT 1 FROM maintenance_state WHERE key='checkpoint_pending'"
+        ).fetchone()
 
 
 @pytest.mark.parametrize("size", [0, 1, 199_999, 200_000, 200_001])

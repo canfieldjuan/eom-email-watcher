@@ -23,7 +23,6 @@ from connect_automate.locking import (
     OperationLockBusy,
     connect_lane_lock_path,
     connect_operation_lock,
-    connect_source_lock_path,
     operation_lock,
     operation_lock_supported,
     operation_lock_uses_soft_fallback,
@@ -31,7 +30,7 @@ from connect_automate.locking import (
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from . import deployment
+from . import deployment, source_locks
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -3768,16 +3767,6 @@ def _require_generic_connect_lane_lock(
     return lock_path
 
 
-def _require_generic_connect_source_lock(runtime: Runtime, message_id: str) -> Path:
-    lock_path = connect_source_lock_path(runtime.store.path, message_id)
-    if not operation_lock_supported(lock_path):
-        raise ApiError(
-            "connect_queue_unavailable",
-            "Connect attachment handoff requires native operation locking.",
-        )
-    return lock_path
-
-
 def _fail_generic_connect_source(
     runtime: Runtime,
     job_id: str,
@@ -3823,10 +3812,9 @@ def _submit_generic_connect_job(
     inactive_dispatch_state: str,
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
-    source_lock = _require_generic_connect_source_lock(runtime, message_id)
     busy_message = "The Connect source attachment is being changed"
     try:
-        with connect_operation_lock(source_lock, busy_message):
+        with runtime.store.source_locks((message_id,), busy_message=busy_message):
             dispatch = runtime.store.connect_dispatch(tracked.job_id)
             if dispatch is None:
                 raise RuntimeError("Connect source handoff is missing dispatch state")
@@ -4640,7 +4628,6 @@ def _prepare_or_create_generic_connect_job(
             "The selected capability requires explicit confirmation.",
         )
     _require_generic_connect_lane_lock(runtime, capability)
-    source_lock = _require_generic_connect_source_lock(runtime, message_id)
 
     def attachment_content() -> bytes:
         return _generic_attachment_content(
@@ -4650,10 +4637,7 @@ def _prepare_or_create_generic_connect_job(
             operation_deadline=operation_deadline,
         )
 
-    with connect_operation_lock(
-        source_lock,
-        "The Connect source attachment is being changed",
-    ):
+    with runtime.store.source_locks((message_id,)):
         locked_source = _retained_connect_message_source(runtime, message_id)
         try:
             locked_attachment = runtime.store.attachment(message_id, part_id)
@@ -6451,6 +6435,13 @@ def _response(request: object) -> dict[str, object]:
     except DeploymentError as exc:
         return {
             "error": {"code": "deployment_refused", "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except source_locks.SourceProtocolUnavailable as exc:
+        return {
+            "error": {"code": "connect_queue_unavailable", "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

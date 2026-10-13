@@ -4043,6 +4043,20 @@ def test_imap_generic_invoke_rechecks_local_fetch_ceiling_under_source_lock(
     payload = invocation_payload(selected)
     payload["part_id"] = "mime-0"
 
+    from contextlib import contextmanager
+
+    original_source_locks = runtime.store.source_locks
+    mutated = False
+
+    @contextmanager
+    def mutating_source_locks(ids, **kwargs):
+        nonlocal mutated
+        with original_source_locks(ids, **kwargs):
+            if not mutated:
+                mutated = True
+                MutatingSourceLock().__enter__()
+            yield
+
     class MutatingSourceLock:
         def __enter__(self) -> None:
             runtime.store.replace_attachments(
@@ -4069,9 +4083,9 @@ def test_imap_generic_invoke_rechecks_local_fetch_ceiling_under_source_lock(
         lambda **kwargs: connect.CapabilityCatalog((selected,)),
     )
     monkeypatch.setattr(
-        engine_api,
-        "connect_operation_lock",
-        lambda *_args: MutatingSourceLock(),
+        runtime.store,
+        "source_locks",
+        mutating_source_locks,
     )
     monkeypatch.setattr(
         engine_api.ImapGateway,

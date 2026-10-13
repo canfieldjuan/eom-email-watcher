@@ -4,13 +4,14 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import math
 import re
 import sqlite3
 import unicodedata
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from itertools import chain
@@ -18,9 +19,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from connect_automate import connect
-from connect_automate.locking import connect_operation_lock, connect_source_lock_path
+from connect_automate.locking import connect_operation_lock
 
-from . import body_state, reconcile_state, thread_migration
+from . import body_state, deployment, reconcile_state, source_locks, thread_migration
 from .automation.rules import (
     MAX_AUTOMATION_ATTACHMENTS,
     MAX_AUTOMATION_RULES,
@@ -5895,18 +5896,29 @@ class Store:
                 connection.close()
 
     @contextmanager
-    def _source_cleanup_locks(self, message_ids: Iterable[str]) -> Iterator[None]:
-        identities = sorted(set(message_ids))
-        with ExitStack() as stack:
-            for message_id in identities:
-                stack.enter_context(
-                    connect_operation_lock(
-                        connect_source_lock_path(self.path, message_id),
-                        "The Connect source attachment is being handed off",
-                        timeout_seconds=-1,
-                    )
+    def source_locks(
+        self,
+        message_ids: Iterable[str],
+        *,
+        timeout_seconds: float = 0,
+        busy_message: str = "The Connect source attachment is being changed",
+    ) -> Iterator[None]:
+        with self.connection() as db:
+            if not source_locks.protocol_ready(db):
+                raise source_locks.SourceProtocolUnavailable(
+                    "Connect source-lock upgrade is deferred; stop older engines and retry"
                 )
+        with source_locks.source_locks(
+            self.path, message_ids, timeout_seconds=timeout_seconds, busy_message=busy_message
+        ):
             yield
+
+    def _source_cleanup_locks(self, message_ids: Iterable[str]):
+        return self.source_locks(
+            message_ids,
+            timeout_seconds=source_locks.SOURCE_LOCK_WAIT_SECONDS,
+            busy_message="The Connect source attachment is being handed off",
+        )
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -5917,12 +5929,14 @@ class Store:
             "The mailbox database is being upgraded",
             timeout_seconds=-1,
         ):
+            fresh = not self.path.exists()
             if self.path.exists():
                 with self.connection() as source:
                     version = source.execute("PRAGMA user_version").fetchone()[0]
                     retained = source.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
                     ).fetchone()
+                    fresh = retained is None
                     if retained is not None and version < 33:
                         thread_migration.write_backup(self.path, source)
             try:
@@ -5931,6 +5945,12 @@ class Store:
                 thread_migration.cleanup_backups(self.path, success=False)
                 raise
             thread_migration.cleanup_backups(self.path, success=True)
+            if SCHEMA_VERSION >= 35:
+                try:
+                    source_locks.qualify_protocol(self, fresh=fresh)
+                except (source_locks.SourceProtocolUnavailable, deployment.DeploymentError) as exc:
+                    # The schema is available; source-protected work remains refused.
+                    logging.getLogger(__name__).warning("Source-lock cutover deferred: %s", exc)
 
     def _initialize_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

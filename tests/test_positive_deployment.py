@@ -136,6 +136,7 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
 
     runtime = SimpleNamespace(
         store=SimpleNamespace(
+            source_locks=lambda *args, **kwargs: nullcontext(),
             connect_dispatch=lambda _: SimpleNamespace(
                 source_available=True, required_manifest_features=()
             ),
@@ -153,7 +154,6 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
     monkeypatch.setattr(engine_api.connect, "ConnectClient", lambda _: client)
     monkeypatch.setattr(engine_api.connect, "ConnectV2Client", lambda _: client)
     monkeypatch.setattr(engine_api, "_mark_connect_failed", persist)
-    monkeypatch.setattr(engine_api, "_require_generic_connect_source_lock", lambda *args: None)
     monkeypatch.setattr(engine_api, "connect_operation_lock", lambda *args: nullcontext())
     monkeypatch.setattr(engine_api, "_require_submission_authority_for_job", lambda *a, **k: True)
     with pytest.raises(deployment.DeploymentError) as observed:

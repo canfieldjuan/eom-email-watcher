@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -819,18 +820,55 @@ def verify_scheduled_readers(binary: Path) -> None:
     _verify_description(deployment_description(binary))
 
 
+@dataclass
+class _CutoverAdmission:
+    description: DeploymentDescription
+    pid: int
+    thread_id: int
+    active: bool = True
+
+
+_exclusive_admission: ContextVar[_CutoverAdmission | None] = ContextVar(
+    "exclusive_database_admission", default=None
+)
+
+
 @contextmanager
-def database_admission() -> Iterator[None]:
-    """Hold admission through the complete packaged Linux connection lifetime."""
+def database_admission(*, exclusive: bool = False) -> Iterator[None]:
+    """One admission owner for connections and qualified protocol cutovers."""
     if not getattr(sys, "frozen", False) or sys.platform != "linux":
         yield
         return
-    description = deployment_description(Path(sys.executable))
-    with deployment_lease(description.manager, exclusive=False):
+    inherited = _exclusive_admission.get()
+    if inherited is not None:
+        if not inherited.active:
+            raise DeploymentError("Database cutover admission has expired")
+        if inherited.pid != os.getpid() or inherited.thread_id != threading.get_ident():
+            raise DeploymentError("Database cutover admission belongs to another execution")
+        description = inherited.description
         _current_engine(description)
         _verify_description(description)
         _current_engine(description)
         yield
+        return
+    description = deployment_description(Path(sys.executable))
+    with deployment_lease(description.manager, exclusive=exclusive):
+        _current_engine(description)
+        _verify_description(description)
+        _current_engine(description)
+        grant = (
+            _CutoverAdmission(description, os.getpid(), threading.get_ident())
+            if exclusive else None
+        )
+        token = _exclusive_admission.set(grant) if grant is not None else None
+        try:
+            yield
+            if exclusive:
+                _current_engine(description)
+        finally:
+            if token is not None:
+                grant.active = False
+                _exclusive_admission.reset(token)
 
 
 def verify_database_admission() -> None:

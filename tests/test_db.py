@@ -4015,7 +4015,9 @@ def test_delete_message_waits_for_cross_process_source_handoff(tmp_path: Path) -
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
     seed_pdf_attachment(store)
-    lock_path = locking.connect_source_lock_path(store.path, "m1")
+    from eom_email_watcher.source_locks import source_lock_path
+
+    lock_path = source_lock_path(store.path, "m1")
 
     with locking.connect_operation_lock(lock_path, "source busy"):
         cleanup = subprocess.Popen(
@@ -4110,6 +4112,8 @@ def test_clear_messages_bounds_simultaneously_held_source_locks(
             subject="Bounded cleanup",
             received_at="2026-09-01T00:00:00+00:00",
         )
+    from eom_email_watcher import source_locks
+
     active = 0
     maximum = 0
 
@@ -4125,7 +4129,7 @@ def test_clear_messages_bounds_simultaneously_held_source_locks(
 
     monkeypatch.setattr(db_module, "SOURCE_CLEANUP_LOCK_BATCH_SIZE", 2)
     monkeypatch.setattr(
-        db_module,
+        source_locks,
         "connect_operation_lock",
         lambda *args, **kwargs: TrackingLock(),
     )
