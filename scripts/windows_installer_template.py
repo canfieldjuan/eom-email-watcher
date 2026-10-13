@@ -34,11 +34,17 @@ def catalog_macro(template: str) -> str:
         '  FileWriteUTF16LE /BOM $EW_PACKAGE_CATALOG_HANDLE "EW-PACKAGE-FILES-V1$\\r$\\n"',
     ]
     files = 0
+    loops = []
     for raw in section[1].splitlines():
         line = raw.strip()
         # Keep the bundler's exact renderer loops/conditions; no executable list.
         if line.startswith("{{") and line.endswith("}}"):
             output.append(raw)
+            each = re.match(r"{{#each\s+(\w+)", line)
+            if each:
+                loops.append(each[1])
+            elif line.startswith("{{/each"):
+                loops.pop()
         elif line.startswith("File "):
             oname = re.search(r'"/oname=([^"]+)"', line)
             if oname:
@@ -50,6 +56,13 @@ def catalog_macro(template: str) -> str:
                 output.append('  ${GetFileName} "' + source[1] + '" $0')
                 value = "$0"
             output.append('  FileWriteUTF16LE $EW_PACKAGE_CATALOG_HANDLE "' + value + '$\\r$\\n"')
+            # Main application / declared sidecars, not generic resource programs.
+            if "binaries" in loops or "MAINBINARYSRCPATH" in line:
+                output.append(
+                    '  FileWriteUTF16LE $EW_PACKAGE_CATALOG_HANDLE "EW-APP-IMAGE|'
+                    + value
+                    + '$\\r$\\n"'
+                )
             files += 1
         elif line.startswith("WriteUninstaller "):
             match = re.fullmatch(r'WriteUninstaller "\$INSTDIR\\([^\"]+)"', line)

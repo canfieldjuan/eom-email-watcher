@@ -100,6 +100,8 @@ jobs:
         run: >-
           uv run pytest -v
           tests/test_windows_cutover.py
+          tests/test_windows_cutover_round9.py
+          tests/test_gmail_recovery_retention.py
           tests/test_thread_bodies_round4.py
           tests/test_thread_bodies.py
           tests/test_thread_reconcile.py::test_check_backfills_vendor_mail_before_current_poll_cursor
@@ -147,9 +149,9 @@ jobs:
           name: email-watcher-windows-source-cutover
           path: |
             ${{ runner.temp }}/ew-source-cutover/qualification.json
-            ${{ runner.temp }}/ew-source-cutover/*/*.log
-            ${{ runner.temp }}/ew-source-cutover/*/installer.*
-            ${{ runner.temp }}/ew-source-cutover/*/cutover-*.txt
+            ${{ runner.temp }}/ew-source-cutover/**/*.log
+            ${{ runner.temp }}/ew-source-cutover/**/installer.*
+            ${{ runner.temp }}/ew-source-cutover/**/cutover-*.txt
             ${{ runner.temp }}/ew-source-cutover/*/package-programs.json
             ${{ runner.temp }}/ew-source-cutover/native-integration.xml
             ${{ runner.temp }}/ew-source-cutover/full/build-inventory.json

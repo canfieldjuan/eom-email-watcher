@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -49,6 +50,34 @@ def wait_file(path: Path, process=None):
         if time.monotonic() > deadline:
             raise TimeoutError(f"Missing fixture receipt: {path.name}")
         time.sleep(0.02)
+
+
+def phase_outcomes(attempt: Path) -> dict:
+    phases = {}
+    for path in attempt.glob("eom-email-watcher-cutover-*.log"):
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        for match in re.finditer(r"^phase=(Name|Pre|Post) exit=(\S+)", text, re.MULTILINE):
+            phase, code = match.groups()
+            phases.setdefault(phase, []).append(code)
+    (attempt / "installer.phases.json").write_text(json.dumps(phases, indent=2))
+    if phases.get("Post"):
+        assert phases.get("Pre") == ["0"], "Post ran without a successful Pre"
+    return phases
+
+
+def run_installer(installer: Path, installation: Path, folder: Path, label: str):
+    attempt = folder / label
+    attempt.mkdir(mode=0o700)
+    result = subprocess.run(
+        [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
+        capture_output=True,
+        timeout=240,
+        env=dict(os.environ, TEMP=str(attempt), TMP=str(attempt)),
+    )
+    (attempt / "installer.stdout").write_bytes(result.stdout)
+    (attempt / "installer.stderr").write_bytes(result.stderr)
+    phase_outcomes(attempt)
+    return result, attempt
 
 
 def isolated_environment(root: Path):
@@ -113,7 +142,7 @@ def build_old_actor(predecessor: Path, output: Path, keyring: Path | None = None
 def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, case: str):
     folder = output / case
     folder.mkdir(mode=0o700)
-    installation = output / "installed"
+    installation = folder / "installed"
     installation.mkdir(exist_ok=True)
     private = folder / "private"
     private.mkdir(mode=0o700)
@@ -129,7 +158,6 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
     )
     config.chmod(0o600)
     environment = isolated_environment(private)
-    installer_environment = dict(os.environ, TEMP=str(folder), TMP=str(folder))
     engine = installation / "eom-mail-engine.exe"
     desktop = installation / "eom-email-watcher-desktop.exe"
     for path in (engine, desktop):
@@ -223,7 +251,8 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             )
             assert late.returncode != 0 and "newer than supported" in late.stderr
             assert not late_ready.exists() and not posts
-        if case == "old-then-new":
+        if case == "unknown-image":
+            prior_digest = hashlib.sha256(engine.read_bytes()).hexdigest()
             unknown_image = installation / "not-from-package.exe"
             shutil.copy2(old_actor, unknown_image)
             unknown_ready = folder / "unknown.ready"
@@ -232,34 +261,34 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             )
             try:
                 wait_file(unknown_ready, unknown)
-                refusal = subprocess.run(
-                    [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
-                    capture_output=True,
-                    timeout=240,
-                    env=installer_environment,
-                )
+                refusal, attempt = run_installer(installer, installation, folder, "unknown-refusal")
                 (folder / "installer.unknown.stdout").write_bytes(refusal.stdout)
                 (folder / "installer.unknown.stderr").write_bytes(refusal.stderr)
                 assert refusal.returncode != 0, "Unknown image was admitted"
-                assert unknown.poll() is None and first.poll() is None
+                assert unknown.poll() is None and first.poll() is None and second.poll() is None
+                assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
+                assert not (installation / "windows-source-cutover-v1.json").exists()
+                assert (
+                    powershell("(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task)
+                    == "Ready"
+                )
                 transcripts = "\n".join(
                     p.read_text(encoding="utf-8-sig", errors="replace")
-                    for p in folder.glob("cutover-*-Pre-*.txt")
+                    for p in attempt.glob("cutover-*-Pre-*.txt")
                 )
                 assert "Unknown installation image: " + str(unknown_image) in transcripts
             finally:
                 if unknown.poll() is None:
                     subprocess.run(["taskkill", "/PID", str(unknown.pid), "/T", "/F"], check=True)
                 unknown.wait(timeout=10)
+            return {"case": case, "result": "PASS", "unknown_survived_refusal": True}
+        if case == "old-then-new":
             # A real installed owner survives the stop attempt. Refusal must
             # leave bytes intact; restoring permissions admits the same update.
             prior_digest = hashlib.sha256(engine.read_bytes()).hexdigest()
             with deny_termination(first):
-                refusal = subprocess.run(
-                    [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
-                    capture_output=True,
-                    timeout=240,
-                    env=installer_environment,
+                refusal, attempt = run_installer(
+                    installer, installation, folder, "protected-refusal"
                 )
                 (folder / "installer.refusal.stdout").write_bytes(refusal.stdout)
                 (folder / "installer.refusal.stderr").write_bytes(refusal.stderr)
@@ -279,7 +308,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 print("REFUSAL_OBSERVED", json.dumps(observed), flush=True)
                 transcripts = "\n".join(
                     p.read_text(encoding="utf-8-sig", errors="replace")
-                    for p in folder.glob("cutover-*-Pre-*.txt")
+                    for p in attempt.glob("cutover-*-Pre-*.txt")
                 )
                 assert f"failure-stage=process-stop process={first.pid} code=5" in transcripts, (
                     "Refusal was not caused by the protected owner's access-denied stop"
@@ -289,12 +318,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
                 assert not (installation / "windows-source-cutover-v1.json").exists()
                 assert task_state == "Ready", observed
-        install = subprocess.run(
-            [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
-            capture_output=True,
-            timeout=240,
-            env=installer_environment,
-        )
+        install, attempt = run_installer(installer, installation, folder, "successful-update")
         (folder / "installer.stdout").write_bytes(install.stdout)
         (folder / "installer.stderr").write_bytes(install.stderr)
         assert install.returncode == 0, install.returncode
@@ -327,7 +351,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
         catalog_programs = {
             name.replace("\\", "/").casefold()
             for name in catalog_lines[1:]
-            if name.casefold().endswith(".exe")
+            if name.casefold().endswith(".exe") and not name.startswith("EW-APP-IMAGE|")
         }
         (folder / "package-programs.json").write_text(
             json.dumps(
@@ -392,7 +416,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             )
         for process in actors:
             if process.poll() is None:
-                process.kill()
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True)
             process.wait(timeout=10)
         for log in handles:
             log.close()
@@ -416,7 +440,7 @@ def main():
         run_case(
             args.output.resolve(), args.installer.resolve(), args.engine.resolve(), actor, case
         )
-        for case in ("old-then-new", "new-then-old")
+        for case in ("unknown-image", "old-then-new", "new-then-old")
     ]
     receipt = {
         "predecessor": PREDECESSOR,

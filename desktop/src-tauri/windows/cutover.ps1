@@ -6,6 +6,26 @@ param(
     [string]$ProgramCatalog = ''
 )
 $ErrorActionPreference = 'Stop'
+$stage = 'initialization'
+$operation = 'phase-entry'
+$targetProcess = 0
+function Write-CutoverFailure($record, [string]$context) {
+    $failure = $record.Exception
+    $base = $failure.GetBaseException()
+    $code = if ($base -is [ComponentModel.Win32Exception]) { $base.NativeErrorCode } else { '' }
+    Write-Output ("Cutover failure-stage=$stage process=$targetProcess code=$code context=$context operation=$operation")
+    while ($failure) {
+        Write-Output ("Cutover exception type=" + $failure.GetType().FullName +
+            " HResult=" + $failure.HResult + " message=" + $failure.Message)
+        if ($failure -is [ComponentModel.Win32Exception]) {
+            Write-Output ("Cutover native-error=" + $failure.NativeErrorCode)
+        }
+        $failure = $failure.InnerException
+    }
+    Write-Output ("Cutover error-id=" + $record.FullyQualifiedErrorId +
+        " position=" + $record.InvocationInfo.PositionMessage)
+}
+trap { Write-CutoverFailure $_ 'phase'; exit 1 }
 $root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 if ($root -eq [IO.Path]::GetPathRoot($root).TrimEnd('\')) { throw 'Installation root cannot be a drive root' }
 $prefix = $root + '\'
@@ -31,6 +51,20 @@ $pending = Join-Path $root 'windows-cutover-pending-v1.json'
 $restoreScript = Join-Path $root 'windows-cutover-restore-v1.ps1'
 $restoreReady = Join-Path $root 'windows-cutover-restore-ready-v1'
 $installedCatalog = Join-Path $root 'windows-package-files-v1.txt'
+$rollback = Join-Path $root 'windows-cutover-rollback-v1.json'
+function File-Sha256([string]$path, [byte[]]$content = $null) {
+    $hash = [Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = if ($null -ne $content) {
+            [IO.MemoryStream]::new($content, $false)
+        } else { [IO.File]::OpenRead($path) }
+        return [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        $hash.Dispose()
+    }
+}
 function Resolve-ExecutablePath([string]$path, [string]$context = 'path') {
     try {
         if ([string]::IsNullOrWhiteSpace($path)) { return $null }
@@ -47,31 +81,64 @@ function Resolve-ExecutablePath([string]$path, [string]$context = 'path') {
 function Is-InstalledPath([string]$path) {
     return $path -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
 }
-function Read-PackagePrograms([string]$catalog) {
-    if (!(Test-Path -LiteralPath $catalog -PathType Leaf) -or
-        ((Get-Item -LiteralPath $catalog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+function Read-PackagePrograms([string]$catalog, [bool]$identityOnly = $false, [byte[]]$content = $null) {
+    if ($null -eq $content -and (!(Test-Path -LiteralPath $catalog -PathType Leaf) -or
+        ((Get-Item -LiteralPath $catalog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint))) {
         throw 'Package program catalog is missing or unsafe'
     }
-    $lines = [IO.File]::ReadAllLines($catalog, [Text.Encoding]::Unicode)
+    if ($null -eq $content) { $content = [IO.File]::ReadAllBytes($catalog) }
+    $lines = [Text.Encoding]::Unicode.GetString($content).TrimStart([char]0xfeff) -split '\r?\n'
     if (!$lines.Length -or $lines[0] -ne 'EW-PACKAGE-FILES-V1') { throw 'Invalid package program catalog' }
     foreach ($entry in $lines | Select-Object -Skip 1) {
         if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $identity = $entry.StartsWith('EW-APP-IMAGE|', [StringComparison]::Ordinal)
+        if ($identity) { $entry = $entry.Substring('EW-APP-IMAGE|'.Length) }
+        if ($identityOnly -ne $identity) { continue }
         if ([IO.Path]::IsPathRooted($entry)) { throw 'Package path must be relative' }
         $full = [IO.Path]::GetFullPath((Join-Path $root $entry))
         if (!(Is-InstalledPath $full)) { throw 'Package path escapes installation' }
         if ([IO.Path]::GetExtension($full) -ieq '.exe') { $full }
     }
 }
-function Load-OwnedPrograms {
-    $set = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($path in @(Read-PackagePrograms $ProgramCatalog)) { $set.Add($path) | Out-Null }
-    if (!$set.Count) { throw 'Package has no executable programs' }
-    # Keep previously shipped programs during an update, bound to the last receipt.
+function Prior-Catalog {
+    if (Test-Path -LiteralPath $rollback) {
+        $record = Get-Content -LiteralPath $rollback -Raw | ConvertFrom-Json
+        $bytes = [Convert]::FromBase64String($record.catalog)
+        if ($record.version -ne 1 -or (File-Sha256 '' $bytes) -ne $record.catalog_sha256) {
+            throw 'Prior package rollback binding is invalid'
+        }
+        return ,$bytes
+    }
     if ((Test-Path -LiteralPath $installedCatalog) -and (Test-Path -LiteralPath $receipt)) {
         $previous = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
         if ($previous.program_catalog_sha256 -and
-            (Get-FileHash -LiteralPath $installedCatalog -Algorithm SHA256).Hash -ieq $previous.program_catalog_sha256) {
-            foreach ($path in @(Read-PackagePrograms $installedCatalog)) { $set.Add($path) | Out-Null }
+            (File-Sha256 $installedCatalog) -ieq $previous.program_catalog_sha256) {
+            return ,([IO.File]::ReadAllBytes($installedCatalog))
+        }
+    }
+    return $null
+}
+function Save-PriorCatalog {
+    $bytes = Prior-Catalog
+    if ($null -eq $bytes -or (Test-Path -LiteralPath $rollback)) { return }
+    $record = [ordered]@{version=1;catalog=[Convert]::ToBase64String($bytes);catalog_sha256=(File-Sha256 '' $bytes)}
+    $temp = $rollback + '.tmp'
+    ConvertTo-Json -InputObject $record -Compress | Set-Content -LiteralPath $temp -Encoding UTF8
+    Move-Item -LiteralPath $temp -Destination $rollback -Force
+}
+function Load-OwnedPrograms {
+    $set = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $script:identityNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in @(Read-PackagePrograms $ProgramCatalog)) { $set.Add($path) | Out-Null }
+    foreach ($path in @(Read-PackagePrograms $ProgramCatalog $true)) {
+        $script:identityNames.Add([IO.Path]::GetFileName($path)) | Out-Null
+    }
+    if (!$set.Count) { throw 'Package has no executable programs' }
+    $prior = Prior-Catalog
+    if ($null -ne $prior) {
+        foreach ($path in @(Read-PackagePrograms '' $false $prior)) { $set.Add($path) | Out-Null }
+        foreach ($path in @(Read-PackagePrograms '' $true $prior)) {
+            $script:identityNames.Add([IO.Path]::GetFileName($path)) | Out-Null
         }
     }
     return ,$set
@@ -118,18 +185,34 @@ if ($Phase -eq 'Restore') {
     }
     # Serialize restoration with every installer transaction. An older worker
     # cannot re-enable a task while the next update is stopping its owners.
+    $stage = 'restoration-exclusion'
+    $operation = 'mutex-create'
     $mutex = [Threading.Mutex]::new($false, (Installer-MutexName))
     $owned = $false
+    $restoreFailure = $null
     try {
         Write-Output 'Cutover stage=restoration-exclusion'
+        $operation = 'mutex-wait'
         try { $owned = $mutex.WaitOne(90000) }
         catch [Threading.AbandonedMutexException] { $owned = $true }
         if (!$owned) { throw 'Task restoration deferred behind an active installer' }
+        $operation = 'task-restoration'
         Restore-Tasks
         Remove-Item -LiteralPath $restoreReady,$restoreScript -ErrorAction SilentlyContinue
+    } catch {
+        $restoreFailure = $_
+        Write-CutoverFailure $_ 'restoration'
+        throw
     } finally {
-        if ($owned) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
+        try {
+            $operation = 'mutex-release'
+            if ($owned) { $mutex.ReleaseMutex() }
+            $operation = 'mutex-dispose'
+            $mutex.Dispose()
+        } catch {
+            Write-CutoverFailure $_ 'restoration-cleanup'
+            if (!$restoreFailure) { throw }
+        }
     }
     exit 0
 }
@@ -166,14 +249,14 @@ function Installed-Processes {
         if ($process.ProcessId -eq $InstallerPid) { continue }
         $path = Resolve-ExecutablePath $process.ExecutablePath ('process ' + $process.ProcessId)
         if (Is-InstalledPath $path) { Assert-OwnedImage $path; $process }
-        elseif (!$process.ExecutablePath -and @($ownedPrograms | Where-Object { [IO.Path]::GetFileName($_) -ieq $process.Name }).Count) {
+        elseif (!$process.ExecutablePath -and $identityNames.Contains($process.Name)) {
             throw 'Cannot establish the identity of a running Email Watcher process'
         }
     }
 }
 if ($Phase -eq 'Pre') {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
-    foreach ($slot in @($root,$receipt,$pending,$restoreScript,$restoreReady,$installedCatalog,(Join-Path $root 'windows-source-cutover-v1.tmp'))) {
+    foreach ($slot in @($root,$receipt,$pending,$restoreScript,$restoreReady,$installedCatalog,$rollback,($rollback + '.tmp'),(Join-Path $root 'windows-source-cutover-v1.tmp'))) {
         if (Test-Path -LiteralPath $slot) {
             $item = Get-Item -LiteralPath $slot -Force
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Installer state cannot be a reparse point' }
@@ -181,6 +264,7 @@ if ($Phase -eq 'Pre') {
     }
     $ownedPrograms = Load-OwnedPrograms
     Restore-Tasks
+    Save-PriorCatalog
     if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt }
     $saved = @()
     $stage = 'scheduled-task-selection'
@@ -212,6 +296,7 @@ if ($Phase -eq 'Pre') {
             }
         }
         $stage = 'process-stop'
+        $operation = 'process-enumeration'
         foreach ($process in @(Installed-Processes)) {
             Write-Output ('Cutover stopping process=' + $process.ProcessId)
             $targetProcess = $process.ProcessId
@@ -219,35 +304,57 @@ if ($Phase -eq 'Pre') {
             if ($live) {
                 # Open the process handle and validate its live image before Kill;
                 # a recycled PID must never authorize killing an unrelated process.
+                $processFailure = $null
                 try {
+                    $operation = 'process-handle'
                     $handle = $live.Handle
+                    $operation = 'held-image'
                     $image = Resolve-ExecutablePath ([CutoverProcess]::Image($handle)) 'held process'
                     if (!(Is-InstalledPath $image)) { continue }
                     Assert-OwnedImage $image
+                    $operation = 'process-termination'
                     [CutoverProcess]::Stop($handle)
-                } finally { $live.Dispose() }
+                } catch {
+                    $processFailure = $_
+                    Write-CutoverFailure $_ 'process'
+                } finally {
+                    try {
+                        $operation = 'process-dispose'
+                        $live.Dispose()
+                    } catch {
+                        Write-CutoverFailure $_ 'process-cleanup'
+                        if (!$processFailure) { throw }
+                    }
+                }
+                if ($processFailure) { throw $processFailure }
             }
         }
         if (@(Installed-Processes).Count) { throw 'An old installation is still running' }
     } catch {
-        $failure = $_.Exception.GetBaseException()
-        Write-Output ("Cutover failure-stage=$stage process=$targetProcess code=" + $failure.NativeErrorCode)
-        Write-Output ('Cutover failure=' + $_.Exception.Message)
-        Restore-Tasks
-        Write-Output 'Cutover stage=tasks-restored-after-failure'
-        throw
+        $originalFailure = $_
+        Write-CutoverFailure $originalFailure 'pre'
+        try {
+            Restore-Tasks
+            Write-Output 'Cutover stage=tasks-restored-after-failure'
+        } catch { Write-CutoverFailure $_ 'rollback' }
+        throw $originalFailure
     }
     exit 0
 }
 # NSIS executes Post only after every replacement has succeeded. Before then,
 # disabled tasks and stopped desktop producers cannot restart the old image.
+$stage = 'publication'
+$operation = 'process-enumeration'
 $ownedPrograms = Load-OwnedPrograms
 if (@(Installed-Processes).Count) { throw 'Publication cannot qualify while an installation owner is running' }
 $engine = Join-Path $root 'eom-mail-engine.exe'
 if (!(Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'The installed engine is missing' }
 Copy-Item -LiteralPath $ProgramCatalog -Destination $installedCatalog -Force
-$record = [ordered]@{version=1;protocol='source-stripe-v1';engine_sha256=(Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant();program_catalog_sha256=(Get-FileHash -LiteralPath $installedCatalog -Algorithm SHA256).Hash.ToLowerInvariant()}
+$operation = 'receipt-hash'
+$record = [ordered]@{version=1;protocol='source-stripe-v1';engine_sha256=(File-Sha256 $engine);program_catalog_sha256=(File-Sha256 $installedCatalog)}
 $temp = Join-Path $root 'windows-source-cutover-v1.tmp'
 ConvertTo-Json -InputObject $record -Compress | Set-Content -LiteralPath $temp -Encoding UTF8
 Move-Item -LiteralPath $temp -Destination $receipt -Force
 Restore-Tasks
+if (Test-Path -LiteralPath $rollback) { Remove-Item -LiteralPath $rollback }
+exit 0
