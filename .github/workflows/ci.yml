@@ -78,7 +78,12 @@ jobs:
       - run: uv run pytest tests/test_desktop_packaging.py
       - run: pnpm --dir desktop install --frozen-lockfile
       - name: Build Windows NSIS installer
-        run: pnpm --dir desktop tauri build --bundles nsis
+        shell: pwsh
+        run: |
+          uv run python scripts/windows_cutover_parity.py record "$env:RUNNER_TEMP/ew-source-cutover/full"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --dir desktop tauri build --bundles nsis
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/checkout@v7
         with:
           ref: 43a850d8b00cddfdad2a767b7b27fc792707b010
@@ -131,6 +136,8 @@ jobs:
           $triple = (rustc --print host-tuple).Trim()
           $setup = @(Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe)
           if ($setup.Count -ne 1) { throw 'Expected one test-only qualification setup' }
+          uv run python scripts/windows_cutover_parity.py verify "$env:RUNNER_TEMP/ew-source-cutover/full" --installer $setup[0].FullName --engine "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run python scripts/prove_windows_cutover_full.py $setup[0].FullName "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" cutover-predecessor "$env:RUNNER_TEMP/ew-source-cutover/full"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve native cutover qualification evidence
@@ -142,8 +149,11 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/qualification.json
             ${{ runner.temp }}/ew-source-cutover/*/*.log
             ${{ runner.temp }}/ew-source-cutover/*/installer.*
+            ${{ runner.temp }}/ew-source-cutover/*/cutover-*.txt
             ${{ runner.temp }}/ew-source-cutover/native-integration.xml
             ${{ runner.temp }}/ew-source-cutover/full/build-inventory.json
+            ${{ runner.temp }}/ew-source-cutover/full/release-sources.json
+            ${{ runner.temp }}/ew-source-cutover/full/parity.json
             ${{ runner.temp }}/ew-source-cutover/full/qualification.json
             ${{ runner.temp }}/ew-source-cutover/full/operations.jsonl
             ${{ runner.temp }}/ew-source-cutover/full/greenmail.log

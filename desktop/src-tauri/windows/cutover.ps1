@@ -18,6 +18,13 @@ function Installer-MutexName {
     } finally { $hash.Dispose() }
 }
 if ($Phase -eq 'Name') { [Console]::Write((Installer-MutexName)); exit 0 }
+# Diagnostics do not participate in admission. NSIS also records each invocation's
+# exit/output, including syntax or Name failures that cannot start a transcript.
+try {
+    $trace = Join-Path ([IO.Path]::GetTempPath()) ('cutover-' + $InstallerPid + '-' + $Phase + '-' + $PID + '.txt')
+    Start-Transcript -Path $trace -Force | Out-Null
+} catch { Write-Warning ('Cutover transcript unavailable: ' + $_.Exception.Message) }
+Write-Output ('Cutover phase=' + $Phase + ' root=' + $root + ' process=' + $PID)
 $receipt = Join-Path $root 'windows-source-cutover-v1.json'
 $pending = Join-Path $root 'windows-cutover-pending-v1.json'
 $restoreScript = Join-Path $root 'windows-cutover-restore-v1.ps1'
@@ -47,6 +54,7 @@ if ($Phase -eq 'Restore') {
     $mutex = [Threading.Mutex]::new($false, (Installer-MutexName))
     $owned = $false
     try {
+        Write-Output 'Cutover stage=restoration-exclusion'
         try { $owned = $mutex.WaitOne(90000) }
         catch [Threading.AbandonedMutexException] { $owned = $true }
         if (!$owned) { throw 'Task restoration deferred behind an active installer' }
@@ -103,6 +111,7 @@ if ($Phase -eq 'Pre') {
     if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt }
     $saved = @()
     try {
+        Write-Output 'Cutover stage=scheduled-task-selection'
         foreach ($task in Get-ScheduledTask) {
             if (@($task.Actions | Where-Object { Is-InstalledPath $_.Execute }).Count) {
                 foreach ($action in @($task.Actions | Where-Object { Is-InstalledPath $_.Execute })) {
@@ -116,6 +125,7 @@ if ($Phase -eq 'Pre') {
                 ConvertTo-Json -InputObject $saved -Compress | Set-Content -LiteralPath $pending -Encoding UTF8
                 Disable-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName | Out-Null
                 Stop-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName
+                Write-Output ('Cutover disabled task=' + $task.TaskPath + $task.TaskName)
             }
         }
         if ($saved.Count) {
@@ -133,6 +143,7 @@ if ($Phase -eq 'Pre') {
             }
         }
         foreach ($process in @(Installed-Processes)) {
+            Write-Output ('Cutover stopping process=' + $process.ProcessId)
             $live = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
             if ($live) {
                 # Open the process handle and validate its live image before Kill;
@@ -145,7 +156,12 @@ if ($Phase -eq 'Pre') {
             }
         }
         if (@(Installed-Processes).Count) { throw 'An old installation is still running' }
-    } catch { Restore-Tasks; throw }
+    } catch {
+        Write-Output ('Cutover failure=' + $_.Exception.Message)
+        Restore-Tasks
+        Write-Output 'Cutover stage=tasks-restored-after-failure'
+        throw
+    }
     exit 0
 }
 # NSIS executes Post only after every replacement has succeeded. Before then,

@@ -943,6 +943,63 @@ def test_development_build_remains_credential_free(
     ]
 
 
+def test_qualification_reuses_release_packaging_owner(tmp_path, monkeypatch):
+    import build_windows_cutover_qualification as qualification
+    from windows_cutover_fixture import fixture_authority
+
+    google, microsoft, release_ring = (
+        tmp_path / name for name in ("google.json", "microsoft.json", "release.json")
+    )
+    _write_oauth_client(google)
+    _write_microsoft_oauth_client(microsoft)
+    _write_entitlement_keyring(release_ring)
+    calls, _ = _configure_fake_sidecar_build(
+        tmp_path, monkeypatch, google=google, microsoft=microsoft, keyring=release_ring
+    )
+    monkeypatch.setattr(qualification, "builder", build_desktop_sidecar, raising=False)
+    snapshots = []
+    run = build_desktop_sidecar.subprocess.run
+
+    def capture(arguments, **kwargs):
+        if "PyInstaller" in arguments:
+            normalized = list(arguments)
+            for index, argument in enumerate(arguments):
+                if argument == "--add-data":
+                    source, destination = arguments[index + 1].rsplit(os.pathsep, 1)
+                    normalized[index + 1] = Path(source).name + os.pathsep + destination
+            snapshots.append(
+                (
+                    normalized,
+                    {
+                        destination + "/" + source.name: source.read_bytes()
+                        for source, destination in _build_data(arguments)
+                    },
+                    kwargs["env"]["PYINSTALLER_CONFIG_DIR"],
+                )
+            )
+        return run(arguments, **kwargs)
+
+    monkeypatch.setattr(build_desktop_sidecar.subprocess, "run", capture)
+    release = build_desktop_sidecar.build_sidecar()
+    test_ring, _ = fixture_authority(tmp_path / "qualification")
+    assert qualification.build_test_sidecar(test_ring) == release
+    assert snapshots[0][0] == snapshots[1][0]
+    assert snapshots[0][2] == snapshots[1][2]
+    key = "connect_automate_data/connect-entitlement-keyring.json"
+    assert snapshots[0][1][key] != snapshots[1][1][key]
+    assert {k: v for k, v in snapshots[0][1].items() if k != key} == {
+        k: v for k, v in snapshots[1][1].items() if k != key
+    }
+    assert calls[1] == calls[3]  # Same real smoke invocation, including OAuth providers.
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="labelled qualification"):
+        qualification.build_test_sidecar(release_ring)
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="non-production"):
+        build_desktop_sidecar.validate_entitlement_keyring(test_ring)
+    monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, "public")
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="not a public build"):
+        qualification.build_test_sidecar(test_ring)
+
+
 def test_public_build_accepts_complete_provider_identity_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

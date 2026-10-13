@@ -41,6 +41,7 @@ GREENMAIL_SHA256 = "9457fdaf45ded6c87bf84a321a5ced4b4b5e72b1d03686b778df381378af
 OWNER = "owner@example.test"
 VENDOR = "vendor@example.test"
 PASSWORD = "public-fixture-password"
+QUALIFICATION_AUTHORITY_ID = "cutover-test-key"
 PDF = b"%PDF-1.4\nPublic native cutover fixture.\n%%EOF\n"
 
 
@@ -69,7 +70,7 @@ def fixture_authority(output: Path) -> tuple[Path, Path]:
             {
                 "keys": [
                     {
-                        "key_id": "cutover-test-key",
+                        "key_id": QUALIFICATION_AUTHORITY_ID,
                         "algorithm": "Ed25519",
                         "public_key_base64url": encoded(key.public_key().public_bytes_raw()),
                     }
@@ -100,7 +101,7 @@ def fixture_authority(output: Path) -> tuple[Path, Path]:
         json.dumps(
             {
                 "format_version": 1,
-                "key_id": "cutover-test-key",
+                "key_id": QUALIFICATION_AUTHORITY_ID,
                 "payload_base64url": encoded(payload),
                 "signature_base64url": encoded(key.sign(payload)),
             }

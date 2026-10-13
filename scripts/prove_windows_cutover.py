@@ -128,6 +128,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
     )
     config.chmod(0o600)
     environment = isolated_environment(private)
+    installer_environment = dict(os.environ, TEMP=str(folder), TMP=str(folder))
     engine = installation / "eom-mail-engine.exe"
     desktop = installation / "eom-email-watcher-desktop.exe"
     for path in (engine, desktop):
@@ -230,21 +231,34 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                     [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
                     capture_output=True,
                     timeout=240,
+                    env=installer_environment,
                 )
                 (folder / "installer.refusal.stdout").write_bytes(refusal.stdout)
                 (folder / "installer.refusal.stderr").write_bytes(refusal.stderr)
+                task_state = powershell(
+                    "(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task
+                )
+                pending = installation / "windows-cutover-pending-v1.json"
+                observed = {
+                    "installer_exit": refusal.returncode,
+                    "task_state": task_state,
+                    "pending": pending.read_text(encoding="utf-8-sig")
+                    if pending.exists()
+                    else None,
+                    "diagnostic_files": sorted(p.name for p in folder.glob("*cutover*")),
+                }
+                (folder / "installer.refusal.state.json").write_text(json.dumps(observed, indent=2))
+                print("REFUSAL_OBSERVED", json.dumps(observed), flush=True)
                 assert refusal.returncode != 0, "Installer accepted an unquiesced owner"
                 assert first.poll() is None, "Protected old owner did not survive"
                 assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
                 assert not (installation / "windows-source-cutover-v1.json").exists()
-                assert (
-                    powershell("(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task)
-                    == "Ready"
-                )
+                assert task_state == "Ready", observed
         install = subprocess.run(
             [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
             capture_output=True,
             timeout=240,
+            env=installer_environment,
         )
         (folder / "installer.stdout").write_bytes(install.stdout)
         (folder / "installer.stderr").write_bytes(install.stderr)
@@ -331,7 +345,7 @@ def main():
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This qualification requires native Windows")
-    args.output.mkdir(parents=True, mode=0o700)
+    args.output.mkdir(parents=True, mode=0o700, exist_ok=True)
     actor = build_old_actor(args.predecessor.resolve(), args.output.resolve())
     results = [
         run_case(

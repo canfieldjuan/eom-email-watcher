@@ -1,11 +1,25 @@
 Var EW_SOURCE_CUTOVER_MUTEX
 Var EW_SOURCE_CUTOVER_PS
+Var EW_SOURCE_CUTOVER_PID
+Var EW_SOURCE_CUTOVER_LOG
 !define EW_HOOK_DIR "${__FILEDIR__}"
+!macro EW_SOURCE_CUTOVER_RECORD TEXT
+  ; Preserve the actual invocation result even when silent NSIS has no stdout.
+  DetailPrint "Email Watcher cutover ${TEXT}"
+  ClearErrors
+  FileOpen $EW_SOURCE_CUTOVER_LOG "$TEMP\eom-email-watcher-cutover-$EW_SOURCE_CUTOVER_PID.log" a
+  IfErrors +3 0
+    FileWrite $EW_SOURCE_CUTOVER_LOG "${TEXT}$\r$\n"
+    FileClose $EW_SOURCE_CUTOVER_LOG
+  ClearErrors
+!macroend
 !macro EW_SOURCE_CUTOVER PHASE
   Push $0
   Push $1
   Push $8
   Push $9
+  System::Call 'kernel32::GetCurrentProcessId() i.r9'
+  StrCpy $EW_SOURCE_CUTOVER_PID $9
   StrCpy $8 "$OUTDIR"
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
@@ -19,6 +33,7 @@ Var EW_SOURCE_CUTOVER_PS
     nsExec::ExecToStack /TIMEOUT=10000 '"$EW_SOURCE_CUTOVER_PS" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase Name -InstallRoot "$INSTDIR"'
     Pop $0
     Pop $1
+    !insertmacro EW_SOURCE_CUTOVER_RECORD "phase=Name exit=$0 output=$1"
     ${If} $0 != 0
       SetOutPath "$8"
       Abort
@@ -26,6 +41,7 @@ Var EW_SOURCE_CUTOVER_PS
     System::Call 'kernel32::CreateMutexW(p 0, i 0, w r1) p.r0'
     StrCpy $EW_SOURCE_CUTOVER_MUTEX $0
     System::Call 'kernel32::WaitForSingleObject(p r0, i 0) i.r1'
+    !insertmacro EW_SOURCE_CUTOVER_RECORD "phase=Mutex handle=$0 wait=$1"
     ${If} $1 != 0
     ${AndIf} $1 != 128
       SetOutPath "$8"
@@ -37,6 +53,7 @@ Var EW_SOURCE_CUTOVER_PS
   nsExec::ExecToStack /TIMEOUT=120000 '"$EW_SOURCE_CUTOVER_PS" -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "$PLUGINSDIR\ew-source-cutover.ps1" -Phase ${PHASE} -InstallRoot "$INSTDIR" -InstallerPid $9'
   Pop $0
   Pop $1
+  !insertmacro EW_SOURCE_CUTOVER_RECORD "phase=${PHASE} exit=$0 output=$1"
   SetOutPath "$8"
   ${If} $0 != 0
     DetailPrint "Email Watcher source-lock update could not qualify: $1"

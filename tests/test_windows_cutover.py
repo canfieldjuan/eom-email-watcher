@@ -11,6 +11,75 @@ from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
 
 
+@pytest.mark.parametrize("change", ["extra", "missing", "changed", "type", "empty"])
+def test_payload_parity_rejects_unlisted_differences(change):
+    from windows_cutover_parity import compare_manifests
+
+    release = {
+        "engine": {"type": "b", "sha256": "release"},
+        "desktop": {"type": "b", "sha256": "same"},
+    }
+    test = {k: dict(v) for k, v in release.items()}
+    test["engine"]["sha256"] = "qualification"
+    if change == "extra":
+        test["extra"] = {"type": "b", "sha256": "extra"}
+    elif change == "missing":
+        del test["desktop"]
+    elif change == "changed":
+        test["desktop"]["sha256"] = "wrong"
+    elif change == "type":
+        test["engine"]["type"] = "s"
+    else:
+        release, test = {}, {}
+    with pytest.raises(ValueError):
+        compare_manifests(release, test, {"engine"})
+
+
+def test_payload_parity_accepts_only_expected_content_delta():
+    from windows_cutover_parity import compare_manifests
+
+    release = {
+        "keyring": {"type": "x", "sha256": "release"},
+        "module": {"type": "s", "sha256": "same"},
+    }
+    test = {
+        "keyring": {"type": "x", "sha256": "qualification"},
+        "module": {"type": "s", "sha256": "same"},
+    }
+    assert compare_manifests(release, test, {"keyring"}) == ["keyring"]
+    assert compare_manifests(release, release, set()) == []
+    with pytest.raises(ValueError):
+        compare_manifests(release, release, {"keyring"})
+
+
+def test_sidecar_parity_reads_real_archives_and_rejects_changed_module(tmp_path):
+    from PyInstaller.archive.writers import CArchiveWriter
+    from windows_cutover_parity import KEYRING, compare_manifests, sidecar_manifest
+
+    def archive(name, keyring, module):
+        ring_file, module_file = tmp_path / (name + ".ring"), tmp_path / (name + ".module")
+        ring_file.write_bytes(keyring)
+        module_file.write_bytes(module)
+        path = tmp_path / (name + ".pkg")
+        CArchiveWriter(
+            str(path),
+            [
+                (KEYRING, str(ring_file), True, "x"),
+                ("module", str(module_file), True, "x"),
+                ("pyi-contents-directory _internal", None, False, "o"),
+            ],
+            "python313.dll",
+        )
+        return sidecar_manifest(path)
+
+    release = archive("release", b"release authority", b"public module")
+    test = archive("qualification", b"test authority", b"public module")
+    assert compare_manifests(release, test, {KEYRING}) == [KEYRING]
+    changed = archive("changed", b"test authority", b"changed module")
+    with pytest.raises(ValueError, match="Unexpected payload differences"):
+        compare_manifests(release, changed, {KEYRING})
+
+
 def test_predecessor_actor_setup_reuses_seeded_account(tmp_path, monkeypatch):
     import windows_cutover_legacy_actor as actor
 

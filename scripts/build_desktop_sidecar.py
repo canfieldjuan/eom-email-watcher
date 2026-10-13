@@ -252,6 +252,26 @@ def build_sidecar() -> Path:
     )
 
     target_triple = determine_target_triple()
+    keyring_content = None
+    if keyring_source_value:
+        validate_entitlement_keyring_target(target_triple)
+        keyring_content = validate_entitlement_keyring(Path(keyring_source_value))
+    return _package_sidecar(
+        target_triple, oauth_source_value, microsoft_source_value, keyring_content
+    )
+
+
+def _package_sidecar(
+    target_triple: str,
+    oauth_source_value: str | None,
+    microsoft_source_value: str | None,
+    keyring_content: bytes | None,
+) -> Path:
+    """One packaging owner; callers supply already validated authority bytes.
+
+    The release CLI always goes through build_sidecar's approved-authority check.
+    Native qualification calls this same packager with its labelled test authority.
+    """
     suffix = executable_suffix(target_triple)
     output_path = sidecar_output_path(target_triple)
     for directory in (
@@ -330,10 +350,7 @@ def build_sidecar() -> Path:
             )
             expected_mail_providers.append("microsoft365")
 
-        if keyring_source_value:
-            validate_entitlement_keyring_target(target_triple)
-            keyring_source = Path(keyring_source_value)
-            keyring_content = validate_entitlement_keyring(keyring_source)
+        if keyring_content is not None:
             staged_keyring = stack.enter_context(
                 _staged_build_bytes(
                     keyring_content,
@@ -362,7 +379,7 @@ def build_sidecar() -> Path:
         str(SCRIPT_DIRECTORY / "smoke_packaged_engine.py"),
         str(output_path),
         "--expected-entitlement-state",
-        "missing" if keyring_source_value else "authority_unavailable",
+        "missing" if keyring_content is not None else "authority_unavailable",
     ]
     for provider in expected_mail_providers:
         smoke_arguments.extend(["--expected-mail-provider", provider])

@@ -116,6 +116,11 @@ def run(args):
     assert os.name == "nt", "Native Windows required"
     inventory = json.loads((folder / "build-inventory.json").read_text())
     assert inventory["purpose"].startswith("TEST ONLY")
+    assert inventory["parity"]["result"] == "PASS", "Measured payload parity required"
+    assert (
+        hashlib.sha256(args.installer.read_bytes()).hexdigest()
+        == inventory["parity"]["installer_sha256"]
+    )
     assert (
         hashlib.sha256(args.engine.read_bytes()).hexdigest()
         == inventory["qualification_engine_sha256"]
@@ -184,6 +189,7 @@ def run(args):
                 [str(args.installer.resolve()), "/S", "/UPDATE", "/D=" + str(installation)],
                 timeout=240,
                 capture_output=True,
+                env=dict(os.environ, TEMP=str(folder), TMP=str(folder)),
             )
             write_private(folder / "installer.stdout", result.stdout)
             write_private(folder / "installer.stderr", result.stderr)
