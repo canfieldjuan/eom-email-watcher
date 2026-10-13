@@ -66,6 +66,10 @@ if ($Phase -eq 'Restore') {
     }
     exit 0
 }
+# Add-Type's compiler must never resolve System.dll from an invoker's plugin
+# directory. PowerShell location and the process-wide .NET directory are distinct.
+Set-Location -LiteralPath ([Environment]::SystemDirectory)
+[Environment]::CurrentDirectory = [Environment]::SystemDirectory
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;

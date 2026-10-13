@@ -11,6 +11,54 @@ from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
 
 
+def test_cutover_sets_trusted_compiler_context_before_add_type():
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    source = script.read_text()
+    compiler = source.index("Add-Type -TypeDefinition")
+    for statement in (
+        "Set-Location -LiteralPath ([Environment]::SystemDirectory)",
+        "[Environment]::CurrentDirectory = [Environment]::SystemDirectory",
+    ):
+        assert statement in source[:compiler], "Compiler still inherits the caller directory"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows compiler-directory reproduction")
+def test_native_cutover_compiles_with_system_dll_in_caller_directory(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    # Isolate the exact production compiler block, before touching real tasks.
+    # The complete NSIS lane separately exercises the whole shipped script.
+    (tmp_path / "System.dll").write_bytes(b"MZ public non-managed compiler-shadow fixture")
+    code = r"""
+$ErrorActionPreference='Stop'
+$source=Get-Content -LiteralPath $env:EW_SCRIPT -Raw
+$prefix=$source.Substring(0,$source.IndexOf('function Installed-Processes'))
+& ([scriptblock]::Create($prefix)) -Phase Pre -InstallRoot $env:EW_ROOT
+$process=[Diagnostics.Process]::GetCurrentProcess()
+try {
+    $image=[CutoverProcess]::Image($process.Handle)
+    if (!$image.EndsWith('powershell.exe',[StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Native image query failed'
+    }
+    'TRUSTED_COMPILER_CONTEXT'
+} finally { $process.Dispose() }
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
+        cwd=tmp_path,
+        env=dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation")),
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "TRUSTED_COMPILER_CONTEXT" in result.stdout.splitlines()
+
+
 @pytest.mark.parametrize("change", ["extra", "missing", "changed", "type", "empty"])
 def test_payload_parity_rejects_unlisted_differences(change):
     from windows_cutover_parity import compare_manifests
