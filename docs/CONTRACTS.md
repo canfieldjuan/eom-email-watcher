@@ -1308,9 +1308,38 @@ before POST returns the job to `waiting` with the deterministic
 source fetch failure is neither provider ambiguity nor proof that the source is
 absent.
 
-Enqueue, handoff, and source deletion share a native per-message source lock
-stored beside the private database. Enqueue holds it across the source
-existence check, first fetch/hash, and atomic job/dispatch insert. A waiting
+**Source exclusion (schema 35).** Enqueue, handoff, and source deletion share
+the native lock for the message's stripe, stored beside the private database.
+`source_lock_stripe(message_id)` is the unsigned big-endian SHA-256 digest of
+UTF-8 `"source\0" + message_id`, modulo `SOURCE_LOCK_STRIPE_COUNT` (64).
+The database's private `.connect-locks` directory contains
+`source-stripe-v1-00.lock` through `source-stripe-v1-63.lock`; no new legacy
+per-message lock files are created, and existing ones remain inert after a
+qualified cutover. Collisions only serialize unrelated messages: stripe
+exclusion is a superset of same-message exclusion, preserving the handoff and
+cleanup linearizations below.
+
+One source-lock owner maps every requested source set, deduplicates stripes,
+and acquires them in ascending stripe order. Selection mutation, descriptor
+replacement, serialized admission, enqueue, handoff and every cleanup consume
+that owner. An existing source context may be reused for a subset of its held
+stripes; it never recursively opens an already-held stripe or expands the set
+under a source lock. A larger set must be frozen and acquired by the outer
+owner before entering the protected work. At most 64 native source-lock
+descriptors are held by one operation, including one indivisible large thread.
+Operation or lane locks precede that set; no operation or lane lock is acquired
+under source locks. Database mutation follows source acquisition.
+
+The schema-35 protocol cutover requires quiescence of every pre-cutover enqueue,
+POST and cleanup owner, including processes that opened the database earlier.
+The upgrade and operation locks serialize migration, but a version-at-open
+check alone does not establish that quiescence. The installed lifecycle must
+stop and drain those owners before migration, or migration must refuse the
+cutover; an old process cannot resume work afterwards. Verify old-then-new and
+new-then-old startup races before claiming installation safety. Unsupported
+native exclusion never enables a soft-lock or unlocked submission fallback.
+
+Enqueue holds it across the source existence check, first fetch/hash, and atomic job/dispatch insert. A waiting
 handoff holds the lane lock and then the source lock across its final database
 source check, re-fetch/hash verification, POST, and atomic recording of the
 POST outcome. Manual deletion and retention acquire the source lock before
