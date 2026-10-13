@@ -2835,6 +2835,7 @@ def test_mail_account_list_adopts_existing_gmail_token_without_exposing_paths(
                 "provider": "gmail",
                 "sent_scope": "not_polled",
                 "sent_poll_failure": None,
+            "source_lock_notice": None,
             }
         ],
         "providers": [
@@ -2911,6 +2912,7 @@ def test_mail_account_connect_installs_private_token_and_initializes_identity(
         "provider": "gmail",
         "sent_scope": "not_polled",
         "sent_poll_failure": None,
+            "source_lock_notice": None,
     }
     runtime = load_runtime(config_path)
     assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "private readonly token"

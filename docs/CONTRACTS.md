@@ -1309,17 +1309,26 @@ source fetch failure is neither provider ambiguity nor proof that the source is
 absent.
 
 **Source exclusion (schema 35).** Enqueue, handoff, and source deletion share
-the native lock for the message's stripe, stored beside the private database.
+the qualified native source protocol stored beside the private database.
 `source_lock_stripe(message_id)` is the unsigned big-endian SHA-256 digest of
 UTF-8 `"source\0" + message_id`, modulo `SOURCE_LOCK_STRIPE_COUNT` (64).
 The database's private `.connect-locks` directory contains
-`source-stripe-v1-00.lock` through `source-stripe-v1-63.lock`; no new legacy
-per-message lock files are created, and existing ones remain inert after a
-qualified cutover. Collisions only serialize unrelated messages: stripe
-exclusion is a superset of same-message exclusion, preserving the handoff and
+`source-stripe-v1-00.lock` through `source-stripe-v1-63.lock` after qualified
+cutover; legacy per-message files then remain inert. Collisions only serialize
+unrelated messages: stripe exclusion is a superset of same-message exclusion, preserving the handoff and
 cleanup linearizations below.
 
-One source-lock owner maps every requested source set, deduplicates stripes,
+One source-lock owner freezes protocol selection with a native selection guard.
+Before qualification, ordinary cleanup uses the native per-message protocol,
+with at most `SOURCE_CLEANUP_LOCK_BATCH_SIZE` (32) source descriptors; the guard
+stays held through mutation, excluding legacy drain and marker publication.
+Whole logical messages and followed threads are indivisible. Oversized units
+are preserved until qualification, with the pending state shown in Health;
+Connect handoffs defer. Ordinary polling, capture, notification reads and
+bounded cleanup remain available. Qualified operations acquire their stripes
+before releasing the guard; the marker never reverts.
+
+That owner maps every qualified requested source set, deduplicates stripes,
 and acquires them in ascending stripe order. Selection mutation, descriptor
 replacement, serialized admission, enqueue, handoff and every cleanup consume
 that owner. An existing source context may be reused for a subset of its held
@@ -1327,6 +1336,7 @@ stripes; it never recursively opens an already-held stripe or expands the set
 under a source lock. A larger set must be frozen and acquired by the outer
 owner before entering the protected work. At most 64 native source-lock
 descriptors are held by one operation, including one indivisible large thread.
+The protocol-selection guard is separate from the source-descriptor bound.
 Operation or lane locks precede that set; no operation or lane lock is acquired
 under source locks. Database mutation follows source acquisition.
 
@@ -1334,10 +1344,21 @@ The schema-35 protocol cutover requires quiescence of every pre-cutover enqueue,
 POST and cleanup owner, including processes that opened the database earlier.
 The upgrade and operation locks serialize migration, but a version-at-open
 check alone does not establish that quiescence. The installed lifecycle must
-stop and drain those owners before migration, or migration must refuse the
+stop and drain those owners before protocol-marker publication, or refuse the
 cutover; an old process cannot resume work afterwards. Verify old-then-new and
 new-then-old startup races before claiming installation safety. Unsupported
 native exclusion never enables a soft-lock or unlocked submission fallback.
+On Windows the NSIS publication owner serializes updates and task restoration,
+disables installed scheduled producers, and stops and verifies exit of every
+installed desktop/sidecar owner before replacing images. It refuses unknown
+scheduled image paths or surviving owners. Only successful replacement publishes
+an engine-digest-bound receipt; the new engine validates it, drains native legacy
+locks within the shared deadline, and publishes the database marker. An aborted
+update restores scheduled tasks without qualifying the cutover. Native Windows
+existing-database and both startup-order proofs are merge gates.
+Unfrozen source runs require old processes to be stopped before changing source
+versions; their native drain does not qualify mixed source-version operation
+through an installed lifecycle identity.
 
 Enqueue holds it across the source existence check, first fetch/hash, and atomic job/dispatch insert. A waiting
 handoff holds the lane lock and then the source lock across its final database

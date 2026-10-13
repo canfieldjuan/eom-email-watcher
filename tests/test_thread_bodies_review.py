@@ -272,7 +272,7 @@ def test_followed_purge_does_not_rescan_full_mailbox_per_thread(tmp_path, monkey
             yield db
 
     monkeypatch.setattr(store, "connection", traced)
-    assert store.purge(30, now=later, after_poll=True) == 11
+    assert store.purge(30, now=later, after_poll=True, polled_scope=("gmail", "mailbox", KEY)) == 11
     scans = [q for q in queries if "GROUP BY canonical" in q]
     assert len(scans) <= 8, len(scans)
 

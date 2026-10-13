@@ -79,6 +79,46 @@ jobs:
       - run: pnpm --dir desktop install --frozen-lockfile
       - name: Build Windows NSIS installer
         run: pnpm --dir desktop tauri build --bundles nsis
+      - uses: actions/checkout@v7
+        with:
+          ref: 43a850d8b00cddfdad2a767b7b27fc792707b010
+          path: cutover-predecessor
+      - name: Qualify native existing-database NSIS cutover and startup races
+        shell: pwsh
+        run: |
+          $triple = (rustc --print host-tuple).Trim()
+          $setup = @(Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if ($setup.Count -ne 1) { throw 'Expected one actual NSIS setup' }
+          uv run python scripts/prove_windows_cutover.py $setup[0].FullName "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" cutover-predecessor "$env:RUNNER_TEMP/ew-source-cutover"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Qualify native polling capture analysis retention Connect and timeout retry
+        run: >-
+          uv run pytest -v
+          tests/test_windows_cutover.py
+          tests/test_thread_bodies_round4.py
+          tests/test_thread_bodies.py
+          tests/test_thread_reconcile.py::test_check_backfills_vendor_mail_before_current_poll_cursor
+          tests/test_service.py::test_exact_allowlist_and_dedup
+          tests/test_service.py::test_public_check_processes_current_pending_work_without_watch_selectors
+          tests/test_source_exclusion.py::test_legacy_drain_timeout_keeps_marker_unset_and_retry_adopts
+          tests/test_source_exclusion.py::test_selected_legacy_operation_excludes_drain_until_mutation_finishes
+          tests/test_source_exclusion.py::test_legacy_cleanup_batches_are_bounded_and_do_not_split_units
+          tests/test_source_exclusion.py::test_legacy_cleanup_context_does_not_authorize_nested_connect
+          tests/test_source_exclusion.py::test_post_with_refused_outcome_reconciles_without_second_post
+          tests/test_connect_v2_engine_api.py::test_automation_submission_requires_connect_entitlement_before_provider_post
+          tests/test_connect_v2_engine_api.py::test_connect_entitlement_is_rechecked_after_source_fetch_before_provider_post
+          --junitxml=${{ runner.temp }}/ew-source-cutover/native-integration.xml
+      - name: Preserve native cutover qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: email-watcher-windows-source-cutover
+          path: |
+            ${{ runner.temp }}/ew-source-cutover/qualification.json
+            ${{ runner.temp }}/ew-source-cutover/*/*.log
+            ${{ runner.temp }}/ew-source-cutover/*/installer.*
+            ${{ runner.temp }}/ew-source-cutover/native-integration.xml
+          if-no-files-found: error
       - name: Verify Windows engine process-tree lifecycle
         run: >-
           cargo test --release --manifest-path desktop/src-tauri/Cargo.toml

@@ -6,6 +6,7 @@ export interface MailAccountDetailInput {
   connected: boolean;
   sent_scope?: "available" | "unavailable" | "not_polled" | null;
   sent_poll_failure?: "unreadable" | null;
+  source_lock_notice?: string | null;
 }
 
 export function mailAccountDetail(account: MailAccountDetailInput): string {
@@ -17,5 +18,6 @@ export function mailAccountDetail(account: MailAccountDetailInput): string {
   if (account.sent_poll_failure === "unreadable") {
     parts.push("Sent folder can't be opened; thread history is paused");
   } else if (account.sent_scope === "unavailable") parts.push("Sent mail unavailable");
+  if (account.source_lock_notice) parts.push(account.source_lock_notice);
   return parts.join(" · ");
 }

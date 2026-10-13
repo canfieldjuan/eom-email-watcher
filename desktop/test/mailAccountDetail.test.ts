@@ -32,3 +32,12 @@ test("an unreadable Sent folder shows the recorded pause before stale scope", as
     "IMAP · Active · Connected",
   );
 });
+
+
+test("Health renders the source owner notice literally and clears after adoption", async () => {
+  const { mailAccountDetail } = await import("../src/mailAccountDetail.ts");
+  const base = { display_name: "Windows", active: true, connected: true };
+  const notice = "Source-lock upgrade pending; oversized thread deletion is deferred <literal>";
+  assert.equal(mailAccountDetail({ ...base, source_lock_notice: notice }), `Windows · Active · Connected · ${notice}`);
+  assert.equal(mailAccountDetail({ ...base, source_lock_notice: null }), "Windows · Active · Connected");
+});

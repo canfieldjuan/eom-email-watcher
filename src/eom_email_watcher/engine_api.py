@@ -446,6 +446,7 @@ def _mail_account_public(runtime: Runtime, account: MailAccount) -> dict[str, ob
         "provider": account.provider,
         # Contract D-scope: whether this account's Sent folder is in scope. An
         # account this build cannot poll is not polled, whatever it last recorded.
+        "source_lock_notice": runtime.store.source_lock_notice(),
         "sent_poll_failure": (
             runtime.store.sent_poll_failure(account.provider, account.account_id)
             if connected

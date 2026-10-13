@@ -2228,7 +2228,10 @@ class Watcher:
         )
         if not dry_run:
             purged += self.store.purge(
-                self.config.retention_days, now=checked_at, after_poll=polling_complete
+                self.config.retention_days,
+                now=checked_at,
+                after_poll=polling_complete,
+                polled_scope=(self.mailbox.provider, self.mailbox.account_id, mailbox_identity_key),
             )
             from .body_state import checkpoint
 

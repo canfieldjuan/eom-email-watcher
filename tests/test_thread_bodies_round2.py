@@ -15,7 +15,7 @@ from test_imap import (
     cursor,
 )
 from test_thread_bodies import followed
-from test_thread_reconcile import NOW, seed
+from test_thread_reconcile import KEY, NOW, seed
 
 from eom_email_watcher import mime
 from eom_email_watcher.imap import ImapError, ImapGateway
@@ -89,7 +89,9 @@ def test_followed_purge_bounds_every_candidate_query_under_sqlite_limit(
             yield db
 
     monkeypatch.setattr(store, "connection", limited)
-    assert store.purge(30, now=later, after_poll=True) == 521
+    assert (
+        store.purge(30, now=later, after_poll=True, polled_scope=("gmail", "mailbox", KEY)) == 521
+    )
     assert store.recent(1) == []
 
 

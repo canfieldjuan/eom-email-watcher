@@ -4623,11 +4623,13 @@ def test_check_uses_retention_snapshot_for_post_poll_purge(
     real_purge = store.purge
 
     def record_purge(
-        retention_days: int, *, now: datetime | None = None, after_poll: bool = False
+        retention_days: int, *, now: datetime | None = None, after_poll: bool = False,
+        polled_scope: tuple[str, str, str] | None = None,
     ) -> int:
         assert after_poll
+        assert polled_scope == ("gmail", "gmail-default", TEST_MAILBOX_IDENTITY_KEY)
         purge_times.append(now)
-        return real_purge(retention_days, now=now, after_poll=after_poll)
+        return real_purge(retention_days, now=now, after_poll=after_poll, polled_scope=polled_scope)
 
     monkeypatch.setattr(store, "purge", record_purge)
 

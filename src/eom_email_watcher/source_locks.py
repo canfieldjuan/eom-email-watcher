@@ -19,8 +19,10 @@ from typing import TYPE_CHECKING
 from connect_automate.locking import (
     OperationLockBusy,
     connect_operation_lock,
+    connect_source_lock_path,
     operation_lock_supported,
 )
+from connect_automate.locking import connect_operation_lock as protocol_guard
 
 from . import deployment
 
@@ -34,6 +36,7 @@ SOURCE_LOCK_PROTOCOL = "source-stripe-v1"
 SOURCE_LOCK_WAIT_SECONDS = 90.0
 LEGACY_NAME = re.compile(r"source-[0-9a-f]{64}\.lock\Z")
 _context = threading.local()
+_selection = threading.local()
 
 
 class SourceProtocolUnavailable(RuntimeError):
@@ -57,6 +60,15 @@ def stripe_path(database_path: Path, stripe: int) -> Path:
     return database_path.parent / ".connect-locks" / f"source-stripe-v1-{stripe:02d}.lock"
 
 
+def validate_timeout(timeout_seconds: float) -> None:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds < 0
+    ):
+        raise ValueError("Source-lock timeout must be nonnegative and finite")
+
+
 @contextmanager
 def source_locks(
     database_path: Path,
@@ -65,12 +77,7 @@ def source_locks(
     timeout_seconds: float = 0,
     busy_message: str = "The Connect source attachment is being changed",
 ) -> Iterator[None]:
-    if (
-        isinstance(timeout_seconds, bool)
-        or not math.isfinite(timeout_seconds)
-        or timeout_seconds < 0
-    ):
-        raise ValueError("Source-lock timeout must be nonnegative and finite")
+    validate_timeout(timeout_seconds)
     stripes = frozenset(source_lock_stripe(m) for m in message_ids)
     key = str(database_path.parent.resolve())
     held = getattr(_context, "held", None)
@@ -116,15 +123,135 @@ def protocol_ready(db: sqlite3.Connection) -> bool:
     return True
 
 
+def selection_path(database_path: Path) -> Path:
+    return database_path.parent / ".connect-locks" / "source-protocol-selection-v1.lock"
+
+
+@contextmanager
+def selected_source_locks(
+    store: Store,
+    message_ids: Iterable[str],
+    *,
+    timeout_seconds: float,
+    busy_message: str,
+    legacy_limit: int | None = None,
+) -> Iterator[bool]:
+    """Freeze protocol selection; legacy cleanup retains the guard through mutation."""
+    validate_timeout(timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    ids = frozenset(message_ids)
+    key = str(store.path.parent.resolve())
+
+    def require_selected_protocol(ready):
+        if not ready and legacy_limit is None:
+            raise SourceProtocolUnavailable(
+                "Connect handoff is deferred while the source-lock upgrade completes"
+            )
+
+    held = getattr(_selection, "held", None)
+    if held is not None and held[0] == os.getpid():
+        require_selected_protocol(held[3])
+        subset = (
+            {source_lock_stripe(m) for m in ids} <= {source_lock_stripe(m) for m in held[2]}
+            if held[3]
+            else ids <= held[2]
+        )
+        if key != held[1] or not subset:
+            raise RuntimeError("Source lock sets must be frozen by the outer owner")
+        yield True
+        return
+    if not operation_lock_supported(selection_path(store.path)):
+        raise SourceProtocolUnavailable(
+            "Connect source exclusion requires native operation locking"
+        )
+    with ExitStack() as guard, ExitStack() as locks:
+        guard.enter_context(
+            protocol_guard(
+                selection_path(store.path),
+                busy_message,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
+            )
+        )
+        with store.connection() as db:
+            ready = protocol_ready(db)
+        require_selected_protocol(ready)
+        if not ready:
+            if len(ids) > legacy_limit:
+                # The owner tells cleanup to preserve this indivisible unit.
+                yield False
+                return
+            for message_id in sorted(ids):
+                locks.enter_context(
+                    connect_operation_lock(
+                        connect_source_lock_path(store.path, message_id),
+                        busy_message,
+                        timeout_seconds=max(0.0, deadline - time.monotonic()),
+                    )
+                )
+        else:
+            locks.enter_context(
+                source_locks(
+                    store.path,
+                    ids,
+                    timeout_seconds=max(0.0, deadline - time.monotonic()),
+                    busy_message=busy_message,
+                )
+            )
+            # A qualified protocol cannot revert; only legacy holders need keep
+            # the selection guard throughout their transaction to exclude drain.
+            guard.close()
+        previous = held
+        _selection.held = (os.getpid(), key, ids, ready)
+        try:
+            yield True
+        finally:
+            _selection.held = previous
+
+
+def cleanup_groups(units, *, legacy_limit: int | None):
+    """Batch whole logical/thread units; oversized units remain indivisible."""
+    keys, rows = [], set()
+    for key, unit_rows in units.items():
+        current = set(unit_rows)
+        if keys and legacy_limit is not None and len(rows | current) > legacy_limit:
+            yield keys, sorted(rows)
+            keys, rows = [], set()
+        keys.append(key)
+        rows.update(current)
+    if keys:
+        yield keys, sorted(rows)
+
+
+def protocol_notice(db: sqlite3.Connection) -> str | None:
+    try:
+        if protocol_ready(db):
+            return None
+    except SourceProtocolUnavailable as exc:
+        return str(exc)
+    suffix = (
+        " Complete the Windows installer update."
+        if sys.platform == "win32"
+        else " Retry after the source-lock upgrade finishes."
+    )
+    return (
+        "Source-lock upgrade pending; Connect handoffs and oversized thread deletion are deferred."
+        + suffix
+    )
+
+
 @contextmanager
 def _cutover_admission() -> Iterator[None]:
     if getattr(sys, "frozen", False):
-        if sys.platform != "linux":
-            raise SourceProtocolUnavailable(
-                "Close all engines before the source-lock upgrade; installer stop proof is required"
-            )
-        with deployment.database_admission(exclusive=True):
+        if sys.platform == "win32":
+            from .windows_cutover import verify_installation
+
+            verify_installation()
             yield
+        elif sys.platform == "linux":
+            with deployment.database_admission(exclusive=True):
+                yield
+        else:
+            raise SourceProtocolUnavailable("This packaged platform has no qualified installer")
     else:
         # Development runs must be stopped before changing versions. The source
         # runtime has no replaced-executable admission guard and mixed versions
@@ -133,15 +260,35 @@ def _cutover_admission() -> Iterator[None]:
 
 
 def qualify_protocol(store: Store, *, fresh: bool) -> None:
+    try:
+        _qualify_protocol(store, fresh=fresh)
+    except OperationLockBusy as exc:
+        raise SourceProtocolUnavailable(
+            "Source-lock upgrade deferred; a native source owner remains active"
+        ) from exc
+
+
+def _qualify_protocol(store: Store, *, fresh: bool) -> None:
     """Caller holds the upgrade lock; no Store connection may enclose admission."""
     database_path = store.path
     with store.connection() as db:
         if protocol_ready(db):
             return
+    if not operation_lock_supported(selection_path(database_path)):
+        raise SourceProtocolUnavailable(
+            "Connect source exclusion requires native operation locking"
+        )
     admission = _cutover_admission() if not fresh else ExitStack()
-    with admission:
+    deadline = time.monotonic() + SOURCE_LOCK_WAIT_SECONDS
+    with (
+        protocol_guard(
+            selection_path(database_path),
+            "Source-lock protocol is being selected",
+            timeout_seconds=max(0.0, deadline - time.monotonic()),
+        ),
+        admission,
+    ):
         directory = database_path.parent / ".connect-locks"
-        deadline = time.monotonic() + SOURCE_LOCK_WAIT_SECONDS
         if directory.exists():
             # Old per-message files are never replaced/unlinked. The installed
             # refusal guard prevents late creators from reaching a database/POST.
@@ -152,17 +299,12 @@ def qualify_protocol(store: Store, *, fresh: bool) -> None:
                     raise SourceProtocolUnavailable(
                         "Connect source exclusion requires native operation locking"
                     )
-                try:
-                    with connect_operation_lock(
-                        path,
-                        "Legacy source handoff remains active",
-                        timeout_seconds=max(0.0, deadline - time.monotonic()),
-                    ):
-                        pass
-                except OperationLockBusy as exc:
-                    raise SourceProtocolUnavailable(
-                        "Legacy source handoff remains active; source-lock upgrade deferred"
-                    ) from exc
+                with connect_operation_lock(
+                    path,
+                    "Legacy source handoff remains active",
+                    timeout_seconds=max(0.0, deadline - time.monotonic()),
+                ):
+                    pass
         # Store.connection reuses this thread/process's verified exclusive
         # admission and remains the only database connection/mutation owner.
         with store.connection() as db:

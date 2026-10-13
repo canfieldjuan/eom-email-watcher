@@ -1314,6 +1314,8 @@ pub struct MailAccountStatus {
     pub sent_scope: Option<String>,
     #[serde(default)]
     pub sent_poll_failure: Option<String>,
+    #[serde(default)]
+    pub source_lock_notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3021,20 +3023,31 @@ mod tests {
         let mut input = json!({
             "provider": "imap", "account_id": "account", "display_name": "IMAP",
             "address": null, "active": true, "connected": true, "last_check": null,
-            "sent_scope": "available", "sent_poll_failure": "unreadable"
+            "sent_scope": "available", "sent_poll_failure": "unreadable",
+            "source_lock_notice": "Source-lock upgrade pending"
         });
         let status: MailAccountStatus = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(status.sent_poll_failure.as_deref(), Some("unreadable"));
         assert_eq!(
-            serde_json::to_value(status).unwrap()["sent_poll_failure"],
-            "unreadable"
+            status.source_lock_notice.as_deref(),
+            Some("Source-lock upgrade pending")
+        );
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized["sent_poll_failure"], "unreadable");
+        assert_eq!(
+            serialized["source_lock_notice"],
+            "Source-lock upgrade pending"
         );
         input["sent_poll_failure"] = serde_json::Value::Null;
+        input["source_lock_notice"] = serde_json::Value::Null;
         let recovered: MailAccountStatus = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(recovered.sent_poll_failure, None);
+        assert_eq!(recovered.source_lock_notice, None);
         input.as_object_mut().unwrap().remove("sent_poll_failure");
+        input.as_object_mut().unwrap().remove("source_lock_notice");
         let legacy: MailAccountStatus = serde_json::from_value(input).unwrap();
         assert_eq!(legacy.sent_poll_failure, None);
+        assert_eq!(legacy.source_lock_notice, None);
     }
 
     use std::fs;

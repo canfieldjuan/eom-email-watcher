@@ -5903,22 +5903,28 @@ class Store:
         timeout_seconds: float = 0,
         busy_message: str = "The Connect source attachment is being changed",
     ) -> Iterator[None]:
-        with self.connection() as db:
-            if not source_locks.protocol_ready(db):
-                raise source_locks.SourceProtocolUnavailable(
-                    "Connect source-lock upgrade is deferred; stop older engines and retry"
-                )
-        with source_locks.source_locks(
-            self.path, message_ids, timeout_seconds=timeout_seconds, busy_message=busy_message
+        with source_locks.selected_source_locks(
+            self, message_ids, timeout_seconds=timeout_seconds, busy_message=busy_message
         ):
             yield
 
     def _source_cleanup_locks(self, message_ids: Iterable[str]):
-        return self.source_locks(
+        return source_locks.selected_source_locks(
+            self,
             message_ids,
             timeout_seconds=source_locks.SOURCE_LOCK_WAIT_SECONDS,
             busy_message="The Connect source attachment is being handed off",
+            legacy_limit=SOURCE_CLEANUP_LOCK_BATCH_SIZE,
         )
+
+    def _source_cleanup_groups(self, units):
+        with self.connection() as db:
+            limit = None if source_locks.protocol_ready(db) else SOURCE_CLEANUP_LOCK_BATCH_SIZE
+        return source_locks.cleanup_groups(units, legacy_limit=limit)
+
+    def source_lock_notice(self) -> str | None:
+        with self.connection() as db:
+            return source_locks.protocol_notice(db)
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -10072,7 +10078,9 @@ class Store:
             unit = _logical_unit(db, message_id)
         if unit is None:
             return False
-        with self._source_cleanup_locks(unit.rows), self.connection() as db:
+        with self._source_cleanup_locks(unit.rows) as acquired, self.connection() as db:
+            if not acquired:
+                return False
             db.execute("BEGIN IMMEDIATE")
             unit = _logical_unit(db, message_id)
             if unit is None:
@@ -10122,70 +10130,73 @@ class Store:
             ]
         deleted = 0
         for offset in range(0, len(canonicals), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
-            chunk = canonicals[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+            initial = canonicals[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
             with self.connection() as db:
-                unit_rows = _unit_rows(db, chunk)
-            if not unit_rows:
-                continue
-            with self._source_cleanup_locks(unit_rows), self.connection() as db:
-                db.execute("BEGIN IMMEDIATE")
-                current_rows = _unit_rows(db, chunk)
-                if not current_rows:
+                units = {key: _unit_rows(db, (key,)) for key in initial}
+            for chunk, unit_rows in self._source_cleanup_groups(units):
+                if not unit_rows:
                     continue
-                row_placeholders = ", ".join("?" for _ in current_rows)
-                rows = db.execute(
-                    f"""SELECT message_id, provider, account_id, mailbox_identity_key,
-                        provider_message_id, received_at FROM messages
-                        WHERE message_id IN ({row_placeholders})""",
-                    tuple(current_rows),
-                ).fetchall()
-                # Recorded locations are source identities too (contract D-identity).
-                located = db.execute(
-                    f"""SELECT m.provider, m.account_id, l.mailbox_identity_key,
-                        l.provider_message_id,
-                        COALESCE(l.received_at, m.received_at) AS received_at
-                    FROM message_locations AS l
-                    JOIN messages AS m ON m.message_id = l.message_id
-                    WHERE l.message_id IN ({row_placeholders})""",
-                    tuple(current_rows),
-                ).fetchall()
-                db.executemany(
-                    """INSERT INTO suppressed_messages(
-                            provider, account_id, message_key, expires_at
-                        ) VALUES (?, ?, ?, ?)
-                        ON CONFLICT(provider, account_id, message_key)
-                        DO UPDATE SET expires_at = excluded.expires_at""",
-                    [
-                        (
-                            str(row["provider"]),
-                            str(row["account_id"]),
-                            _message_suppression_key(
+                with self._source_cleanup_locks(unit_rows) as acquired, self.connection() as db:
+                    if not acquired:
+                        continue
+                    db.execute("BEGIN IMMEDIATE")
+                    current_rows = _unit_rows(db, chunk)
+                    if not current_rows:
+                        continue
+                    row_placeholders = ", ".join("?" for _ in current_rows)
+                    rows = db.execute(
+                        f"""SELECT message_id, provider, account_id, mailbox_identity_key,
+                            provider_message_id, received_at FROM messages
+                            WHERE message_id IN ({row_placeholders})""",
+                        tuple(current_rows),
+                    ).fetchall()
+                    # Recorded locations are source identities too (contract D-identity).
+                    located = db.execute(
+                        f"""SELECT m.provider, m.account_id, l.mailbox_identity_key,
+                            l.provider_message_id,
+                            COALESCE(l.received_at, m.received_at) AS received_at
+                        FROM message_locations AS l
+                        JOIN messages AS m ON m.message_id = l.message_id
+                        WHERE l.message_id IN ({row_placeholders})""",
+                        tuple(current_rows),
+                    ).fetchall()
+                    db.executemany(
+                        """INSERT INTO suppressed_messages(
+                                provider, account_id, message_key, expires_at
+                            ) VALUES (?, ?, ?, ?)
+                            ON CONFLICT(provider, account_id, message_key)
+                            DO UPDATE SET expires_at = excluded.expires_at""",
+                        [
+                            (
                                 str(row["provider"]),
                                 str(row["account_id"]),
-                                str(row["provider_message_id"]),
-                                (
-                                    str(row["mailbox_identity_key"])
-                                    if row["mailbox_identity_key"] is not None
-                                    else None
+                                _message_suppression_key(
+                                    str(row["provider"]),
+                                    str(row["account_id"]),
+                                    str(row["provider_message_id"]),
+                                    (
+                                        str(row["mailbox_identity_key"])
+                                        if row["mailbox_identity_key"] is not None
+                                        else None
+                                    ),
                                 ),
-                            ),
-                            _suppression_expiry(str(row["received_at"]), stamp),
-                        )
-                        for row in (*rows, *located)
-                    ],
-                )
-                _mark_automation_sources_unavailable(
-                    db,
-                    current_rows,
-                    updated_at=stamp.isoformat(),
-                )
-                current_canonicals = [m for m in chunk if m in set(current_rows)]
-                canonical_placeholders = ", ".join("?" for _ in current_canonicals)
-                db.execute(
-                    f"DELETE FROM messages WHERE message_id IN ({canonical_placeholders})",
-                    tuple(current_canonicals),
-                )
-                deleted += len(current_rows)
+                                _suppression_expiry(str(row["received_at"]), stamp),
+                            )
+                            for row in (*rows, *located)
+                        ],
+                    )
+                    _mark_automation_sources_unavailable(
+                        db,
+                        current_rows,
+                        updated_at=stamp.isoformat(),
+                    )
+                    current_canonicals = [m for m in chunk if m in set(current_rows)]
+                    canonical_placeholders = ", ".join("?" for _ in current_canonicals)
+                    db.execute(
+                        f"DELETE FROM messages WHERE message_id IN ({canonical_placeholders})",
+                        tuple(current_canonicals),
+                    )
+                    deleted += len(current_rows)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             _purge_expired_automation_tombstones(db, now=stamp.isoformat())
@@ -10200,7 +10211,9 @@ class Store:
     ) -> None:
         """Store a message's attachment catalog, remembering the copy that listed it."""
         items = tuple(attachments)
-        with self._source_cleanup_locks((message_id,)), self.connection() as db:
+        with self._source_cleanup_locks((message_id,)) as acquired, self.connection() as db:
+            if not acquired:
+                raise RuntimeError("Single-source cleanup cannot exceed the legacy batch bound")
             db.execute("BEGIN IMMEDIATE")
             if (
                 db.execute("SELECT 1 FROM messages WHERE message_id = ?", (message_id,)).fetchone()
@@ -14111,7 +14124,7 @@ class Store:
             item["calendar_proposal"] = proposal_by_message.get(message_id)
         return items
 
-    def _purge_followed(self, retention_days, stamp, expired_units, parameters):
+    def _purge_followed(self, retention_days, stamp, expired_units, parameters, polled_scope):
         deleted = reviews = 0
 
         def members(db, *, scope=None, keys=None):
@@ -14123,6 +14136,9 @@ class Store:
                 AND f.thread_key=m.thread_key WHERE f.followed=1"""
             values = ()
             if scope is not None:
+                sql += " AND f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?"
+                values = tuple(scope)
+            if keys is not None:
                 if len(keys) > SOURCE_CLEANUP_LOCK_BATCH_SIZE:
                     grouped = {}
                     for offset in range(0, len(keys), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
@@ -14131,9 +14147,8 @@ class Store:
                             grouped.setdefault(key, {}).update(threads)
                     return grouped
                 placeholders = ",".join("?" for _ in keys)
-                sql += (" AND f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?"
-                        f" AND f.thread_key IN ({placeholders})")
-                values = (*scope, *keys)
+                sql += f" AND f.thread_key IN ({placeholders})"
+                values = (*values, *keys)
             grouped = {}
             for row in db.execute(sql, values):
                 grouped.setdefault(tuple(row[:3]), {}).setdefault(row[3], []).append(row[4])
@@ -14141,7 +14156,7 @@ class Store:
 
         with self.connection() as db:
             db.execute("BEGIN")
-            grouped = members(db)
+            grouped = members(db, scope=polled_scope)
             expired = {r[0] for r in db.execute(expired_units, parameters)}
             candidates = {}
             for scope, threads in grouped.items():
@@ -14151,39 +14166,50 @@ class Store:
                     continue
                 keys = [key for key, ids in threads.items() if all(m in expired for m in ids)]
                 if keys:
-                    ids = [m for key in keys for m in threads[key]]
-                    candidates[scope] = (keys, _unit_rows(db, ids))
-        for scope, (keys, rows) in candidates.items():
-            with self._source_cleanup_locks(rows), self.connection() as db:
-                db.execute("BEGIN IMMEDIATE")
-                if not reconcile_state.coverage_current(
-                    db, scope, now=stamp, retention_days=retention_days
-                ):
-                    continue
-                threads = members(db, scope=scope, keys=keys).get(scope, {})
-                ids = [m for unit in threads.values() for m in unit]
-                # The same expiry owner now scans only the candidate logical units.
-                current_expired = set()
-                for offset in range(0, len(ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
-                    chunk = ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
-                    current_sql, current_params = _logical_messages_past_cutoff_sql(
-                        (stamp-timedelta(days=retention_days)).timestamp(), stamp.timestamp(),
-                        canonical_ids=chunk,
+                    candidates[scope] = {key: _unit_rows(db, threads[key]) for key in keys}
+        for scope, units in candidates.items():
+            for keys, rows in self._source_cleanup_groups(units):
+                with self._source_cleanup_locks(rows) as acquired, self.connection() as db:
+                    if not acquired:
+                        continue
+                    db.execute("BEGIN IMMEDIATE")
+                    if not reconcile_state.coverage_current(
+                        db, scope, now=stamp, retention_days=retention_days
+                    ):
+                        continue
+                    threads = members(db, scope=scope, keys=keys).get(scope, {})
+                    ids = [m for unit in threads.values() for m in unit]
+                    # The same expiry owner now scans only the candidate logical units.
+                    current_expired = set()
+                    for offset in range(0, len(ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+                        chunk = ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+                        current_sql, current_params = _logical_messages_past_cutoff_sql(
+                            (stamp - timedelta(days=retention_days)).timestamp(),
+                            stamp.timestamp(),
+                            canonical_ids=chunk,
+                        )
+                        current_expired.update(
+                            r[0] for r in db.execute(current_sql, current_params)
+                        )
+                    current = [
+                        m
+                        for unit in threads.values()
+                        if all(m in current_expired for m in unit)
+                        for m in unit
+                    ]
+                    current_rows = _unit_rows(db, current)
+                    if not current_rows or not set(current_rows) <= set(rows):
+                        continue
+                    reviews += _mark_automation_sources_unavailable(
+                        db, current_rows, updated_at=stamp.isoformat()
                     )
-                    current_expired.update(r[0] for r in db.execute(current_sql, current_params))
-                current = [m for unit in threads.values() if all(m in current_expired for m in unit)
-                           for m in unit]
-                current_rows = _unit_rows(db, current)
-                if not current_rows or not set(current_rows) <= set(rows):
-                    continue
-                reviews += _mark_automation_sources_unavailable(
-                    db, current_rows, updated_at=stamp.isoformat()
-                )
-                for offset in range(0, len(current), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
-                    chunk = current[offset:offset+SOURCE_CLEANUP_LOCK_BATCH_SIZE]
-                    placeholders = ",".join("?" for _ in chunk)
-                    db.execute(f"DELETE FROM messages WHERE message_id IN ({placeholders})", chunk)
-                deleted += len(current_rows)
+                    for offset in range(0, len(current), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+                        chunk = current[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+                        placeholders = ",".join("?" for _ in chunk)
+                        db.execute(
+                            f"DELETE FROM messages WHERE message_id IN ({placeholders})", chunk
+                        )
+                    deleted += len(current_rows)
         return PurgeOutcome(deleted, reviews)
 
     def purge_with_outcome(
@@ -14192,6 +14218,7 @@ class Store:
         *,
         now: datetime | None = None,
         after_poll: bool = False,
+        polled_scope: tuple[str, str, str] | None = None,
     ) -> PurgeOutcome:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         cutoff = stamp - timedelta(days=retention_days)
@@ -14218,42 +14245,48 @@ class Store:
                 ).fetchall()
             ]
         followed = (
-            self._purge_followed(retention_days, stamp, followed_expired_units, expiry_parameters)
-            if after_poll else PurgeOutcome(0, 0)
+            self._purge_followed(
+                retention_days, stamp, followed_expired_units, expiry_parameters, polled_scope
+            )
+            if after_poll and polled_scope is not None
+            else PurgeOutcome(0, 0)
         )
         deleted = followed.messages
         automation_review_required = followed.automation_review_required
         for offset in range(0, len(expired_ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
-            chunk = expired_ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+            initial = expired_ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
             with self.connection() as db:
-                unit_rows = _unit_rows(db, chunk)
-            if not unit_rows:
-                continue
-            with self._source_cleanup_locks(unit_rows), self.connection() as db:
-                db.execute("BEGIN IMMEDIATE")
-                placeholders = ", ".join("?" for _ in chunk)
-                current_expired = [
-                    str(row["canonical"])
-                    for row in db.execute(
-                        f"""SELECT canonical FROM ({expired_units})
-                            WHERE canonical IN ({placeholders})""",
-                        (*expiry_parameters, *chunk),
-                    ).fetchall()
-                ]
-                current_rows = _unit_rows(db, current_expired)
-                automation_review_required += _mark_automation_sources_unavailable(
-                    db,
-                    current_rows,
-                    updated_at=stamp.isoformat(),
-                )
-                if current_expired:
-                    current_placeholders = ", ".join("?" for _ in current_expired)
-                    # The delete trigger removes the rows pointing at each canonical.
-                    db.execute(
-                        f"DELETE FROM messages WHERE message_id IN ({current_placeholders})",
-                        tuple(current_expired),
+                units = {key: _unit_rows(db, (key,)) for key in initial}
+            for chunk, unit_rows in self._source_cleanup_groups(units):
+                if not unit_rows:
+                    continue
+                with self._source_cleanup_locks(unit_rows) as acquired, self.connection() as db:
+                    if not acquired:
+                        continue
+                    db.execute("BEGIN IMMEDIATE")
+                    placeholders = ", ".join("?" for _ in chunk)
+                    current_expired = [
+                        str(row["canonical"])
+                        for row in db.execute(
+                            f"""SELECT canonical FROM ({expired_units})
+                                WHERE canonical IN ({placeholders})""",
+                            (*expiry_parameters, *chunk),
+                        ).fetchall()
+                    ]
+                    current_rows = _unit_rows(db, current_expired)
+                    automation_review_required += _mark_automation_sources_unavailable(
+                        db,
+                        current_rows,
+                        updated_at=stamp.isoformat(),
                     )
-                    deleted += len(current_rows)
+                    if current_expired:
+                        current_placeholders = ", ".join("?" for _ in current_expired)
+                        # The delete trigger removes the rows pointing at each canonical.
+                        db.execute(
+                            f"DELETE FROM messages WHERE message_id IN ({current_placeholders})",
+                            tuple(current_expired),
+                        )
+                        deleted += len(current_rows)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             _purge_expired_automation_tombstones(
@@ -14275,9 +14308,16 @@ class Store:
         return PurgeOutcome(deleted, automation_review_required)
 
     def purge(
-        self, retention_days: int, *, now: datetime | None = None, after_poll: bool = False
+        self,
+        retention_days: int,
+        *,
+        now: datetime | None = None,
+        after_poll: bool = False,
+        polled_scope: tuple[str, str, str] | None = None,
     ) -> int:
-        return self.purge_with_outcome(retention_days, now=now, after_poll=after_poll).messages
+        return self.purge_with_outcome(
+            retention_days, now=now, after_poll=after_poll, polled_scope=polled_scope
+        ).messages
 
     def logical_messages_within_cutoff(
         self, message_ids: Iterable[str], *, cutoff: datetime, now: datetime

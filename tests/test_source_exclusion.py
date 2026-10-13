@@ -12,6 +12,17 @@ from eom_email_watcher.db import Store
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture
+def source_connect_entitlement(monkeypatch):
+    from connect_automate import connect
+
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.ACTIVE,
+    )
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor limit")
 def test_source_cleanup_large_unit_has_bounded_descriptors(tmp_path):
     script = """
@@ -98,7 +109,7 @@ with connect_operation_lock(Path(sys.argv[1]), 'busy'):
         with store.connection() as db:
             assert not locks.protocol_ready(db)
         with (
-            pytest.raises(locks.SourceProtocolUnavailable),
+            pytest.raises(locks.OperationLockBusy),
             store._source_cleanup_locks(["same-message"]),
         ):
             pytest.fail("unqualified cleanup entered")
@@ -162,7 +173,7 @@ def test_native_backend_refusal_and_invalid_timeouts(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("cleanup_before_reconcile", [False, True])
 def test_post_with_refused_outcome_reconciles_without_second_post(
-    tmp_path, monkeypatch, cleanup_before_reconcile
+    tmp_path, monkeypatch, cleanup_before_reconcile, source_connect_entitlement
 ):
     from contextlib import contextmanager
 
@@ -268,7 +279,8 @@ progress=state.load_or_start(later,30,{'units':[]})
 for thread in state.threads():state.watermark(progress,thread)
 state.complete(progress)
 resource.setrlimit(resource.RLIMIT_NOFILE,(1024,1024))
-assert store.purge(30,now=later,after_poll=True)==1101
+scope=('gmail','mailbox',state.scope[2])
+assert store.purge(30,now=later,after_poll=True,polled_scope=scope)==1101
 assert store.recent(1)==[]
 print('REAL_PURGE_1101_ROWS_RLIMIT_1024',flush=True)
 """
@@ -319,12 +331,13 @@ def test_packaged_non_linux_upgrade_refuses_unproven_cutover(tmp_path, monkeypat
         db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "win32")
-    with pytest.raises(locks.SourceProtocolUnavailable, match="installer stop proof"):
+    with pytest.raises(locks.SourceProtocolUnavailable, match="installer update"):
         locks.qualify_protocol(store, fresh=False)
     with store.connection() as db:
         assert not locks.protocol_ready(db)
-    with pytest.raises(locks.SourceProtocolUnavailable), store._source_cleanup_locks(["m"]):
-        pytest.fail("unsupported cutover enabled cleanup")
+    with store._source_cleanup_locks(["m"]) as acquired:
+        assert acquired
+    assert "upgrade pending" in store.source_lock_notice()
 
 
 def test_closed_cutover_grant_cannot_be_reused(paired_deployment, tmp_path):
@@ -370,3 +383,123 @@ def test_cutover_grant_is_not_transferable_to_another_thread(paired_deployment, 
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             executor.submit(copied.run, foreign_connection).result(timeout=5)
+
+
+def test_selected_legacy_operation_excludes_drain_until_mutation_finishes(tmp_path, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+
+    from eom_email_watcher import source_locks as locks
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    selected, resume, completed = threading.Event(), threading.Event(), threading.Event()
+    original = locks.connect_operation_lock
+    errors = []
+
+    @contextmanager
+    def paused(path, message, **kwargs):
+        if locks.LEGACY_NAME.fullmatch(path.name):
+            selected.set()
+            assert resume.wait(5)
+        with original(path, message, **kwargs):
+            yield
+
+    monkeypatch.setattr(locks, "connect_operation_lock", paused)
+
+    def cleanup():
+        try:
+            with store._source_cleanup_locks(["m"]) as acquired:
+                assert acquired
+                with store.connection() as db:
+                    assert not locks.protocol_ready(db)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=cleanup)
+    worker.start()
+    try:
+        assert selected.wait(5)
+        monkeypatch.setattr(locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+        with pytest.raises(locks.SourceProtocolUnavailable, match="deferred"):
+            locks.qualify_protocol(store, fresh=False)
+        with store.connection() as db:
+            assert not locks.protocol_ready(db)
+    finally:
+        resume.set()
+        worker.join(5)
+    assert completed.is_set() and not errors, errors
+    locks.qualify_protocol(store, fresh=False)
+    assert store.source_lock_notice() is None
+
+
+def test_legacy_cleanup_batches_are_bounded_and_do_not_split_units(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from eom_email_watcher import source_locks as locks
+    from eom_email_watcher.db import SOURCE_CLEANUP_LOCK_BATCH_SIZE
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    limit = SOURCE_CLEANUP_LOCK_BATCH_SIZE
+    units = {str(i): [str(i)] for i in range(limit * 3 + 1)}
+    units["large"] = [f"large-{i}" for i in range(limit + 1)]
+    units["last"] = ["last"]
+    real_lock = locks.connect_operation_lock
+    active = peak = 0
+
+    @contextmanager
+    def tracked(*args, **kwargs):
+        nonlocal active, peak
+        with real_lock(*args, **kwargs):
+            active += 1
+            peak = max(peak, active)
+            try:
+                yield
+            finally:
+                active -= 1
+
+    monkeypatch.setattr(locks, "connect_operation_lock", tracked)
+    preserved, deleted = [], []
+    for keys, rows in store._source_cleanup_groups(units):
+        with store._source_cleanup_locks(rows) as acquired:
+            if acquired:
+                deleted.extend(keys)
+            else:
+                preserved.extend(keys)
+    assert peak == limit
+    assert active == 0
+    assert preserved == ["large"]
+    assert set(deleted) == set(units) - {"large"}
+    assert "oversized thread deletion" in store.source_lock_notice()
+    with (
+        pytest.raises(locks.SourceProtocolUnavailable, match="deferred"),
+        store.source_locks(["m"]),
+    ):
+        pytest.fail("legacy Connect must defer")
+    locks.qualify_protocol(store, fresh=False)
+    with store._source_cleanup_locks(units["large"]) as acquired:
+        assert acquired
+    assert store.source_lock_notice() is None
+
+
+def test_legacy_cleanup_context_does_not_authorize_nested_connect(tmp_path):
+    from eom_email_watcher import source_locks as locks
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    with store._source_cleanup_locks(["m"]) as acquired:
+        assert acquired
+        with (
+            pytest.raises(locks.SourceProtocolUnavailable, match="deferred"),
+            store.source_locks(["m"]),
+        ):
+            pytest.fail("Nested Connect bypassed qualification")

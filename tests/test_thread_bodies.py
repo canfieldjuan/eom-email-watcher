@@ -88,7 +88,15 @@ def test_old_followed_thread_requires_current_coverage_then_purges_whole(tmp_pat
     store, state, _ = followed(tmp_path)
     seed(store, "older", received_at=(NOW - timedelta(days=40)).isoformat())
     body_state.record(store, "m", ("body", 4), fetched_at=NOW)
-    assert store.purge(30, now=NOW + timedelta(days=35), after_poll=True) == 0
+    assert (
+        store.purge(
+            30,
+            now=NOW + timedelta(days=35),
+            after_poll=True,
+            polled_scope=("gmail", "mailbox", KEY),
+        )
+        == 0
+    )
     progress = state.load_or_start(NOW + timedelta(days=35), 30, {"stage": "derived", "units": []})
     with store.connection() as db:
         db.execute(
@@ -97,7 +105,15 @@ def test_old_followed_thread_requires_current_coverage_then_purges_whole(tmp_pat
             ((NOW + timedelta(days=35)).isoformat(),),
         )
     state.complete(progress)
-    assert store.purge(30, now=NOW + timedelta(days=35), after_poll=True) == 2
+    assert (
+        store.purge(
+            30,
+            now=NOW + timedelta(days=35),
+            after_poll=True,
+            polled_scope=("gmail", "mailbox", KEY),
+        )
+        == 2
+    )
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
         assert not db.execute("SELECT 1 FROM thread_follow").fetchone()
