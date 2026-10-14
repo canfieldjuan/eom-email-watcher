@@ -58,10 +58,60 @@ def validate_request(request, output, account, task):
     return engine, argv
 
 
-REGISTER_ATTEMPTS = r"""
+REGISTER_EVIDENCE = r"""
+function S4U-Json($value) {
+    $json=ConvertTo-Json -InputObject $value -Depth 12 -Compress
+    if (![string]::IsNullOrEmpty($env:EW_PROBE_PASSWORD)) {
+        $quoted=ConvertTo-Json -InputObject $env:EW_PROBE_PASSWORD -Compress
+        $json=$json.Replace($quoted.Substring(1,$quoted.Length-2),'[REDACTED]')
+    }
+    return $json
+}
 function Write-S4UEvidence {
-    $evidence | ConvertTo-Json -Depth 10 |
-        Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
+    S4U-Json $evidence | Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
+}
+"""
+
+
+REGISTER_ATTEMPTS = r"""
+function Task-DaclKey([string]$sddl) {
+    $sd=[Security.AccessControl.RawSecurityDescriptor]::new($sddl)
+    $flags=[Security.AccessControl.ControlFlags]
+    if (!$sd.DiscretionaryAcl -or
+        !($sd.ControlFlags -band $flags::DiscretionaryAclPresent) -or
+        !($sd.ControlFlags -band $flags::DiscretionaryAclProtected)) {
+        throw 'Task DACL must be present and protected'
+    }
+    # Task permissions are file permissions. Normalize generic rights to their
+    # file mapping so equivalent GA/FA or reordered SID aliases compare equally.
+    $file=[Security.AccessControl.FileSystemRights]
+    $mapping=@{
+        268435456=[int64]($file::FullControl)
+        2147483648=[int64]($file::Read -bor $file::Synchronize)
+        1073741824=[int64]($file::Write -bor $file::ReadPermissions -bor $file::Synchronize)
+        536870912=[int64]($file::ExecuteFile -bor $file::ReadAttributes -bor
+            $file::ReadPermissions -bor $file::Synchronize)
+    }
+    $entries=@{}
+    foreach ($ace in $sd.DiscretionaryAcl) {
+        if ($ace -isnot [Security.AccessControl.CommonAce] -or $ace.IsCallback -or
+            $ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed -or
+            $ace.AceFlags -ne [Security.AccessControl.AceFlags]::None) {
+            throw 'Task DACL has an unexpected ACE'
+        }
+        $mask=[int64]$ace.AccessMask -band 4294967295
+        $normalized=$mask -band 268435455
+        foreach ($generic in $mapping.Keys) {
+            if ($mask -band $generic) { $normalized=$normalized -bor $mapping[$generic] }
+        }
+        $entries[$ace.SecurityIdentifier.Value+':'+$normalized]=$true
+    }
+    return (@($entries.Keys | Sort-Object) -join '|')
+}
+function Assert-TaskDacl([string]$requested,[string]$readBack) {
+    if ((Task-DaclKey $requested) -cne (Task-DaclKey $readBack)) {
+        throw 'Task DACL read-back differs from the requested grants'
+    }
 }
 $folder=$scheduler.GetFolder('\')
 $dacl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)(A;;GA;;;BA)'
@@ -76,30 +126,35 @@ foreach ($variant in @('explicit-owner','dacl-only','default-security')) {
         error=$null;security=$null}
     $evidence.attempts+=@($attempt)
     Write-S4UEvidence
+    $candidate=$null
     try {
         $candidate=$folder.RegisterTaskDefinition(
-            $env:EW_S4U_TASK,$definition,2,$sid,$null,[int]$env:EW_S4U_LOGON,$sddl)
-        if ($variant -eq 'default-security') {
-            $attempt.security=[ordered]@{status='pending';hresult=$null;error=$null;sddl=$null}
-            Write-S4UEvidence
-            try {
-                $candidate.SetSecurityDescriptor($dacl,0)
-                $attempt.security.sddl=$candidate.GetSecurityDescriptor(4)
-                $attempt.security.status='applied';$attempt.security.hresult=0
-            } catch {
-                $attempt.security.status='failed'
-                $attempt.security.hresult=$_.Exception.GetBaseException().HResult
-                $attempt.security.error=$_.Exception.ToString()
-                throw
-            }
-        }
-        # Never adopt a candidate whose post-registration DACL failed.
-        $task=$candidate
+            $env:EW_S4U_TASK,$definition,2,$sid,$env:EW_PROBE_PASSWORD,
+            [int]$env:EW_S4U_LOGON,$sddl)
+        # This is the authoritative POST result, before any subsequent reader.
         $attempt.status='registered';$attempt.hresult=0
-        $evidence.selected=$variant
     } catch {
         $attempt.status='failed';$attempt.hresult=$_.Exception.GetBaseException().HResult
         $attempt.error=$_.Exception.ToString()
+    }
+    Write-S4UEvidence
+    if ($null -ne $candidate) {
+        $attempt.security=[ordered]@{status='pending';hresult=$null;error=$null;sddl=$null}
+        Write-S4UEvidence
+        try {
+            if ($variant -eq 'default-security') {
+                $candidate.SetSecurityDescriptor($dacl,0)
+            }
+            $attempt.security.sddl=$candidate.GetSecurityDescriptor(4)
+            Assert-TaskDacl $dacl $attempt.security.sddl
+            $attempt.security.status='applied';$attempt.security.hresult=0
+            $task=$candidate
+            $evidence.selected=$variant
+        } catch {
+            $attempt.security.status='failed'
+            $attempt.security.hresult=$_.Exception.GetBaseException().HResult
+            $attempt.security.error=$_.Exception.ToString()
+        }
     }
     Write-S4UEvidence
     if ($null -ne $task) { break }
@@ -108,7 +163,7 @@ if ($evidence.attempts.Count -eq 3) {
     # Diagnostic D is a distinct disabled task. It can never become the case actor.
     $controlName=$env:EW_S4U_TASK+'-calling-account-control'
     $control=[ordered]@{task=$controlName;principal=$evidence.registering_sid
-        status='pending';hresult=$null;error=$null;native=$null
+        status='pending';hresult=$null;error=$null;native=$null;metadata=$null
         cleanup=[ordered]@{settled=$false;operations=@();errors=@()}}
     $evidence.control=$control
     Write-S4UEvidence
@@ -121,19 +176,34 @@ if ($evidence.attempts.Count -eq 3) {
         $controlDefinition.Settings.Enabled=$false
         $diagnostic=$folder.RegisterTaskDefinition(
             $controlName,$controlDefinition,2,$evidence.registering_sid,$null,2,$null)
-        $control.native=[ordered]@{principal=(Principal-Sid $diagnostic.Definition.Principal.UserId)
-            logon_type=[int]$diagnostic.Definition.Principal.LogonType
-            run_level=[int]$diagnostic.Definition.Principal.RunLevel;enabled=$diagnostic.Enabled}
-        if ($control.native.principal -ne $evidence.registering_sid -or
-            $control.native.logon_type -ne 2 -or $control.native.run_level -ne 0 -or
-            $control.native.enabled) {
-            throw 'Diagnostic D metadata differs from its fixed definition'
-        }
+        # Preserve successful registration even if the next read/check fails.
         $control.status='registered';$control.hresult=0
     } catch {
         $control.status='failed';$control.hresult=$_.Exception.GetBaseException().HResult
         $control.error=$_.Exception.ToString()
     } finally {
+        if ($control.status -eq 'registered') {
+            $control.metadata=[ordered]@{status='pending';hresult=$null;error=$null}
+            Write-S4UEvidence
+            try {
+                $control.native=[ordered]@{
+                    principal=(Principal-Sid $diagnostic.Definition.Principal.UserId)
+                    logon_type=[int]$diagnostic.Definition.Principal.LogonType
+                    run_level=[int]$diagnostic.Definition.Principal.RunLevel
+                    enabled=$diagnostic.Enabled}
+                if ($control.native.principal -ne $evidence.registering_sid -or
+                    $control.native.logon_type -ne 2 -or $control.native.run_level -ne 0 -or
+                    $control.native.enabled) {
+                    throw 'Diagnostic D metadata differs from its fixed definition'
+                }
+                $control.metadata.status='validated';$control.metadata.hresult=0
+            } catch {
+                $control.metadata.status='failed'
+                $control.metadata.hresult=$_.Exception.GetBaseException().HResult
+                $control.metadata.error=$_.Exception.ToString()
+            }
+            Write-S4UEvidence
+        }
         # Observe by name even after a failed POST; a partial registration is owned.
         $owned=$null;$absent=$false;$idle=$false
         try {
@@ -172,6 +242,9 @@ if ($evidence.attempts.Count -eq 3) {
     if (!$control.cleanup.settled) {
         throw 'Diagnostic task cleanup unproven; retain fixture resources'
     }
+    if ($null -ne $control.metadata -and $control.metadata.status -ne 'validated') {
+        throw 'Diagnostic D metadata failed after registration; see separate outcomes'
+    }
 }
 if ($null -eq $task) {
     throw 'Probe-account S4U registration failed; see original HRESULTs and C/D controls'
@@ -181,6 +254,7 @@ if ($null -eq $task) {
 
 REGISTER = (
     PRINCIPAL_ID
+    + REGISTER_EVIDENCE
     + r"""$ErrorActionPreference='Stop'
 $scheduler=New-Object -ComObject Schedule.Service
 $scheduler.Connect()
@@ -217,15 +291,14 @@ try {
     + REGISTER_ATTEMPTS
     + r"""
 } finally {
-    $evidence | ConvertTo-Json -Depth 10 |
-        Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
+    Write-S4UEvidence
 }
-[ordered]@{task=$task.Name;principal=(Principal-Sid $task.Definition.Principal.UserId)
+S4U-Json ([ordered]@{task=$task.Name;principal=(Principal-Sid $task.Definition.Principal.UserId)
     logon_type=[int]$task.Definition.Principal.LogonType
     run_level=[int]$task.Definition.Principal.RunLevel
     sddl=$task.GetSecurityDescriptor(7);enabled=$task.Enabled
     engine=$task.Definition.Actions.Item(1).Path
-    arguments=$task.Definition.Actions.Item(1).Arguments} | ConvertTo-Json -Compress
+    arguments=$task.Definition.Actions.Item(1).Arguments})
 """
 )
 
@@ -233,7 +306,7 @@ try {
 class S4URegistration:
     """Own the one request and settle its native operation before resource cleanup."""
 
-    def __init__(self, output, account, sid, task, shell):
+    def __init__(self, output, account, sid, task, shell, *, password=""):
         self.output, self.account, self.sid, self.task, self.shell = (
             output,
             account,
@@ -242,6 +315,7 @@ class S4URegistration:
             shell,
         )
         self.request = output / "standard-user-task-request.json"
+        self.password = password  # Private transport only, never part of a request/receipt.
         self.response = output / "standard-user-task-registration.json"
         self.stop = threading.Event()
         self.thread = None
@@ -288,6 +362,7 @@ class S4URegistration:
                     EW_S4U_LOGON=str(S4U),
                     EW_S4U_LEVEL=str(LIMITED),
                     EW_S4U_RIGHTS=json.dumps({"rights": rights}),
+                    EW_PROBE_PASSWORD=self.password,
                     EW_S4U_SOURCE=str(
                         Path(__file__).resolve().parents[1]
                         / "desktop/src-tauri/windows/cutover.ps1"
@@ -300,7 +375,7 @@ class S4URegistration:
                     "operation": "register", "started_at": started,
                     "finished_at": time.monotonic(),
                 })
-            native = json.loads(result)
+            native = json.loads(self._redact(result))
             if (
                 native["task"] != self.task
                 or native["principal"] != self.sid
@@ -313,11 +388,17 @@ class S4URegistration:
                 raise ValueError("Registered S4U task differs from the requested case")
             self.outcome.update(status="registered", native=native)
         except Exception as error:
-            self.outcome.update(status="failed", error=str(error))
+            self.outcome.update(status="failed", error=self._redact(str(error)))
         finally:
             temporary = self.response.with_suffix(".tmp")
             temporary.write_text(json.dumps(self.outcome, indent=2))
             temporary.replace(self.response)
+
+    def _redact(self, value):
+        if self.password:
+            value = value.replace(json.dumps(self.password)[1:-1], "[REDACTED]")
+            value = value.replace(self.password, "[REDACTED]")
+        return value
 
     def close(self):
         self.stop.set()

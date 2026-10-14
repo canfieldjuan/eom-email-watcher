@@ -120,6 +120,14 @@ class MessageUnavailable(GmailError, MailboxMessageUnavailable):
     caller should skip this one message, not fail the whole run."""
 
 
+def _message_fetch_error(exc: HttpError, message_id: str, operation: str) -> GmailError:
+    """A missing message resource is terminal across every content fetch path."""
+    status = getattr(exc.resp, "status", None)
+    if status == 404:
+        return MessageUnavailable(f"Gmail message {message_id} unavailable (HTTP 404)")
+    return GmailError(f"Gmail {operation} fetch failed (HTTP {status})")
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -1056,11 +1064,7 @@ class GmailGateway:
             )
             message = self._execute_request(request, timeout_seconds=timeout_seconds)
         except HttpError as exc:
-            if getattr(exc.resp, "status", None) == 404:
-                raise MessageUnavailable(
-                    f"Gmail message {message_id} unavailable (HTTP 404)"
-                ) from exc
-            raise GmailError(f"Gmail metadata fetch failed (HTTP {exc.resp.status})") from exc
+            raise _message_fetch_error(exc, message_id, "metadata") from exc
         except (TimeoutError, OSError, httplib2.HttpLib2Error) as exc:
             raise GmailError("Gmail metadata fetch timed out or failed") from exc
         return parse_metadata(message)
@@ -1074,11 +1078,7 @@ class GmailGateway:
             )
             message = self._execute_request(request)
         except HttpError as exc:
-            if getattr(exc.resp, "status", None) == 404:
-                raise MessageUnavailable(
-                    f"Gmail message {message_id} unavailable (HTTP 404)"
-                ) from exc
-            raise GmailError(f"Gmail body fetch failed (HTTP {exc.resp.status})") from exc
+            raise _message_fetch_error(exc, message_id, "body") from exc
         return message
 
     def full_payload(self, message_id: str) -> dict[str, Any]:
@@ -1113,7 +1113,7 @@ class GmailGateway:
             try:
                 response = self._execute_request(request)
             except HttpError as exc:
-                raise GmailError("Gmail text part fetch failed") from exc
+                raise _message_fetch_error(exc, message_id, "text part") from exc
             data = response.get("data")
             if not isinstance(data, str):
                 raise GmailError("Gmail text part response did not contain data")
@@ -1147,11 +1147,7 @@ class GmailGateway:
                     .execute()
                 )
             except HttpError as exc:
-                if getattr(exc.resp, "status", None) == 404:
-                    raise MessageUnavailable(
-                        f"Gmail message {message_id} attachment unavailable (HTTP 404)"
-                    ) from exc
-                raise GmailError(f"Gmail attachment fetch failed (HTTP {exc.resp.status})") from exc
+                raise _message_fetch_error(exc, message_id, "attachment") from exc
             return _decode_attachment_data(response.get("data"))
 
         part = _find_part(self.full_payload(message_id), part_id)

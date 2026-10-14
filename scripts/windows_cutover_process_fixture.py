@@ -258,7 +258,9 @@ def run_standard_user_case(
             command.append("--orphan-probe")
         if not timeout_probe and not orphan_probe:
             task = "EW-Cutover-" + name
-            registration = S4URegistration(output, name, sid, task, run_powershell)
+            registration = S4URegistration(
+                output, name, sid, task, run_powershell, password=password
+            )
             registration.start()
             command.extend(["--registered-task", task])
         launch_attempted = True

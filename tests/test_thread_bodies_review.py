@@ -185,7 +185,7 @@ def test_unclosed_html_storage_is_bounded_in_time():
     assert result.stdout.strip() == "bounded"
 
 
-def gmail_with_payload(payload):
+def gmail_with_payload(payload, *, external_error=None):
     requests = []
 
     def full(**kwargs):
@@ -194,13 +194,15 @@ def gmail_with_payload(payload):
 
     def external(**kwargs):
         requests.append(("part", kwargs))
-        return SimpleNamespace(
-            execute=lambda: {
+        def execute():
+            if external_error is not None:
+                raise external_error
+            return {
                 "data": base64.urlsafe_b64encode(
                     b"<blockquote>External quote</blockquote>"
                 ).decode()
             }
-        )
+        return SimpleNamespace(execute=execute)
 
     api = SimpleNamespace(get=full, attachments=lambda: SimpleNamespace(get=external))
     return GmailGateway(
@@ -216,6 +218,59 @@ def test_gmail_external_text_uses_budgeted_part_fetch_instead_of_empty_capture()
     assert gateway.stored_body("m", scope=frozenset({"inbox"})) == ("> External quote", 16)
     assert [r[0] for r in requests] == ["full", "part"]
     assert gateway._reconcile_budget.calls == 2
+
+
+@pytest.mark.parametrize("kind", ["text", "attachment"])
+@pytest.mark.parametrize("status", [404, 403, 410, 429, 500])
+def test_gmail_attachment_resource_errors_have_one_terminal_classification(kind, status):
+    from googleapiclient.errors import HttpError
+
+    from eom_email_watcher.gmail import GmailError
+    from eom_email_watcher.mailbox import MailboxMessageUnavailable
+
+    error = HttpError(SimpleNamespace(status=status, reason="public failure"), b'{}')
+    gateway, requests = gmail_with_payload(
+        {"mimeType": "text/html", "body": {"attachmentId": "external"}},
+        external_error=error,
+    )
+    with pytest.raises(MailboxMessageUnavailable if status == 404 else GmailError) as caught:
+        if kind == "text":
+            gateway.stored_body("m", scope=frozenset({"inbox"}))
+        else:
+            gateway.attachment_bytes("m", "part", "external")
+    assert isinstance(caught.value, MailboxMessageUnavailable) is (status == 404)
+    assert caught.value.__cause__ is error
+    assert requests[-1] == ("part", {"userId": "me", "messageId": "m", "id": "external"})
+
+
+@pytest.mark.parametrize("sibling", [False, True])
+def test_real_gmail_missing_text_finishes_reconcile_or_uses_sibling(tmp_path, monkeypatch, sibling):
+    from googleapiclient.errors import HttpError
+
+    provider, requests = gmail_with_payload(
+        {"mimeType": "text/html", "body": {"attachmentId": "external"}},
+        external_error=HttpError(SimpleNamespace(status=404, reason="gone"), b'{}'),
+    )
+    watcher, state, gateway = body_runner(tmp_path, monkeypatch, {"z-copy": ("quote", 5)})
+    if sibling:
+        seed(watcher.store, "z-copy", rfc_message_id="same@vendor")
+    fallback = gateway.stored_body
+    gateway.stored_body = lambda source, **kw: (
+        provider.stored_body(source, **kw) if source == "m" else fallback(source, **kw)
+    )
+    prepare_derived(state)
+    reconcile.run(watcher, KEY, "unavailable", label_selectors=(), now=NOW)
+    assert not state.stale()
+    assert [r[0] for r in requests] == ["full", "part"]
+    with watcher.store.connection() as db:
+        if sibling:
+            assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "quote"
+            assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        else:
+            assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+            assert db.execute("SELECT reason FROM message_body_unavailable").fetchone()[0] == (
+                "source_gone"
+            )
 
 
 def test_rendered_empty_html_alternative_falls_back_to_plain():

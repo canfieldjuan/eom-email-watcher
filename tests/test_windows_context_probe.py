@@ -590,7 +590,8 @@ def test_elevated_s4u_request_is_bound_to_the_standard_case(tmp_path, change):
             validate_request(request, tmp_path, "case-user", "case-task")
 
 
-def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path, monkeypatch):
+@pytest.mark.parametrize("encoding", ["raw", "json"])
+def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path, monkeypatch, encoding):
     import windows_s4u_task_fixture
     from windows_s4u_task_fixture import LIMITED, S4U, S4URegistration
 
@@ -613,16 +614,28 @@ def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path, monkeyp
     }
     calls = []
 
+    private_password = 'public!password"\\sentinel'
+
     def shell(script, **values):
         calls.append(values)
-        raise OSError("public registration denied")
+        leaked = private_password if encoding == "raw" else json.dumps(private_password)[1:-1]
+        raise OSError("public registration denied " + leaked)
 
-    broker = S4URegistration(tmp_path, "case-user", "S-1-5-21-1-2-3-1001", "case-task", shell)
+    broker = S4URegistration(
+        tmp_path, "case-user", "S-1-5-21-1-2-3-1001", "case-task", shell,
+        password=private_password,
+    )
     broker.request.write_text(json.dumps(request))
     broker._serve()
     broker.close()
     result = json.loads(broker.response.read_text())
-    assert result["status"] == "failed" and result["error"] == "public registration denied"
+    assert result["status"] == "failed"
+    assert private_password not in result["error"]
+    assert result["error"] == "public registration denied [REDACTED]"
+    assert calls[0]["EW_PROBE_PASSWORD"] == private_password
+    assert private_password not in calls[0]["EW_S4U_ARGS"]
+    assert private_password not in broker.request.read_text()
+    assert json.dumps(private_password)[1:-1] not in broker.response.read_text()
     assert calls[0]["EW_S4U_LOGON"] == str(S4U)
     assert calls[0]["EW_S4U_LEVEL"] == str(LIMITED)
     assert calls[0]["EW_S4U_SID"] == "S-1-5-21-1-2-3-1001"
@@ -735,15 +748,18 @@ def test_s4u_diagnostic_cleanup_controls_resource_release(tmp_path, cleanup):
 @pytest.mark.skipif(os.name != "nt", reason="actual PowerShell S4U registration decision owner")
 @pytest.mark.parametrize("mode", [
     "explicit", "dacl", "default", "d-only", "none", "security-failure", "cleanup-failure",
+    "canonical-security", "acl-missing", "acl-broader", "acl-denied", "acl-unprotected",
+    "acl-null", "acl-malformed", "metadata-read-failure", "metadata-mismatch",
+    "password-error",
 ])
 def test_native_s4u_registration_controls_preserve_denials_and_never_adopt_d(tmp_path, mode):
     import prove_windows_cutover as proof
-    from windows_s4u_task_fixture import PRINCIPAL_ID, REGISTER_ATTEMPTS
+    from windows_s4u_task_fixture import PRINCIPAL_ID, REGISTER_ATTEMPTS, REGISTER_EVIDENCE
 
     output = proof.probe_output(f"s4u-registration-{mode}", tmp_path)
     # Execute the production fixture's PowerShell owner with public COM doubles.
     # The separate CI qualification still exercises the actual Task Scheduler.
-    code = PRINCIPAL_ID + r'''$ErrorActionPreference='Stop'
+    code = PRINCIPAL_ID + REGISTER_EVIDENCE + r'''$ErrorActionPreference='Stop'
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -755,11 +771,30 @@ public class FakeDefinition {
     public FakeSettings Settings = new FakeSettings(); public string XmlText;
 }
 public class FakeTask {
-    public string Name; public FakeDefinition Definition; public bool Enabled;
-    public bool CleanupFault; public bool SecurityFault; public string Security;
+    public string Name; public bool Enabled; public string Mode;
+    private FakeDefinition definition;
+    public FakeDefinition Definition {
+        get {
+            if (MetadataReadFault)
+                throw new InvalidOperationException("public metadata read failed");
+            return definition;
+        }
+        set { definition=value; }
+    }
+    public bool MetadataReadFault; public bool CleanupFault; public bool SecurityFault;
+    public string Security;
     public void SetSecurityDescriptor(string value, int flags) {
         if (SecurityFault) throw new UnauthorizedAccessException("public DACL denied");
         Security = value;
+        string probe="S-1-5-21-1-2-3-1001";
+        if (Mode == "canonical-security")
+            Security="D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;"+probe+")";
+        if (Mode == "acl-missing") Security="D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+        if (Mode == "acl-broader") Security=value+"(A;;GA;;;WD)";
+        if (Mode == "acl-denied") Security=value.Replace("(A;;GA;;;"+probe,"(D;;GA;;;"+probe);
+        if (Mode == "acl-unprotected") Security=value.Replace("D:P", "D:");
+        if (Mode == "acl-null") Security="D:NO_ACCESS_CONTROL";
+        if (Mode == "acl-malformed") Security="not-sddl";
     }
     public string GetSecurityDescriptor(int flags) { return Security; }
     public void Stop(int flags) {
@@ -776,22 +811,32 @@ public class FakeFolder {
         string variant = sid != ProbeSid ? "D" : sddl == null ? "C" :
             sddl.ToString().StartsWith("O:") ? "A" : "B";
         Calls.Add(variant);
+        bool credentialMatches = sid == ProbeSid ?
+            (string)password == Environment.GetEnvironmentVariable("EW_PROBE_PASSWORD") :
+            password == null;
         if (flags != 2 || logon != 2 || definition.Principal.RunLevel != 0 ||
-            sid != definition.Principal.UserId || password != null)
+            sid != definition.Principal.UserId || !credentialMatches)
             throw new Exception("fixed metadata changed");
+        if (sid == ProbeSid && Mode == "password-error")
+            throw new UnauthorizedAccessException(
+                "public denial " + Environment.GetEnvironmentVariable("EW_PROBE_PASSWORD"));
         bool allowed = (variant == "A" && Mode == "explicit") ||
             (variant == "B" && Mode == "dacl") ||
             (variant == "C" && (Mode == "default" || Mode == "security-failure" ||
-                Mode == "cleanup-failure")) ||
+                Mode == "cleanup-failure" || Mode == "canonical-security" ||
+                Mode.StartsWith("acl-") || Mode.StartsWith("metadata-"))) ||
             (variant == "D" && Mode != "none");
         if (!allowed)
             throw new UnauthorizedAccessException("public registration denied " + variant);
         if (variant == "D" && definition.Settings.Enabled)
             throw new Exception("D must stay disabled");
         var task = new FakeTask { Name=name, Definition=definition,
-            Enabled=definition.Settings.Enabled,
+            Enabled=definition.Settings.Enabled, Mode=Mode,
+            MetadataReadFault=variant == "D" && Mode == "metadata-read-failure",
             SecurityFault=variant == "C" && Mode == "security-failure",
             CleanupFault=variant == "D" && Mode == "cleanup-failure", Security=sddl as string };
+        if (variant == "D" && Mode == "metadata-mismatch")
+            definition.Principal.UserId="S-1-5-21-1-2-3-1002";
         Tasks.Add(name, task); return task;
     }
     public FakeTask GetTask(string name) {
@@ -817,13 +862,44 @@ $errorResult=$null
 try {
 ''' + REGISTER_ATTEMPTS + r'''
 } catch { $errorResult=$_.Exception.Message }
-[ordered]@{evidence=$evidence;error=$errorResult;calls=$scheduler.Folder.Calls
+# Frozen reviewed C reader: a nonthrowing setter/read always claims applied.
+$legacySecurity=$null
+if ($env:EW_MODE.StartsWith('acl-')) {
+    $legacyTask=New-Object FakeTask;$legacyTask.Mode=$env:EW_MODE
+    $legacyTask.SetSecurityDescriptor($dacl,0)
+    $legacySecurity=[ordered]@{status='applied';sddl=$legacyTask.GetSecurityDescriptor(4)}
+}
+# Frozen reviewed D owner: a metadata exception overwrites the successful POST.
+$legacyRegistration=$null
+if ($env:EW_MODE.StartsWith('metadata-')) {
+    $legacyScheduler=New-Object FakeScheduler;$legacyScheduler.Folder.Mode=$env:EW_MODE
+    $legacyDefinition=$legacyScheduler.NewTask(0)
+    $legacyDefinition.Principal.UserId=$evidence.registering_sid
+    $legacyDefinition.Principal.RunLevel=0;$legacyDefinition.Settings.Enabled=$false
+    $legacyRegistration=[ordered]@{status='pending';hresult=$null;registration_succeeded=$false}
+    try {
+        $legacy=$legacyScheduler.Folder.RegisterTaskDefinition('legacy',$legacyDefinition,
+            2,$evidence.registering_sid,$null,2,$null)
+        $legacyRegistration.registration_succeeded=$true
+        if ($legacy.Definition.Principal.UserId -ne $evidence.registering_sid) {
+            throw 'Diagnostic D metadata differs from its fixed definition'
+        }
+        $legacyRegistration.status='registered';$legacyRegistration.hresult=0
+    } catch {
+        $legacyRegistration.status='failed'
+        $legacyRegistration.hresult=$_.Exception.GetBaseException().HResult
+    }
+}
+S4U-Json ([ordered]@{evidence=$evidence;error=$errorResult;calls=$scheduler.Folder.Calls
+    legacy_security=$legacySecurity;legacy_registration=$legacyRegistration
     case_principal=if ($null -ne $task) {$task.Definition.Principal.UserId} else {$null}
-    remaining_tasks=@($scheduler.Folder.Tasks.Keys)} | ConvertTo-Json -Depth 12 -Compress
+    remaining_tasks=@($scheduler.Folder.Tasks.Keys)})
 '''
+    private_password = 'public!password"\\sentinel'
     receipt = json.loads(proof.powershell(
         code, EW_MODE=mode, EW_S4U_TASK="public-case", EW_S4U_LOGON="2",
         EW_S4U_DIAGNOSTICS=str(output / "registration-attempts.json"),
+        EW_PROBE_PASSWORD=private_password,
     ))
     (output / "registration-controls.json").write_text(json.dumps(receipt, indent=2))
     evidence = receipt["evidence"]
@@ -840,23 +916,44 @@ try {
             assert control["status"] == "failed" and control["hresult"] == -2147024891
             assert control["cleanup"]["operations"] == ["already-absent"]
         else:
-            assert control["native"]["enabled"] is False
+            assert control["status"] == "registered" and control["hresult"] == 0
+            if mode != "metadata-read-failure":
+                assert control["native"]["enabled"] is False
             expected = ["get", "idle", "delete", "absent"] if mode == "cleanup-failure" else [
                 "get", "stop", "idle", "delete", "absent",
             ]
             assert control["cleanup"]["operations"] == expected
         assert control["cleanup"]["settled"] is (mode != "cleanup-failure")
-    if mode in {"explicit", "dacl", "default"}:
+        if mode.startswith("metadata-"):
+            assert control["metadata"]["status"] == "failed"
+            legacy = receipt["legacy_registration"]
+            assert legacy["registration_succeeded"] is True
+            assert legacy["status"] == "failed" and legacy["hresult"] != 0
+        elif mode != "none":
+            assert control["metadata"]["status"] == "validated"
+    if mode in {"explicit", "dacl", "default", "canonical-security"}:
         assert receipt["error"] is None and receipt["case_principal"] == "S-1-5-21-1-2-3-1001"
     else:
         assert receipt["error"] is not None
-    if mode == "default":
+    if mode in {"default", "canonical-security"}:
         assert evidence["selected"] == "default-security"
         assert evidence["attempts"][2]["security"]["status"] == "applied"
     if mode in {"d-only", "none", "security-failure"}:
         assert evidence["selected"] is None and receipt["case_principal"] is None
     if mode == "security-failure":
         assert evidence["attempts"][2]["security"]["hresult"] == -2147024891
+    if mode == "security-failure" or mode.startswith("acl-"):
+        attempt = evidence["attempts"][2]
+        assert attempt["status"] == "registered" and attempt["hresult"] == 0
+        assert attempt["security"]["status"] == "failed"
+        assert evidence["selected"] is None and receipt["case_principal"] is None
+    if mode.startswith("acl-"):
+        assert receipt["legacy_security"]["status"] == "applied"
+    if mode == "password-error":
+        assert all("[REDACTED]" in a["error"] for a in evidence["attempts"])
+    for value in (json.dumps(receipt), (output / "registration-attempts.json").read_text()):
+        assert private_password not in value
+        assert json.dumps(private_password)[1:-1] not in value
 
 
 def test_unproven_live_case_keeps_its_identity_acls_and_batch_right(monkeypatch, tmp_path):
@@ -902,7 +999,7 @@ def test_live_registration_retains_resources_despite_signaled_case(monkeypatch, 
         settled = False
         outcome = {"status": "in-flight"}
 
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def start(self):
