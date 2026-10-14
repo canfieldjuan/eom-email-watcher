@@ -1324,6 +1324,8 @@ with at most `SOURCE_CLEANUP_LOCK_BATCH_SIZE` (32) source descriptors; the guard
 stays held through mutation, excluding legacy drain and marker publication.
 Whole logical messages and followed threads are indivisible. Oversized units
 are preserved until qualification, with the pending state shown in Health;
+requested local deletion outcomes and their durable completion belong to
+`docs/THREAD_VIEW_CONTRACT.md`, D-removal.
 Connect handoffs defer. Ordinary polling, capture, notification reads and
 bounded cleanup remain available. Qualified operations acquire their stripes
 before releasing the guard; the marker never reverts.

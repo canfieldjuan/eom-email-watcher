@@ -31,7 +31,7 @@ None of it exists today:
 
 ## Operator decisions (2026-10-06)
 
-1. **Unfollow deletes bodies right away.** A thread that stops being followed loses its stored bodies in the same transaction (C/D-body, C/D-derived).
+1. **Unfollow deletes bodies right away.** A thread that stops being followed loses its stored bodies in the same transaction (C/D-body, C/D-derived), with the operator's accepted source-exclusion exception owned by C/D-removal (2026-10-14, PR #255 issuecomment-6173830783).
 2. **Sent is polled only while Connect is active** (step 2).
 3. **The `messages` rebuild gets a backup, besides its in-transaction checks** (step 11).
 4. **The stored-body cap is 200,000 characters** (step 21).

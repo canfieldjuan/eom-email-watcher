@@ -167,7 +167,7 @@ Each definition is the only place its rule is stated.
   All of them live in the database. Mail-capture admission provenance and discovery order are never inputs.
 - **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`). I-order's serialized admission and outcome transactions (attachment inspection, in Dependencies) are the exception: they hold the lane then source locks in the order `docs/CONTRACTS.md` fixes and recompute in their own `BEGIN IMMEDIATE` transaction, which serializes them with every other writer. This includes prepared-source hash invalidation, cache-hit settlement and Connect/job-join settlement; none reacquires the operation lock while holding the lane/source locks.
   - The paths include capture, a recorded location, deletion, purge, an IMAP merge, a vendor record change, and a verified identity being added or changed. That list is illustrative; the rule is not.
-- **Only local work happens in that transaction.** It recomputes state and deletes what a definition no longer allows. Anything that needs a provider or the model, such as a body to fetch or claims to extract, is left to the reconcile pass ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)).
+- **Only local work happens in that transaction.** It recomputes state and deletes what a definition no longer allows. Physical removal held by source exclusion follows [D-removal](#d-removal-held-local-deletions); that exception does not postpone the follow or attribution transition. Anything that needs a provider or the model, such as a body to fetch or claims to extract, is left to the reconcile pass ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)).
 
 ### D-reconcile: coverage and the reconcile pass
 
@@ -199,7 +199,7 @@ Each definition is the only place its rule is stated.
 
 ### D-body: stored bodies
 
-- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage, so a thread that stops being followed loses its bodies ([D-derived](#d-derived-derived-state-and-invalidation)).
+- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage, so a thread that stops being followed loses its bodies ([D-derived](#d-derived-derived-state-and-invalidation)), subject to the physical-removal exception in [D-removal](#d-removal-held-local-deletions).
 - **What is stored:**
   - the normalized text, from `bounded_body_text` with a named storage cap larger than `body_char_limit`;
   - the pre-cut length;
@@ -221,7 +221,7 @@ Each definition is the only place its rule is stated.
   - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, body storage, reconcile, and claim extraction.
     - All need the paid entitlement `connect.capability_exchange` (decision D3, `require_connect_entitlement`).
   - **automation:** enabling new-mail inspection, granting a historical selection range, inspecting explicitly selected attachments, and producing invoice records (attachment inspection, I-selection and I-gate). Selection grants require both `connect.capability_exchange` and `connect.automations` when granted; inspection and extraction intended for invoice-record adoption require both at handoff; an account being watched and a valid licence do not select artifacts. The shared queue owns the checks, as each operation requires (decision D5). Claims from a stored record are derived state, not an operation, and need no entitlement.
-  - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, dismissing a suggestion, and disabling or revoking attachment-inspection selection.
+  - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, dismissing a suggestion, deleting a local message, clearing local history, and disabling or revoking attachment-inspection selection.
     - Never gated, and available regardless of entitlement or provider state.
 - **The desktop shows controls by class.**
   - Gated controls are hidden while the entitlement is inactive, under a "Connect required to update" notice.
@@ -238,6 +238,14 @@ Each definition is the only place its rule is stated.
     - It can also stop watching its addresses ("Also stop watching these addresses", off by default).
     - Addresses left watched keep today's `exact_sender` admission.
 - **Two stores.** The watchlist is a separate file, so no operation changes it and the database in one transaction. An operation that changes both writes the watchlist first, in one write, then the database. An interruption therefore leaves either an extra watched address or a vendor address shown `watched: false`, and a retry completes the operation.
+
+### D-removal: held local deletions
+
+- **One removal owner.** A local message deletion, clear-history request, or body cleanup caused by unfollow uses the source-exclusion owner in `docs/CONTRACTS.md`. If an indivisible target cannot be locked while the schema-35 protocol is unqualified, the outcome is **deferred**, not deleted or absent. Targets that can be locked are removed immediately using the existing suppression and content-cleanup owners.
+- **Durable intent.** The database records the requested operation and its account/mailbox-bound targets in the same transaction that accepts the deferred request. Clear-history selects the messages present at that request; later arrivals are not targets. Unfollow requests removal of the content its derived transition no longer permits, without deleting retained message headers. The intent persists across restarts until its targets have actually been removed. Repeated requests and completion are idempotent; a missing target counts as completed rather than causing another deletion.
+- **Completion.** Successful source-protocol qualification and subsequent ordinary checks resume pending intents under the operation then source locks, before further work can use those targets. Completion requires neither an entitlement nor a provider/model. It performs physical removal and settles the intent together in a transaction. A failed or still-held attempt preserves the intent and its deferred outcome. Retained bytes awaiting unfollow cleanup do not become an eligible body because physical removal is pending.
+- **Public outcome.** The API carries a `deferred` outcome, the counts of completed and pending targets, and the persisted intent identity whenever any requested target remains. It never maps a held target to `not_found` or reports the request cleared. The desktop says "Deletion pending until the local upgrade completes" and reports the completed and pending counts separately for partial completion; its status readers retain that pending state across restart and show completion only after the persisted intent settles. Delete and clear keep their completed behavior when nothing is held. Body state reads show the pending removal for an unfollowed target instead of rendering its retained bytes.
+- **Verification.** An unqualified 33-row logical unit reports deferred and retains its intent and bytes; a smaller non-held unit is removed immediately. Qualification completes the held deletion and removes its body. A restart between acceptance and qualification preserves the request and still completes it once, with truthful partial and terminal outcomes through the API and desktop. The same owner covers delete, clear-history and unfollow.
 
 ### D-claims: claims and comparability
 
