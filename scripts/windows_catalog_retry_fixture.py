@@ -44,7 +44,8 @@ def compiler_from_build_log(log):
     """Consume Tauri's actual CommandExt invocation, never its tool inventory."""
     log = re.sub(r"\x1b\[[0-9;]*m", "", log)
     commands = re.findall(
-        r"Running\s+Command `([^`\r\n]+[/\\]makensis\.exe) "
+        r"Running(?:[ \t]+\[tauri_bundler::utils\])?[ \t]+Command "
+        r"`([^`\r\n]+[/\\]makensis\.exe)[ \t]+"
         r"-INPUTCHARSET UTF8 -OUTPUTCHARSET UTF8 -V[1-4] [^`\r\n]+`",
         log,
     )

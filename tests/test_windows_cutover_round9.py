@@ -9,6 +9,36 @@ from windows_qualification_environment import powershell_environment
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_compiler_identity_replays_actual_tauri_verbose_build_line():
+    from windows_catalog_retry_fixture import compiler_from_build_log
+
+    # Literal formatter output from run38605083419: module field and the
+    # doubled space emitted by pinned CommandExt's argument fold.
+    compiler = r"C:\Users\runneradmin\AppData\Local\tauri\NSIS\makensis.exe"
+    line = (
+        "\x1b[31;1m     Running [tauri_bundler::utils] Command `" + compiler
+        + "  -INPUTCHARSET UTF8 -OUTPUTCHARSET UTF8 -V3 "
+        + r"D:\a\eom-email-watcher\eom-email-watcher\desktop\src-tauri\target\release"
+        + r"\nsis\x64\installer.nsi`" + "\x1b[0m"
+    )
+    assert str(compiler_from_build_log(line)) == compiler
+
+
+@pytest.mark.parametrize("module", ["", " [tauri_bundler::utils]"])
+@pytest.mark.parametrize("separator", [" ", "  ", "\t"])
+def test_compiler_identity_preserves_formatter_whitespace_and_optional_module(
+    tmp_path, module, separator
+):
+    from windows_catalog_retry_fixture import compiler_from_build_log
+
+    compiler = tmp_path / "makensis.exe"
+    line = (
+        f"Running{module} Command `{compiler}{separator}"
+        "-INPUTCHARSET UTF8 -OUTPUTCHARSET UTF8 -V3 installer.nsi`"
+    )
+    assert compiler_from_build_log(line) == compiler
+
+
 def test_compiler_identity_comes_from_invoked_build_command_not_recursive_inventory(tmp_path):
     import windows_catalog_retry_fixture as fixture
 
