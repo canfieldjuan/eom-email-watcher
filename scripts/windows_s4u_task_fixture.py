@@ -77,7 +77,7 @@ $action.Arguments=$env:EW_S4U_ARGS
 $sid=$env:EW_S4U_SID
 $evidence=[ordered]@{principal=$sid;logon_type=[int]$env:EW_S4U_LOGON
     run_level=[int]$env:EW_S4U_LEVEL;flags=2
-    target_rights=@($env:EW_S4U_RIGHTS | ConvertFrom-Json)
+    target_rights=[string[]](($env:EW_S4U_RIGHTS | ConvertFrom-Json).rights)
     token=$null;registering_sid=$null;attempts=@();selected=$null}
 try {
     # Reuse the existing query-only token owner in this exact registration host.
@@ -163,10 +163,19 @@ class S4URegistration:
             engine, argv = validate_request(
                 json.loads(content), self.output, self.account, self.task
             )
-            rights = account_rights(self.sid)
+            self.outcome["timings"] = []
+            started = time.monotonic()
+            try:
+                rights = account_rights(self.sid)
+            finally:
+                self.outcome["timings"].append({
+                    "operation": "verify-rights", "started_at": started,
+                    "finished_at": time.monotonic(),
+                })
             self.outcome["target_rights"] = rights
-            native = json.loads(
-                self.shell(
+            started = time.monotonic()
+            try:
+                result = self.shell(
                     REGISTER,
                     EW_S4U_SID=self.sid,
                     EW_S4U_TASK=self.task,
@@ -174,7 +183,7 @@ class S4URegistration:
                     EW_S4U_ARGS=subprocess.list2cmdline(argv),
                     EW_S4U_LOGON=str(S4U),
                     EW_S4U_LEVEL=str(LIMITED),
-                    EW_S4U_RIGHTS=json.dumps(rights),
+                    EW_S4U_RIGHTS=json.dumps({"rights": rights}),
                     EW_S4U_SOURCE=str(
                         Path(__file__).resolve().parents[1]
                         / "desktop/src-tauri/windows/cutover.ps1"
@@ -182,7 +191,12 @@ class S4URegistration:
                     EW_S4U_OUTPUT=str(self.output),
                     EW_S4U_DIAGNOSTICS=str(self.output / "standard-user-task-diagnostics.json"),
                 )
-            )
+            finally:
+                self.outcome["timings"].append({
+                    "operation": "register", "started_at": started,
+                    "finished_at": time.monotonic(),
+                })
+            native = json.loads(result)
             if (
                 native["task"] != self.task
                 or native["principal"] != self.sid

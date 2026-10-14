@@ -224,7 +224,8 @@ def run_standard_user_case(
             set_batch_logon_right(sid, True)
         finally:
             lease_timings.append(
-                {"operation": "grant", "sid": sid, "seconds": time.monotonic() - started}
+                {"operation": "grant", "sid": sid, "seconds": time.monotonic() - started,
+                 "started_at": started, "finished_at": time.monotonic()}
             )
         run_powershell(
             "$ErrorActionPreference='Stop'; "
@@ -309,7 +310,8 @@ def run_standard_user_case(
                     cleanup_errors.append(error)
                 finally:
                     lease_timings.append(
-                        {"operation": "revoke", "sid": sid, "seconds": time.monotonic() - started}
+                        {"operation": "revoke", "sid": sid, "seconds": time.monotonic() - started,
+                         "started_at": started, "finished_at": time.monotonic()}
                     )
             if created:
                 try:

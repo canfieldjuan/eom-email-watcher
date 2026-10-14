@@ -626,9 +626,48 @@ def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path, monkeyp
     assert calls[0]["EW_S4U_LOGON"] == str(S4U)
     assert calls[0]["EW_S4U_LEVEL"] == str(LIMITED)
     assert calls[0]["EW_S4U_SID"] == "S-1-5-21-1-2-3-1001"
-    assert json.loads(calls[0]["EW_S4U_RIGHTS"]) == ["SeBatchLogonRight"]
+    assert json.loads(calls[0]["EW_S4U_RIGHTS"]) == {"rights": ["SeBatchLogonRight"]}
     assert result["target_rights"] == ["SeBatchLogonRight"]
+    verify, registration = result["timings"]
+    assert verify["operation"] == "verify-rights" and registration["operation"] == "register"
+    assert verify["started_at"] <= verify["finished_at"] <= registration["started_at"]
+    assert registration["started_at"] <= registration["finished_at"]
     assert broker.settled is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual Windows PowerShell rights projection")
+@pytest.mark.parametrize("rights", [[], ["SeBatchLogonRight"],
+    ["SeShutdownPrivilege", "SeBatchLogonRight"], ["SeShutdownPrivilege"]])
+def test_native_s4u_rights_projection_preserves_flat_values_and_membership(tmp_path, rights):
+    import sys
+
+    import prove_windows_cutover as proof
+    from windows_s4u_task_fixture import REGISTER
+
+    # Execute the actual producer header, stopping before any registration POST.
+    header = REGISTER.split("try {", 1)[0]
+    code = header + r"""
+[ordered]@{rights=$evidence.target_rights
+    allowed=($evidence.target_rights -contains 'SeBatchLogonRight')} |
+    ConvertTo-Json -Depth 4 -Compress
+"""
+    sid = proof.powershell("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value")
+    result = json.loads(proof.powershell(
+        code, EW_S4U_SID=sid, EW_S4U_LOGON="2", EW_S4U_LEVEL="0",
+        EW_S4U_ENGINE=sys.executable, EW_S4U_ARGS="",
+        EW_S4U_RIGHTS=json.dumps({"rights": rights}),
+    ))
+    assert result["rights"] == rights
+    assert result["allowed"] is ("SeBatchLogonRight" in rights)
+    (tmp_path / "rights-projection.json").write_text(json.dumps(result, indent=2))
+    # Frozen published transport, under Windows PowerShell5, misprojects this
+    # legitimate singleton. Keep the original defect as an executable control.
+    legacy = json.loads(proof.powershell(
+        "$value=@($env:EW_OLD_RIGHTS | ConvertFrom-Json); "
+        "[ordered]@{allowed=($value -contains 'SeBatchLogonRight')} | ConvertTo-Json",
+        EW_OLD_RIGHTS=json.dumps(["SeBatchLogonRight"]),
+    ))
+    assert legacy["allowed"] is False
 
 
 @pytest.mark.parametrize("operation", [None, "get", "disable", "enable", "stop"])
