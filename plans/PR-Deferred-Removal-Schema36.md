@@ -1,0 +1,47 @@
+# Schema 36 — durable deferred-removal targets
+
+Status: proposed implementation plan for the operator-accepted D-removal amendment. Oversight reviews this plan before migration or deletion code. The accepted behavior is owned only by `docs/THREAD_VIEW_CONTRACT.md`, D-removal; this plan does not redefine it.
+
+## Contract and source inventory
+
+The version allocation, combined release boundary and backup guarantees are owned by `plans/PR-Source-Header-Evidence.md`.
+
+Current code has no removal-intent storage. `Store.delete_message` and `clear_messages` in `db.py` return false/zero when an unqualified source unit cannot be locked. Suppression is written with physical deletion and is not a retained-row visibility barrier. `_refresh_logical_messages_view` selects every canonical physical row. `Store.message_source`/`message_sources` and `_logical_unit` own source identity and physical membership. `_recompute_derived` owns derived transitions. `thread_migration.write_backup` exclusively creates the private backup and uses `VACUUM INTO`; `Store.initialize` serializes backup/migration and `_initialize_locked` reads the version inside `BEGIN IMMEDIATE` before DDL. These owners are extended rather than copied.
+
+## Additive shape
+
+1. `message_removal_intents`: opaque `intent_id` primary key; a caller operation/idempotency key; frozen provider/account/mailbox binding; constrained kind (`delete`, `clear`, `unfollow`); canonical UTC acceptance time; constrained state (`pending`, `completed`); requested/completed logical-target counts; nullable canonical UTC settlement time. A clear spanning retained scopes creates bound sibling intents behind one persisted request key and one aggregate status; it does not give one intent authority over another mailbox. A retry reuses its request key and frozen selection rather than selecting later arrivals.
+2. `message_removal_targets`: foreign key to its intent, stable logical-target identity and stable stored `message_id` text identity, frozen effective source binding and source identifiers needed for completion, constrained target state, and settlement time. Capture the whole selected logical unit through `_logical_unit` and its existing effective-identity/source membership helpers; never persist SQLite rowid or introduce a second message-key algorithm. All members of a unit share its logical-target identity; counts are logical targets, not alias rows. An unfollow target denotes content cleanup and never hides message headers.
+3. Uniqueness: intent IDs are globally unique; the operation key plus its frozen binding is unique (separate NULL/non-NULL identity indexes preserve uniqueness for unresolved legacy identities). Target membership is unique per intent/stable message identity. Add indexes for active target lookup by stable message identity and binding, logical-unit target grouping, and pending intent resumption.
+4. Targets reference intents with `ON DELETE CASCADE`. Do not make a physical message/account deletion silently erase its durable completion identity: target bindings are immutable metadata, not a cascading FK to live message/account rows. A missing bound target is completed through the same completion owner; a reused message ID in another binding cannot be deleted or hidden by the old intent.
+5. Retain settled status/counts as non-content operational receipts until the existing retention maintenance owner retires them after the retention interval; never retire a pending intent or use capture-suppression expiry to retire its barrier. Retirement removes a settled intent and its target metadata together. No content or provider credentials belong in either table. Account/profile-removal behavior remains outside this slice and #259 is untouched.
+
+No messages-table rebuild, row renaming, body rewrite or migration-time deletion. Legacy NULL identity uses the existing effective-identity/continuity owner; do not invent a mailbox identity during migration or acceptance.
+
+## Migration and recovery owners
+
+- Extend the existing backup owner with an explicit target-schema parameter to implement the allocation owner's guarantees; do not add another snapshot path. The existing upgrade lock covers both snapshot and migration, with the backup preceding the upgrade chain. Incomplete newly created backups are removed by the same owner.
+- Inside `_initialize_locked`'s existing `BEGIN IMMEDIATE`, re-read the version, reject a version newer than the binary supports, run any prior migrations, create additive intent/target tables and indexes, then refresh the shared projection after the tables exist. No accepted intents are invented from old false/zero return values. Existing captures, copies, recipient/location/header observations, bodies, claims, automation/Connect ownership, suppression and source-protocol state are preserved.
+- Run foreign-key and integrity checks in the transaction; advance `user_version` to 36 only after the complete shape/projection is valid. Any exception rolls back the DDL, projection and version together. Successful-open backup cleanup follows the existing owner; source qualification still has its own deferred outcome and cannot discard pending intents.
+- The downgrade guard remains `_initialize_locked`, after the locked version read and before DDL. A schema-34/35 binary must refuse a v36 database through that guard, not rebuild a view it cannot interpret. Test the frozen older version limit explicitly.
+
+## Logical-target and source integration
+
+- One persisted-target predicate owns membership. The shared logical message projection, derived input selection and source-availability owner consume it. Raw storage-unit access remains available only for cleanup, qualification and status; a source descriptor, model input or provider fetch cannot use that raw access to bypass a pending target. Audit all existing readers/writers before implementation; route direct consumers through these owners instead of adding per-reader target filters.
+- Acceptance persists the frozen target set, changes logical eligibility, invalidates queued source work through the existing source-unavailable owner, and recomputes derived state in one transaction. Reconcile/capture consult the same target owner before fetching or storing, including duplicate/legacy re-parent transitions, so a changed canonical row cannot resurrect a pending unit.
+- Reconcile this transaction with the existing operation/source exclusion contract before writing it. Include a real in-flight source/handoff control: committed acceptance must not authorize a later new use or adopt a late result, while held physical bytes remain available only to the existing protected cleanup/reconciliation owners. If this cannot be achieved under existing exclusion semantics, STOP and return the conflict to oversight; do not add a later race-prone check or relax the legacy bound.
+- Resume through one completion owner after source qualification and at the start of ordinary checks, with no provider/model/entitlement dependency. It uses frozen bindings and existing suppression/content cleanup, settles byte removal and target/intent outcome atomically, keeps unknown/held attempts pending, and treats already-missing bound targets as completed. Existing operation-then-source ordering remains authoritative.
+- Public API/Rust/desktop outcomes project that same intent state and physical counts; they do not infer completion from a missing visible message. Source/layout schema changes and source-reader routing are part of the reviewable implementation diff, not undocumented follow-up filters.
+
+## Fail-first and recovery proof
+
+- v35 public 33-row reproduction first: false/zero, retained bytes and readable/refetched target. After upgrade/acceptance, persisted deferred intent and truthful counts; every real reader/pipeline excludes the target and recapture/fetch is prevented, with raw bytes still present.
+- v34 → v36 chain in one open: captures/copies/locations/recipients/body/queue/suppression preserved, additive tables empty, source qualification outcome unchanged. Also reopen v35 → v36 and v36 repeatedly without replaying one-time migrations.
+- Inject failure after each new table/index/projection step and before the version stamp: old version, rows and old projection unchanged after rollback; newest complete pre-v36 backup retained with held bytes. A full-disk/backup failure changes no source data or version. Inspect backup permission/content through raw storage, not the logical projection.
+- Restart after acceptance and before lift: same intent, same frozen target set, same barrier/counts. Lift completes once; settled status survives restart. Repeat requests/completion do not duplicate removal or select later arrivals.
+- Stable-ID/alias promotion, NULL legacy identity, provider/account/mailbox-binding mismatch, mixed immediate/deferred units, body-only unfollow, missing targets and in-flight source use/late result controls. No target from another binding is hidden or removed.
+- Transport/render tests for physical pending versus completed counts and status. Native Windows installed/populated qualification repeats at the final schema/head; local simulation or an earlier v35 Windows pass is insufficient.
+
+## Gap audit
+
+NOT DONE: plan only. Oversight schema readthrough, source-exclusion compatibility proof, fail-first tests, migration/source/API/UI implementation and final exact-head qualification remain required. No live database, installed app, account/profile or other repository change.
