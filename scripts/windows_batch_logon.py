@@ -2,9 +2,11 @@
 
 import ctypes
 import os
+from contextlib import contextmanager
 
 
-def set_batch_logon_right(sid, grant):
+@contextmanager
+def _account_policy(sid):
     assert os.name == "nt"
     pointer, word = ctypes.c_void_p, ctypes.c_uint32
 
@@ -55,10 +57,19 @@ def set_batch_logon_right(sid, grant):
         status = api.LsaOpenPolicy(None, ctypes.byref(attributes), 0x810, ctypes.byref(policy))
         if status:
             raise ctypes.WinError(api.LsaNtStatusToWinError(status))
+        yield api, policy, native_sid, UnicodeString
+    finally:
+        if policy:
+            api.LsaClose(policy)
+        kernel.LocalFree(native_sid)
+
+
+def set_batch_logon_right(sid, grant):
+    with _account_policy(sid) as (api, policy, native_sid, UnicodeString):
         right = ctypes.create_unicode_buffer("SeBatchLogonRight")
         length = len(right.value) * ctypes.sizeof(ctypes.c_wchar)
         value = UnicodeString(
-            length, length + ctypes.sizeof(ctypes.c_wchar), ctypes.cast(right, pointer)
+            length, length + ctypes.sizeof(ctypes.c_wchar), ctypes.cast(right, ctypes.c_void_p)
         )
         status = (
             api.LsaAddAccountRights(policy, native_sid, ctypes.byref(value), 1)
@@ -67,7 +78,35 @@ def set_batch_logon_right(sid, grant):
         )
         if status and not (not grant and api.LsaNtStatusToWinError(status) == 2):
             raise ctypes.WinError(api.LsaNtStatusToWinError(status))
-    finally:
-        if policy:
-            api.LsaClose(policy)
-        kernel.LocalFree(native_sid)
+
+
+def account_rights(sid):
+    """Read the same target SID's actual lease immediately before registration."""
+    with _account_policy(sid) as (api, policy, native_sid, UnicodeString):
+        values = ctypes.POINTER(UnicodeString)()
+        count = ctypes.c_uint32()
+        api.LsaEnumerateAccountRights.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.POINTER(UnicodeString)),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        api.LsaEnumerateAccountRights.restype = ctypes.c_uint32
+        api.LsaFreeMemory.argtypes = [ctypes.c_void_p]
+        status = api.LsaEnumerateAccountRights(
+            policy, native_sid, ctypes.byref(values), ctypes.byref(count)
+        )
+        if status:
+            code = api.LsaNtStatusToWinError(status)
+            if code == 2:
+                return []
+            raise ctypes.WinError(code)
+        try:
+            return [
+                ctypes.wstring_at(
+                    values[index].buffer, values[index].length // ctypes.sizeof(ctypes.c_wchar)
+                )
+                for index in range(count.value)
+            ]
+        finally:
+            api.LsaFreeMemory(values)

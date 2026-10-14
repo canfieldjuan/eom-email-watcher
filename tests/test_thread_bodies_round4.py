@@ -244,3 +244,55 @@ def test_deferred_cutover_preserves_oversized_thread_then_purges_whole(tmp_path)
         store.purge(30, now=later, after_poll=True, polled_scope=scope)
         == SOURCE_CLEANUP_LOCK_BATCH_SIZE + 1
     )
+
+
+def test_scheduled_gmail_check_reconciles_followed_body_without_sent_reader(tmp_path, monkeypatch):
+    from test_service import FakeGmail, config
+
+    from eom_email_watcher.mailbox import MailboxChanges, MailboxSession
+    from eom_email_watcher.reconcile import ReconcilePage
+
+    store, state, _ = followed(tmp_path)
+
+    class Gmail(FakeGmail):
+        def mailbox_identity_key(self):
+            return KEY
+
+        def changes_since(self, cursor):
+            return MailboxChanges((), "200")
+
+        def reconcile_page(self, unit, **kwargs):
+            return ReconcilePage((), None)
+
+    gateway = Gmail()
+    assert not hasattr(gateway, "sent_scope"), "Gmail uses its mailbox-wide cursor"
+    cfg = replace(config(tmp_path), database_file=store.path, senders=(), retention_days=30)
+    store.activate_mail_account("gmail", "mailbox")
+    store.set_state("100", provider="gmail", account_id="mailbox", mailbox_identity_key=KEY)
+    monkeypatch.setattr(
+        service, "connect_entitlement_decision", lambda: service.EntitlementDecision.ACTIVE
+    )
+    monkeypatch.setattr(
+        service,
+        "load_configured_mailbox",
+        lambda *_: MailboxSession("gmail", "mailbox", gateway, KEY),
+    )
+    scopes = []
+    from eom_email_watcher import reconcile
+
+    original = reconcile.run
+
+    def traced(watcher, identity, scope, **kwargs):
+        scopes.append(scope)
+        return original(watcher, identity, scope, **kwargs)
+
+    monkeypatch.setattr(reconcile, "run", traced)
+    result = service.run_watcher_check(cfg, store, FakeModel(), deliver_notifications=False)
+    assert result["active"] is True
+    assert scopes == ["available"]
+    with store.connection() as db:
+        assert (
+            db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0]
+            == "Hello"
+        )
+    assert not state.stale()

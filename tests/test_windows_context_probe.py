@@ -590,14 +590,27 @@ def test_elevated_s4u_request_is_bound_to_the_standard_case(tmp_path, change):
             validate_request(request, tmp_path, "case-user", "case-task")
 
 
-def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path):
+def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path, monkeypatch):
+    import windows_s4u_task_fixture
     from windows_s4u_task_fixture import LIMITED, S4U, S4URegistration
 
+    monkeypatch.setattr(
+        windows_s4u_task_fixture, "account_rights", lambda sid: ["SeBatchLogonRight"]
+    )
+
     folder = tmp_path / "old-then-new"
-    request = {"account": "case-user", "task": "case-task",
-               "engine": str(folder / "installed/eom-mail-engine.exe"),
-               "argv": [str(folder / "private/mail.sqlite3"), str(folder / "scheduled.ready"),
-                        str(folder / "resume-old"), "http://127.0.0.1:12345/public-job", "idle"]}
+    request = {
+        "account": "case-user",
+        "task": "case-task",
+        "engine": str(folder / "installed/eom-mail-engine.exe"),
+        "argv": [
+            str(folder / "private/mail.sqlite3"),
+            str(folder / "scheduled.ready"),
+            str(folder / "resume-old"),
+            "http://127.0.0.1:12345/public-job",
+            "idle",
+        ],
+    }
     calls = []
 
     def shell(script, **values):
@@ -613,6 +626,8 @@ def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path):
     assert calls[0]["EW_S4U_LOGON"] == str(S4U)
     assert calls[0]["EW_S4U_LEVEL"] == str(LIMITED)
     assert calls[0]["EW_S4U_SID"] == "S-1-5-21-1-2-3-1001"
+    assert json.loads(calls[0]["EW_S4U_RIGHTS"]) == ["SeBatchLogonRight"]
+    assert result["target_rights"] == ["SeBatchLogonRight"]
     assert broker.settled is True
 
 

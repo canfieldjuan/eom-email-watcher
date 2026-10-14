@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from windows_batch_logon import account_rights
+
 S4U = 2
 LIMITED = 0
 MAX_REQUEST_BYTES = 16384
@@ -73,9 +75,47 @@ $action=$definition.Actions.Create(0)
 $action.Path=$env:EW_S4U_ENGINE
 $action.Arguments=$env:EW_S4U_ARGS
 $sid=$env:EW_S4U_SID
-$sddl='O:'+ $sid +'D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)(A;;GA;;;BA)'
-$task=$scheduler.GetFolder('\').RegisterTaskDefinition(
-    $env:EW_S4U_TASK,$definition,2,$sid,$null,[int]$env:EW_S4U_LOGON,$sddl)
+$evidence=[ordered]@{principal=$sid;logon_type=[int]$env:EW_S4U_LOGON
+    run_level=[int]$env:EW_S4U_LEVEL;flags=2
+    target_rights=@($env:EW_S4U_RIGHTS | ConvertFrom-Json)
+    token=$null;registering_sid=$null;attempts=@();selected=$null}
+try {
+    # Reuse the existing query-only token owner in this exact registration host.
+    $source=Get-Content -LiteralPath $env:EW_S4U_SOURCE -Raw
+    $prefix=$source.Substring(0,$source.IndexOf('function Installed-Processes'))
+    . ([scriptblock]::Create($prefix)) -Phase Pre -InstallRoot $env:EW_S4U_OUTPUT | Out-Null
+    $evidence.token=[CutoverProcess]::Token($PID) | ConvertFrom-Json
+    $evidence.registering_sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if (!$evidence.token.elevated -or $evidence.token.integrity_rid -lt 12288) {
+        throw 'S4U registration requires the elevated outer fixture token'
+    }
+    if ($evidence.target_rights -notcontains 'SeBatchLogonRight') {
+        throw 'S4U target batch right is absent at registration'
+    }
+    $dacl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)(A;;GA;;;BA)'
+    $task=$null
+    foreach ($variant in @('explicit-owner','dacl-only')) {
+        $sddl=if ($variant -eq 'explicit-owner') {'O:'+$sid+$dacl} else {$dacl}
+        $attempt=[ordered]@{variant=$variant;sddl=$sddl;status='pending';hresult=$null;error=$null}
+        try {
+            $task=$scheduler.GetFolder('\').RegisterTaskDefinition(
+                $env:EW_S4U_TASK,$definition,2,$sid,$null,[int]$env:EW_S4U_LOGON,$sddl)
+            $attempt.status='registered';$attempt.hresult=0
+            $evidence.selected=$variant
+        } catch {
+            $attempt.status='failed';$attempt.hresult=$_.Exception.GetBaseException().HResult
+            $attempt.error=$_.Exception.ToString()
+        }
+        $evidence.attempts+=@($attempt)
+        $evidence | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
+        if ($null -ne $task) { break }
+    }
+    if ($null -eq $task) { throw 'Both S4U registration variants failed; see original HRESULTs' }
+} finally {
+    $evidence | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
+}
 [ordered]@{task=$task.Name;principal=(Principal-Sid $task.Definition.Principal.UserId)
     logon_type=[int]$task.Definition.Principal.LogonType
     run_level=[int]$task.Definition.Principal.RunLevel
@@ -123,6 +163,8 @@ class S4URegistration:
             engine, argv = validate_request(
                 json.loads(content), self.output, self.account, self.task
             )
+            rights = account_rights(self.sid)
+            self.outcome["target_rights"] = rights
             native = json.loads(
                 self.shell(
                     REGISTER,
@@ -132,6 +174,13 @@ class S4URegistration:
                     EW_S4U_ARGS=subprocess.list2cmdline(argv),
                     EW_S4U_LOGON=str(S4U),
                     EW_S4U_LEVEL=str(LIMITED),
+                    EW_S4U_RIGHTS=json.dumps(rights),
+                    EW_S4U_SOURCE=str(
+                        Path(__file__).resolve().parents[1]
+                        / "desktop/src-tauri/windows/cutover.ps1"
+                    ),
+                    EW_S4U_OUTPUT=str(self.output),
+                    EW_S4U_DIAGNOSTICS=str(self.output / "standard-user-task-diagnostics.json"),
                 )
             )
             if (
@@ -141,6 +190,7 @@ class S4URegistration:
                 or native["run_level"] != LIMITED
                 or native["engine"] != str(engine)
                 or native["enabled"] is not True
+                or native["arguments"] != subprocess.list2cmdline(argv)
             ):
                 raise ValueError("Registered S4U task differs from the requested case")
             self.outcome.update(status="registered", native=native)

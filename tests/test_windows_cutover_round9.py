@@ -9,6 +9,72 @@ from windows_qualification_environment import powershell_environment
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_compiler_identity_comes_from_invoked_build_command_not_recursive_inventory(tmp_path):
+    import windows_catalog_retry_fixture as fixture
+
+    compiler = tmp_path / "tools with spaces/NSIS/makensis.exe"
+    other = tmp_path / "tools with spaces/NSIS/Bin/makensis.exe"
+    compiler.parent.mkdir(parents=True)
+    other.parent.mkdir()
+    compiler.write_bytes(b"public invoked compiler")
+    other.write_bytes(b"public unused compiler")
+    log = f"Running Command `{compiler} -INPUTCHARSET UTF8 -OUTPUTCHARSET UTF8 -V4 installer.nsi`"
+    owner = getattr(fixture, "compiler_from_build_log", None)
+    assert callable(owner), "The fixture has no invoked-compiler identity owner"
+    assert owner(log) == compiler
+    assert owner(log.replace("Running", "\x1b[32mRunning\x1b[0m")) == compiler
+
+
+@pytest.mark.parametrize(
+    "log", [
+        "", "Running makensis to produce setup.exe", "Command `makensis.exe -V4 installer.nsi`",
+        "Running Command `relative/makensis.exe -INPUTCHARSET UTF8 "
+        "-OUTPUTCHARSET UTF8 -V4 installer.nsi`",
+    ]
+)
+def test_compiler_identity_refuses_missing_command_evidence(log):
+    from windows_catalog_retry_fixture import compiler_from_build_log
+
+    with pytest.raises(ValueError, match="compiler command"):
+        compiler_from_build_log(log)
+
+
+def test_compiler_identity_refuses_multiple_build_commands(tmp_path):
+    from windows_catalog_retry_fixture import compiler_from_build_log
+
+    one = (
+        f"Running Command `{tmp_path}/makensis.exe "
+        "-INPUTCHARSET UTF8 -OUTPUTCHARSET UTF8 -V4 installer.nsi`"
+    )
+    with pytest.raises(ValueError, match="compiler command"):
+        compiler_from_build_log(one + "\n" + one)
+
+
+@pytest.mark.parametrize("changed", ["compiler", "log", "receipt"])
+def test_compiler_receipt_is_bound_to_actual_executable_and_build(tmp_path, changed):
+    import windows_catalog_retry_fixture as fixture
+
+    folder = tmp_path / "full"
+    folder.mkdir()
+    compiler = tmp_path / "makensis.exe"
+    compiler.write_bytes(b"public compiler bytes")
+    log = folder / "nsis-build.log"
+    log.write_text(
+        f"Running Command `{compiler} -INPUTCHARSET UTF8 -OUTPUTCHARSET UTF8 -V4 installer.nsi`"
+    )
+    receipt = folder / "nsis-compiler.json"
+    fixture.record_build_compiler(log, receipt)
+    assert fixture.qualified_compiler(tmp_path) == compiler
+    if changed == "compiler":
+        compiler.write_bytes(b"replaced compiler")
+    elif changed == "log":
+        log.write_text(log.read_text() + "\nreplacement build log")
+    else:
+        receipt.write_text(receipt.read_text().replace("compiler_sha256", "other_hash"))
+    with pytest.raises((ValueError, KeyError)):
+        fixture.qualified_compiler(tmp_path)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native installed catalog abort/retry")
 @pytest.mark.parametrize("retain_binding", [True, False])
 def test_native_installed_catalog_abort_then_retry(tmp_path, retain_binding):

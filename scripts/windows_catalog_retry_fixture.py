@@ -6,12 +6,13 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from prove_windows_cutover import (
     isolated_environment,
@@ -20,7 +21,7 @@ from prove_windows_cutover import (
     wait_file,
 )
 from windows_cutover_process_fixture import ScheduledActor
-from windows_installer_template import catalog_macro
+from windows_installer_template import CLI_VERSION, catalog_macro
 from windows_qualification_environment import encoded_powershell_script, powershell_environment
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,53 @@ ABORT_CHILD = (
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def compiler_from_build_log(log):
+    """Consume Tauri's actual CommandExt invocation, never its tool inventory."""
+    log = re.sub(r"\x1b\[[0-9;]*m", "", log)
+    commands = re.findall(
+        r"Running\s+Command `([^`\r\n]+[/\\]makensis\.exe) "
+        r"-INPUTCHARSET UTF8 -OUTPUTCHARSET UTF8 -V[1-4] [^`\r\n]+`",
+        log,
+    )
+    if len(commands) != 1:
+        raise ValueError("Expected exactly one invoked NSIS compiler command")
+    compiler = Path(commands[0])
+    if not (compiler.is_absolute() or PureWindowsPath(commands[0]).is_absolute()):
+        raise ValueError("Invoked NSIS compiler command must use its absolute path")
+    return compiler
+
+
+def record_build_compiler(log, receipt):
+    compiler = compiler_from_build_log(log.read_text(encoding="utf-8-sig"))
+    if not compiler.is_file():
+        raise ValueError("Invoked NSIS compiler is missing")
+    receipt.write_text(
+        json.dumps(
+            {
+                "cli_version": CLI_VERSION,
+                "compiler": str(compiler),
+                "compiler_sha256": sha(compiler),
+                "build_log_sha256": sha(log),
+            },
+            indent=2,
+        )
+    )
+
+
+def qualified_compiler(packet):
+    log = packet / "full/nsis-build.log"
+    receipt = json.loads((packet / "full/nsis-compiler.json").read_text())
+    compiler = compiler_from_build_log(log.read_text(encoding="utf-8-sig"))
+    if (
+        receipt["cli_version"] != CLI_VERSION
+        or receipt["compiler"] != str(compiler)
+        or receipt["build_log_sha256"] != sha(log)
+        or receipt["compiler_sha256"] != sha(compiler)
+    ):
+        raise ValueError("Invoked NSIS compiler evidence changed")
+    return compiler
 
 
 def package_template(desktop, engine, destination):
@@ -134,12 +182,9 @@ def run_catalog_retry(output, *, retain_binding):
 
     # Compile B from A's real payload with one renamed image. The production
     # generator emits B's catalog from B's actual NSIS File instructions.
-    compilers = (
-        [Path(shutil.which("makensis"))]
-        if shutil.which("makensis")
-        else list(Path(os.environ["LOCALAPPDATA"]).rglob("makensis.exe"))
-    )
-    assert len(compilers) == 1, "Expected the existing native NSIS compiler"
+    compiler = qualified_compiler(packet)
+    state["compiler"] = json.loads((packet / "full/nsis-compiler.json").read_text())
+    save()
     template = package_template(retired, root / "eom-mail-engine.exe", replacement)
     package = output / "package-b.exe"
     source = output / "package-b.nsi"
@@ -157,7 +202,7 @@ def run_catalog_retry(output, *, retain_binding):
     assert "{{" not in generated, "Fixture package has an unrendered catalog directive"
     source.write_text(generated, encoding="utf-8")
     for label, argv in (
-        ("compile-b", [str(compilers[0]), str(source)]),
+        ("compile-b", [str(compiler), str(source)]),
         ("extract-b", [str(package), "/S", "/D=" + str(stage)]),
     ):
         result = subprocess.run(argv, capture_output=True, timeout=40)
@@ -379,3 +424,13 @@ try {
         save()
         assert not cleanup["errors"], cleanup["errors"]
     return state
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Bind native compiler to the real build")
+    parser.add_argument("build_log", type=Path)
+    parser.add_argument("receipt", type=Path)
+    args = parser.parse_args()
+    record_build_compiler(args.build_log, args.receipt)
