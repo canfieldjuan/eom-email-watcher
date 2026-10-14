@@ -9,6 +9,16 @@ from windows_qualification_environment import powershell_environment
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native installed catalog abort/retry")
+@pytest.mark.parametrize("retain_binding", [True, False])
+def test_native_installed_catalog_abort_then_retry(tmp_path, retain_binding):
+    from windows_catalog_retry_fixture import run_catalog_retry
+
+    result = run_catalog_retry(tmp_path, retain_binding=retain_binding)
+    assert result["result"] == "PASS"
+    assert result["cleanup"]["quiesced"] is True
+
+
 def test_file_hash_owner_has_no_cmdlet_autoload_dependency():
     source = (ROOT / "desktop/src-tauri/windows/cutover.ps1").read_text()
     assert "Get-FileHash" not in source, "File hashing still depends on module autoload"

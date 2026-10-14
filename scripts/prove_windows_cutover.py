@@ -32,6 +32,7 @@ from windows_cutover_process_fixture import (
     run_standard_user_case as standard_case,
 )
 from windows_qualification_environment import powershell_environment, profile_environment_report
+from windows_s4u_task_fixture import request_s4u_task
 
 PREDECESSOR = "43a850d8b00cddfdad2a767b7b27fc792707b010"
 ROOT = Path(__file__).resolve().parents[1]
@@ -262,17 +263,10 @@ def build_old_actor(predecessor: Path, output: Path, keyring: Path | None = None
     return binary
 
 
-def task_principal_parameters(case):
-    if case != "old-then-new":
-        return ""
-    return (
-        "$principal=New-ScheduledTaskPrincipal "
-        "-UserId ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) "
-        "-LogonType S4U -RunLevel Limited; "
-    )
-
-
-def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, case: str):
+def run_case(
+    output: Path, installer: Path, new_engine: Path, old_actor: Path, case: str,
+    *, registered_task=None,
+):
     if case == "old-then-new":
         assert_standard_context(
             token_profile([os.getpid()], output / "standard-user-profile"),
@@ -327,9 +321,10 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
     trigger = folder / "resume-old"
     actors = []
     handles = []
-    task = "EW-Cutover-" + case + "-" + str(os.getpid())
+    task = registered_task or ("EW-Cutover-" + case + "-" + str(os.getpid()))
     registered = False
     scheduled = None
+    task_control = None
 
     def command(path, ready, mode):
         return [str(path), str(database), str(ready), str(trigger), endpoint, mode]
@@ -358,19 +353,21 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
         task_ready = folder / "scheduled.ready"
         task_args = subprocess.list2cmdline(command(engine, task_ready, "idle")[1:])
         registered = True  # A partial registration still belongs to cleanup.
-        powershell(
-            "$ErrorActionPreference='Stop'; "
-            "$a=New-ScheduledTaskAction -Execute $env:EW_ENGINE -Argument $env:EW_ARGS; "
-            "$t=New-ScheduledTaskTrigger -Once -At (Get-Date).AddDays(1); "
-            + task_principal_parameters(case)
-            + "Register-ScheduledTask -TaskName $env:EW_TASK -Action $a -Trigger $t "
-            + ("-Principal $principal " if case == "old-then-new" else "")
-            + "| Out-Null; "
-            + "Start-ScheduledTask -TaskName $env:EW_TASK",
-            EW_ENGINE=str(engine),
-            EW_ARGS=task_args,
-            EW_TASK=task,
-        )
+        if case == "old-then-new":
+            assert registered_task, "Standard case requires its elevated S4U fixture owner"
+            task_control = request_s4u_task(
+                output, task, engine, command(engine, task_ready, "idle")[1:], powershell,
+            )
+            powershell("Start-ScheduledTask -TaskName $env:EW_TASK", EW_TASK=task)
+        else:
+            powershell(
+                "$ErrorActionPreference='Stop'; "
+                "$a=New-ScheduledTaskAction -Execute $env:EW_ENGINE -Argument $env:EW_ARGS; "
+                "$t=New-ScheduledTaskTrigger -Once -At (Get-Date).AddDays(1); "
+                "Register-ScheduledTask -TaskName $env:EW_TASK -Action $a -Trigger $t | Out-Null; "
+                "Start-ScheduledTask -TaskName $env:EW_TASK",
+                EW_ENGINE=str(engine), EW_ARGS=task_args, EW_TASK=task,
+            )
         wait_file(
             task_ready, observe=task_startup_observer(task, folder / "scheduled-task-state.json")
         )
@@ -596,6 +593,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             "task_restored": restored_state,
             "installed_sha256": receipt["engine_sha256"],
             "installer_refusal_then_retry": case == "old-then-new",
+            "task_control": task_control,
         }
     finally:
         operations = []
@@ -673,6 +671,7 @@ def main():
     parser.add_argument("--case", choices=["old-then-new"])
     parser.add_argument("--actor", type=Path)
     parser.add_argument("--tool-directory", type=Path)
+    parser.add_argument("--registered-task")
     parser.add_argument("--timeout-probe", action="store_true")
     parser.add_argument("--orphan-probe", action="store_true")
     args = parser.parse_args()
@@ -726,6 +725,7 @@ def main():
                     args.engine.resolve(),
                     args.actor.resolve(),
                     args.case,
+                    registered_task=args.registered_task,
                 )
                 (args.output / "standard-user-result.json").write_text(json.dumps(result, indent=2))
                 print(json.dumps(result, indent=2))

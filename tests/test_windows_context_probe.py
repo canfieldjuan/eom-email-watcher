@@ -550,14 +550,114 @@ def test_cleanup_admission_requires_account_bound_authoritative_quiescence():
         assert not fixture.cleanup_admitted(record, user)
 
 
-def test_only_standard_case_uses_an_explicit_noninteractive_principal():
-    import prove_windows_cutover as proof
+@pytest.mark.parametrize("change", [
+    None, "max-port", "account", "task", "engine", "argv", "mode", "peer", "missing",
+    "extra", "short", "long", "empty", "false", "zero", "over-port",
+])
+def test_elevated_s4u_request_is_bound_to_the_standard_case(tmp_path, change):
+    from windows_s4u_task_fixture import validate_request
 
-    standard = proof.task_principal_parameters("old-then-new")
-    assert "S4U" in standard and "Limited" in standard
-    assert "GetCurrent().User.Value" in standard
-    assert proof.task_principal_parameters("unknown-image") == ""
-    assert proof.task_principal_parameters("new-then-old") == ""
+    folder = tmp_path / "old-then-new"
+    engine = folder / "installed/eom-mail-engine.exe"
+    args = [str(folder / "private/mail.sqlite3"), str(folder / "scheduled.ready"),
+            str(folder / "resume-old"), "http://127.0.0.1:12345/public-job", "idle"]
+    request = {"account": "case-user", "task": "case-task", "engine": str(engine), "argv": args}
+    if change in {"account", "task", "engine"}:
+        request[change] = "another-case"
+    elif change == "argv":
+        request["argv"][0] = str(tmp_path / "other-database")
+    elif change == "mode":
+        request["argv"][4] = "held"
+    elif change == "peer":
+        request["argv"][3] = "http://example.test:12345/public-job"
+    elif change == "missing":
+        request.pop("engine")
+    elif change == "extra":
+        request["sid"] = "another-owner"
+    elif change == "short":
+        request["argv"].pop()
+    elif change == "long":
+        request["argv"].append("extra")
+    elif change in {"empty", "false"}:
+        request["argv"][3] = "" if change == "empty" else False
+    elif change in {"zero", "over-port", "max-port"}:
+        port = {"zero": 0, "over-port": 65536, "max-port": 65535}[change]
+        request["argv"][3] = f"http://127.0.0.1:{port}/public-job"
+    if change in {None, "max-port"}:
+        assert validate_request(request, tmp_path, "case-user", "case-task") == (engine, args)
+    else:
+        with pytest.raises(ValueError):
+            validate_request(request, tmp_path, "case-user", "case-task")
+
+
+def test_s4u_broker_registers_fixed_principal_and_keeps_denial(tmp_path):
+    from windows_s4u_task_fixture import LIMITED, S4U, S4URegistration
+
+    folder = tmp_path / "old-then-new"
+    request = {"account": "case-user", "task": "case-task",
+               "engine": str(folder / "installed/eom-mail-engine.exe"),
+               "argv": [str(folder / "private/mail.sqlite3"), str(folder / "scheduled.ready"),
+                        str(folder / "resume-old"), "http://127.0.0.1:12345/public-job", "idle"]}
+    calls = []
+
+    def shell(script, **values):
+        calls.append(values)
+        raise OSError("public registration denied")
+
+    broker = S4URegistration(tmp_path, "case-user", "S-1-5-21-1-2-3-1001", "case-task", shell)
+    broker.request.write_text(json.dumps(request))
+    broker._serve()
+    broker.close()
+    result = json.loads(broker.response.read_text())
+    assert result["status"] == "failed" and result["error"] == "public registration denied"
+    assert calls[0]["EW_S4U_LOGON"] == str(S4U)
+    assert calls[0]["EW_S4U_LEVEL"] == str(LIMITED)
+    assert calls[0]["EW_S4U_SID"] == "S-1-5-21-1-2-3-1001"
+    assert broker.settled is True
+
+
+@pytest.mark.parametrize("operation", [None, "get", "disable", "enable", "stop"])
+def test_standard_s4u_control_requires_every_operation(tmp_path, monkeypatch, operation):
+    from windows_s4u_task_fixture import request_s4u_task
+
+    monkeypatch.setenv("USERNAME", "case-user")
+    sid = "S-1-5-21-1-2-3-1001"
+    registration = {"account": "case-user", "task": "case-task", "status": "registered",
+                    "native": {"principal": sid}}
+    (tmp_path / "standard-user-task-registration.json").write_text(json.dumps(registration))
+    control = {"account": "case-user", "task": "case-task", "sid": sid, "errors": [],
+               "operations": {"get": True, "disable": True, "enable": True, "stop": True}}
+    if operation:
+        control["operations"][operation] = False
+
+    def shell(script, **values):
+        return json.dumps(control)
+
+    if operation is None:
+        assert request_s4u_task(tmp_path, "case-task", "engine", [], shell) == control
+    else:
+        with pytest.raises(AssertionError):
+            request_s4u_task(tmp_path, "case-task", "engine", [], shell)
+    assert json.loads((tmp_path / "standard-user-task-control.json").read_text()) == control
+
+
+def test_s4u_registration_in_flight_does_not_claim_settled(tmp_path):
+    from windows_s4u_task_fixture import S4URegistration
+
+    waits = []
+
+    class Thread:
+        def join(self, timeout):
+            waits.append(timeout)
+
+        def is_alive(self):
+            return True
+
+    broker = S4URegistration(tmp_path, "case-user", "sid", "case-task", None)
+    broker.thread = Thread()
+    with pytest.raises(RuntimeError, match="retain fixture resources"):
+        broker.close()
+    assert waits == [40] and broker.settled is False
 
 
 def test_unproven_live_case_keeps_its_identity_acls_and_batch_right(monkeypatch, tmp_path):
@@ -894,6 +994,17 @@ def test_receipt_write_failure_does_not_skip_case_cleanup(tmp_path):
     assert result["errors"] == [{"owner": "receipt", "error": "public receipt fault"}]
 
 
+@pytest.mark.parametrize("script", ["", "'BUSY'", '"double quotes"', "'ひとこと'", "throw 'a b'"])
+def test_native_script_encoding_preserves_quotes_and_unicode(script):
+    import base64
+
+    from windows_qualification_environment import encoded_powershell_script
+
+    encoded = encoded_powershell_script(script)
+    assert base64.b64decode(encoded).decode("utf-16-le") == script
+    assert not any(character in encoded for character in "'\" \r\n")
+
+
 def test_scheduled_actor_terminates_held_object_before_waiting():
     import windows_cutover_process_fixture as fixture
 
@@ -940,6 +1051,38 @@ def test_scheduled_actor_does_not_terminate_an_exited_held_object():
     actor.kernel, actor.handle = Kernel(), 42
     actor.settle()
     assert calls == [("wait", 0), ("close", 42)]
+
+
+@pytest.mark.parametrize("settled", [0, 258, 0xFFFFFFFF])
+def test_scheduled_actor_termination_race_uses_same_held_object(monkeypatch, settled):
+    import windows_cutover_process_fixture as fixture
+
+    calls = []
+
+    class Kernel:
+        def WaitForSingleObject(self, handle, timeout):
+            calls.append(("wait", handle, timeout))
+            return 258 if len(calls) == 1 else settled
+
+        def TerminateProcess(self, handle, code):
+            calls.append(("terminate", handle, code))
+            return False
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+
+    monkeypatch.setattr(
+        fixture.ctypes, "WinError", lambda code: OSError(code, "public denial"), raising=False
+    )
+    monkeypatch.setattr(fixture.ctypes, "get_last_error", lambda: 5, raising=False)
+    actor = fixture.ScheduledActor.__new__(fixture.ScheduledActor)
+    actor.kernel, actor.handle = Kernel(), 42
+    if settled == 0:
+        actor.settle()
+    else:
+        with pytest.raises(OSError, match="public denial"):
+            actor.settle()
+    assert calls == [("wait", 42, 0), ("terminate", 42, 1), ("wait", 42, 0), ("close", 42)]
 
 
 def test_scheduled_actor_denial_remains_failure_and_closes_handle(monkeypatch):

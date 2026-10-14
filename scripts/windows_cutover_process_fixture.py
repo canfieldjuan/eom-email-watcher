@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from windows_batch_logon import set_batch_logon_right
+from windows_s4u_task_fixture import S4URegistration
 
 
 class ScheduledActor:
@@ -39,7 +40,12 @@ class ScheduledActor:
             if initial != 258:
                 raise ctypes.WinError(ctypes.get_last_error())
             if not self.kernel.TerminateProcess(self.handle, 1):
-                raise ctypes.WinError(ctypes.get_last_error())
+                error = ctypes.get_last_error()
+                # Stop-ScheduledTask can settle the object between wait and stop.
+                # Only that same held object being signaled proves this race safe.
+                if self.kernel.WaitForSingleObject(self.handle, 0) == 0:
+                    return
+                raise ctypes.WinError(error)
             if self.kernel.WaitForSingleObject(self.handle, 10000) != 0:
                 raise RuntimeError("Scheduled actor termination is unproven")
         finally:
@@ -173,6 +179,7 @@ def run_standard_user_case(
     lease_timings = []
     primary = None
     result = None
+    registration = None
 
     def acl(path, access=None):
         started = time.monotonic()
@@ -248,6 +255,11 @@ def run_standard_user_case(
             command.append("--timeout-probe")
         if orphan_probe:
             command.append("--orphan-probe")
+        if not timeout_probe and not orphan_probe:
+            task = "EW-Cutover-" + name
+            registration = S4URegistration(output, name, sid, task, run_powershell)
+            registration.start()
+            command.extend(["--registered-task", task])
         launch_attempted = True
         run_powershell(
             "& $env:EW_PROBE_LAUNCHER",
@@ -264,6 +276,11 @@ def run_standard_user_case(
     except Exception as error:
         primary = error
     finally:
+        if registration is not None:
+            try:
+                registration.close()
+            except Exception as error:
+                cleanup_errors.append(error)
         admitted = not launch_attempted
         if launch_attempted:
             try:
@@ -273,6 +290,7 @@ def run_standard_user_case(
                 admitted = cleanup_admitted(process_state, name)
             except (OSError, ValueError) as error:
                 cleanup_errors.append(error)
+        admitted = admitted and (registration is None or registration.settled)
         if not admitted:
             cleanup_errors.append(
                 RuntimeError("Case quiescence unproven; identity, right and ACLs retained")
@@ -310,6 +328,7 @@ def run_standard_user_case(
                     "batch_logon_lease": lease_timings,
                     "process_state": process_state,
                     "resources_retained": not admitted,
+                    "task_registration": registration.outcome if registration else None,
                 },
                 indent=2,
             )

@@ -6,7 +6,7 @@ import os
 import sys
 
 import pytest
-from windows_qualification_environment import powershell_environment
+from windows_qualification_environment import encoded_powershell_script, powershell_environment
 
 from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
@@ -305,13 +305,17 @@ def test_predecessor_actor_setup_reuses_seeded_account(tmp_path, monkeypatch):
     assert len([a for a in store.mail_accounts() if a.account_id == "public-fixture"]) == 1
 
 
-def test_fixture_authority_signs_tests_and_is_rejected_for_release(tmp_path):
+def test_fixture_authority_signs_tests_and_is_rejected_for_release(tmp_path, monkeypatch):
     from datetime import UTC, datetime, timedelta
 
     from build_desktop_sidecar import SidecarBuildError, validate_entitlement_keyring
     from connect_automate.entitlement import EntitlementDecision, EntitlementGate
     from windows_cutover_fixture import fixture_authority
 
+    # Native archive routing moves this fixture outside the runner's profile.
+    # Give the real verifier an explicit isolated root, as the full proof does;
+    # retain its ACL/ancestor/bounds checks and never use the host licence.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     keyring, licence = fixture_authority(tmp_path)
     now = datetime.now(UTC)
     gate = EntitlementGate.for_test(licence, keyring.read_bytes(), now)
@@ -436,10 +440,7 @@ try {
         throw ('Session-local kernel object: ' + $actual)
     }
     $env:EW_MUTEX=$name
-    $out = & powershell.exe -NoProfile -NonInteractive -Command '
-        $m=[Threading.Mutex]::OpenExisting($env:EW_MUTEX)
-        try { if ($m.WaitOne(0)) { $m.ReleaseMutex(); throw "Concurrent admission" }; "BUSY" }
-        finally { $m.Dispose() }'
+    $out = & powershell.exe -NoProfile -NonInteractive -EncodedCommand $env:EW_MUTEX_CHILD
     if ($LASTEXITCODE -ne 0 -or $out -ne 'BUSY') { throw 'Concurrent admission was not excluded' }
     'GLOBAL_KERNEL_EXCLUSION'
 } finally { $m.ReleaseMutex(); $m.Dispose() }
@@ -447,7 +448,15 @@ try {
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
         env=powershell_environment(
-            dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation"))
+            dict(
+                os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation"),
+                EW_MUTEX_CHILD=encoded_powershell_script(
+                    "$ErrorActionPreference='Stop'; "
+                    "$m=[Threading.Mutex]::OpenExisting($env:EW_MUTEX); "
+                    "try { if ($m.WaitOne(0)) { $m.ReleaseMutex(); "
+                    "throw 'Concurrent admission' }; 'BUSY' } finally { $m.Dispose() }"
+                ),
+            )
         ),
         capture_output=True,
         text=True,
@@ -501,6 +510,16 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
         EW_SCRIPT=str(script),
         EW_CATALOG=str(catalog),
         EW_FIRST_DISABLE=str(tmp_path / "first-disable.json"),
+        EW_ABORT_CHILD=encoded_powershell_script(
+            "Import-Module ScheduledTasks; "
+            "function Disable-ScheduledTask { param($TaskPath,$TaskName); "
+            r"ScheduledTasks\Disable-ScheduledTask -TaskPath $TaskPath "
+            "-TaskName $TaskName | Out-Null; "
+            "[pscustomobject]@{Task=$TaskName;ProcessId=$PID} | ConvertTo-Json -Compress | "
+            "Set-Content -LiteralPath $env:EW_FIRST_DISABLE -Encoding UTF8; "
+            "exit 7 }; & $env:EW_SCRIPT -Phase Pre -InstallRoot $env:EW_ROOT "
+            "-InstallerPid $env:EW_INSTALLER -ProgramCatalog $env:EW_CATALOG; exit $LASTEXITCODE"
+        ),
     )
 
     def powershell(code, *, expected=0):
@@ -531,16 +550,8 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
             "$m=[Threading.Mutex]::new($false,$name); "
             "if (!$m.WaitOne(10000)) { throw 'Fixture installer busy' }; "
             "$env:EW_INSTALLER=$PID; "
-            "$child='Import-Module ScheduledTasks; "
-            "function Disable-ScheduledTask { param($TaskPath,$TaskName); "
-            r"ScheduledTasks\Disable-ScheduledTask -TaskPath $TaskPath "
-            "-TaskName $TaskName | Out-Null; "
-            "[pscustomobject]@{Task=$TaskName;ProcessId=$PID} | ConvertTo-Json -Compress | "
-            "Set-Content -LiteralPath $env:EW_FIRST_DISABLE -Encoding UTF8; "
-            "exit 7 }; & $env:EW_SCRIPT -Phase Pre -InstallRoot $env:EW_ROOT "
-            "-InstallerPid $env:EW_INSTALLER -ProgramCatalog $env:EW_CATALOG; exit $LASTEXITCODE'; "
             "& powershell.exe -NoProfile -NonInteractive "
-            "-ExecutionPolicy RemoteSigned -Command $child; "
+            "-ExecutionPolicy RemoteSigned -EncodedCommand $env:EW_ABORT_CHILD; "
             "if ($LASTEXITCODE -ne 7) { throw 'Pre did not abort at the first mutation' }; "
             "if ((Get-ScheduledTask -TaskName $env:EW_TASK).State -ne 'Disabled') "
             "{ throw 'Pre did not disable task' }; exit 7",

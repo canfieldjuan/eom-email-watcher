@@ -1,8 +1,14 @@
 """Environment owners for native Windows qualification, never product policy."""
 
+import base64
 import ctypes
 import os
 import uuid
+
+
+def encoded_powershell_script(script):
+    """Preserve script quotes across Windows PowerShell's native argv boundary."""
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 
 def powershell_environment(base=None, **values):
