@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from fixture_toml import toml_path_literal
 
 import eom_email_watcher.config as config_module
 import eom_email_watcher.notifications as notifications_module
@@ -831,11 +832,11 @@ def test_systemd_cli_check_recovers_mismatch_before_consuming_topic(
 ) -> None:
     path = tmp_path / "config.toml"
     runtime_paths = (
-        f'database_file = "{tmp_path / "watcher.sqlite3"}"\n'
-        f'gmail_credentials_file = "{tmp_path / "credentials.json"}"\n'
-        f'microsoft_credentials_file = "{tmp_path / "microsoft.json"}"\n'
-        f'gmail_token_file = "{tmp_path / "token.json"}"\n'
-        f'gmail_send_token_file = "{tmp_path / "send-token.json"}"'
+        f'database_file = {toml_path_literal(tmp_path / "watcher.sqlite3")}\n'
+        f'gmail_credentials_file = {toml_path_literal(tmp_path / "credentials.json")}\n'
+        f'microsoft_credentials_file = {toml_path_literal(tmp_path / "microsoft.json")}\n'
+        f'gmail_token_file = {toml_path_literal(tmp_path / "token.json")}\n'
+        f'gmail_send_token_file = {toml_path_literal(tmp_path / "send-token.json")}'
     )
     _write_bytes(path, _config_bytes(extra=runtime_paths))
     revision = ntfy_disclosure_status(path).expected_revision

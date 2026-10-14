@@ -8,13 +8,6 @@ import pytest
 from probe_windows_cutover_context import parse_tokens, token_profile, transcript_probe
 
 
-@pytest.fixture
-def tmp_path(tmp_path, request):
-    from prove_windows_cutover import probe_output
-
-    return probe_output(request.node.name, tmp_path)
-
-
 @pytest.mark.parametrize("enabled", [False, True])
 def test_context_preserves_privilege_state_and_target(enabled):
     token = {
@@ -899,3 +892,99 @@ def test_receipt_write_failure_does_not_skip_case_cleanup(tmp_path):
     assert calls == ["stopped"] and result["quiesced"] is False
     assert result["primary_error"] == "public original failure"
     assert result["errors"] == [{"owner": "receipt", "error": "public receipt fault"}]
+
+
+def test_scheduled_actor_terminates_held_object_before_waiting():
+    import windows_cutover_process_fixture as fixture
+
+    calls = []
+
+    class Kernel:
+        terminated = False
+
+        def WaitForSingleObject(self, handle, timeout):
+            calls.append(("wait", handle, timeout))
+            return 0 if self.terminated else 258
+
+        def TerminateProcess(self, handle, code):
+            calls.append(("terminate", handle, code))
+            self.terminated = True
+            return True
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+
+    actor = fixture.ScheduledActor.__new__(fixture.ScheduledActor)
+    actor.kernel, actor.handle = Kernel(), 42
+    actor.settle()
+    assert calls == [("wait", 42, 0), ("terminate", 42, 1), ("wait", 42, 10000), ("close", 42)]
+
+
+def test_scheduled_actor_does_not_terminate_an_exited_held_object():
+    import windows_cutover_process_fixture as fixture
+
+    calls = []
+
+    class Kernel:
+        def WaitForSingleObject(self, handle, timeout):
+            calls.append(("wait", timeout))
+            return 0
+
+        def TerminateProcess(self, handle, code):
+            pytest.fail("Exited object must not be terminated")
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+
+    actor = fixture.ScheduledActor.__new__(fixture.ScheduledActor)
+    actor.kernel, actor.handle = Kernel(), 42
+    actor.settle()
+    assert calls == [("wait", 0), ("close", 42)]
+
+
+def test_scheduled_actor_denial_remains_failure_and_closes_handle(monkeypatch):
+    import windows_cutover_process_fixture as fixture
+
+    calls = []
+
+    class Kernel:
+        def WaitForSingleObject(self, handle, timeout):
+            return 258
+
+        def TerminateProcess(self, handle, code):
+            return False
+
+        def CloseHandle(self, handle):
+            calls.append(handle)
+
+    monkeypatch.setattr(
+        fixture.ctypes, "WinError", lambda code: OSError(code, "public denial"), raising=False
+    )
+    monkeypatch.setattr(fixture.ctypes, "get_last_error", lambda: 5, raising=False)
+    actor = fixture.ScheduledActor.__new__(fixture.ScheduledActor)
+    actor.kernel, actor.handle = Kernel(), 42
+    with pytest.raises(OSError, match="public denial"):
+        actor.settle()
+    assert calls == [42]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual held scheduled actor cleanup")
+def test_native_scheduled_actor_terminates_actual_held_process(tmp_path):
+    import subprocess
+    import sys
+
+    from windows_cutover_process_fixture import ScheduledActor
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        actor = ScheduledActor(child.pid)
+        actor.settle()
+        child.wait(timeout=10)
+        assert child.returncode != 0
+        (tmp_path / "scheduled-actor-cleanup.json").write_text(
+            json.dumps({"pid": child.pid, "returncode": child.returncode, "quiesced": True})
+        )
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)

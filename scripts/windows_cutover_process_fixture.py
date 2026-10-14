@@ -24,13 +24,22 @@ class ScheduledActor:
         self.kernel.OpenProcess.restype = ctypes.c_void_p
         self.kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         self.kernel.WaitForSingleObject.restype = ctypes.c_uint32
+        self.kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self.kernel.TerminateProcess.restype = ctypes.c_int
         self.kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        self.handle = self.kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only
+        self.handle = self.kernel.OpenProcess(0x00100001, False, pid)  # SYNCHRONIZE | TERMINATE
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
 
     def settle(self):
         try:
+            initial = self.kernel.WaitForSingleObject(self.handle, 0)
+            if initial == 0:
+                return
+            if initial != 258:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not self.kernel.TerminateProcess(self.handle, 1):
+                raise ctypes.WinError(ctypes.get_last_error())
             if self.kernel.WaitForSingleObject(self.handle, 10000) != 0:
                 raise RuntimeError("Scheduled actor termination is unproven")
         finally:

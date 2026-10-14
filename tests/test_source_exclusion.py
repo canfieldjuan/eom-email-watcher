@@ -1,6 +1,8 @@
 """Public source-exclusion and mixed-protocol cutover regressions."""
 
+import hashlib
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +79,20 @@ def test_sorted_deduplicated_collision_and_nested_subset(tmp_path, monkeypatch):
             pass
 
 
+def legacy_artifact_snapshot(directory):
+    from eom_email_watcher.source_locks import LEGACY_NAME
+
+    return {
+        path.name: (
+            stat.S_IFMT(path.lstat().st_mode),
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            path.lstat().st_ino or None,
+        )
+        for path in directory.iterdir()
+        if LEGACY_NAME.fullmatch(path.name)
+    }
+
+
 def test_legacy_drain_timeout_keeps_marker_unset_and_retry_adopts(tmp_path, monkeypatch):
     from connect_automate.locking import connect_source_lock_path
 
@@ -117,10 +133,16 @@ with connect_operation_lock(Path(sys.argv[1]), 'busy'):
     finally:
         output, error = holder.communicate("release\n", timeout=5)
         assert holder.returncode == 0, output + error
+    # filelock._windows.WindowsFileLock._release removes its own marker unless
+    # preserve_lock_file is set. Capture AFTER the holder releases, so migration
+    # must leave every artifact it actually receives unchanged on both platforms.
+    before = legacy_artifact_snapshot(legacy.parent)
+    if os.name != "nt":
+        assert legacy.exists(), "Linux SDK release must preserve the legacy inode"
     locks.qualify_protocol(store, fresh=False)
     with store.connection() as db:
         assert locks.protocol_ready(db)
-    assert legacy.exists(), "legacy files must remain inert"
+    assert legacy_artifact_snapshot(legacy.parent) == before, "Legacy artifacts changed"
     with store._source_cleanup_locks(["same-message"]):
         pass
 

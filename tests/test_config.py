@@ -5,6 +5,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, reset_tzpath
 
 import pytest
+from fixture_toml import toml_path_literal
 
 import eom_email_watcher.config as config_module
 from eom_email_watcher.config import (
@@ -328,7 +329,10 @@ def test_gateway_config_rejects_unsafe_authorities(tmp_path: Path, base_url: str
     write_config(
         path,
         base_url=base_url,
-        extra=f'model_backend = "gateway"\nmodel_ca_file = "{tmp_path / "ca.pem"}"',
+        extra=(
+            'model_backend = "gateway"\n'
+            f'model_ca_file = {toml_path_literal(tmp_path / "ca.pem")}'
+        ),
     )
 
     with pytest.raises(ConfigError, match="model_base_url"):
@@ -341,7 +345,10 @@ def test_gateway_config_accepts_maximum_dns_label(tmp_path: Path) -> None:
     write_config(
         path,
         base_url=base_url,
-        extra=f'model_backend = "gateway"\nmodel_ca_file = "{tmp_path / "ca.pem"}"',
+        extra=(
+            'model_backend = "gateway"\n'
+            f'model_ca_file = {toml_path_literal(tmp_path / "ca.pem")}'
+        ),
     )
 
     assert load_config(path).model_base_url == base_url

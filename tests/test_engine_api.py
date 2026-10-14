@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from connect_automate import connect
+from fixture_toml import toml_path_literal
 
 from eom_email_watcher import config as config_module
 from eom_email_watcher import engine_api
@@ -5751,8 +5752,8 @@ def test_settings_reports_gateway_model_as_read_only_and_rejects_mutation(
         config_path,
         extra_settings=(
             'model_backend = "gateway"\n'
-            f'model_api_token_file = "{tmp_path / "model-token"}"\n'
-            f'model_ca_file = "{tmp_path / "gateway-ca.pem"}"'
+            f'model_api_token_file = {toml_path_literal(tmp_path / "model-token")}\n'
+            f'model_ca_file = {toml_path_literal(tmp_path / "gateway-ca.pem")}'
         ),
     )
     gateway_config = (

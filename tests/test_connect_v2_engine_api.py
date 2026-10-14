@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from connect_automate import connect
+from fixture_toml import toml_path_literal
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import config_admission_snapshot
@@ -82,10 +83,10 @@ def active_connect_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
 def write_config(path: Path) -> None:
     path.write_text(
         f'''timezone = "America/Chicago"
-gmail_credentials_file = "{path.parent / "credentials.json"}"
-gmail_token_file = "{path.parent / "token.json"}"
-gmail_send_token_file = "{path.parent / "send-token.json"}"
-database_file = "{path.parent / "watcher.sqlite3"}"
+gmail_credentials_file = {toml_path_literal(path.parent / "credentials.json")}
+gmail_token_file = {toml_path_literal(path.parent / "token.json")}
+gmail_send_token_file = {toml_path_literal(path.parent / "send-token.json")}
+database_file = {toml_path_literal(path.parent / "watcher.sqlite3")}
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "local-model"
 model_require_auth = false
@@ -6171,3 +6172,24 @@ def test_concurrent_same_request_id_reuses_the_persisted_winner(
     assert queried == [REQUEST_ID]
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
+
+
+def test_shared_config_fixture_serializes_native_windows_paths():
+    import tomllib
+    from pathlib import PureWindowsPath
+
+    class Sink:
+        parent = PureWindowsPath(r"C:\Users\Public\O'Connor あ")
+        text = ""
+
+        def write_text(self, text, **kwargs):
+            self.text = text
+
+        def chmod(self, mode):
+            pass
+
+    sink = Sink()
+    write_config(sink)
+    data = tomllib.loads(sink.text)
+    assert data["database_file"] == str(sink.parent / "watcher.sqlite3")
+    assert data["gmail_credentials_file"] == str(sink.parent / "credentials.json")

@@ -404,9 +404,12 @@ def test_native_installer_mutex_is_root_keyed_in_global_kernel_namespace(tmp_pat
     script = Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
     code = r"""
 $ErrorActionPreference='Stop'
-$name = & $env:EW_SCRIPT -Phase Name -InstallRoot $env:EW_ROOT
-$same = & $env:EW_SCRIPT -Phase Name -InstallRoot ($env:EW_ROOT.ToUpperInvariant())
-$other = & $env:EW_SCRIPT -Phase Name -InstallRoot ($env:EW_ROOT + '-other')
+$name = & powershell.exe -NoProfile -NonInteractive -File $env:EW_SCRIPT `
+    -Phase Name -InstallRoot $env:EW_ROOT
+$same = & powershell.exe -NoProfile -NonInteractive -File $env:EW_SCRIPT `
+    -Phase Name -InstallRoot ($env:EW_ROOT.ToUpperInvariant())
+$other = & powershell.exe -NoProfile -NonInteractive -File $env:EW_SCRIPT `
+    -Phase Name -InstallRoot ($env:EW_ROOT + '-other')
 if ($name -cne $same -or $name -ceq $other) { throw 'Install identity is not canonical' }
 Add-Type @'
 using System;
@@ -492,7 +495,12 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
     catalog.write_text("EW-PACKAGE-FILES-V1\neom-mail-engine.exe\n", encoding="utf-16")
     task = "EW-Cutover-Abort-" + uuid.uuid4().hex
     environment = dict(
-        os.environ, EW_ROOT=str(root), EW_TASK=task, EW_SCRIPT=str(script), EW_CATALOG=str(catalog)
+        os.environ,
+        EW_ROOT=str(root),
+        EW_TASK=task,
+        EW_SCRIPT=str(script),
+        EW_CATALOG=str(catalog),
+        EW_FIRST_DISABLE=str(tmp_path / "first-disable.json"),
     )
 
     def powershell(code, *, expected=0):
@@ -518,15 +526,19 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
         # must already have an owner, not one launched by a later statement.
         powershell(
             "$ErrorActionPreference='Stop'; "
-            "$name= & $env:EW_SCRIPT -Phase Name -InstallRoot $env:EW_ROOT; "
+            "$name= & powershell.exe -NoProfile -NonInteractive -File $env:EW_SCRIPT "
+            "-Phase Name -InstallRoot $env:EW_ROOT; "
             "$m=[Threading.Mutex]::new($false,$name); "
             "if (!$m.WaitOne(10000)) { throw 'Fixture installer busy' }; "
             "$env:EW_INSTALLER=$PID; "
-            "$child='function Disable-ScheduledTask { param($TaskPath,$TaskName); "
+            "$child='Import-Module ScheduledTasks; "
+            "function Disable-ScheduledTask { param($TaskPath,$TaskName); "
             r"ScheduledTasks\Disable-ScheduledTask -TaskPath $TaskPath "
             "-TaskName $TaskName | Out-Null; "
+            "[pscustomobject]@{Task=$TaskName;ProcessId=$PID} | ConvertTo-Json -Compress | "
+            "Set-Content -LiteralPath $env:EW_FIRST_DISABLE -Encoding UTF8; "
             "exit 7 }; & $env:EW_SCRIPT -Phase Pre -InstallRoot $env:EW_ROOT "
-            "-InstallerPid $env:EW_INSTALLER -ProgramCatalog $env:EW_CATALOG'; "
+            "-InstallerPid $env:EW_INSTALLER -ProgramCatalog $env:EW_CATALOG; exit $LASTEXITCODE'; "
             "& powershell.exe -NoProfile -NonInteractive "
             "-ExecutionPolicy RemoteSigned -Command $child; "
             "if ($LASTEXITCODE -ne 7) { throw 'Pre did not abort at the first mutation' }; "
@@ -534,6 +546,8 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
             "{ throw 'Pre did not disable task' }; exit 7",
             expected=7,
         )
+        marker = json.loads((tmp_path / "first-disable.json").read_text(encoding="utf-8-sig"))
+        assert marker["Task"] == task and marker["ProcessId"] > 0
         deadline = time.monotonic() + 30
         pending = root / "windows-cutover-pending-v1.json"
         while pending.exists():

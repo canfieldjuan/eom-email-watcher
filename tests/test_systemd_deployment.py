@@ -10,6 +10,7 @@ import pytest
 from connect_automate import entitlement
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from fixture_toml import toml_path_literal
 
 import eom_email_watcher.config as config_module
 
@@ -95,9 +96,9 @@ def test_systemd_services_grant_only_runtime_config_and_legacy_state_parents(
         (
             b'model_base_url = "http://127.0.0.1:1234/v1"\n'
             b'model_name = "local-model"\n'
-            + f'database_file = "{legacy_state / "watcher.sqlite3"}"\n'.encode()
-            + f'gmail_token_file = "{legacy_state / "token.json"}"\n'.encode()
-            + f'model_api_token_file = "{legacy_state / "model-token"}"\n'.encode()
+            + f'database_file = {toml_path_literal(legacy_state / "watcher.sqlite3")}\n'.encode()
+            + f'gmail_token_file = {toml_path_literal(legacy_state / "token.json")}\n'.encode()
+            + f'model_api_token_file = {toml_path_literal(legacy_state / "model-token")}\n'.encode()
         ),
         config_path,
     )
@@ -233,9 +234,9 @@ def test_explicit_absolute_state_paths_override_runtime_state_root(
         (
             b'model_base_url = "http://127.0.0.1:1234/v1"\n'
             b'model_name = "local-model"\n'
-            + f'database_file = "{explicit / "watcher.sqlite3"}"\n'.encode()
-            + f'gmail_token_file = "{explicit / "token.json"}"\n'.encode()
-            + f'model_api_token_file = "{explicit / "model-token"}"\n'.encode()
+            + f'database_file = {toml_path_literal(explicit / "watcher.sqlite3")}\n'.encode()
+            + f'gmail_token_file = {toml_path_literal(explicit / "token.json")}\n'.encode()
+            + f'model_api_token_file = {toml_path_literal(explicit / "model-token")}\n'.encode()
         ),
         tmp_path / "config.toml",
     )
