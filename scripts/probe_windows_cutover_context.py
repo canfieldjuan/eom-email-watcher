@@ -23,6 +23,29 @@ def parse_tokens(text):
     return records
 
 
+def assert_standard_context(records, *, required_roles, required_pids=frozenset()):
+    """Qualification only: missing/partial context never proves a user-level test."""
+    assert records, "standard-user token evidence missing"
+    assert required_roles <= {row.get("role") for row in records}, (
+        "standard-user required token roles missing",
+        required_roles,
+        records,
+    )
+    assert required_pids <= {row.get("token", {}).get("pid") for row in records}, (
+        "standard-user required process tokens missing",
+        required_pids,
+        records,
+    )
+    for row in records:
+        token = row.get("token", {})
+        assert (
+            token.get("elevated") is False
+            and token.get("integrity_rid") == 8192
+            and token.get("debug_present") is False
+            and token.get("debug_enabled") is False
+        ), ("standard-user context must be Medium, non-elevated, with no debug privilege", row)
+
+
 def token_profile(process_ids, output):
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     code = r"""

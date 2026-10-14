@@ -20,23 +20,28 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from probe_windows_cutover_context import parse_tokens, token_profile
+from probe_windows_cutover_context import assert_standard_context, parse_tokens, token_profile
 from smoke_packaged_engine import _request
 from windows_cutover_parity import installer_manifest
-from windows_cutover_process_fixture import deny_termination
+from windows_cutover_process_fixture import (
+    deny_termination,
+)
+from windows_cutover_process_fixture import (
+    run_standard_user_case as standard_case,
+)
 
 PREDECESSOR = "43a850d8b00cddfdad2a767b7b27fc792707b010"
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def powershell(script: str, **values: str) -> str:
+def powershell(script: str, *, timeout: int = 40, **values: str) -> str:
     # Data travels through environment, never interpolated as PowerShell code.
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
         env=dict(os.environ, **values),
         capture_output=True,
         text=True,
-        timeout=40,
+        timeout=timeout,
     )
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
@@ -141,6 +146,12 @@ def build_old_actor(predecessor: Path, output: Path, keyring: Path | None = None
 
 
 def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, case: str):
+    if case == "old-then-new":
+        assert_standard_context(
+            token_profile([os.getpid()], output / "standard-user-profile"),
+            required_roles={"diagnostic-probe", "stop-host-entry"},
+            required_pids={os.getpid()},
+        )
     folder = output / case
     folder.mkdir(mode=0o700)
     installation = folder / "installed"
@@ -291,6 +302,11 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 actor_profile = token_profile(
                     [os.getpid(), first.pid], folder / "protected-actor-profile"
                 )
+                assert_standard_context(
+                    actor_profile,
+                    required_roles={"diagnostic-probe", "stop-host-entry"},
+                    required_pids={os.getpid(), first.pid},
+                )
                 refusal, attempt = run_installer(
                     installer, installation, folder, "protected-refusal"
                 )
@@ -324,6 +340,16 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 observed["stop_tokens"] = parse_tokens(transcripts)
                 (folder / "installer.refusal.state.json").write_text(json.dumps(observed, indent=2))
                 print("REFUSAL_CONTEXT", json.dumps(observed), flush=True)
+                assert_standard_context(
+                    observed["stop_tokens"],
+                    required_roles={
+                        "installer",
+                        "stop-host-entry",
+                        "stop-host-before-handle",
+                        "actor-before-stop",
+                    },
+                    required_pids={first.pid},
+                )
                 assert f"failure-stage=process-stop process={first.pid} code=5" in transcripts, (
                     "Refusal was not caused by the protected owner's access-denied stop"
                 )
@@ -335,6 +361,23 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
         install, attempt = run_installer(installer, installation, folder, "successful-update")
         (folder / "installer.stdout").write_bytes(install.stdout)
         (folder / "installer.stderr").write_bytes(install.stderr)
+        if case == "old-then-new":
+            retry_tokens = parse_tokens(
+                "\n".join(
+                    p.read_text(encoding="utf-8-sig", errors="replace")
+                    for p in attempt.glob("cutover-*-Pre-*.txt")
+                )
+            )
+            assert_standard_context(
+                retry_tokens,
+                required_roles={
+                    "installer",
+                    "stop-host-entry",
+                    "stop-host-before-terminate",
+                    "actor-before-stop",
+                },
+                required_pids={first.pid},
+            )
         assert install.returncode == 0, install.returncode
         first.wait(timeout=10)
         second.wait(timeout=10)
@@ -439,23 +482,47 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
         server.server_close()
 
 
+def run_standard_user_case(output, installer, engine, actor):
+    return standard_case(output, installer, engine, actor, powershell)
+
+
+def run_cases(output, installer, engine, actor):
+    return [
+        run_case(output, installer, engine, actor, "unknown-image"),
+        run_standard_user_case(output, installer, engine, actor),
+        run_case(output, installer, engine, actor, "new-then-old"),
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("installer", type=Path)
     parser.add_argument("engine", type=Path)
     parser.add_argument("predecessor", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--case", choices=["old-then-new"])
+    parser.add_argument("--actor", type=Path)
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This qualification requires native Windows")
     args.output.mkdir(parents=True, mode=0o700, exist_ok=True)
-    actor = build_old_actor(args.predecessor.resolve(), args.output.resolve())
-    results = [
-        run_case(
-            args.output.resolve(), args.installer.resolve(), args.engine.resolve(), actor, case
+    if args.case:
+        if args.actor is None:
+            parser.error("Standard-user child requires the prebuilt frozen actor")
+        result = run_case(
+            args.output.resolve(),
+            args.installer.resolve(),
+            args.engine.resolve(),
+            args.actor.resolve(),
+            args.case,
         )
-        for case in ("unknown-image", "old-then-new", "new-then-old")
-    ]
+        (args.output / "standard-user-result.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2))
+        return
+    actor = build_old_actor(args.predecessor.resolve(), args.output.resolve())
+    results = run_cases(
+        args.output.resolve(), args.installer.resolve(), args.engine.resolve(), actor
+    )
     receipt = {
         "predecessor": PREDECESSOR,
         "platform": sys.platform,
