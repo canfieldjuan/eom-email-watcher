@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from windows_qualification_environment import powershell_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -114,12 +115,14 @@ if (@(Installed-Processes).Count -ne 1) { throw 'Shipped full-path helper reject
 """
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
-        env=dict(
-            os.environ,
-            EW_SCRIPT=str(ROOT / "desktop/src-tauri/windows/cutover.ps1"),
-            EW_ROOT=str(root),
-            EW_CATALOG=str(catalog),
-            EW_OLD_SHA=old_sha,
+        env=powershell_environment(
+            dict(
+                os.environ,
+                EW_SCRIPT=str(ROOT / "desktop/src-tauri/windows/cutover.ps1"),
+                EW_ROOT=str(root),
+                EW_CATALOG=str(catalog),
+                EW_OLD_SHA=old_sha,
+            )
         ),
         capture_output=True,
         text=True,
@@ -151,6 +154,7 @@ def test_native_phase_failure_exits_nonzero_with_exception_chain(tmp_path):
             "-ProgramCatalog",
             str(catalog),
         ],
+        env=powershell_environment(),
         capture_output=True,
         text=True,
         timeout=40,

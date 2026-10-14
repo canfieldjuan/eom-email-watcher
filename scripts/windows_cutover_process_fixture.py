@@ -1,11 +1,14 @@
 """Native public process permission boundary, only for installer qualification."""
 
 import ctypes
+import hashlib
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -68,15 +71,85 @@ def deny_termination(process):
             kernel.LocalFree(denied)
 
 
+def fixture_payloads(output, installer, engine, actor):
+    """Give the case private SHA-identical inputs without granting build trees."""
+    destination = output / "standard-inputs"
+    destination.mkdir(mode=0o700)
+    copies, hashes = [], {}
+    for name, original in (
+        ("installer.exe", installer),
+        ("engine.exe", engine),
+        ("actor.exe", actor),
+    ):
+        copied = destination / name
+        shutil.copy2(original, copied)
+        original_sha = hashlib.sha256(original.read_bytes()).hexdigest()
+        copied_sha = hashlib.sha256(copied.read_bytes()).hexdigest()
+        assert original_sha == copied_sha, "Fixture input copy changed source bytes"
+        hashes[name] = {"source_sha256": original_sha, "copied_sha256": copied_sha}
+        copies.append(copied)
+    (output / "standard-inputs.json").write_text(json.dumps(hashes, indent=2))
+    return copies
+
+
+def fixture_access_paths(root, output):
+    return list(
+        dict.fromkeys(
+            [
+                (root / "scripts", "RX"),
+                (root / "src", "RX"),
+                (root / "desktop/src-tauri/windows", "RX"),
+                (Path(sys.base_prefix), "RX"),
+                (Path(sys.prefix), "RX"),
+                (output, "M"),
+            ]
+        )
+    )
+
+
 def run_standard_user_case(output, installer, engine, actor, run_powershell):
-    """Run the entire refusal/retry fixture in a fresh non-admin user profile."""
+    """Own identity, bounded input permissions, native user environment and cleanup."""
     assert os.name == "nt", "standard-user qualification requires native Windows"
     root = Path(__file__).resolve().parents[1]
+    installer, engine, actor = fixture_payloads(output, installer, engine, actor)
+    tool = shutil.which("7z")
+    assert tool, "Installer payload comparison requires the CI 7z executable"
     name = "EWProbe-" + secrets.token_hex(4)
     password = "EW!a9" + secrets.token_urlsafe(24)
     values = dict(EW_PROBE_USER=name, EW_PROBE_PASSWORD=password)
-    grants = []
+    grants, cleanup_errors, timings = [], [], []
     created = False
+    primary = None
+    result = None
+
+    def acl(path, access=None):
+        started = time.monotonic()
+        try:
+            run_powershell(
+                "$ErrorActionPreference='Stop'; "
+                "& icacls.exe $env:EW_PROBE_PATH "
+                + (
+                    "/grant ($env:COMPUTERNAME+'\\'+$env:EW_PROBE_USER+':(OI)(CI)'+"
+                    "$env:EW_PROBE_ACCESS) /T /Q; "
+                    if access
+                    else "/remove:g ($env:COMPUTERNAME+'\\'+$env:EW_PROBE_USER) /T /Q; "
+                )
+                + "if ($LASTEXITCODE -ne 0) { throw 'Fixture ACL operation failed' }",
+                timeout=300,
+                EW_PROBE_USER=name,
+                EW_PROBE_PATH=str(path),
+                EW_PROBE_ACCESS=access or "",
+            )
+        finally:
+            timings.append(
+                {
+                    "operation": "grant" if access else "remove",
+                    "path": str(path),
+                    "seconds": time.monotonic() - started,
+                    "timeout_seconds": 300,
+                }
+            )
+
     try:
         run_powershell(
             "$ErrorActionPreference='Stop'; "
@@ -86,32 +159,18 @@ def run_standard_user_case(output, installer, engine, actor, run_powershell):
         )
         created = True
         run_powershell(
-            "Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $env:EW_PROBE_USER",
+            "$ErrorActionPreference='Stop'; "
+            "$group=Get-LocalGroup -SID 'S-1-5-32-545'; "
+            "if (-not (Get-LocalGroupMember -Group $group | Where-Object "
+            "{ $_.Name -eq ($env:COMPUTERNAME+'\\'+$env:EW_PROBE_USER) })) "
+            "{ Add-LocalGroupMember -Group $group -Member $env:EW_PROBE_USER }",
             EW_PROBE_USER=name,
         )
-        # Grant only required inputs and this fixture's output, never all Users
-        # or the runner profile. The disposable SID is removed in finally.
-        for path, access in dict.fromkeys(
-            [
-                (root, "RX"),
-                (Path(sys.base_prefix), "RX"),
-                (Path(sys.prefix), "RX"),
-                (output, "M"),
-            ]
-        ):
-            grants.append(path)
-            run_powershell(
-                "$ErrorActionPreference='Stop'; "
-                "& icacls.exe $env:EW_PROBE_PATH /grant "
-                "($env:COMPUTERNAME+'\\'+$env:EW_PROBE_USER+':(OI)(CI)'+"
-                "$env:EW_PROBE_ACCESS) /T /Q; "
-                "if ($LASTEXITCODE -ne 0) { throw 'Fixture input ACL grant failed' }",
-                EW_PROBE_USER=name,
-                EW_PROBE_PATH=str(path),
-                EW_PROBE_ACCESS=access,
-            )
-        stdout, stderr = output / "standard-user.stdout.log", output / "standard-user.stderr.log"
+        for path, access in fixture_access_paths(root, output):
+            grants.append(path)  # Include partial recursive grants in cleanup.
+            acl(path, access)
         command = [
+            sys.executable,
             str(root / "scripts/prove_windows_cutover.py"),
             str(installer),
             str(engine),
@@ -121,45 +180,51 @@ def run_standard_user_case(output, installer, engine, actor, run_powershell):
             "old-then-new",
             "--actor",
             str(actor),
+            "--tool-directory",
+            str(Path(tool).parent),
         ]
         run_powershell(
-            "$ErrorActionPreference='Stop'; "
-            "$secret=ConvertTo-SecureString $env:EW_PROBE_PASSWORD -AsPlainText -Force; "
-            "$credential=New-Object System.Management.Automation.PSCredential "
-            "($env:COMPUTERNAME+'\\'+$env:EW_PROBE_USER),$secret; "
-            "Remove-Item Env:EW_PROBE_PASSWORD; "
-            "$p=Start-Process -FilePath $env:EW_PROBE_PYTHON -ArgumentList $env:EW_PROBE_ARGS "
-            "-Credential $credential -LoadUserProfile -WorkingDirectory $env:EW_PROBE_OUTPUT "
-            "-RedirectStandardOutput $env:EW_PROBE_STDOUT "
-            "-RedirectStandardError $env:EW_PROBE_STDERR "
-            "-PassThru; $handle=$p.Handle; "
-            "if (-not $p.WaitForExit(600000)) { "
-            "& taskkill.exe /PID $p.Id /T /F | Out-Null; throw 'Standard-user fixture timeout' }; "
-            "$p.Refresh(); if ($p.ExitCode -ne 0) { "
-            "throw ('Standard-user fixture exit='+$p.ExitCode+'; '+"
-            "(Get-Content -LiteralPath $env:EW_PROBE_STDERR -Raw)) }",
+            "& $env:EW_PROBE_LAUNCHER",
             **values,
             timeout=700,
             EW_PROBE_PYTHON=sys.executable,
             EW_PROBE_ARGS=subprocess.list2cmdline(command),
             EW_PROBE_OUTPUT=str(output),
-            EW_PROBE_STDOUT=str(stdout),
-            EW_PROBE_STDERR=str(stderr),
+            EW_PROBE_LAUNCHER=str(root / "scripts/windows_standard_user.ps1"),
         )
         result = json.loads((output / "standard-user-result.json").read_text())
         assert result["case"] == "old-then-new" and result["result"] == "PASS", result
-        return result
+    except Exception as error:
+        primary = error
     finally:
         for path in reversed(grants):
-            run_powershell(
-                "$ErrorActionPreference='Stop'; "
-                "& icacls.exe $env:EW_PROBE_PATH /remove:g "
-                "($env:COMPUTERNAME+'\\'+$env:EW_PROBE_USER) /T /Q; "
-                "if ($LASTEXITCODE -ne 0) { throw 'Fixture ACL removal failed' }",
-                EW_PROBE_USER=name,
-                EW_PROBE_PATH=str(path),
-            )
+            try:
+                acl(path)
+            except Exception as error:
+                cleanup_errors.append(error)
         if created:
-            run_powershell(
-                "Remove-LocalUser -Name $env:EW_PROBE_USER -ErrorAction Stop", EW_PROBE_USER=name
+            try:
+                run_powershell(
+                    "Remove-LocalUser -Name $env:EW_PROBE_USER -ErrorAction Stop",
+                    EW_PROBE_USER=name,
+                )
+            except Exception as error:
+                cleanup_errors.append(error)
+        (output / "standard-user-cleanup.json").write_text(
+            json.dumps(
+                {
+                    "primary_error": str(primary) if primary else None,
+                    "cleanup_errors": [str(error) for error in cleanup_errors],
+                    "acl_timings": timings,
+                },
+                indent=2,
             )
+        )
+    if cleanup_errors:
+        raise ExceptionGroup(
+            "Standard-user fixture and cleanup failed",
+            ([primary] if primary else []) + cleanup_errors,
+        )
+    if primary is not None:
+        raise primary
+    return result

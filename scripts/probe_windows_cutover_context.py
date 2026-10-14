@@ -7,6 +7,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from windows_qualification_environment import powershell_environment
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -59,11 +61,13 @@ foreach ($id in ($env:EW_PROBE_IDS | ConvertFrom-Json)) {
 """
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
-        env=dict(
-            os.environ,
-            EW_SCRIPT=str(ROOT / "desktop/src-tauri/windows/cutover.ps1"),
-            EW_PROBE_ROOT=str(output),
-            EW_PROBE_IDS=json.dumps(process_ids),
+        env=powershell_environment(
+            dict(
+                os.environ,
+                EW_SCRIPT=str(ROOT / "desktop/src-tauri/windows/cutover.ps1"),
+                EW_PROBE_ROOT=str(output),
+                EW_PROBE_IDS=json.dumps(process_ids),
+            )
         ),
         capture_output=True,
         text=True,
@@ -94,7 +98,7 @@ def transcript_probe(output):
         )
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-File", str(script)],
-            env=dict(os.environ, EW_EXIT_TRACE=str(transcript)),
+            env=powershell_environment(dict(os.environ, EW_EXIT_TRACE=str(transcript))),
             capture_output=True,
             text=True,
             timeout=40,
@@ -113,6 +117,52 @@ def transcript_probe(output):
     return rows
 
 
+def module_probe(output):
+    """Keep the inherited-path control labelled; never use it for fixture work."""
+    output.mkdir(mode=0o700, parents=True, exist_ok=True)
+    code = r"""
+[Console]::WriteLine('PSModulePath='+$env:PSModulePath)
+[Console]::WriteLine('PSVersion='+$PSVersionTable.PSVersion)
+try {
+    $ErrorActionPreference='Stop'
+    $null=ConvertTo-SecureString 'public module probe' -AsPlainText -Force
+    [Console]::WriteLine('SECURITY_MODULE_PASS')
+    exit 0
+} catch {
+    [Console]::Error.WriteLine($_.Exception.ToString())
+    exit 1
+}
+"""
+    rows = []
+    for label, environment in (
+        ("inherited-control", dict(os.environ)),
+        ("windows-default", powershell_environment()),
+    ):
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+        (output / (label + ".stdout.log")).write_text(result.stdout)
+        (output / (label + ".stderr.log")).write_text(result.stderr)
+        rows.append(
+            {
+                "context": label,
+                "exit": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "inherited_module_path": next(
+                    (v for k, v in os.environ.items() if k.casefold() == "psmodulepath"), None
+                ),
+            }
+        )
+    (output / "module-context.json").write_text(json.dumps(rows, indent=2))
+    assert rows[-1]["exit"] == 0 and "SECURITY_MODULE_PASS" in rows[-1]["stdout"], rows
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
@@ -122,6 +172,7 @@ def main():
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     result = {
+        "module_controls": module_probe(output / "module-controls"),
         "runner_tokens": token_profile([os.getpid()], output / "runner-profile"),
         "transcript_controls": transcript_probe(output / "transcript-controls"),
     }

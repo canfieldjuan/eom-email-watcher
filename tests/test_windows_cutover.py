@@ -6,6 +6,7 @@ import os
 import sys
 
 import pytest
+from windows_qualification_environment import powershell_environment
 
 from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
@@ -93,7 +94,9 @@ foreach ($p in $unknowns) {
 """
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
-        env=dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(root), EW_CATALOG=str(catalog)),
+        env=powershell_environment(
+            dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(root), EW_CATALOG=str(catalog))
+        ),
         capture_output=True,
         text=True,
         timeout=40,
@@ -138,11 +141,13 @@ try {
 """
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
-        env=dict(
-            os.environ,
-            EW_SCRIPT=str(script),
-            EW_ROOT=str(tmp_path / "installation"),
-            EW_TASK="EW-Enablement-" + uuid.uuid4().hex,
+        env=powershell_environment(
+            dict(
+                os.environ,
+                EW_SCRIPT=str(script),
+                EW_ROOT=str(tmp_path / "installation"),
+                EW_TASK="EW-Enablement-" + uuid.uuid4().hex,
+            )
         ),
         capture_output=True,
         text=True,
@@ -191,7 +196,9 @@ try {
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
         cwd=tmp_path,
-        env=dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation")),
+        env=powershell_environment(
+            dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation"))
+        ),
         capture_output=True,
         text=True,
         timeout=40,
@@ -436,7 +443,9 @@ try {
 """
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
-        env=dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation")),
+        env=powershell_environment(
+            dict(os.environ, EW_SCRIPT=str(script), EW_ROOT=str(tmp_path / "installation"))
+        ),
         capture_output=True,
         text=True,
         timeout=40,
@@ -489,7 +498,7 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
     def powershell(code, *, expected=0):
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
-            env=environment,
+            env=powershell_environment(environment),
             capture_output=True,
             text=True,
             timeout=40,

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from windows_cutover_process_fixture import (
 from windows_cutover_process_fixture import (
     run_standard_user_case as standard_case,
 )
+from windows_qualification_environment import powershell_environment, profile_environment_report
 
 PREDECESSOR = "43a850d8b00cddfdad2a767b7b27fc792707b010"
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,7 +40,7 @@ def powershell(script: str, *, timeout: int = 40, **values: str) -> str:
     # Data travels through environment, never interpolated as PowerShell code.
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        env=dict(os.environ, **values),
+        env=powershell_environment(dict(os.environ, **values)),
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -78,7 +80,7 @@ def run_installer(installer: Path, installation: Path, folder: Path, label: str)
         [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
         capture_output=True,
         timeout=240,
-        env=dict(os.environ, TEMP=str(attempt), TMP=str(attempt)),
+        env=powershell_environment(TEMP=str(attempt), TMP=str(attempt)),
     )
     (attempt / "installer.stdout").write_bytes(result.stdout)
     (attempt / "installer.stderr").write_bytes(result.stderr)
@@ -87,7 +89,7 @@ def run_installer(installer: Path, installation: Path, folder: Path, label: str)
 
 
 def isolated_environment(root: Path):
-    environment = os.environ.copy()
+    environment = powershell_environment()
     for key in ("PYTHONHOME", "PYTHONPATH", "STATE_DIRECTORY"):
         environment.pop(key, None)
     for key in ("APPDATA", "HOME", "LOCALAPPDATA", "USERPROFILE", "XDG_CONFIG_HOME"):
@@ -502,6 +504,7 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--case", choices=["old-then-new"])
     parser.add_argument("--actor", type=Path)
+    parser.add_argument("--tool-directory", type=Path)
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This qualification requires native Windows")
@@ -509,15 +512,37 @@ def main():
     if args.case:
         if args.actor is None:
             parser.error("Standard-user child requires the prebuilt frozen actor")
-        result = run_case(
-            args.output.resolve(),
-            args.installer.resolve(),
-            args.engine.resolve(),
-            args.actor.resolve(),
-            args.case,
-        )
-        (args.output / "standard-user-result.json").write_text(json.dumps(result, indent=2))
-        print(json.dumps(result, indent=2))
+        with (
+            (args.output / "standard-user.stdout.log").open("w") as stdout,
+            (args.output / "standard-user.stderr.log").open("w") as stderr,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            try:
+                profile = profile_environment_report()
+                (args.output / "standard-user-profile.json").write_text(
+                    json.dumps(profile, indent=2)
+                )
+                if args.tool_directory is None:
+                    parser.error("Standard-user child requires the explicit fixture tool directory")
+                # Add only the measured extraction tool, never the administrator's PATH.
+                os.environ["PATH"] = (
+                    os.environ.get("PATH", "") + os.pathsep + str(args.tool_directory)
+                )
+                result = run_case(
+                    args.output.resolve(),
+                    args.installer.resolve(),
+                    args.engine.resolve(),
+                    args.actor.resolve(),
+                    args.case,
+                )
+                (args.output / "standard-user-result.json").write_text(json.dumps(result, indent=2))
+                print(json.dumps(result, indent=2))
+            except BaseException:
+                import traceback
+
+                traceback.print_exc()
+                raise
         return
     actor = build_old_actor(args.predecessor.resolve(), args.output.resolve())
     results = run_cases(

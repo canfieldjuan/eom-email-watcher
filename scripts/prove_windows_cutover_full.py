@@ -25,6 +25,7 @@ from windows_cutover_fixture import (
     reference_provider,
     write_private,
 )
+from windows_qualification_environment import powershell_environment
 
 from eom_email_watcher.engine_api import ADMISSION_REQUIRED_OPERATIONS
 
@@ -189,7 +190,7 @@ def run(args):
                 [str(args.installer.resolve()), "/S", "/UPDATE", "/D=" + str(installation)],
                 timeout=240,
                 capture_output=True,
-                env=dict(os.environ, TEMP=str(folder), TMP=str(folder)),
+                env=powershell_environment(TEMP=str(folder), TMP=str(folder)),
             )
             write_private(folder / "installer.stdout", result.stdout)
             write_private(folder / "installer.stderr", result.stderr)
