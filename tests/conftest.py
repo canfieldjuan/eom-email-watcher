@@ -67,11 +67,8 @@ def paired_deployment(tmp_path, monkeypatch):
         records = unit_records(directory, loaded=loaded, home=home)
         for name, values in (changes or {}).items():
             records[name].update(values)
-        monkeypatch.setattr(
-            deployment,
-            "_manager_environment",
-            lambda: {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")},
-        )
+        monkeypatch.setattr(deployment, "_manager_environment",
+                            lambda: {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")})
         monkeypatch.setattr(deployment, "_account_home", lambda: home)
         monkeypatch.setattr(deployment, "_manager_unit_paths", lambda: (directory,))
         monkeypatch.setenv("HOME", str(home))
@@ -93,17 +90,12 @@ def paired_deployment(tmp_path, monkeypatch):
         def output(names):
             assert names == deployment.UNIT_NAMES
             calls.append("snapshot")
-            return render_unit_records(
-                {
-                    name: {
-                        key: value
-                        for key, value in record.items()
-                        if key in deployment._MANAGER_FIELDS
-                    }
-                    for name, record in records.items()
-                    if name in deployment.UNIT_NAMES or hasattr(deployment, "_PLATFORM_SELECTORS")
-                }
-            )
+            return render_unit_records({
+                name: {key: value for key, value in record.items()
+                       if key in deployment._MANAGER_FIELDS}
+                for name, record in records.items()
+                if name in deployment.UNIT_NAMES or hasattr(deployment, "_PLATFORM_SELECTORS")
+            })
 
         monkeypatch.setattr(deployment, "_manager_output", output)
         return binary, records, calls, directory
