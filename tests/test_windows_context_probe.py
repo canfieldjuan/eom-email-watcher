@@ -694,6 +694,54 @@ def test_unproven_live_case_keeps_its_identity_acls_and_batch_right(monkeypatch,
     assert report["primary_error"] == "public case still live"
 
 
+def test_live_registration_retains_resources_despite_signaled_case(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import windows_cutover_process_fixture as fixture
+
+    class Registration:
+        settled = False
+        outcome = {"status": "in-flight"}
+
+        def __init__(self, *args):
+            pass
+
+        def start(self):
+            pass
+
+        def close(self):
+            raise RuntimeError("public registration still live")
+
+    monkeypatch.setattr(fixture, "S4URegistration", Registration)
+    monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
+    monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public/bin/7z")
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    leases, calls = [], []
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: leases.append(grant))
+
+    def shell(script, **values):
+        calls.append(script)
+        if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(json.dumps({
+                "account": values["EW_PROBE_USER"], "phase": "exited", "quiesced": True,
+            }))
+            (tmp_path / "standard-user-result.json").write_text(json.dumps({
+                "case": "old-then-new", "result": "PASS",
+            }))
+        return ""
+
+    with pytest.raises(ExceptionGroup, match="fixture and cleanup failed"):
+        fixture.run_standard_user_case(
+            tmp_path, Path("installer"), Path("engine"), Path("actor"), shell,
+        )
+    assert leases == [True]
+    assert not any(" /remove:g " in script or "Remove-LocalUser" in script for script in calls)
+    report = json.loads((tmp_path / "standard-user-cleanup.json").read_text())
+    assert report["resources_retained"] is True
+    assert "public registration still live" in report["cleanup_errors"]
+
+
 def test_batch_right_revoke_is_attempted_after_other_cleanup_errors(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
