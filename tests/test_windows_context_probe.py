@@ -398,3 +398,100 @@ def test_every_windows_host_producer_uses_the_environment_owner():
                     and isinstance(env.func, ast.Name)
                     and env.func.id == "powershell_environment"
                 ), (filename, function.name, call.lineno)
+
+
+def test_task_observer_keeps_principal_and_zero_result_and_read_errors(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import prove_windows_cutover as proof
+
+    clock = [0.0]
+    monkeypatch.setattr(proof, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    seen = []
+    task = {
+        "State": "Ready",
+        "Principal": {"UserId": "public-user", "LogonType": "Interactive", "RunLevel": "Limited"},
+        "LastTaskResult": 0,
+        "NumberOfMissedRuns": 0,
+        "LastRunTime": "public timestamp",
+    }
+
+    def shell(code, **values):
+        seen.append(values)
+        if len(seen) == 2:
+            raise RuntimeError("public task read failure")
+        return json.dumps(task)
+
+    monkeypatch.setattr(proof, "powershell", shell)
+    path = tmp_path / "scheduled-task-state.json"
+    observer = proof.task_startup_observer("public-task", path)
+    observer(40.0)
+    clock[0] = 2.0
+    observer(40.0)
+    rows = json.loads(path.read_text())
+    assert rows[0]["snapshot"] == task
+    assert rows[1]["read_error"] == "public task read failure"
+    assert seen[0]["EW_TASK"] == "public-task"
+    assert seen[0]["timeout"] <= 40.0
+
+
+def test_task_observer_runs_within_the_existing_startup_deadline(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import prove_windows_cutover as proof
+
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(proof, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    seen = []
+
+    def observe(deadline):
+        seen.append(deadline)
+
+    with pytest.raises(TimeoutError, match="Missing fixture receipt"):
+        proof.wait_file(tmp_path / "scheduled.ready", observe=observe)
+    assert seen and set(seen) == {40.0}
+    assert 40.0 <= clock[0] < 40.1
+
+
+def test_task_observer_samples_even_when_actor_is_already_ready(monkeypatch, tmp_path):
+    import prove_windows_cutover as proof
+
+    ready = tmp_path / "scheduled.ready"
+    ready.write_text("public ready")
+    observed = []
+    proof.wait_file(ready, observe=lambda deadline: observed.append(deadline))
+    assert len(observed) == 1
+
+
+def test_task_observer_does_not_add_budget_after_read_timeout(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import prove_windows_cutover as proof
+
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(proof, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    budgets = []
+
+    def shell(code, **values):
+        budget = values["timeout"]
+        budgets.append(budget)
+        clock[0] += budget
+        raise proof.subprocess.TimeoutExpired("public task-state query", budget)
+
+    monkeypatch.setattr(proof, "powershell", shell)
+    report = tmp_path / "scheduled-task-state.json"
+    with pytest.raises(TimeoutError, match="Missing fixture receipt"):
+        proof.wait_file(
+            tmp_path / "scheduled.ready", observe=proof.task_startup_observer("public-task", report)
+        )
+    assert budgets and max(budgets) <= 5
+    assert 40 <= clock[0] < 40.1
+    assert all(row["error_type"] == "TimeoutExpired" for row in json.loads(report.read_text()))

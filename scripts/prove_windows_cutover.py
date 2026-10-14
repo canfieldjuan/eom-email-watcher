@@ -50,14 +50,62 @@ def powershell(script: str, *, timeout: int = 40, **values: str) -> str:
     return result.stdout.strip()
 
 
-def wait_file(path: Path, process=None):
+def wait_file(path: Path, process=None, *, observe=None):
     deadline = time.monotonic() + 40
+    if observe is not None:
+        observe(deadline)
     while not path.exists():
         if process is not None and process.poll() is not None:
             raise RuntimeError(f"Old actor exited before {path.name}: {process.returncode}")
         if time.monotonic() > deadline:
             raise TimeoutError(f"Missing fixture receipt: {path.name}")
+        if observe is not None:
+            observe(deadline)
         time.sleep(0.02)
+
+
+def task_startup_observer(task, path):
+    """Read the existing task inside the startup wait; never change its principal."""
+    started, next_sample = time.monotonic(), float("-inf")
+    rows = []
+    code = r"""
+$ErrorActionPreference='Stop'
+$task=Get-ScheduledTask -TaskName $env:EW_TASK
+$info=Get-ScheduledTaskInfo -TaskName $env:EW_TASK
+@{
+    State=[string]$task.State
+    Principal=@{
+        UserId=$task.Principal.UserId
+        LogonType=[string]$task.Principal.LogonType
+        RunLevel=[string]$task.Principal.RunLevel
+    }
+    LastTaskResult=$info.LastTaskResult
+    NumberOfMissedRuns=$info.NumberOfMissedRuns
+    LastRunTime=$info.LastRunTime.ToString('o')
+    SessionId=[Diagnostics.Process]::GetCurrentProcess().SessionId
+    CurrentUser=[Security.Principal.WindowsIdentity]::GetCurrent().Name
+    Actions=@($task.Actions | ForEach-Object { @{ Execute=$_.Execute; Arguments=$_.Arguments } })
+} | ConvertTo-Json -Depth 5 -Compress
+"""
+
+    def observe(deadline):
+        nonlocal next_sample
+        now = time.monotonic()
+        if now < next_sample or now >= deadline:
+            return
+        row = {"elapsed_seconds": now - started}
+        try:
+            row["snapshot"] = json.loads(
+                powershell(code, timeout=min(5, deadline - now), EW_TASK=task)
+            )
+        except (RuntimeError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            row["read_error"] = str(error)
+            row["error_type"] = type(error).__name__
+        rows.append(row)
+        path.write_text(json.dumps(rows, indent=2))
+        next_sample = time.monotonic() + 1
+
+    return observe
 
 
 def phase_outcomes(attempt: Path) -> dict:
@@ -242,7 +290,9 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             EW_TASK=task,
         )
         registered = True
-        wait_file(task_ready)
+        wait_file(
+            task_ready, observe=task_startup_observer(task, folder / "scheduled-task-state.json")
+        )
         if case == "new-then-old":
             # The new image opens first without a lifecycle receipt. It must
             # keep the legacy protocol and allow ordinary reads, not qualify.

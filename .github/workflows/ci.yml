@@ -161,6 +161,7 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/**/tokens.json
             ${{ runner.temp }}/ew-source-cutover/standard-user-*.json
             ${{ runner.temp }}/ew-source-cutover/standard-inputs.json
+            ${{ runner.temp }}/ew-source-cutover/*/scheduled-task-state.json
             ${{ runner.temp }}/ew-source-cutover/**/*.log
             ${{ runner.temp }}/ew-source-cutover/**/installer.*
             ${{ runner.temp }}/ew-source-cutover/**/cutover-*.txt
