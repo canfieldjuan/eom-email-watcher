@@ -1,6 +1,7 @@
 """Frozen schema-34 actor. Built against the pinned predecessor, never shipped."""
 
 import argparse
+import os
 import sys
 import time
 import urllib.request
@@ -36,6 +37,7 @@ def main():
     # Both modes open the old database first. Idle creates its legacy lock only
     # after the trigger, covering an owner absent from the initial drain list.
     if args.mode == "idle":
+        args.ready.with_suffix(".pid").write_text(str(os.getpid()), encoding="ascii")
         args.ready.write_text("OLD_DATABASE_OPEN", encoding="ascii")
         deadline = time.monotonic() + 180
         while not args.trigger.exists():

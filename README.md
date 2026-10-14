@@ -8,8 +8,9 @@ push via [ntfy](https://ntfy.sh)).
 Email content is never sent to a cloud model. Optional ntfy phone notifications are a separate,
 explicitly acknowledged disclosure to the configured ntfy service, described below. Mailbox grants
 are read-only, attachment content is downloaded only when the user explicitly opens it or requests
-an available local capability, non-matching message metadata is not stored, and message bodies are
-discarded after each local inference request.
+an available local capability, and non-matching message metadata is not stored. Temporary inference
+buffers are discarded after each request. With paid Connect, followed vendor threads retain
+normalized bodies locally under the retention behavior described below.
 
 ## Behavior
 

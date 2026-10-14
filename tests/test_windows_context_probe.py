@@ -111,6 +111,8 @@ def test_standard_launcher_scopes_permissions_and_cleans_up(monkeypatch, tmp_pat
     import windows_cutover_process_fixture as fixture
 
     monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: None)
     monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
     monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public tool/bin/7z")
     calls = []
@@ -120,6 +122,11 @@ def test_standard_launcher_scopes_permissions_and_cleans_up(monkeypatch, tmp_pat
     def shell(script, **values):
         calls.append((script, values))
         if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(
+                json.dumps(
+                    {"account": values["EW_PROBE_USER"], "phase": "exited", "quiesced": True}
+                )
+            )
             assert "--tool-directory" in values["EW_PROBE_ARGS"]
             assert values["timeout"] == 700
             assert '"--case"' not in values["EW_PROBE_ARGS"]  # normal argv quoting
@@ -152,6 +159,8 @@ def test_standard_launcher_does_not_report_pass_after_child_failure(monkeypatch,
     import windows_cutover_process_fixture as fixture
 
     monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: None)
     monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
     monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public tool/bin/7z")
     scripts = []
@@ -159,6 +168,11 @@ def test_standard_launcher_does_not_report_pass_after_child_failure(monkeypatch,
     def shell(script, **values):
         scripts.append(script)
         if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(
+                json.dumps(
+                    {"account": values["EW_PROBE_USER"], "phase": "exited", "quiesced": True}
+                )
+            )
             raise RuntimeError("public child failure")
         return ""
 
@@ -202,6 +216,8 @@ def test_launcher_cleanup_attempts_all_removals_after_mixed_failure(monkeypatch,
     import windows_cutover_process_fixture as fixture
 
     monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: None)
     monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
     monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public tool/bin/7z")
     calls = []
@@ -209,6 +225,11 @@ def test_launcher_cleanup_attempts_all_removals_after_mixed_failure(monkeypatch,
     def shell(script, **values):
         calls.append((script, values))
         if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(
+                json.dumps(
+                    {"account": values["EW_PROBE_USER"], "phase": "exited", "quiesced": True}
+                )
+            )
             raise RuntimeError("public launch failure")
         if " /remove:g " in script:
             raise RuntimeError("public cleanup failure")
@@ -230,6 +251,8 @@ def test_launcher_never_grants_the_built_checkout_root(monkeypatch, tmp_path):
     import windows_cutover_process_fixture as fixture
 
     monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: None)
     monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
     monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public tool/bin/7z")
     calls = []
@@ -239,6 +262,12 @@ def test_launcher_never_grants_the_built_checkout_root(monkeypatch, tmp_path):
 
     def shell(script, **values):
         calls.append((script, values))
+        if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(
+                json.dumps(
+                    {"account": values["EW_PROBE_USER"], "phase": "exited", "quiesced": True}
+                )
+            )
         return ""
 
     fixture.run_standard_user_case(
@@ -302,6 +331,8 @@ def test_partial_acl_acquisition_is_also_cleaned_up(monkeypatch, tmp_path):
     import windows_cutover_process_fixture as fixture
 
     monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: None)
     monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
     monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public/bin/7z")
     calls = []
@@ -328,11 +359,18 @@ def test_cleanup_failures_preserve_primary_and_attempt_account_delete(monkeypatc
     import windows_cutover_process_fixture as fixture
 
     monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: None)
     monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
     monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public/bin/7z")
 
     def shell(script, **values):
         if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(
+                json.dumps(
+                    {"account": values["EW_PROBE_USER"], "phase": "exited", "quiesced": True}
+                )
+            )
             raise RuntimeError("public primary failure")
         if " /remove:g " in script or "Remove-LocalUser" in script:
             raise RuntimeError("public cleanup failure")
@@ -495,3 +533,150 @@ def test_task_observer_does_not_add_budget_after_read_timeout(monkeypatch, tmp_p
     assert budgets and max(budgets) <= 5
     assert 40 <= clock[0] < 40.1
     assert all(row["error_type"] == "TimeoutExpired" for row in json.loads(report.read_text()))
+
+
+def test_cleanup_admission_requires_account_bound_authoritative_quiescence():
+    import windows_cutover_process_fixture as fixture
+
+    user = "EWProbe-01234567"
+    assert fixture.cleanup_admitted({"account": user, "phase": "exited", "quiesced": True}, user)
+    for record in (
+        None,
+        {},
+        {"account": user, "quiesced": False},
+        {"account": "other-user", "phase": "exited", "quiesced": True},
+        {"account": user, "phase": "active", "quiesced": True},
+    ):
+        assert not fixture.cleanup_admitted(record, user)
+
+
+def test_only_standard_case_uses_an_explicit_noninteractive_principal():
+    import prove_windows_cutover as proof
+
+    standard = proof.task_principal_parameters("old-then-new")
+    assert "S4U" in standard and "Limited" in standard
+    assert "GetCurrent().User.Value" in standard
+    assert proof.task_principal_parameters("unknown-image") == ""
+    assert proof.task_principal_parameters("new-then-old") == ""
+
+
+def test_unproven_live_case_keeps_its_identity_acls_and_batch_right(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import windows_cutover_process_fixture as fixture
+
+    monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
+    monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public/bin/7z")
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: "S-1-5-21-1-2-3-1001")
+    leases, calls = [], []
+    monkeypatch.setattr(fixture, "set_batch_logon_right", lambda sid, grant: leases.append(grant))
+
+    def shell(script, **values):
+        calls.append(script)
+        if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(
+                json.dumps(
+                    {"account": values["EW_PROBE_USER"], "phase": "timeout-live", "quiesced": False}
+                )
+            )
+            raise RuntimeError("public case still live")
+        return ""
+
+    with pytest.raises(ExceptionGroup, match="fixture and cleanup failed"):
+        fixture.run_standard_user_case(
+            tmp_path, Path("installer"), Path("engine"), Path("actor"), shell
+        )
+    assert leases == [True]
+    assert not any(" /remove:g " in script or "Remove-LocalUser" in script for script in calls)
+    report = json.loads((tmp_path / "standard-user-cleanup.json").read_text())
+    assert report["resources_retained"] is True
+    assert report["primary_error"] == "public case still live"
+
+
+def test_batch_right_revoke_is_attempted_after_other_cleanup_errors(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import windows_cutover_process_fixture as fixture
+
+    monkeypatch.setattr(fixture, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(fixture, "fixture_payloads", lambda output, *paths: paths)
+    monkeypatch.setattr(fixture.shutil, "which", lambda name: "/public/bin/7z")
+    sid = "S-1-5-21-1-2-3-1001"
+    monkeypatch.setattr(fixture, "disposable_user_sid", lambda name, shell: sid)
+    leases, calls = [], []
+    monkeypatch.setattr(
+        fixture, "set_batch_logon_right", lambda account, grant: leases.append((account, grant))
+    )
+
+    def shell(script, **values):
+        calls.append(script)
+        if "EW_PROBE_LAUNCHER" in values:
+            (tmp_path / "native-process-state.json").write_text(
+                json.dumps(
+                    {"account": values["EW_PROBE_USER"], "phase": "exited", "quiesced": True}
+                )
+            )
+            raise RuntimeError("public child failure")
+        if " /remove:g " in script:
+            raise RuntimeError("public ACL failure")
+        return ""
+
+    with pytest.raises(ExceptionGroup):
+        fixture.run_standard_user_case(
+            tmp_path, Path("installer"), Path("engine"), Path("actor"), shell
+        )
+    assert leases == [(sid, True), (sid, False)]
+    assert "Remove-LocalUser" in calls[-1]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual standard-user protected-tree timeout")
+def test_native_protected_tree_timeout_is_quiescent_before_cleanup(tmp_path):
+    import sys
+
+    import prove_windows_cutover as proof
+    from windows_cutover_process_fixture import run_standard_user_case
+
+    # Payloads only satisfy immutable input staging; timeout mode never executes them.
+    with pytest.raises(RuntimeError, match="fixture timeout"):
+        run_standard_user_case(
+            tmp_path,
+            Path(sys.executable),
+            Path(sys.executable),
+            Path(sys.executable),
+            proof.powershell,
+            timeout_probe=True,
+        )
+    protected = json.loads((tmp_path / "timeout-protected-actor.json").read_text())
+    assert protected["pid"] > 0, "Probe never reached its real PROCESS_TERMINATE deny"
+    state = json.loads((tmp_path / "native-process-state.json").read_text())
+    assert state["phase"] == "timeout-quiesced" and state["quiesced"] is True
+    assert state["kill_exit"] == 0 and state["process_signalled"] is True
+    cleanup = json.loads((tmp_path / "standard-user-cleanup.json").read_text())
+    assert cleanup["resources_retained"] is False and cleanup["cleanup_errors"] == []
+    assert [r["operation"] for r in cleanup["batch_logon_lease"]] == ["grant", "revoke"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native timeout outcome owner")
+def test_native_timeout_outcome_requires_successful_kill_and_signal(tmp_path):
+    import prove_windows_cutover as proof
+
+    source = Path(__file__).resolve().parents[1] / "scripts/windows_standard_user.ps1"
+    output = proof.powershell(
+        r"""
+$source=Get-Content -LiteralPath $env:EW_NATIVE_SOURCE -Raw
+$prefix=$source.Substring(0,$source.IndexOf('$code=[QualificationUser]'))
+. ([scriptblock]::Create($prefix))
+foreach ($code in @(-1,0,5)) {
+    foreach ($signal in @($false,$true)) {
+        $actual=[QualificationUser]::TimeoutQuiesced($code,$signal)
+        if ($actual -ne ($code -eq 0 -and $signal)) { throw 'Unsafe timeout outcome' }
+    }
+}
+'TIMEOUT_OUTCOME_BOUNDARIES_PASS'
+""",
+        EW_NATIVE_SOURCE=str(source),
+        EW_PROBE_OUTPUT=str(tmp_path),
+        EW_PROBE_USER="EWProbe-public",
+    )
+    assert "TIMEOUT_OUTCOME_BOUNDARIES_PASS" in output.splitlines()

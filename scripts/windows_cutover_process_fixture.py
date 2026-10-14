@@ -12,6 +12,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from windows_batch_logon import set_batch_logon_right
+
 
 @contextmanager
 def deny_termination(process):
@@ -107,7 +109,24 @@ def fixture_access_paths(root, output):
     )
 
 
-def run_standard_user_case(output, installer, engine, actor, run_powershell):
+def cleanup_admitted(receipt, account):
+    return (
+        isinstance(receipt, dict)
+        and receipt.get("account") == account
+        and receipt.get("quiesced") is True
+        and receipt.get("phase") in ("not-started", "exited", "timeout-quiesced")
+    )
+
+
+def disposable_user_sid(name, run_powershell):
+    return run_powershell(
+        "(Get-LocalUser -Name $env:EW_PROBE_USER -ErrorAction Stop).SID.Value", EW_PROBE_USER=name
+    )
+
+
+def run_standard_user_case(
+    output, installer, engine, actor, run_powershell, *, timeout_probe=False
+):
     """Own identity, bounded input permissions, native user environment and cleanup."""
     assert os.name == "nt", "standard-user qualification requires native Windows"
     root = Path(__file__).resolve().parents[1]
@@ -119,6 +138,8 @@ def run_standard_user_case(output, installer, engine, actor, run_powershell):
     values = dict(EW_PROBE_USER=name, EW_PROBE_PASSWORD=password)
     grants, cleanup_errors, timings = [], [], []
     created = False
+    sid, batch_leased, launch_attempted, process_state = None, False, False, None
+    lease_timings = []
     primary = None
     result = None
 
@@ -158,6 +179,15 @@ def run_standard_user_case(output, installer, engine, actor, run_powershell):
             **values,
         )
         created = True
+        sid = disposable_user_sid(name, run_powershell)
+        batch_leased = True  # Include a partially completed LSA grant in cleanup.
+        started = time.monotonic()
+        try:
+            set_batch_logon_right(sid, True)
+        finally:
+            lease_timings.append(
+                {"operation": "grant", "sid": sid, "seconds": time.monotonic() - started}
+            )
         run_powershell(
             "$ErrorActionPreference='Stop'; "
             "$group=Get-LocalGroup -SID 'S-1-5-32-545'; "
@@ -183,6 +213,9 @@ def run_standard_user_case(output, installer, engine, actor, run_powershell):
             "--tool-directory",
             str(Path(tool).parent),
         ]
+        if timeout_probe:
+            command.append("--timeout-probe")
+        launch_attempted = True
         run_powershell(
             "& $env:EW_PROBE_LAUNCHER",
             **values,
@@ -191,31 +224,57 @@ def run_standard_user_case(output, installer, engine, actor, run_powershell):
             EW_PROBE_ARGS=subprocess.list2cmdline(command),
             EW_PROBE_OUTPUT=str(output),
             EW_PROBE_LAUNCHER=str(root / "scripts/windows_standard_user.ps1"),
+            EW_PROBE_WAIT_MS="10000" if timeout_probe else "600000",
         )
         result = json.loads((output / "standard-user-result.json").read_text())
         assert result["case"] == "old-then-new" and result["result"] == "PASS", result
     except Exception as error:
         primary = error
     finally:
-        for path in reversed(grants):
+        admitted = not launch_attempted
+        if launch_attempted:
             try:
-                acl(path)
-            except Exception as error:
+                process_state = json.loads((output / "native-process-state.json").read_text())
+                admitted = cleanup_admitted(process_state, name)
+            except (OSError, ValueError) as error:
                 cleanup_errors.append(error)
-        if created:
-            try:
-                run_powershell(
-                    "Remove-LocalUser -Name $env:EW_PROBE_USER -ErrorAction Stop",
-                    EW_PROBE_USER=name,
-                )
-            except Exception as error:
-                cleanup_errors.append(error)
+        if not admitted:
+            cleanup_errors.append(
+                RuntimeError("Case quiescence unproven; identity, right and ACLs retained")
+            )
+        else:
+            for path in reversed(grants):
+                try:
+                    acl(path)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            if batch_leased:
+                started = time.monotonic()
+                try:
+                    set_batch_logon_right(sid, False)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                finally:
+                    lease_timings.append(
+                        {"operation": "revoke", "sid": sid, "seconds": time.monotonic() - started}
+                    )
+            if created:
+                try:
+                    run_powershell(
+                        "Remove-LocalUser -Name $env:EW_PROBE_USER -ErrorAction Stop",
+                        EW_PROBE_USER=name,
+                    )
+                except Exception as error:
+                    cleanup_errors.append(error)
         (output / "standard-user-cleanup.json").write_text(
             json.dumps(
                 {
                     "primary_error": str(primary) if primary else None,
                     "cleanup_errors": [str(error) for error in cleanup_errors],
                     "acl_timings": timings,
+                    "batch_logon_lease": lease_timings,
+                    "process_state": process_state,
+                    "resources_retained": not admitted,
                 },
                 indent=2,
             )

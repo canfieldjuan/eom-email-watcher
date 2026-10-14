@@ -99,7 +99,12 @@ $info=Get-ScheduledTaskInfo -TaskName $env:EW_TASK
                 powershell(code, timeout=min(5, deadline - now), EW_TASK=task)
             )
         except (RuntimeError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
-            row["read_error"] = str(error)
+            key = (
+                "deadline_truncation"
+                if isinstance(error, subprocess.TimeoutExpired) and deadline - now < 5
+                else "read_error"
+            )
+            row[key] = str(error)
             row["error_type"] = type(error).__name__
         rows.append(row)
         path.write_text(json.dumps(rows, indent=2))
@@ -195,6 +200,16 @@ def build_old_actor(predecessor: Path, output: Path, keyring: Path | None = None
     return binary
 
 
+def task_principal_parameters(case):
+    if case != "old-then-new":
+        return ""
+    return (
+        "$principal=New-ScheduledTaskPrincipal "
+        "-UserId ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) "
+        "-LogonType S4U -RunLevel Limited; "
+    )
+
+
 def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, case: str):
     if case == "old-then-new":
         assert_standard_context(
@@ -283,8 +298,11 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             "$ErrorActionPreference='Stop'; "
             "$a=New-ScheduledTaskAction -Execute $env:EW_ENGINE -Argument $env:EW_ARGS; "
             "$t=New-ScheduledTaskTrigger -Once -At (Get-Date).AddDays(1); "
-            "Register-ScheduledTask -TaskName $env:EW_TASK -Action $a -Trigger $t | Out-Null; "
-            "Start-ScheduledTask -TaskName $env:EW_TASK",
+            + task_principal_parameters(case)
+            + "Register-ScheduledTask -TaskName $env:EW_TASK -Action $a -Trigger $t "
+            + ("-Principal $principal " if case == "old-then-new" else "")
+            + "| Out-Null; "
+            + "Start-ScheduledTask -TaskName $env:EW_TASK",
             EW_ENGINE=str(engine),
             EW_ARGS=task_args,
             EW_TASK=task,
@@ -293,6 +311,14 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
         wait_file(
             task_ready, observe=task_startup_observer(task, folder / "scheduled-task-state.json")
         )
+        if case == "old-then-new":
+            scheduled_pid = int(task_ready.with_suffix(".pid").read_text())
+            scheduled_profile = token_profile([scheduled_pid], folder / "scheduled-actor-profile")
+            assert_standard_context(
+                scheduled_profile,
+                required_roles={"diagnostic-probe"},
+                required_pids={scheduled_pid},
+            )
         if case == "new-then-old":
             # The new image opens first without a lifecycle receipt. It must
             # keep the legacy protocol and allow ordinary reads, not qualify.
@@ -555,6 +581,7 @@ def main():
     parser.add_argument("--case", choices=["old-then-new"])
     parser.add_argument("--actor", type=Path)
     parser.add_argument("--tool-directory", type=Path)
+    parser.add_argument("--timeout-probe", action="store_true")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This qualification requires native Windows")
@@ -579,6 +606,14 @@ def main():
                 os.environ["PATH"] = (
                     os.environ.get("PATH", "") + os.pathsep + str(args.tool_directory)
                 )
+                if args.timeout_probe:
+                    probe = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+                    with deny_termination(probe):
+                        (args.output / "timeout-protected-actor.json").write_text(
+                            json.dumps({"pid": probe.pid})
+                        )
+                        time.sleep(120)  # Native launcher times out and kills this protected tree.
+                    raise RuntimeError("Timeout probe was not interrupted")
                 result = run_case(
                     args.output.resolve(),
                     args.installer.resolve(),
