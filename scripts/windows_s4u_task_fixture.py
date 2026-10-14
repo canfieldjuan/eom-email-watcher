@@ -70,6 +70,40 @@ function S4U-Json($value) {
 function Write-S4UEvidence {
     S4U-Json $evidence | Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
 }
+function Settle-S4UTask($folder,[string]$name,$cleanup) {
+    $owned=$null;$absent=$false;$idle=$false
+    try {
+        $owned=$folder.GetTask($name)
+        $cleanup.operations+=@('get')
+    } catch {
+        if ($_.Exception.GetBaseException().HResult -eq -2147024894) {
+            $absent=$true;$cleanup.operations+=@('already-absent')
+        } else { $cleanup.errors+=@($_.Exception.ToString()) }
+    }
+    if ($null -ne $owned) {
+        try { $owned.Stop(0);$cleanup.operations+=@('stop') }
+        catch { $cleanup.errors+=@($_.Exception.ToString()) }
+        try {
+            $idle=($owned.GetInstances(0).Count -eq 0)
+            if (!$idle) { throw 'Owned diagnostic task has running instances' }
+            $cleanup.operations+=@('idle')
+        } catch { $cleanup.errors+=@($_.Exception.ToString()) }
+        if ($idle) {
+            try { $folder.DeleteTask($name,0);$cleanup.operations+=@('delete') }
+            catch { $cleanup.errors+=@($_.Exception.ToString()) }
+        }
+        try {
+            $folder.GetTask($name) | Out-Null
+            throw 'Owned diagnostic task remains registered'
+        } catch {
+            if ($_.Exception.GetBaseException().HResult -eq -2147024894) {
+                $absent=$true;$cleanup.operations+=@('absent')
+            } else { $cleanup.errors+=@($_.Exception.ToString()) }
+        }
+    }
+    $cleanup.settled=($absent -and !$cleanup.errors.Count)
+    Write-S4UEvidence
+}
 """
 
 
@@ -77,10 +111,8 @@ REGISTER_ATTEMPTS = r"""
 function Task-DaclKey([string]$sddl) {
     $sd=[Security.AccessControl.RawSecurityDescriptor]::new($sddl)
     $flags=[Security.AccessControl.ControlFlags]
-    if (!$sd.DiscretionaryAcl -or
-        !($sd.ControlFlags -band $flags::DiscretionaryAclPresent) -or
-        !($sd.ControlFlags -band $flags::DiscretionaryAclProtected)) {
-        throw 'Task DACL must be present and protected'
+    if (!$sd.DiscretionaryAcl -or !($sd.ControlFlags -band $flags::DiscretionaryAclPresent)) {
+        throw 'Task DACL must be present'
     }
     # Task permissions are file permissions. Normalize generic rights to their
     # file mapping so equivalent GA/FA or reordered SID aliases compare equally.
@@ -104,9 +136,11 @@ function Task-DaclKey([string]$sddl) {
         foreach ($generic in $mapping.Keys) {
             if ($mask -band $generic) { $normalized=$normalized -bor $mapping[$generic] }
         }
-        $entries[$ace.SecurityIdentifier.Value+':'+$normalized]=$true
+        $sid=$ace.SecurityIdentifier.Value
+        if (!$entries.ContainsKey($sid)) { $entries[$sid]=0 }
+        $entries[$sid]=$entries[$sid] -bor $normalized
     }
-    return (@($entries.Keys | Sort-Object) -join '|')
+    return (@($entries.Keys | Sort-Object | ForEach-Object {$_+':'+$entries[$_]}) -join '|')
 }
 function Assert-TaskDacl([string]$requested,[string]$readBack) {
     if ((Task-DaclKey $requested) -cne (Task-DaclKey $readBack)) {
@@ -123,7 +157,7 @@ foreach ($variant in @('explicit-owner','dacl-only','default-security')) {
         'default-security' {$null}
     }
     $attempt=[ordered]@{variant=$variant;sddl=$sddl;status='pending';hresult=$null
-        error=$null;security=$null}
+        error=$null;security=$null;cleanup=$null}
     $evidence.attempts+=@($attempt)
     Write-S4UEvidence
     $candidate=$null
@@ -154,6 +188,14 @@ foreach ($variant in @('explicit-owner','dacl-only','default-security')) {
             $attempt.security.status='failed'
             $attempt.security.hresult=$_.Exception.GetBaseException().HResult
             $attempt.security.error=$_.Exception.ToString()
+        }
+        if ($null -eq $task) {
+            $attempt.cleanup=[ordered]@{settled=$false;operations=@();errors=@()}
+            Write-S4UEvidence
+            Settle-S4UTask $folder $env:EW_S4U_TASK $attempt.cleanup
+            if (!$attempt.cleanup.settled) {
+                throw 'Rejected candidate cleanup unproven; retain fixture resources'
+            }
         }
     }
     Write-S4UEvidence
@@ -204,40 +246,8 @@ if ($evidence.attempts.Count -eq 3) {
             }
             Write-S4UEvidence
         }
-        # Observe by name even after a failed POST; a partial registration is owned.
-        $owned=$null;$absent=$false;$idle=$false
-        try {
-            $owned=$folder.GetTask($controlName)
-            $control.cleanup.operations+=@('get')
-        } catch {
-            if ($_.Exception.GetBaseException().HResult -eq -2147024894) {
-                $absent=$true;$control.cleanup.operations+=@('already-absent')
-            } else { $control.cleanup.errors+=@($_.Exception.ToString()) }
-        }
-        if ($null -ne $owned) {
-            try { $owned.Stop(0);$control.cleanup.operations+=@('stop') }
-            catch { $control.cleanup.errors+=@($_.Exception.ToString()) }
-            try {
-                $idle=($owned.GetInstances(0).Count -eq 0)
-                if (!$idle) { throw 'Diagnostic D has running instances' }
-                $control.cleanup.operations+=@('idle')
-            } catch { $control.cleanup.errors+=@($_.Exception.ToString()) }
-            if ($idle) {
-                try { $folder.DeleteTask($controlName,0);$control.cleanup.operations+=@('delete') }
-                catch { $control.cleanup.errors+=@($_.Exception.ToString()) }
-            }
-            try {
-                $folder.GetTask($controlName) | Out-Null
-                throw 'Diagnostic D task remains registered'
-            }
-            catch {
-                if ($_.Exception.GetBaseException().HResult -eq -2147024894) {
-                    $absent=$true;$control.cleanup.operations+=@('absent')
-                } else { $control.cleanup.errors+=@($_.Exception.ToString()) }
-            }
-        }
-        $control.cleanup.settled=($absent -and !$control.cleanup.errors.Count)
-        Write-S4UEvidence
+        # The same owner observes partial control POSTs and rejected candidates.
+        Settle-S4UTask $folder $controlName $control.cleanup
     }
     if (!$control.cleanup.settled) {
         throw 'Diagnostic task cleanup unproven; retain fixture resources'
@@ -252,10 +262,7 @@ if ($null -eq $task) {
 """
 
 
-REGISTER = (
-    PRINCIPAL_ID
-    + REGISTER_EVIDENCE
-    + r"""$ErrorActionPreference='Stop'
+REGISTER_HEADER = r"""$ErrorActionPreference='Stop'
 $scheduler=New-Object -ComObject Schedule.Service
 $scheduler.Connect()
 $definition=$scheduler.NewTask(0)
@@ -274,7 +281,14 @@ $evidence=[ordered]@{principal=$sid;logon_type=[int]$env:EW_S4U_LOGON
     run_level=[int]$env:EW_S4U_LEVEL;flags=2
     target_rights=[string[]](($env:EW_S4U_RIGHTS | ConvertFrom-Json).rights)
     token=$null;registering_sid=$null;attempts=@();selected=$null}
-try {
+"""
+
+
+REGISTER = (
+    PRINCIPAL_ID
+    + REGISTER_EVIDENCE
+    + REGISTER_HEADER
+    + r"""try {
     # Reuse the existing query-only token owner in this exact registration host.
     $source=Get-Content -LiteralPath $env:EW_S4U_SOURCE -Raw
     $prefix=$source.Substring(0,$source.IndexOf('function Installed-Processes'))
@@ -409,6 +423,16 @@ class S4URegistration:
         diagnostics = self.output / "standard-user-task-diagnostics.json"
         if diagnostics.exists():
             evidence = json.loads(diagnostics.read_text(encoding="utf-8-sig"))
+            for attempt in evidence.get("attempts", []):
+                if attempt.get("status") == "pending":
+                    raise RuntimeError("Registration outcome unproven; retain fixture resources")
+                if (
+                    attempt.get("status") == "registered"
+                    and attempt.get("variant") != evidence.get("selected")
+                ):
+                    cleanup = attempt.get("cleanup")
+                    if not isinstance(cleanup, dict) or cleanup.get("settled") is not True:
+                        raise RuntimeError("Rejected candidate cleanup unproven; retain resources")
             if "control" in evidence:
                 cleanup = evidence["control"].get("cleanup")
                 if not isinstance(cleanup, dict) or cleanup.get("settled") is not True:

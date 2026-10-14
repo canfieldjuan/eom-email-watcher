@@ -655,11 +655,10 @@ def test_native_s4u_rights_projection_preserves_flat_values_and_membership(tmp_p
     import sys
 
     import prove_windows_cutover as proof
-    from windows_s4u_task_fixture import REGISTER
+    from windows_s4u_task_fixture import PRINCIPAL_ID, REGISTER_HEADER
 
     # Execute the actual producer header, stopping before any registration POST.
-    header = REGISTER.split("try {", 1)[0]
-    code = header + r"""
+    code = PRINCIPAL_ID + REGISTER_HEADER + r"""
 [ordered]@{rights=$evidence.target_rights
     allowed=($evidence.target_rights -contains 'SeBatchLogonRight')} |
     ConvertTo-Json -Depth 4 -Compress
@@ -745,12 +744,43 @@ def test_s4u_diagnostic_cleanup_controls_resource_release(tmp_path, cleanup):
         assert broker.settled is False
 
 
+@pytest.mark.parametrize("cleanup", [None, {"settled": False}, {"settled": True}])
+def test_rejected_s4u_candidate_cleanup_controls_resource_release(tmp_path, cleanup):
+    from windows_s4u_task_fixture import S4URegistration
+
+    evidence = {"selected": None, "attempts": [
+        {"variant": "dacl-only", "status": "registered", "cleanup": cleanup},
+    ]}
+    (tmp_path / "standard-user-task-diagnostics.json").write_text(json.dumps(evidence))
+    broker = S4URegistration(tmp_path, "case-user", "sid", "case-task", None)
+    if cleanup == {"settled": True}:
+        broker.close()
+        assert broker.settled is True
+    else:
+        with pytest.raises(RuntimeError, match="Rejected candidate cleanup unproven"):
+            broker.close()
+        assert broker.settled is False
+
+
+def test_pending_s4u_post_does_not_claim_resource_release(tmp_path):
+    from windows_s4u_task_fixture import S4URegistration
+
+    (tmp_path / "standard-user-task-diagnostics.json").write_text(json.dumps({
+        "attempts": [{"variant": "dacl-only", "status": "pending"}], "selected": None,
+    }))
+    broker = S4URegistration(tmp_path, "case-user", "sid", "case-task", None)
+    with pytest.raises(RuntimeError, match="Registration outcome unproven"):
+        broker.close()
+    assert broker.settled is False
+
+
 @pytest.mark.skipif(os.name != "nt", reason="actual PowerShell S4U registration decision owner")
 @pytest.mark.parametrize("mode", [
     "explicit", "dacl", "default", "d-only", "none", "security-failure", "cleanup-failure",
     "canonical-security", "acl-missing", "acl-broader", "acl-denied", "acl-unprotected",
     "acl-null", "acl-malformed", "metadata-read-failure", "metadata-mismatch",
-    "password-error",
+    "password-error", "observed-security", "redundant-security", "acl-inherited",
+    "acl-broader-mask", "retry-after-rejection", "candidate-cleanup-failure",
 ])
 def test_native_s4u_registration_controls_preserve_denials_and_never_adopt_d(tmp_path, mode):
     import prove_windows_cutover as proof
@@ -789,10 +819,17 @@ public class FakeTask {
         string probe="S-1-5-21-1-2-3-1001";
         if (Mode == "canonical-security")
             Security="D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;"+probe+")";
+        if (Mode == "observed-security" || Mode == "redundant-security")
+            Security=(Mode == "observed-security" ? "D:" : "D:P")+
+                "(A;;FA;;;"+probe+")(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;"+probe+")";
         if (Mode == "acl-missing") Security="D:P(A;;GA;;;SY)(A;;GA;;;BA)";
         if (Mode == "acl-broader") Security=value+"(A;;GA;;;WD)";
         if (Mode == "acl-denied") Security=value.Replace("(A;;GA;;;"+probe,"(D;;GA;;;"+probe);
         if (Mode == "acl-unprotected") Security=value.Replace("D:P", "D:");
+        if (Mode == "acl-inherited")
+            Security=value.Replace("(A;;GA;;;"+probe,"(A;ID;GA;;;"+probe);
+        if (Mode == "acl-broader-mask")
+            Security=value.Replace("(A;;GA;;;"+probe,"(A;;0x011f01ff;;;"+probe);
         if (Mode == "acl-null") Security="D:NO_ACCESS_CONTROL";
         if (Mode == "acl-malformed") Security="not-sddl";
     }
@@ -821,20 +858,29 @@ public class FakeFolder {
             throw new UnauthorizedAccessException(
                 "public denial " + Environment.GetEnvironmentVariable("EW_PROBE_PASSWORD"));
         bool allowed = (variant == "A" && Mode == "explicit") ||
-            (variant == "B" && Mode == "dacl") ||
+            (variant == "B" && (Mode == "dacl" || Mode == "retry-after-rejection" ||
+                Mode == "candidate-cleanup-failure")) ||
             (variant == "C" && (Mode == "default" || Mode == "security-failure" ||
                 Mode == "cleanup-failure" || Mode == "canonical-security" ||
+                Mode == "observed-security" || Mode == "redundant-security" ||
+                Mode == "retry-after-rejection" ||
                 Mode.StartsWith("acl-") || Mode.StartsWith("metadata-"))) ||
             (variant == "D" && Mode != "none");
         if (!allowed)
             throw new UnauthorizedAccessException("public registration denied " + variant);
+        if (Tasks.ContainsKey(name))
+            throw new System.Runtime.InteropServices.COMException(
+                "public duplicate task", unchecked((int)0x800700B7));
         if (variant == "D" && definition.Settings.Enabled)
             throw new Exception("D must stay disabled");
         var task = new FakeTask { Name=name, Definition=definition,
             Enabled=definition.Settings.Enabled, Mode=Mode,
             MetadataReadFault=variant == "D" && Mode == "metadata-read-failure",
             SecurityFault=variant == "C" && Mode == "security-failure",
-            CleanupFault=variant == "D" && Mode == "cleanup-failure", Security=sddl as string };
+            CleanupFault=(variant == "D" && Mode == "cleanup-failure") ||
+                (variant == "B" && Mode == "candidate-cleanup-failure"), Security=sddl as string };
+        if (variant == "B" && (Mode == "retry-after-rejection" ||
+            Mode == "candidate-cleanup-failure")) task.Security="D:(A;;FA;;;SY)(A;;FA;;;BA)";
         if (variant == "D" && Mode == "metadata-mismatch")
             definition.Principal.UserId="S-1-5-21-1-2-3-1002";
         Tasks.Add(name, task); return task;
@@ -903,12 +949,30 @@ S4U-Json ([ordered]@{evidence=$evidence;error=$errorResult;calls=$scheduler.Fold
     ))
     (output / "registration-controls.json").write_text(json.dumps(receipt, indent=2))
     evidence = receipt["evidence"]
+    for value in (json.dumps(receipt), (output / "registration-attempts.json").read_text()):
+        assert private_password not in value
+        assert json.dumps(private_password)[1:-1] not in value
+    if mode == "candidate-cleanup-failure":
+        assert receipt["calls"] == ["A", "B"] and "control" not in evidence
+        rejected = evidence["attempts"][1]
+        assert rejected["status"] == "registered" and rejected["hresult"] == 0
+        assert rejected["cleanup"]["settled"] is False
+        assert rejected["cleanup"]["errors"]
+        assert rejected["cleanup"]["operations"] == ["get", "idle", "delete", "absent"]
+        assert evidence["selected"] is None and receipt["error"] is not None
+        return
     if mode in {"explicit", "dacl"}:
         assert receipt["calls"] == (["A"] if mode == "explicit" else ["A", "B"])
         assert "control" not in evidence and receipt["error"] is None
     else:
         assert receipt["calls"] == ["A", "B", "C", "D"]
-        assert [a["hresult"] for a in evidence["attempts"][:2]] == [-2147024891] * 2
+        if mode == "retry-after-rejection":
+            rejected = evidence["attempts"][1]
+            assert rejected["hresult"] == 0 and rejected["security"]["status"] == "failed"
+            assert rejected["cleanup"]["settled"] is True
+            assert rejected["cleanup"]["operations"] == ["get", "stop", "idle", "delete", "absent"]
+        else:
+            assert [a["hresult"] for a in evidence["attempts"][:2]] == [-2147024891] * 2
         control = evidence["control"]
         assert control["principal"] == "S-1-5-21-1-2-3-500"
         assert "public-case-calling-account-control" not in receipt["remaining_tasks"]
@@ -931,18 +995,22 @@ S4U-Json ([ordered]@{evidence=$evidence;error=$errorResult;calls=$scheduler.Fold
             assert legacy["status"] == "failed" and legacy["hresult"] != 0
         elif mode != "none":
             assert control["metadata"]["status"] == "validated"
-    if mode in {"explicit", "dacl", "default", "canonical-security"}:
+    successful = {
+        "explicit", "dacl", "default", "canonical-security", "acl-unprotected",
+        "observed-security", "redundant-security", "retry-after-rejection",
+    }
+    if mode in successful:
         assert receipt["error"] is None and receipt["case_principal"] == "S-1-5-21-1-2-3-1001"
     else:
         assert receipt["error"] is not None
-    if mode in {"default", "canonical-security"}:
+    if mode in successful - {"explicit", "dacl"}:
         assert evidence["selected"] == "default-security"
         assert evidence["attempts"][2]["security"]["status"] == "applied"
     if mode in {"d-only", "none", "security-failure"}:
         assert evidence["selected"] is None and receipt["case_principal"] is None
     if mode == "security-failure":
         assert evidence["attempts"][2]["security"]["hresult"] == -2147024891
-    if mode == "security-failure" or mode.startswith("acl-"):
+    if mode == "security-failure" or (mode.startswith("acl-") and mode not in successful):
         attempt = evidence["attempts"][2]
         assert attempt["status"] == "registered" and attempt["hresult"] == 0
         assert attempt["security"]["status"] == "failed"
@@ -951,9 +1019,6 @@ S4U-Json ([ordered]@{evidence=$evidence;error=$errorResult;calls=$scheduler.Fold
         assert receipt["legacy_security"]["status"] == "applied"
     if mode == "password-error":
         assert all("[REDACTED]" in a["error"] for a in evidence["attempts"])
-    for value in (json.dumps(receipt), (output / "registration-attempts.json").read_text()):
-        assert private_password not in value
-        assert json.dumps(private_password)[1:-1] not in value
 
 
 def test_unproven_live_case_keeps_its_identity_acls_and_batch_right(monkeypatch, tmp_path):
