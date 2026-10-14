@@ -714,6 +714,151 @@ def test_s4u_registration_in_flight_does_not_claim_settled(tmp_path):
     assert waits == [40] and broker.settled is False
 
 
+@pytest.mark.parametrize("cleanup", [
+    None, {}, {"settled": False}, {"settled": 0}, {"settled": "true"}, {"settled": True},
+])
+def test_s4u_diagnostic_cleanup_controls_resource_release(tmp_path, cleanup):
+    from windows_s4u_task_fixture import S4URegistration
+
+    evidence = {"control": {"task": "case-task-calling-account-control", "cleanup": cleanup}}
+    (tmp_path / "standard-user-task-diagnostics.json").write_text(json.dumps(evidence))
+    broker = S4URegistration(tmp_path, "case-user", "sid", "case-task", None)
+    if cleanup == {"settled": True}:
+        broker.close()
+        assert broker.settled is True
+    else:
+        with pytest.raises(RuntimeError, match="Diagnostic task cleanup unproven"):
+            broker.close()
+        assert broker.settled is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual PowerShell S4U registration decision owner")
+@pytest.mark.parametrize("mode", [
+    "explicit", "dacl", "default", "d-only", "none", "security-failure", "cleanup-failure",
+])
+def test_native_s4u_registration_controls_preserve_denials_and_never_adopt_d(tmp_path, mode):
+    import prove_windows_cutover as proof
+    from windows_s4u_task_fixture import PRINCIPAL_ID, REGISTER_ATTEMPTS
+
+    output = proof.probe_output(f"s4u-registration-{mode}", tmp_path)
+    # Execute the production fixture's PowerShell owner with public COM doubles.
+    # The separate CI qualification still exercises the actual Task Scheduler.
+    code = PRINCIPAL_ID + r'''$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+public class FakePrincipal { public string UserId; public int LogonType; public int RunLevel; }
+public class FakeSettings { public bool Enabled; }
+public class FakeDefinition {
+    public FakePrincipal Principal = new FakePrincipal();
+    public FakeSettings Settings = new FakeSettings(); public string XmlText;
+}
+public class FakeTask {
+    public string Name; public FakeDefinition Definition; public bool Enabled;
+    public bool CleanupFault; public bool SecurityFault; public string Security;
+    public void SetSecurityDescriptor(string value, int flags) {
+        if (SecurityFault) throw new UnauthorizedAccessException("public DACL denied");
+        Security = value;
+    }
+    public string GetSecurityDescriptor(int flags) { return Security; }
+    public void Stop(int flags) {
+        if (CleanupFault) throw new UnauthorizedAccessException("public stop denied");
+    }
+    public object[] GetInstances(int flags) { return new object[0]; }
+}
+public class FakeFolder {
+    public string Mode; public string ProbeSid;
+    public List<string> Calls = new List<string>();
+    public Dictionary<string, FakeTask> Tasks = new Dictionary<string, FakeTask>();
+    public FakeTask RegisterTaskDefinition(string name, FakeDefinition definition, int flags,
+        string sid, object password, int logon, object sddl) {
+        string variant = sid != ProbeSid ? "D" : sddl == null ? "C" :
+            sddl.ToString().StartsWith("O:") ? "A" : "B";
+        Calls.Add(variant);
+        if (flags != 2 || logon != 2 || definition.Principal.RunLevel != 0 ||
+            sid != definition.Principal.UserId || password != null)
+            throw new Exception("fixed metadata changed");
+        bool allowed = (variant == "A" && Mode == "explicit") ||
+            (variant == "B" && Mode == "dacl") ||
+            (variant == "C" && (Mode == "default" || Mode == "security-failure" ||
+                Mode == "cleanup-failure")) ||
+            (variant == "D" && Mode != "none");
+        if (!allowed)
+            throw new UnauthorizedAccessException("public registration denied " + variant);
+        if (variant == "D" && definition.Settings.Enabled)
+            throw new Exception("D must stay disabled");
+        var task = new FakeTask { Name=name, Definition=definition,
+            Enabled=definition.Settings.Enabled,
+            SecurityFault=variant == "C" && Mode == "security-failure",
+            CleanupFault=variant == "D" && Mode == "cleanup-failure", Security=sddl as string };
+        Tasks.Add(name, task); return task;
+    }
+    public FakeTask GetTask(string name) {
+        if (!Tasks.ContainsKey(name)) throw new FileNotFoundException("public task absent");
+        return Tasks[name];
+    }
+    public void DeleteTask(string name, int flags) { Tasks.Remove(name); }
+}
+public class FakeScheduler {
+    public FakeFolder Folder = new FakeFolder();
+    public FakeFolder GetFolder(string path) { return Folder; }
+    public FakeDefinition NewTask(int flags) { return new FakeDefinition(); }
+}
+'@
+$sid='S-1-5-21-1-2-3-1001'
+$scheduler=New-Object FakeScheduler
+$scheduler.Folder.Mode=$env:EW_MODE;$scheduler.Folder.ProbeSid=$sid
+$definition=$scheduler.NewTask(0)
+$definition.Principal.UserId=$sid;$definition.Principal.LogonType=2
+$definition.Principal.RunLevel=0;$definition.Settings.Enabled=$true
+$evidence=[ordered]@{attempts=@();selected=$null;registering_sid='S-1-5-21-1-2-3-500'}
+$errorResult=$null
+try {
+''' + REGISTER_ATTEMPTS + r'''
+} catch { $errorResult=$_.Exception.Message }
+[ordered]@{evidence=$evidence;error=$errorResult;calls=$scheduler.Folder.Calls
+    case_principal=if ($null -ne $task) {$task.Definition.Principal.UserId} else {$null}
+    remaining_tasks=@($scheduler.Folder.Tasks.Keys)} | ConvertTo-Json -Depth 12 -Compress
+'''
+    receipt = json.loads(proof.powershell(
+        code, EW_MODE=mode, EW_S4U_TASK="public-case", EW_S4U_LOGON="2",
+        EW_S4U_DIAGNOSTICS=str(output / "registration-attempts.json"),
+    ))
+    (output / "registration-controls.json").write_text(json.dumps(receipt, indent=2))
+    evidence = receipt["evidence"]
+    if mode in {"explicit", "dacl"}:
+        assert receipt["calls"] == (["A"] if mode == "explicit" else ["A", "B"])
+        assert "control" not in evidence and receipt["error"] is None
+    else:
+        assert receipt["calls"] == ["A", "B", "C", "D"]
+        assert [a["hresult"] for a in evidence["attempts"][:2]] == [-2147024891] * 2
+        control = evidence["control"]
+        assert control["principal"] == "S-1-5-21-1-2-3-500"
+        assert "public-case-calling-account-control" not in receipt["remaining_tasks"]
+        if mode == "none":
+            assert control["status"] == "failed" and control["hresult"] == -2147024891
+            assert control["cleanup"]["operations"] == ["already-absent"]
+        else:
+            assert control["native"]["enabled"] is False
+            expected = ["get", "idle", "delete", "absent"] if mode == "cleanup-failure" else [
+                "get", "stop", "idle", "delete", "absent",
+            ]
+            assert control["cleanup"]["operations"] == expected
+        assert control["cleanup"]["settled"] is (mode != "cleanup-failure")
+    if mode in {"explicit", "dacl", "default"}:
+        assert receipt["error"] is None and receipt["case_principal"] == "S-1-5-21-1-2-3-1001"
+    else:
+        assert receipt["error"] is not None
+    if mode == "default":
+        assert evidence["selected"] == "default-security"
+        assert evidence["attempts"][2]["security"]["status"] == "applied"
+    if mode in {"d-only", "none", "security-failure"}:
+        assert evidence["selected"] is None and receipt["case_principal"] is None
+    if mode == "security-failure":
+        assert evidence["attempts"][2]["security"]["hresult"] == -2147024891
+
+
 def test_unproven_live_case_keeps_its_identity_acls_and_batch_right(monkeypatch, tmp_path):
     from types import SimpleNamespace
 

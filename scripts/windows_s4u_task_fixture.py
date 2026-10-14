@@ -58,6 +58,127 @@ def validate_request(request, output, account, task):
     return engine, argv
 
 
+REGISTER_ATTEMPTS = r"""
+function Write-S4UEvidence {
+    $evidence | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
+}
+$folder=$scheduler.GetFolder('\')
+$dacl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)(A;;GA;;;BA)'
+$task=$null
+foreach ($variant in @('explicit-owner','dacl-only','default-security')) {
+    $sddl=switch ($variant) {
+        'explicit-owner' {'O:'+$sid+$dacl}
+        'dacl-only' {$dacl}
+        'default-security' {$null}
+    }
+    $attempt=[ordered]@{variant=$variant;sddl=$sddl;status='pending';hresult=$null
+        error=$null;security=$null}
+    $evidence.attempts+=@($attempt)
+    Write-S4UEvidence
+    try {
+        $candidate=$folder.RegisterTaskDefinition(
+            $env:EW_S4U_TASK,$definition,2,$sid,$null,[int]$env:EW_S4U_LOGON,$sddl)
+        if ($variant -eq 'default-security') {
+            $attempt.security=[ordered]@{status='pending';hresult=$null;error=$null;sddl=$null}
+            Write-S4UEvidence
+            try {
+                $candidate.SetSecurityDescriptor($dacl,0)
+                $attempt.security.sddl=$candidate.GetSecurityDescriptor(4)
+                $attempt.security.status='applied';$attempt.security.hresult=0
+            } catch {
+                $attempt.security.status='failed'
+                $attempt.security.hresult=$_.Exception.GetBaseException().HResult
+                $attempt.security.error=$_.Exception.ToString()
+                throw
+            }
+        }
+        # Never adopt a candidate whose post-registration DACL failed.
+        $task=$candidate
+        $attempt.status='registered';$attempt.hresult=0
+        $evidence.selected=$variant
+    } catch {
+        $attempt.status='failed';$attempt.hresult=$_.Exception.GetBaseException().HResult
+        $attempt.error=$_.Exception.ToString()
+    }
+    Write-S4UEvidence
+    if ($null -ne $task) { break }
+}
+if ($evidence.attempts.Count -eq 3) {
+    # Diagnostic D is a distinct disabled task. It can never become the case actor.
+    $controlName=$env:EW_S4U_TASK+'-calling-account-control'
+    $control=[ordered]@{task=$controlName;principal=$evidence.registering_sid
+        status='pending';hresult=$null;error=$null;native=$null
+        cleanup=[ordered]@{settled=$false;operations=@();errors=@()}}
+    $evidence.control=$control
+    Write-S4UEvidence
+    try {
+        $controlDefinition=$scheduler.NewTask(0)
+        $controlDefinition.XmlText=$definition.XmlText
+        $controlDefinition.Principal.UserId=$evidence.registering_sid
+        $controlDefinition.Principal.LogonType=2
+        $controlDefinition.Principal.RunLevel=0
+        $controlDefinition.Settings.Enabled=$false
+        $diagnostic=$folder.RegisterTaskDefinition(
+            $controlName,$controlDefinition,2,$evidence.registering_sid,$null,2,$null)
+        $control.native=[ordered]@{principal=(Principal-Sid $diagnostic.Definition.Principal.UserId)
+            logon_type=[int]$diagnostic.Definition.Principal.LogonType
+            run_level=[int]$diagnostic.Definition.Principal.RunLevel;enabled=$diagnostic.Enabled}
+        if ($control.native.principal -ne $evidence.registering_sid -or
+            $control.native.logon_type -ne 2 -or $control.native.run_level -ne 0 -or
+            $control.native.enabled) {
+            throw 'Diagnostic D metadata differs from its fixed definition'
+        }
+        $control.status='registered';$control.hresult=0
+    } catch {
+        $control.status='failed';$control.hresult=$_.Exception.GetBaseException().HResult
+        $control.error=$_.Exception.ToString()
+    } finally {
+        # Observe by name even after a failed POST; a partial registration is owned.
+        $owned=$null;$absent=$false;$idle=$false
+        try {
+            $owned=$folder.GetTask($controlName)
+            $control.cleanup.operations+=@('get')
+        } catch {
+            if ($_.Exception.GetBaseException().HResult -eq -2147024894) {
+                $absent=$true;$control.cleanup.operations+=@('already-absent')
+            } else { $control.cleanup.errors+=@($_.Exception.ToString()) }
+        }
+        if ($null -ne $owned) {
+            try { $owned.Stop(0);$control.cleanup.operations+=@('stop') }
+            catch { $control.cleanup.errors+=@($_.Exception.ToString()) }
+            try {
+                $idle=($owned.GetInstances(0).Count -eq 0)
+                if (!$idle) { throw 'Diagnostic D has running instances' }
+                $control.cleanup.operations+=@('idle')
+            } catch { $control.cleanup.errors+=@($_.Exception.ToString()) }
+            if ($idle) {
+                try { $folder.DeleteTask($controlName,0);$control.cleanup.operations+=@('delete') }
+                catch { $control.cleanup.errors+=@($_.Exception.ToString()) }
+            }
+            try {
+                $folder.GetTask($controlName) | Out-Null
+                throw 'Diagnostic D task remains registered'
+            }
+            catch {
+                if ($_.Exception.GetBaseException().HResult -eq -2147024894) {
+                    $absent=$true;$control.cleanup.operations+=@('absent')
+                } else { $control.cleanup.errors+=@($_.Exception.ToString()) }
+            }
+        }
+        $control.cleanup.settled=($absent -and !$control.cleanup.errors.Count)
+        Write-S4UEvidence
+    }
+    if (!$control.cleanup.settled) {
+        throw 'Diagnostic task cleanup unproven; retain fixture resources'
+    }
+}
+if ($null -eq $task) {
+    throw 'Probe-account S4U registration failed; see original HRESULTs and C/D controls'
+}
+"""
+
+
 REGISTER = (
     PRINCIPAL_ID
     + r"""$ErrorActionPreference='Stop'
@@ -92,28 +213,11 @@ try {
     if ($evidence.target_rights -notcontains 'SeBatchLogonRight') {
         throw 'S4U target batch right is absent at registration'
     }
-    $dacl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)(A;;GA;;;BA)'
-    $task=$null
-    foreach ($variant in @('explicit-owner','dacl-only')) {
-        $sddl=if ($variant -eq 'explicit-owner') {'O:'+$sid+$dacl} else {$dacl}
-        $attempt=[ordered]@{variant=$variant;sddl=$sddl;status='pending';hresult=$null;error=$null}
-        try {
-            $task=$scheduler.GetFolder('\').RegisterTaskDefinition(
-                $env:EW_S4U_TASK,$definition,2,$sid,$null,[int]$env:EW_S4U_LOGON,$sddl)
-            $attempt.status='registered';$attempt.hresult=0
-            $evidence.selected=$variant
-        } catch {
-            $attempt.status='failed';$attempt.hresult=$_.Exception.GetBaseException().HResult
-            $attempt.error=$_.Exception.ToString()
-        }
-        $evidence.attempts+=@($attempt)
-        $evidence | ConvertTo-Json -Depth 8 |
-            Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
-        if ($null -ne $task) { break }
-    }
-    if ($null -eq $task) { throw 'Both S4U registration variants failed; see original HRESULTs' }
+"""
+    + REGISTER_ATTEMPTS
+    + r"""
 } finally {
-    $evidence | ConvertTo-Json -Depth 8 |
+    $evidence | ConvertTo-Json -Depth 10 |
         Set-Content -LiteralPath $env:EW_S4U_DIAGNOSTICS -Encoding UTF8
 }
 [ordered]@{task=$task.Name;principal=(Principal-Sid $task.Definition.Principal.UserId)
@@ -221,6 +325,13 @@ class S4URegistration:
             self.thread.join(40)  # Same bounded native PowerShell operation budget.
             if self.thread.is_alive():
                 raise RuntimeError("S4U registration remains in flight; retain fixture resources")
+        diagnostics = self.output / "standard-user-task-diagnostics.json"
+        if diagnostics.exists():
+            evidence = json.loads(diagnostics.read_text(encoding="utf-8-sig"))
+            if "control" in evidence:
+                cleanup = evidence["control"].get("cleanup")
+                if not isinstance(cleanup, dict) or cleanup.get("settled") is not True:
+                    raise RuntimeError("Diagnostic task cleanup unproven; retain fixture resources")
         self.settled = True
 
 
