@@ -25,6 +25,11 @@ function Write-CutoverFailure($record, [string]$context) {
     Write-Output ("Cutover error-id=" + $record.FullyQualifiedErrorId +
         " position=" + $record.InvocationInfo.PositionMessage)
 }
+function Open-CutoverProcessHandle($process) {
+    # A property access suppresses getter exceptions in PowerShell. The method
+    # preserves Win32Exception and the same Process object's cached handle.
+    return $process.get_Handle()
+}
 trap { Write-CutoverFailure $_ 'phase'; exit 1 }
 $root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 if ($root -eq [IO.Path]::GetPathRoot($root).TrimEnd('\')) { throw 'Installation root cannot be a drive root' }
@@ -179,7 +184,7 @@ if ($Phase -eq 'Restore') {
     # Keep the original process object/handle, not a PID that can be reused.
     $installer = Get-Process -Id $InstallerPid -ErrorAction SilentlyContinue
     if ($installer -and $installer.StartTime.ToUniversalTime().Ticks -eq $InstallerStarted) {
-        $handle = $installer.Handle
+        $handle = Open-CutoverProcessHandle $installer
         Set-Content -LiteralPath $restoreReady -Value 'ready' -Encoding ASCII
         $installer.WaitForExit()
     }
@@ -390,7 +395,7 @@ if ($Phase -eq 'Pre') {
                 try {
                     $operation = 'process-handle'
                     Write-CutoverToken $PID 'stop-host-before-handle'
-                    $handle = $live.Handle
+                    $handle = Open-CutoverProcessHandle $live
                     Write-CutoverToken $PID 'stop-host-after-handle'
                     $operation = 'held-image'
                     $image = Resolve-ExecutablePath ([CutoverProcess]::Image($handle)) 'held process'

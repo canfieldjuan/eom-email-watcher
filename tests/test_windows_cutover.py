@@ -12,6 +12,75 @@ from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
 
 
+@pytest.mark.skipif(os.name != "nt", reason="actual PowerShell process getter exception semantics")
+@pytest.mark.parametrize("native_error", [0, 5, 6, 87])
+def test_native_product_handle_open_preserves_win32_error(tmp_path, native_error):
+    from pathlib import Path
+
+    import prove_windows_cutover as proof
+
+    # Invoke the actual product getter assignments, with a public throwing CLR
+    # getter. This also exercises the old assignments before the owner fix.
+    code = r'''
+$ErrorActionPreference='Stop'
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:EW_PRODUCT_SOURCE,[ref]$tokens,[ref]$errors)
+if ($errors.Count) { throw 'Product script does not parse' }
+$owner=@($ast.FindAll({param($n)
+    $n -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Open-CutoverProcessHandle'
+},$true))
+foreach ($function in $owner) { . ([scriptblock]::Create($function.Extent.Text)) }
+$assignments=@($ast.FindAll({param($n)
+    $n -is [Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left.Extent.Text -eq '$handle' -and
+    ($n.Right.Extent.Text -match 'Open-CutoverProcessHandle|\$(live|installer)\.Handle')
+},$true))
+if ($assignments.Count -ne 2) { throw 'Process handle readers changed without this proof' }
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+public class PublicHandleProbe {
+    public int Error;
+    public IntPtr Handle {
+        get {
+            if (Error != 0) throw new Win32Exception(Error);
+            return new IntPtr(1234);
+        }
+    }
+}
+'@
+$expected=[int]$env:EW_NATIVE_ERROR
+$probe=New-Object PublicHandleProbe;$probe.Error=$expected
+$legacy=$probe.Handle
+if ($expected -ne 0 -and $null -ne $legacy) { throw 'Frozen property control did not suppress' }
+foreach ($assignment in $assignments) {
+    $live=$probe;$installer=$probe;$handle=$null;$caught=$false
+    try {
+        . ([scriptblock]::Create($assignment.Extent.Text))
+        if ($expected -ne 0) { throw 'Handle denial was converted to a null handle' }
+        if ($handle -ne [IntPtr]::new(1234)) { throw 'Valid handle was changed' }
+    } catch {
+        $base=$_.Exception.GetBaseException()
+        if ($expected -eq 0 -or $base -isnot [ComponentModel.Win32Exception] -or
+            $base.NativeErrorCode -ne $expected) { throw }
+        $caught=$true
+    }
+    if ($caught -ne ($expected -ne 0)) { throw 'Handle result did not preserve the error' }
+}
+'HANDLE_OWNER_BOUNDARIES_PASS'
+'''
+    output = proof.probe_output(f"product-handle-error-{native_error}", tmp_path)
+    result = proof.powershell(
+        code, EW_PRODUCT_SOURCE=str(
+            Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+        ), EW_NATIVE_ERROR=str(native_error),
+    )
+    (output / "handle-owner.txt").write_text(result)
+    assert "HANDLE_OWNER_BOUNDARIES_PASS" in result.splitlines()
+
+
 def test_cutover_normalizes_paths_and_prepares_recovery_before_mutation():
     from pathlib import Path
 
