@@ -49,6 +49,7 @@ jobs:
   windows-package:
     runs-on: windows-latest
     env:
+      EW_QUALIFICATION_TEST_OUTPUT: ${{ runner.temp }}/ew-source-cutover/native-tests
       CONNECT_CONTRACTS_DIR: ${{ github.workspace }}\connect-contracts
       LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE: ${{ github.workspace }}\connect-contracts\entitlements\v1\release\keyring.json
     steps:
@@ -102,6 +103,7 @@ jobs:
           uv run python scripts/prove_windows_cutover.py $setup[0].FullName "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" cutover-predecessor "$env:RUNNER_TEMP/ew-source-cutover"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Qualify native polling capture analysis retention Connect and timeout retry
+        if: success() || failure()
         run: >-
           uv run pytest -v
           tests/test_windows_cutover.py
@@ -162,7 +164,10 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/standard-user-*.json
             ${{ runner.temp }}/ew-source-cutover/standard-inputs.json
             ${{ runner.temp }}/ew-source-cutover/native-process-state.json
-            ${{ runner.temp }}/ew-source-cutover/timeout-protected-actor.json
+            ${{ runner.temp }}/ew-source-cutover/native-tests/**/*.json
+            ${{ runner.temp }}/ew-source-cutover/native-tests/**/*.log
+            ${{ runner.temp }}/ew-source-cutover/**/case-cleanup.json
+            ${{ runner.temp }}/ew-source-cutover/**/task-state-query.json
             ${{ runner.temp }}/ew-source-cutover/*/scheduled-task-state.json
             ${{ runner.temp }}/ew-source-cutover/**/*.log
             ${{ runner.temp }}/ew-source-cutover/**/installer.*

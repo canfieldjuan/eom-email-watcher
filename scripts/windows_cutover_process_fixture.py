@@ -15,6 +15,28 @@ from pathlib import Path
 from windows_batch_logon import set_batch_logon_right
 
 
+class ScheduledActor:
+    """Hold the actual scheduled actor's process object, not a later PID lookup."""
+
+    def __init__(self, pid):
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        self.kernel.OpenProcess.restype = ctypes.c_void_p
+        self.kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self.kernel.WaitForSingleObject.restype = ctypes.c_uint32
+        self.kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        self.handle = self.kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def settle(self):
+        try:
+            if self.kernel.WaitForSingleObject(self.handle, 10000) != 0:
+                raise RuntimeError("Scheduled actor termination is unproven")
+        finally:
+            self.kernel.CloseHandle(self.handle)
+
+
 @contextmanager
 def deny_termination(process):
     """Keep the CreateProcess handle to restore this fixture's original DACL."""
@@ -125,7 +147,7 @@ def disposable_user_sid(name, run_powershell):
 
 
 def run_standard_user_case(
-    output, installer, engine, actor, run_powershell, *, timeout_probe=False
+    output, installer, engine, actor, run_powershell, *, timeout_probe=False, orphan_probe=False
 ):
     """Own identity, bounded input permissions, native user environment and cleanup."""
     assert os.name == "nt", "standard-user qualification requires native Windows"
@@ -215,6 +237,8 @@ def run_standard_user_case(
         ]
         if timeout_probe:
             command.append("--timeout-probe")
+        if orphan_probe:
+            command.append("--orphan-probe")
         launch_attempted = True
         run_powershell(
             "& $env:EW_PROBE_LAUNCHER",
@@ -234,7 +258,9 @@ def run_standard_user_case(
         admitted = not launch_attempted
         if launch_attempted:
             try:
-                process_state = json.loads((output / "native-process-state.json").read_text())
+                process_state = json.loads(
+                    (output / "native-process-state.json").read_text(encoding="utf-8-sig")
+                )
                 admitted = cleanup_admitted(process_state, name)
             except (OSError, ValueError) as error:
                 cleanup_errors.append(error)

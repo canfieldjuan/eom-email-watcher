@@ -25,6 +25,7 @@ from probe_windows_cutover_context import assert_standard_context, parse_tokens,
 from smoke_packaged_engine import _request
 from windows_cutover_parity import installer_manifest
 from windows_cutover_process_fixture import (
+    ScheduledActor,
     deny_termination,
 )
 from windows_cutover_process_fixture import (
@@ -48,6 +49,67 @@ def powershell(script: str, *, timeout: int = 40, **values: str) -> str:
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
     return result.stdout.strip()
+
+
+def probe_output(name, fallback):
+    """CI selects the evidence root; a probe never writes into another probe."""
+    destination = os.environ.get("EW_QUALIFICATION_TEST_OUTPUT")
+    if not destination:
+        return fallback
+    path = Path(destination) / hashlib.sha256(name.encode()).hexdigest()[:24]
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def settle_case_cleanup(path, account, case, operations, *, primary=None):
+    """Run all owners, keeping failure evidence even when earlier cleanup throws."""
+    result = {"account": account, "case": case, "phase": "pending", "quiesced": False, "errors": []}
+    result["primary_error"] = str(primary) if primary is not None else None
+    try:
+        path.write_text(json.dumps(result, indent=2))
+    except Exception as error:
+        result["errors"].append({"owner": "receipt", "error": str(error)})
+    for owner, operation in operations:
+        try:
+            operation()
+        except BaseException as error:
+            result["errors"].append({"owner": owner, "error": str(error)})
+    result["quiesced"] = not result["errors"]
+    result["phase"] = "complete"
+    path.write_text(json.dumps(result, indent=2))
+    return result
+
+
+def task_state(task, path):
+    """Keep the original CIM observation/oracle; diagnose failures separately."""
+    row = {"task": task, "phase": "query-enter", "outcome": "pending"}
+    path.write_text(json.dumps(row, indent=2))
+    started = time.monotonic()
+    try:
+        state = powershell("(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task)
+        row.update(outcome="returned", state=state)
+        return state
+    except Exception as error:
+        row.update(outcome="timeout" if isinstance(error, subprocess.TimeoutExpired) else "error")
+        row["error"] = str(error)
+        for stream in ("stdout", "stderr"):
+            value = getattr(error, stream, None)
+            row[stream] = value.decode(errors="replace") if isinstance(value, bytes) else value
+        try:
+            row["direct_scheduler"] = powershell(
+                "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; "
+                "$s.Connect(); $t=$s.GetFolder('\\').GetTask($env:EW_TASK); "
+                "@{State=$t.State; Enabled=$t.Enabled; LastTaskResult=$t.LastTaskResult} "
+                "| ConvertTo-Json -Compress",
+                timeout=10,
+                EW_TASK=task,
+            )
+        except Exception as diagnostic:
+            row["direct_scheduler_error"] = str(diagnostic)
+        raise
+    finally:
+        row.update(phase="query-exit", elapsed_seconds=time.monotonic() - started)
+        path.write_text(json.dumps(row, indent=2))
 
 
 def wait_file(path: Path, process=None, *, observe=None):
@@ -267,6 +329,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
     handles = []
     task = "EW-Cutover-" + case + "-" + str(os.getpid())
     registered = False
+    scheduled = None
 
     def command(path, ready, mode):
         return [str(path), str(database), str(ready), str(trigger), endpoint, mode]
@@ -294,6 +357,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             assert posted.wait(15)
         task_ready = folder / "scheduled.ready"
         task_args = subprocess.list2cmdline(command(engine, task_ready, "idle")[1:])
+        registered = True  # A partial registration still belongs to cleanup.
         powershell(
             "$ErrorActionPreference='Stop'; "
             "$a=New-ScheduledTaskAction -Execute $env:EW_ENGINE -Argument $env:EW_ARGS; "
@@ -307,12 +371,12 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             EW_ARGS=task_args,
             EW_TASK=task,
         )
-        registered = True
         wait_file(
             task_ready, observe=task_startup_observer(task, folder / "scheduled-task-state.json")
         )
+        scheduled_pid = int(task_ready.with_suffix(".pid").read_text())
+        scheduled = ScheduledActor(scheduled_pid)
         if case == "old-then-new":
-            scheduled_pid = int(task_ready.with_suffix(".pid").read_text())
             scheduled_profile = token_profile([scheduled_pid], folder / "scheduled-actor-profile")
             assert_standard_context(
                 scheduled_profile,
@@ -349,28 +413,21 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             unknown = subprocess.Popen(
                 command(unknown_image, unknown_ready, "idle"), env=environment
             )
-            try:
-                wait_file(unknown_ready, unknown)
-                refusal, attempt = run_installer(installer, installation, folder, "unknown-refusal")
-                (folder / "installer.unknown.stdout").write_bytes(refusal.stdout)
-                (folder / "installer.unknown.stderr").write_bytes(refusal.stderr)
-                assert refusal.returncode != 0, "Unknown image was admitted"
-                assert unknown.poll() is None and first.poll() is None and second.poll() is None
-                assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
-                assert not (installation / "windows-source-cutover-v1.json").exists()
-                assert (
-                    powershell("(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task)
-                    == "Ready"
-                )
-                transcripts = "\n".join(
-                    p.read_text(encoding="utf-8-sig", errors="replace")
-                    for p in attempt.glob("cutover-*-Pre-*.txt")
-                )
-                assert "Unknown installation image: " + str(unknown_image) in transcripts
-            finally:
-                if unknown.poll() is None:
-                    subprocess.run(["taskkill", "/PID", str(unknown.pid), "/T", "/F"], check=True)
-                unknown.wait(timeout=10)
+            actors.append(unknown)
+            wait_file(unknown_ready, unknown)
+            refusal, attempt = run_installer(installer, installation, folder, "unknown-refusal")
+            (folder / "installer.unknown.stdout").write_bytes(refusal.stdout)
+            (folder / "installer.unknown.stderr").write_bytes(refusal.stderr)
+            assert refusal.returncode != 0, "Unknown image was admitted"
+            assert unknown.poll() is None and first.poll() is None and second.poll() is None
+            assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
+            assert not (installation / "windows-source-cutover-v1.json").exists()
+            assert task_state(task, folder / "task-state-query.json") == "Ready"
+            transcripts = "\n".join(
+                p.read_text(encoding="utf-8-sig", errors="replace")
+                for p in attempt.glob("cutover-*-Pre-*.txt")
+            )
+            assert "Unknown installation image: " + str(unknown_image) in transcripts
             return {"case": case, "result": "PASS", "unknown_survived_refusal": True}
         if case == "old-then-new":
             # A real installed owner survives the stop attempt. Refusal must
@@ -390,15 +447,13 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 )
                 (folder / "installer.refusal.stdout").write_bytes(refusal.stdout)
                 (folder / "installer.refusal.stderr").write_bytes(refusal.stderr)
-                task_state = powershell(
-                    "(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task
-                )
+                restored_state = task_state(task, folder / "task-state-query.json")
                 pending = installation / "windows-cutover-pending-v1.json"
                 observed = {
                     "installer_exit": refusal.returncode,
                     "protected_pid": first.pid,
                     "protected_actor_profile": actor_profile,
-                    "task_state": task_state,
+                    "task_state": restored_state,
                     "pending": pending.read_text(encoding="utf-8-sig")
                     if pending.exists()
                     else None,
@@ -435,7 +490,7 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
                 assert first.poll() is None, "Protected old owner did not survive"
                 assert hashlib.sha256(engine.read_bytes()).hexdigest() == prior_digest
                 assert not (installation / "windows-source-cutover-v1.json").exists()
-                assert task_state == "Ready", observed
+                assert restored_state == "Ready", observed
         install, attempt = run_installer(installer, installation, folder, "successful-update")
         (folder / "installer.stdout").write_bytes(install.stdout)
         (folder / "installer.stderr").write_bytes(install.stderr)
@@ -460,8 +515,8 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
         first.wait(timeout=10)
         second.wait(timeout=10)
         assert first.returncode != 0 and second.returncode != 0
-        task_state = powershell("(Get-ScheduledTask -TaskName $env:EW_TASK).State", EW_TASK=task)
-        assert task_state == "Ready", task_state
+        restored_state = task_state(task, folder / "task-state-query.json")
+        assert restored_state == "Ready", restored_state
         assert (
             hashlib.sha256(engine.read_bytes()).digest()
             == hashlib.sha256(new_engine.read_bytes()).digest()
@@ -538,26 +593,63 @@ def run_case(output: Path, installer: Path, new_engine: Path, old_actor: Path, c
             "case": case,
             "result": "PASS",
             "pre_cutover_posts": len(posts),
-            "task_restored": task_state,
+            "task_restored": restored_state,
             "installed_sha256": receipt["engine_sha256"],
             "installer_refusal_then_retry": case == "old-then-new",
         }
     finally:
+        operations = []
         if registered:
-            powershell(
-                "Stop-ScheduledTask -TaskName $env:EW_TASK; "
-                "Unregister-ScheduledTask -TaskName $env:EW_TASK -Confirm:$false",
-                EW_TASK=task,
-            )
+            for action in ("Stop", "Unregister"):
+                script = action + "-ScheduledTask -TaskName $env:EW_TASK -ErrorAction Stop"
+                if action == "Unregister":
+                    script += " -Confirm:$false"
+                else:
+                    script += (
+                        "; $s=New-Object -ComObject Schedule.Service; $s.Connect(); "
+                        "$t=$s.GetFolder('\\').GetTask($env:EW_TASK); "
+                        "if ($t.GetInstances(0).Count -ne 0) { "
+                        "throw 'Scheduled instances remain live' }"
+                    )
+                operations.append(
+                    (action + " task", lambda code=script: powershell(code, EW_TASK=task))
+                )
+
+            def settle_scheduled():
+                if scheduled is None:
+                    raise RuntimeError("Scheduled actor handle was never established")
+                scheduled.settle()
+
+            operations.append(("scheduled actor", settle_scheduled))
         for process in actors:
-            if process.poll() is None:
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=True)
-            process.wait(timeout=10)
-        for log in handles:
-            log.close()
-        release.set()
-        server.shutdown()
-        server.server_close()
+
+            def settle_actor(actor=process):
+                if actor.poll() is None:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(actor.pid), "/T", "/F"],
+                        check=True,
+                        timeout=10,
+                    )
+                actor.wait(timeout=10)
+
+            operations.append(("actor " + str(process.pid), settle_actor))
+        operations.extend(("log", log.close) for log in handles)
+        operations.extend(
+            [
+                ("release", release.set),
+                ("server shutdown", server.shutdown),
+                ("server close", server.server_close),
+            ]
+        )
+        cleanup = settle_case_cleanup(
+            folder / "case-cleanup.json",
+            os.environ.get("USERNAME", ""),
+            case,
+            operations,
+            primary=sys.exception(),
+        )
+        if cleanup["errors"]:
+            raise RuntimeError("Case cleanup incomplete: " + json.dumps(cleanup["errors"]))
 
 
 def run_standard_user_case(output, installer, engine, actor):
@@ -582,6 +674,7 @@ def main():
     parser.add_argument("--actor", type=Path)
     parser.add_argument("--tool-directory", type=Path)
     parser.add_argument("--timeout-probe", action="store_true")
+    parser.add_argument("--orphan-probe", action="store_true")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("This qualification requires native Windows")
@@ -606,8 +699,21 @@ def main():
                 os.environ["PATH"] = (
                     os.environ.get("PATH", "") + os.pathsep + str(args.tool_directory)
                 )
-                if args.timeout_probe:
+                if args.timeout_probe or args.orphan_probe:
+                    scope = args.output / "old-then-new"
+                    scope.mkdir(mode=0o700)
+                    settle_case_cleanup(
+                        scope / "case-cleanup.json",
+                        os.environ["USERNAME"],
+                        "old-then-new",
+                        [],
+                    )
                     probe = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+                    if args.orphan_probe:
+                        (args.output / "orphan-actor.json").write_text(
+                            json.dumps({"pid": probe.pid})
+                        )
+                        raise RuntimeError("Public early-cleanup failure with a live descendant")
                     with deny_termination(probe):
                         (args.output / "timeout-protected-actor.json").write_text(
                             json.dumps({"pid": probe.pid})

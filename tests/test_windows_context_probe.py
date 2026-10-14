@@ -8,6 +8,13 @@ import pytest
 from probe_windows_cutover_context import parse_tokens, token_profile, transcript_probe
 
 
+@pytest.fixture
+def tmp_path(tmp_path, request):
+    from prove_windows_cutover import probe_output
+
+    return probe_output(request.node.name, tmp_path)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_context_preserves_privilege_state_and_target(enabled):
     token = {
@@ -649,9 +656,10 @@ def test_native_protected_tree_timeout_is_quiescent_before_cleanup(tmp_path):
         )
     protected = json.loads((tmp_path / "timeout-protected-actor.json").read_text())
     assert protected["pid"] > 0, "Probe never reached its real PROCESS_TERMINATE deny"
-    state = json.loads((tmp_path / "native-process-state.json").read_text())
+    state = json.loads((tmp_path / "native-process-state.json").read_text(encoding="utf-8-sig"))
     assert state["phase"] == "timeout-quiesced" and state["quiesced"] is True
     assert state["kill_exit"] == 0 and state["process_signalled"] is True
+    assert state["active_processes"] == 0
     cleanup = json.loads((tmp_path / "standard-user-cleanup.json").read_text())
     assert cleanup["resources_retained"] is False and cleanup["cleanup_errors"] == []
     assert [r["operation"] for r in cleanup["batch_logon_lease"]] == ["grant", "revoke"]
@@ -671,6 +679,12 @@ foreach ($code in @(-1,0,5)) {
     foreach ($signal in @($false,$true)) {
         $actual=[QualificationUser]::TimeoutQuiesced($code,$signal)
         if ($actual -ne ($code -eq 0 -and $signal)) { throw 'Unsafe timeout outcome' }
+        foreach ($active in @(0,1,10)) {
+            $whole=[QualificationUser]::WholeTreeQuiesced($code,$signal,$active)
+            if ($whole -ne ($code -eq 0 -and $signal -and $active -eq 0)) {
+                throw 'Unsafe tree outcome'
+            }
+        }
     }
 }
 'TIMEOUT_OUTCOME_BOUNDARIES_PASS'
@@ -680,3 +694,208 @@ foreach ($code in @(-1,0,5)) {
         EW_PROBE_USER="EWProbe-public",
     )
     assert "TIMEOUT_OUTCOME_BOUNDARIES_PASS" in output.splitlines()
+
+
+def test_case_cleanup_attempts_actors_after_task_failure(tmp_path):
+    import prove_windows_cutover as proof
+
+    calls = []
+
+    def task_cleanup():
+        calls.append("task")
+        raise RuntimeError("public task cleanup failure")
+
+    def actor_cleanup():
+        calls.append("actor")
+
+    result = proof.settle_case_cleanup(
+        tmp_path / "case-cleanup.json",
+        "public-user",
+        "old-then-new",
+        [("task", task_cleanup), ("actor", actor_cleanup)],
+    )
+    assert calls == ["task", "actor"]
+    assert result["quiesced"] is False
+    assert result["errors"] == [{"owner": "task", "error": "public task cleanup failure"}]
+
+
+def test_case_cleanup_aggregates_failures_and_binds_success(tmp_path):
+    import prove_windows_cutover as proof
+
+    calls = []
+
+    def failure():
+        calls.append("bad")
+        raise RuntimeError("public actor failure")
+
+    result = proof.settle_case_cleanup(
+        tmp_path / "case-cleanup.json",
+        "public-user",
+        "old-then-new",
+        [("first", failure), ("second", failure), ("last", lambda: calls.append("good"))],
+    )
+    assert calls == ["bad", "bad", "good"] and len(result["errors"]) == 2
+    assert result["quiesced"] is False
+    result = proof.settle_case_cleanup(
+        tmp_path / "case-cleanup.json",
+        "public-user",
+        "old-then-new",
+        [],
+    )
+    assert result == json.loads((tmp_path / "case-cleanup.json").read_text())
+    assert result["account"] == "public-user" and result["case"] == "old-then-new"
+    assert result["quiesced"] is True
+
+
+def test_native_evidence_destination_is_ci_selected_and_probe_isolated(tmp_path, monkeypatch):
+    import prove_windows_cutover as proof
+
+    monkeypatch.setenv("EW_QUALIFICATION_TEST_OUTPUT", str(tmp_path / "archive"))
+    first = proof.probe_output("protected-timeout", tmp_path / "pytest")
+    other = proof.probe_output("normal-exit", tmp_path / "pytest")
+    assert first.parent == tmp_path / "archive" and first != other
+    assert first.is_dir()
+    monkeypatch.delenv("EW_QUALIFICATION_TEST_OUTPUT")
+    assert proof.probe_output("protected-timeout", tmp_path / "pytest") == tmp_path / "pytest"
+
+
+def test_task_state_timeout_keeps_original_failure_and_records_diagnostics(tmp_path, monkeypatch):
+    import subprocess
+
+    import prove_windows_cutover as proof
+
+    budgets = []
+    original = subprocess.TimeoutExpired("public-state", 40, output="public partial stdout")
+
+    def query(script, *, timeout=40, **values):
+        budgets.append(timeout)
+        if len(budgets) == 1:
+            raise original
+        return "public direct scheduler state"
+
+    monkeypatch.setattr(proof, "powershell", query)
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        proof.task_state("public-task", tmp_path / "query.json")
+    assert caught.value is original and budgets == [40, 10]
+    receipt = json.loads((tmp_path / "query.json").read_text())
+    assert receipt["outcome"] == "timeout" and receipt["stdout"] == "public partial stdout"
+    assert receipt["direct_scheduler"] == "public direct scheduler state"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual normal-exit descendant job")
+def test_native_normal_exit_settles_remaining_descendants(tmp_path):
+    import sys
+
+    import prove_windows_cutover as proof
+    from windows_cutover_process_fixture import run_standard_user_case
+
+    with pytest.raises(RuntimeError, match="fixture exit"):
+        run_standard_user_case(
+            tmp_path,
+            Path(sys.executable),
+            Path(sys.executable),
+            Path(sys.executable),
+            proof.powershell,
+            orphan_probe=True,
+        )
+    assert json.loads((tmp_path / "orphan-actor.json").read_text())["pid"] > 0
+    native = json.loads((tmp_path / "native-process-state.json").read_text(encoding="utf-8-sig"))
+    assert native["phase"] == "exited" and native["quiesced"] is True
+    assert native["active_before_cleanup"] > 0 and native["active_processes"] == 0
+    cleanup = json.loads((tmp_path / "standard-user-cleanup.json").read_text())
+    assert cleanup["resources_retained"] is False and cleanup["cleanup_errors"] == []
+    assert [row["operation"] for row in cleanup["batch_logon_lease"]] == ["grant", "revoke"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual process cleanup after early owner failure")
+def test_native_case_cleanup_fault_still_stops_every_actor(tmp_path):
+    import subprocess
+    import sys
+
+    import prove_windows_cutover as proof
+
+    actors = [
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"]) for _ in range(2)
+    ]
+
+    def fail():
+        raise RuntimeError("public task cleanup fault")
+
+    def stop(actor):
+        actor.kill()
+        actor.wait(timeout=10)
+
+    try:
+        result = proof.settle_case_cleanup(
+            tmp_path / "case-cleanup.json",
+            "public-user",
+            "old-then-new",
+            [("task", fail)] + [("actor", lambda p=p: stop(p)) for p in actors],
+        )
+        assert result["quiesced"] is False
+        assert all(p.poll() is not None for p in actors)
+    finally:
+        for actor in actors:
+            if actor.poll() is None:
+                stop(actor)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native receipt join owner")
+def test_native_quiescence_join_rejects_missing_mixed_and_incomplete_outcomes(tmp_path):
+    import prove_windows_cutover as proof
+
+    source = Path(__file__).resolve().parents[1] / "scripts/windows_standard_user.ps1"
+    output = proof.powershell(
+        r"""
+$source=Get-Content -LiteralPath $env:EW_NATIVE_SOURCE -Raw
+$prefix=$source.Substring(0,$source.IndexOf('$code=[QualificationUser]'))
+. ([scriptblock]::Create($prefix))
+$native=@{account='public-user';phase='exited-tree';process_signalled=$true;kill_exit=0;active_processes=0}
+$case=@{account='public-user';case='old-then-new';phase='complete';quiesced=$true}
+if (-not (Join-Quiescence $native $case 'public-user')) {throw 'Faithful result rejected'}
+foreach ($patch in @(
+    @{account='other'},@{case='other'},@{phase='pending'},@{quiesced=$false},@{quiesced='true'}
+)) {
+    $bad=$case.Clone(); foreach ($key in $patch.Keys) {$bad[$key]=$patch[$key]}
+    if (Join-Quiescence $native $bad 'public-user') {throw 'Unsafe case admitted'}
+}
+if (Join-Quiescence $native $null 'public-user') {throw 'Missing case admitted'}
+foreach ($patch in @(
+    @{account='other'},@{phase='active'},@{kill_exit=5},@{process_signalled=$false},
+    @{active_processes=1},@{active_processes=$null}
+)) {
+    $bad=$native.Clone(); foreach ($key in $patch.Keys) {$bad[$key]=$patch[$key]}
+    if (Join-Quiescence $bad $case 'public-user') {throw 'Unsafe tree admitted'}
+}
+'CASE_JOIN_BOUNDARIES_PASS'
+""",
+        EW_NATIVE_SOURCE=str(source),
+        EW_PROBE_OUTPUT=str(tmp_path),
+        EW_PROBE_USER="public-user",
+    )
+    assert "CASE_JOIN_BOUNDARIES_PASS" in output.splitlines()
+
+
+def test_receipt_write_failure_does_not_skip_case_cleanup(tmp_path):
+    import prove_windows_cutover as proof
+
+    class Receipt:
+        calls = 0
+
+        def write_text(self, content):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("public receipt fault")
+            return (tmp_path / "case-cleanup.json").write_text(content)
+
+    calls = []
+    result = proof.settle_case_cleanup(
+        Receipt(),
+        "public-user",
+        "old-then-new",
+        [("actor", lambda: calls.append("stopped"))],
+        primary=RuntimeError("public original failure"),
+    )
+    assert calls == ["stopped"] and result["quiesced"] is False
+    assert result["primary_error"] == "public original failure"
+    assert result["errors"] == [{"owner": "receipt", "error": "public receipt fault"}]
