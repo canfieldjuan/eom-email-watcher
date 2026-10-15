@@ -109,9 +109,10 @@ def executable_suffix(target_triple: str) -> str:
     return ".exe" if _target_family(target_triple) == "windows" else ""
 
 
-def sidecar_output_path(target_triple: str) -> Path:
+def sidecar_output_path(target_triple: str, *, output_directory: Path | None = None) -> Path:
     suffix = executable_suffix(target_triple)
-    return OUTPUT_DIRECTORY / f"{ENGINE_NAME}-{target_triple}{suffix}"
+    directory = OUTPUT_DIRECTORY if output_directory is None else output_directory
+    return directory / f"{ENGINE_NAME}-{target_triple}{suffix}"
 
 
 def _document_keys(value: object) -> Iterator[str]:
@@ -195,8 +196,10 @@ def validate_entitlement_keyring_target(target_triple: str) -> None:
 
 
 @contextmanager
-def _staged_build_input(source: Path, filename: str, prefix: str) -> Iterator[Path]:
-    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=BUILD_DIRECTORY))
+def _staged_build_input(
+    source: Path, filename: str, prefix: str, *, build_directory: Path,
+) -> Iterator[Path]:
+    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=build_directory))
     destination = directory / filename
     try:
         shutil.copyfile(source, destination)
@@ -210,8 +213,10 @@ def _staged_build_input(source: Path, filename: str, prefix: str) -> Iterator[Pa
 
 
 @contextmanager
-def _staged_build_bytes(content: bytes, filename: str, prefix: str) -> Iterator[Path]:
-    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=BUILD_DIRECTORY))
+def _staged_build_bytes(
+    content: bytes, filename: str, prefix: str, *, build_directory: Path,
+) -> Iterator[Path]:
+    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=build_directory))
     destination = directory / filename
     try:
         destination.write_bytes(content)
@@ -266,6 +271,9 @@ def _package_sidecar(
     oauth_source_value: str | None,
     microsoft_source_value: str | None,
     keyring_content: bytes | None,
+    *,
+    build_directory: Path | None = None,
+    output_directory: Path | None = None,
 ) -> Path:
     """One packaging owner; callers supply already validated authority bytes.
 
@@ -273,14 +281,16 @@ def _package_sidecar(
     Native qualification calls this same packager with its labelled test authority.
     """
     suffix = executable_suffix(target_triple)
-    output_path = sidecar_output_path(target_triple)
+    build_directory = BUILD_DIRECTORY if build_directory is None else build_directory
+    output_directory = OUTPUT_DIRECTORY if output_directory is None else output_directory
+    output_path = sidecar_output_path(target_triple, output_directory=output_directory)
     for directory in (
-        BUILD_DIRECTORY,
-        BUILD_DIRECTORY / "cache",
-        BUILD_DIRECTORY / "dist",
-        BUILD_DIRECTORY / "spec",
-        BUILD_DIRECTORY / "work",
-        OUTPUT_DIRECTORY,
+        build_directory,
+        build_directory / "cache",
+        build_directory / "dist",
+        build_directory / "spec",
+        build_directory / "work",
+        output_directory,
     ):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -294,11 +304,11 @@ def _package_sidecar(
         "--name",
         ENGINE_NAME,
         "--distpath",
-        str(BUILD_DIRECTORY / "dist"),
+        str(build_directory / "dist"),
         "--workpath",
-        str(BUILD_DIRECTORY / "work"),
+        str(build_directory / "work"),
         "--specpath",
-        str(BUILD_DIRECTORY / "spec"),
+        str(build_directory / "spec"),
         "--collect-all",
         "tzdata",
     ]
@@ -306,7 +316,9 @@ def _package_sidecar(
     with ExitStack() as stack:
         for unit in _unit_payloads():
             staged_unit = stack.enter_context(
-                _staged_build_bytes(unit.content, unit.name, "deployment-unit.")
+                _staged_build_bytes(
+                    unit.content, unit.name, "deployment-unit.", build_directory=build_directory,
+                )
             )
             pyinstaller_arguments.extend(
                 ["--add-data", f"{staged_unit}{os.pathsep}eom_email_watcher_data/systemd"]
@@ -323,6 +335,7 @@ def _package_sidecar(
                     oauth_source,
                     "google-oauth-client.json",
                     "oauth-client.",
+                    build_directory=build_directory,
                 )
             )
             validate_oauth_client(staged_oauth)
@@ -342,6 +355,7 @@ def _package_sidecar(
                     microsoft_source,
                     "microsoft-oauth-client.json",
                     "microsoft-oauth-client.",
+                    build_directory=build_directory,
                 )
             )
             validate_microsoft_oauth_client(staged_microsoft)
@@ -356,6 +370,7 @@ def _package_sidecar(
                     keyring_content,
                     "connect-entitlement-keyring.json",
                     "connect-keyring.",
+                    build_directory=build_directory,
                 )
             )
             pyinstaller_arguments.extend(
@@ -364,7 +379,7 @@ def _package_sidecar(
 
         pyinstaller_arguments.append(str(PROJECT_DIRECTORY / "packaging" / "engine_entry.py"))
         build_environment = os.environ.copy()
-        build_environment["PYINSTALLER_CONFIG_DIR"] = str(BUILD_DIRECTORY / "cache")
+        build_environment["PYINSTALLER_CONFIG_DIR"] = str(build_directory / "cache")
         # PyInstaller's stdlib ZIP preserves module-graph iteration order.
         # Both release and qualification must start with the same hash seed.
         build_environment["PYTHONHASHSEED"] = "0"
@@ -375,7 +390,7 @@ def _package_sidecar(
             env=build_environment,
         )
 
-    built_path = BUILD_DIRECTORY / "dist" / f"{ENGINE_NAME}{suffix}"
+    built_path = build_directory / "dist" / f"{ENGINE_NAME}{suffix}"
     _publish_sidecar(built_path, output_path)
     smoke_arguments = [
         sys.executable,

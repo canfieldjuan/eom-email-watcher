@@ -7,6 +7,10 @@ from test_thread_reconcile import NOW, seed
 from eom_email_watcher import body_state, engine_api
 
 MESSAGE = "Can't delete this yet, the local upgrade is still finishing; try again later"
+SAVED_NOTICE = (
+    "Saved. Removing this thread's stored email text is waiting for the local upgrade to finish; "
+    "it will finish automatically."
+)
 
 
 def held_runtime(tmp_path, monkeypatch, *, small=False, copies=32):
@@ -100,9 +104,8 @@ def test_held_unfollow_preserves_body_and_commits_follow_transition(
         "protocol": 1, "operation": operation, "payload": payload,
         "config_path": str(tmp_path / "fixture-config.toml"),
     })
-    assert result["ok"] is False, result
-    assert result["error"]["code"] == "inbox_removal_held"
-    assert result["error"]["message"] == MESSAGE
+    assert result["ok"] is True, result
+    assert result["data"]["notice"] == SAVED_NOTICE
     with store.connection() as db:
         assert tuple(db.execute("SELECT * FROM message_bodies").fetchone()) == body_before
         assert not db.execute("SELECT 1 FROM thread_follow WHERE followed=1").fetchone()
@@ -126,7 +129,7 @@ def test_small_unfollow_still_removes_body_immediately(tmp_path, monkeypatch):
     with store.connection() as db:
         db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
         vendor_id = db.execute("SELECT vendor_id FROM vendor_addresses").fetchone()[0]
-    assert store.remove_vendor_address(vendor_id, "vendor@example.com")
+    assert store.remove_vendor_address(vendor_id, "vendor@example.com").removed
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
 
@@ -148,3 +151,34 @@ def test_exact_legacy_unit_boundary_and_explicit_retry(tmp_path, monkeypatch, ro
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM messages").fetchone()
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+
+
+@pytest.mark.parametrize("already_qualified", [False, True])
+def test_qualification_finishes_held_unfollow_cleanup(tmp_path, monkeypatch, already_qualified):
+    from eom_email_watcher import source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    with store.connection() as db:
+        vendor_id = db.execute("SELECT vendor_id FROM vendor_addresses").fetchone()[0]
+    runtime = engine_api._runtime({})
+    monkeypatch.setattr(engine_api, "load_config", lambda _: runtime.config)
+    # Setup may currently return the known saved-as-error defect; this probe
+    # isolates the independent missing qualification cleanup.
+    engine_api._response({
+        "protocol": 1, "operation": "vendors.delete", "payload": {"vendor_id": vendor_id},
+        "config_path": str(tmp_path / "fixture-config.toml"),
+    })
+    with store.connection() as db:
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+        assert not db.execute("SELECT 1 FROM thread_follow WHERE followed=1").fetchone()
+        if already_qualified:
+            db.execute(
+                "INSERT INTO maintenance_state VALUES('source_lock_protocol',?,?)",
+                (source_locks.SOURCE_LOCK_PROTOCOL, NOW.isoformat()),
+            )
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert db.execute(
+            "SELECT 1 FROM maintenance_state WHERE key='checkpoint_pending'"
+        ).fetchone()

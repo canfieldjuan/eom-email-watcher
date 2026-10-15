@@ -580,3 +580,5 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-10: the separate inspection-pipeline proposal amends only purge ownership, settlement transaction integration, and the paid operation class here. D5 claims semantics remain the separate PR #234. Explicit selection stays required by shared ADR-0003.
 - 2026-10-14: the operator answered the D-removal logical-barrier question, verbatim, "Yes, hide immediately (Recommended)" (relay #255 issuecomment-6178381502). D-removal owns the decision and its schema review gate.
 - 2026-10-15 UTC: the operator answered the scope-freeze question, verbatim, "Split: stopgap now (Recommended)" (relay #255 issuecomment-6183774906). D-removal owns the schema-35 refusal in #255 and the unchanged accepted deferred-removal behavior reserved for follow-up #260.
+
+- 2026-10-15 UTC: the operator answered the committed-unfollow wording question, verbatim, "Saved + notice (Recommended)" (relay #255 issuecomment-6184184429). D-removal records the success notice and automatic body cleanup at qualification; delete and clear refusal semantics are unchanged.

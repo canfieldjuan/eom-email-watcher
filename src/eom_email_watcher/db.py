@@ -69,6 +69,22 @@ class LocalRemovalHeld(RuntimeError):
         self.deleted = deleted
 
 
+@dataclass(frozen=True)
+class VendorRemoval:
+    removed: bool
+    addresses: tuple[str, ...] = ()
+    held_message_ids: tuple[str, ...] = ()
+
+    @property
+    def notice(self) -> str | None:
+        if not self.held_message_ids:
+            return None
+        return (
+            "Saved. Removing this thread's stored email text is waiting for the local upgrade "
+            "to finish; it will finish automatically."
+        )
+
+
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -10045,8 +10061,8 @@ class Store:
 
     def remove_vendor_address(
         self, vendor_id: str, address: str, *, now: datetime | None = None
-    ) -> bool:
-        """Unlink an address and record its dismissal (contract D-ops); False if not linked."""
+    ) -> VendorRemoval:
+        """Unlink an address and report the committed change and any held body cleanup."""
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -10056,19 +10072,16 @@ class Store:
                 (vendor_id, address),
             )
             if removed.rowcount != 1:
-                return False
+                return VendorRemoval(False)
             db.execute(
                 """INSERT OR IGNORE INTO vendor_address_dismissals(vendor_id, address, created_at)
                 VALUES (?, ?, ?)""",
                 (vendor_id, address, stamp),
             )
-        # Follow/attribution has committed; only physical body cleanup is held.
-        if db._held_body_cleanup:
-            raise LocalRemovalHeld(db._held_body_cleanup)
-        return True
+        return VendorRemoval(True, held_message_ids=db._held_body_cleanup)
 
-    def delete_vendor(self, vendor_id: str) -> list[str]:
-        """Delete a vendor with its addresses and dismissals; return the addresses it had."""
+    def delete_vendor(self, vendor_id: str) -> VendorRemoval:
+        """Delete a vendor and report its addresses and any held body cleanup."""
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             addresses = [
@@ -10081,9 +10094,7 @@ class Store:
             deleted = db.execute("DELETE FROM vendors WHERE vendor_id = ?", (vendor_id,))
             if deleted.rowcount != 1:
                 raise KeyError(vendor_id)
-        if db._held_body_cleanup:
-            raise LocalRemovalHeld(db._held_body_cleanup)
-        return addresses
+        return VendorRemoval(True, tuple(addresses), db._held_body_cleanup)
 
     def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
         """Delete a logical message as one unit (contract D-identity).

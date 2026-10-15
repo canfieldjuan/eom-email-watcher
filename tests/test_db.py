@@ -6339,10 +6339,10 @@ def test_vendor_records_enforce_one_vendor_per_address(tmp_path: Path) -> None:
         ("Other Co", []),
     ]
     assert store.vendor_for_address("billing@acme.com")["vendor_id"] == acme
-    assert store.remove_vendor_address(acme, "billing@acme.com") is True
-    assert store.remove_vendor_address(acme, "billing@acme.com") is False
+    assert store.remove_vendor_address(acme, "billing@acme.com").removed is True
+    assert store.remove_vendor_address(acme, "billing@acme.com").removed is False
     assert store.add_vendor_address(other, "billing@acme.com") is True
-    assert store.delete_vendor(other) == ["billing@acme.com"]
+    assert store.delete_vendor(other).addresses == ("billing@acme.com",)
     assert store.vendor_for_address("billing@acme.com") is None
     with pytest.raises(KeyError):
         store.delete_vendor(other)
@@ -6606,9 +6606,9 @@ def test_vendor_address_removal_records_a_dismissal_that_leaves_with_its_vendor(
             rows = db.execute("SELECT vendor_id, address FROM vendor_address_dismissals")
             return [(row["vendor_id"], row["address"]) for row in rows.fetchall()]
 
-    assert store.remove_vendor_address(acme, "other@acme.com") is False
+    assert store.remove_vendor_address(acme, "other@acme.com").removed is False
     assert dismissals() == []
-    assert store.remove_vendor_address(acme, "billing@acme.com") is True
+    assert store.remove_vendor_address(acme, "billing@acme.com").removed is True
     assert dismissals() == [(acme, "billing@acme.com")]
     store.delete_vendor(acme)
     assert dismissals() == []

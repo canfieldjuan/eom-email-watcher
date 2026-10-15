@@ -174,9 +174,15 @@ function Start-RestorationOwner {
 }
 function Restore-Tasks {
     if (Test-Path -LiteralPath $pending) {
+        $failures = @()
         foreach ($saved in @(Get-Content -LiteralPath $pending -Raw | ConvertFrom-Json)) {
-            if ($saved.Enabled) { Enable-ScheduledTask -TaskPath $saved.TaskPath -TaskName $saved.TaskName | Out-Null }
+            try {
+                if ($saved.Enabled) { Enable-ScheduledTask -TaskPath $saved.TaskPath -TaskName $saved.TaskName | Out-Null }
+            } catch {
+                $failures += ($saved.TaskPath + $saved.TaskName + ': ' + $_.Exception.Message)
+            }
         }
+        if ($failures.Count) { throw ('Task restoration failed: ' + ($failures -join '; ')) }
         Remove-Item -LiteralPath $pending
     }
 }

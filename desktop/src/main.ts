@@ -4859,14 +4859,12 @@ async function vendorOperation(
   // are in flight and an older list can never land after a newer one.
   try {
     let message: string | null = null;
-    let failureCode: string | undefined;
     try {
       message = await operation();
     } catch (error) {
-      failureCode = errorCode(error) ?? undefined;
       vendorFailure(error);
     }
-    const reload = vendorReloadAfter(message !== null, changesWatchlist, failureCode);
+    const reload = vendorReloadAfter(message !== null, changesWatchlist);
     if (reload !== "none") await loadVendors(reload === "with_message" ? message : null);
     if (changesWatchlist) await loadSenders();
   } finally {
@@ -4918,7 +4916,7 @@ async function removeVendorAddress(
   }
   await vendorOperation(`Removing ${address}…`, async () => {
     const vendor = await invoke<Vendor>("vendors_address_remove", { vendorId, address, unwatch });
-    return `${address} was removed from ${vendor.display_name}.`;
+    return vendor.notice ?? `${address} was removed from ${vendor.display_name}.`;
   }, unwatch);
 }
 
@@ -4935,8 +4933,10 @@ async function deleteVendor(
     return;
   }
   await vendorOperation(`Deleting ${vendorName}…`, async () => {
-    await invoke("vendors_delete", { vendorId, unwatchAddresses });
-    return `${vendorName} was deleted.`;
+    const result = await invoke<{ notice?: string | null }>("vendors_delete", {
+      vendorId, unwatchAddresses,
+    });
+    return result.notice ?? `${vendorName} was deleted.`;
   }, unwatchAddresses);
 }
 

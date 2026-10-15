@@ -598,6 +598,35 @@ def test_schema35_upgrade_retains_mail_and_invalidates_coverage_once(tmp_path, m
         assert db.execute("SELECT 1 FROM reconcile_coverage").fetchone()
 
 
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_body_cleanup_trigger_exists_and_deletes_logical_unit(tmp_path, monkeypatch, upgrade):
+    store = legacy_body_store(tmp_path, monkeypatch) if upgrade else followed(tmp_path)[0]
+    store.initialize()
+    seed(store, "copy", rfc_message_id="different@vendor")
+    with store.connection() as db:
+        db.execute("UPDATE messages SET logical_of='m' WHERE message_id='copy'")
+    with store.connection() as db:
+        sql = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='messages_delete_recipients_and_locations'"
+        ).fetchone()[0]
+        for table in ("message_recipients", "message_locations", "message_bodies",
+                      "message_body_unavailable", "messages"):
+            assert f"DELETE FROM {table}" in sql
+        db.execute(
+            "INSERT INTO message_bodies VALUES('m','private body',12,12,?)", (NOW.isoformat(),)
+        )
+        db.execute("INSERT INTO message_body_unavailable VALUES('copy','source_gone')")
+    # Exercise the actual trigger directly, so derived cleanup cannot conceal
+    # a missing or stale trigger after fresh creation or a v34 upgrade.
+    with sqlite3.connect(store.path) as db:
+        db.execute("PRAGMA recursive_triggers=ON")
+        db.execute("DELETE FROM messages WHERE message_id='m'")
+        for table in ("messages", "message_recipients", "message_locations",
+                      "message_bodies", "message_body_unavailable"):
+            assert not db.execute(f"SELECT 1 FROM {table}").fetchone(), table
+
+
 def test_schema35_full_disk_rolls_back_schema_mail_and_coverage(tmp_path, monkeypatch):
     from eom_email_watcher import body_state
 

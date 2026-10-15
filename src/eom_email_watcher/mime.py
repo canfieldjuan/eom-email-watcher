@@ -232,6 +232,15 @@ def validate_stored_payload(payload: object) -> None:
             raise StoredBodyInvalid("Message MIME body data is invalid")
         if len(body.get("data", "")) > (MAX_STORED_BODY_INPUT_CHARS + 2) // 3 * 4:
             raise StoredBodyInvalid("Message MIME body exceeds the safe input limit")
+        if "data" in body and size > 0:
+            try:
+                decoded = base64.b64decode(
+                    body["data"] + "=" * (-len(body["data"]) % 4), altchars=b"-_", validate=True
+                )
+            except ValueError as exc:
+                raise StoredBodyInvalid("Message body has invalid base64 encoding") from exc
+            if len(decoded) < size:
+                raise StoredBodyInvalid("Message body is shorter than its declared size")
         if "attachmentId" in body and (
             not isinstance(body["attachmentId"], str) or not body["attachmentId"].strip()
         ):
@@ -275,6 +284,7 @@ def extract_stored_body(payload: dict[str, Any], *, load_text=None) -> tuple[str
             if load_text is None:
                 raise StoredBodyInvalid("Message text part was not retrieved")
             data = load_text(part)
+            validate_stored_payload({**part, "body": {**body, "data": data}})
         header = Message()
         for item in part.get("headers", []):
             if item["name"].casefold() == "content-type":

@@ -24,7 +24,7 @@ from connect_automate.locking import (
 )
 from connect_automate.locking import connect_operation_lock as protocol_guard
 
-from . import deployment
+from . import body_state, deployment
 
 if TYPE_CHECKING:
     from .db import Store
@@ -278,6 +278,8 @@ def _qualify_protocol(store: Store, *, fresh: bool) -> None:
     database_path = store.path
     with store.connection() as db:
         if protocol_ready(db):
+            db.execute("BEGIN IMMEDIATE")
+            body_state.recompute(db)
             return
     if not operation_lock_supported(selection_path(database_path)):
         raise SourceProtocolUnavailable(
@@ -320,3 +322,4 @@ def _qualify_protocol(store: Store, *, fresh: bool) -> None:
                 "SET value=excluded.value,updated_at=excluded.updated_at",
                 (SOURCE_LOCK_PROTOCOL, datetime.now(UTC).isoformat()),
             )
+            body_state.recompute(db)
