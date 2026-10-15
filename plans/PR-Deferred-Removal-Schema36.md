@@ -1,12 +1,12 @@
 # Schema 36 — durable deferred-removal targets
 
-Status: proposed implementation plan for the operator-accepted D-removal amendment. Oversight reviews this plan before migration or deletion code. The accepted behavior is owned only by `docs/THREAD_VIEW_CONTRACT.md`, D-removal; this plan does not redefine it.
+Status: reviewed plan reserved for follow-up #260, contract-first and stacked on #255; it cannot merge before #255. The operator chose "Split: stopgap now (Recommended)" in #255 issuecomment-6183774906. #255 ships schema 35 and its refusal only: no schema-36 code, intent table or logical barrier. This plan and its transition map are carried here for the follow-up, not part of #255's implementation. The accepted behavior is owned only by `docs/THREAD_VIEW_CONTRACT.md`, D-removal; this plan does not redefine it.
 
 ## Contract and source inventory
 
 The version allocation, combined release boundary and backup guarantees are owned by `plans/PR-Source-Header-Evidence.md`.
 
-Current code has no removal-intent storage. `Store.delete_message` and `clear_messages` in `db.py` return false/zero when an unqualified source unit cannot be locked. Suppression is written with physical deletion and is not a retained-row visibility barrier. `_refresh_logical_messages_view` selects every canonical physical row. `Store.message_source`/`message_sources` and `_logical_unit` own source identity and physical membership. `_recompute_derived` owns derived transitions. `thread_migration.write_backup` exclusively creates the private backup and uses `VACUUM INTO`; `Store.initialize` serializes backup/migration and `_initialize_locked` reads the version inside `BEGIN IMMEDIATE` before DDL. These owners are extended rather than copied.
+The inventory baseline is `5a7fa32`, before the schema-35 refusal fix. It has no removal-intent storage; `Store.delete_message` and `clear_messages` in `db.py` return false/zero when an unqualified source unit cannot be locked. Refresh this inventory against merged #255 before follow-up implementation. Suppression is written with physical deletion and is not a retained-row visibility barrier. `_refresh_logical_messages_view` selects every canonical physical row. `Store.message_source`/`message_sources` and `_logical_unit` own source identity and physical membership. `_recompute_derived` owns derived transitions. `thread_migration.write_backup` exclusively creates the private backup and uses `VACUUM INTO`; `Store.initialize` serializes backup/migration and `_initialize_locked` reads the version inside `BEGIN IMMEDIATE` before DDL. These owners are extended rather than copied.
 
 ## Additive shape
 
