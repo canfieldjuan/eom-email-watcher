@@ -56,6 +56,19 @@ from .text import within_utf8_bytes
 from .thread_state import VendorIndex, vendor_index
 
 SCHEMA_VERSION = 35
+
+
+class LocalRemovalHeld(RuntimeError):
+    """No held unit was changed; a clear may have removed other units."""
+
+    def __init__(self, message_ids: Sequence[str], *, deleted: int = 0):
+        super().__init__(
+            "Can't delete this yet, the local upgrade is still finishing; try again later"
+        )
+        self.message_ids = tuple(message_ids)
+        self.deleted = deleted
+
+
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -5810,6 +5823,7 @@ class _DerivedConnection(sqlite3.Connection):
     _derived_enabled = False
     _derived_ready = False
     _derived_input_seen = False
+    _held_body_cleanup: tuple[str, ...] = ()
 
     def _prepare_derived_write(self, sql, parameters):
         if not self._derived_enabled or self._derived_ready:
@@ -10048,6 +10062,9 @@ class Store:
                 VALUES (?, ?, ?)""",
                 (vendor_id, address, stamp),
             )
+        # Follow/attribution has committed; only physical body cleanup is held.
+        if db._held_body_cleanup:
+            raise LocalRemovalHeld(db._held_body_cleanup)
         return True
 
     def delete_vendor(self, vendor_id: str) -> list[str]:
@@ -10064,6 +10081,8 @@ class Store:
             deleted = db.execute("DELETE FROM vendors WHERE vendor_id = ?", (vendor_id,))
             if deleted.rowcount != 1:
                 raise KeyError(vendor_id)
+        if db._held_body_cleanup:
+            raise LocalRemovalHeld(db._held_body_cleanup)
         return addresses
 
     def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
@@ -10080,7 +10099,7 @@ class Store:
             return False
         with self._source_cleanup_locks(unit.rows) as acquired, self.connection() as db:
             if not acquired:
-                return False
+                raise LocalRemovalHeld((message_id,))
             db.execute("BEGIN IMMEDIATE")
             unit = _logical_unit(db, message_id)
             if unit is None:
@@ -10129,6 +10148,7 @@ class Store:
                 ).fetchall()
             ]
         deleted = 0
+        held: list[str] = []
         for offset in range(0, len(canonicals), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
             initial = canonicals[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
             with self.connection() as db:
@@ -10138,6 +10158,7 @@ class Store:
                     continue
                 with self._source_cleanup_locks(unit_rows) as acquired, self.connection() as db:
                     if not acquired:
+                        held.extend(chunk)
                         continue
                     db.execute("BEGIN IMMEDIATE")
                     current_rows = _unit_rows(db, chunk)
@@ -10197,6 +10218,8 @@ class Store:
                         tuple(current_canonicals),
                     )
                     deleted += len(current_rows)
+        if held:
+            raise LocalRemovalHeld(held, deleted=deleted)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             _purge_expired_automation_tombstones(db, now=stamp.isoformat())

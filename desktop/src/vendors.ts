@@ -124,12 +124,15 @@ export function latestRequestFence() {
 // After a vendor operation, what the view reloads (D-ops, two stores). A
 // success reloads with its message. A failure of an operation that can change
 // the watchlist may follow a committed watchlist write, so it reloads too but
-// keeps the error showing; any other failure changed nothing.
+// keeps the error showing. A held body cleanup also follows a committed
+// follow transition, so that refusal must reload while preserving the error.
 export type VendorReload = "with_message" | "keep_error" | "none";
 
-export function vendorReloadAfter(succeeded: boolean, changesWatchlist: boolean): VendorReload {
+export function vendorReloadAfter(
+  succeeded: boolean, changesWatchlist: boolean, errorCode?: string,
+): VendorReload {
   if (succeeded) return "with_message";
-  return changesWatchlist ? "keep_error" : "none";
+  return changesWatchlist || errorCode === "inbox_removal_held" ? "keep_error" : "none";
 }
 
 export interface VendorDraft {

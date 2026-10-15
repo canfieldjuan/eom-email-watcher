@@ -1246,9 +1246,20 @@ struct InboxDeletion {
     message_id: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-struct InboxClear {
-    deleted: u64,
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxClear {
+    pub deleted: u64,
+    #[serde(default)]
+    pub refused: u64,
+    #[serde(default)]
+    pub held_message_ids: Vec<String>,
+    #[serde(default = "completed_removal_outcome")]
+    pub outcome: String,
+    pub message: Option<String>,
+}
+
+fn completed_removal_outcome() -> String {
+    "completed".to_owned()
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1914,9 +1925,8 @@ impl Engine {
         ))
     }
 
-    pub fn clear_inbox(&self) -> Result<u64, EngineError> {
+    pub fn clear_inbox(&self) -> Result<InboxClear, EngineError> {
         self.request::<InboxClear>("inbox.clear", json!({}))
-            .map(|response| response.deleted)
     }
 
     pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
@@ -3661,6 +3671,19 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
         let cleared: InboxClear =
             serde_json::from_value(json!({"deleted": 3})).expect("deserialize inbox clear result");
         assert_eq!(cleared.deleted, 3);
+        assert_eq!(cleared.outcome, "completed");
+        let partial: InboxClear = serde_json::from_value(json!({
+            "deleted": 1,
+            "refused": 1,
+            "held_message_ids": ["held"],
+            "outcome": "partial",
+            "message": "Can't delete this yet, the local upgrade is still finishing; try again later"
+        }))
+        .expect("deserialize held clear");
+        let webview = serde_json::to_value(partial).expect("serialize clear for webview");
+        assert_eq!(webview["outcome"], "partial");
+        assert_eq!(webview["refused"], 1);
+        assert_eq!(webview["held_message_ids"], json!(["held"]));
     }
 
     #[cfg(unix)]
@@ -5618,7 +5641,8 @@ timezone = "UTC"
         assert_eq!(
             engine
                 .clear_inbox()
-                .expect("released host lock is reusable"),
+                .expect("released host lock is reusable")
+                .deleted,
             0
         );
         assert_eq!(
@@ -5733,7 +5757,7 @@ timezone = "UTC"
                 .items,
             vec![]
         );
-        assert_eq!(engine.clear_inbox().expect("clear empty inbox"), 0);
+        assert_eq!(engine.clear_inbox().expect("clear empty inbox").deleted, 0);
         assert_eq!(
             engine
                 .delete_inbox_item("missing-message".into())

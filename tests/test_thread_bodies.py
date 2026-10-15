@@ -526,10 +526,11 @@ def test_gmail_invalid_folder_evidence_is_terminal_on_both_body_paths():
         gateway.content("m", 100, scope=frozenset({"inbox"}))
 
 
-def test_microsoft_invalid_body_is_a_retryable_provider_error():
+def test_microsoft_invalid_body_is_terminal():
     import httpx
 
-    from eom_email_watcher.microsoft365 import Microsoft365Error, Microsoft365Gateway
+    from eom_email_watcher.mailbox import MailboxMessageInvalid
+    from eom_email_watcher.microsoft365 import Microsoft365Gateway
 
     def handler(request):
         return httpx.Response(200, json={"parentFolderId": "inbox-id", "body": ["invalid"]})
@@ -537,7 +538,7 @@ def test_microsoft_invalid_body_is_a_retryable_provider_error():
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         gateway = Microsoft365Gateway("private", "owner@example.com", client)
         gateway._folder_ids = {"inbox": "inbox-id"}
-        with pytest.raises(Microsoft365Error):
+        with pytest.raises(MailboxMessageInvalid):
             gateway.stored_body("m", scope=frozenset({"inbox"}))
 
 

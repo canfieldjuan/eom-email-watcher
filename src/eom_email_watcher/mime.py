@@ -9,6 +9,8 @@ from typing import Any
 
 MAX_STORED_BODY_CHARS = 200_000
 MAX_STORED_BODY_INPUT_CHARS = 50 * 1024 * 1024
+MAX_MIME_DEPTH = 100
+MAX_MIME_PARTS = 1000
 
 
 class StoredBodyInvalid(ValueError):
@@ -196,22 +198,76 @@ def select_stored_alternative(alternatives):
     )
 
 
+def validate_stored_payload(payload: object) -> None:
+    """Validate the whole Gmail tree before selection or an external text fetch."""
+    pending = [(payload, 0)]
+    visited = 0
+    while pending:
+        node, depth = pending.pop()
+        visited += 1
+        if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH:
+            raise StoredBodyInvalid("Message MIME structure exceeds the safe limit")
+        if (
+            not isinstance(node, dict) or not isinstance(node.get("mimeType"), str)
+            or not node["mimeType"].strip()
+        ):
+            raise StoredBodyInvalid("Message MIME node is invalid")
+        children = node.get("parts", [])
+        if not isinstance(children, list):
+            raise StoredBodyInvalid("Message MIME parts are invalid")
+        if visited + len(pending) + len(children) > MAX_MIME_PARTS:
+            raise StoredBodyInvalid("Message MIME structure exceeds the safe limit")
+        if any(not isinstance(c, dict) for c in children):
+            raise StoredBodyInvalid("Message MIME parts are invalid")
+        # A container may omit its empty body; an explicit malformed value is
+        # never replaced with an empty object. Leaf bodies must be objects.
+        empty = {} if node["mimeType"].casefold().startswith("multipart/") else None
+        body = node.get("body", empty)
+        if not isinstance(body, dict):
+            raise StoredBodyInvalid("Message MIME body is invalid")
+        size = body.get("size", 0)
+        if type(size) is not int or size < 0:
+            raise StoredBodyInvalid("Message MIME body size is invalid")
+        if "data" in body and not isinstance(body["data"], str):
+            raise StoredBodyInvalid("Message MIME body data is invalid")
+        if len(body.get("data", "")) > (MAX_STORED_BODY_INPUT_CHARS + 2) // 3 * 4:
+            raise StoredBodyInvalid("Message MIME body exceeds the safe input limit")
+        if "attachmentId" in body and (
+            not isinstance(body["attachmentId"], str) or not body["attachmentId"].strip()
+        ):
+            raise StoredBodyInvalid("Message MIME attachment identity is invalid")
+        if not children and size and "data" not in body and "attachmentId" not in body:
+            raise StoredBodyInvalid("External message body has no attachment identity")
+        headers = node.get("headers", [])
+        if not isinstance(headers, list) or any(
+            not isinstance(h, dict) or not isinstance(h.get("name"), str)
+            or not isinstance(h.get("value"), str) for h in headers
+        ):
+            raise StoredBodyInvalid("Message MIME headers are invalid")
+        if "filename" in node and not isinstance(node["filename"], str):
+            raise StoredBodyInvalid("Message MIME filename is invalid")
+        pending.extend((child, depth + 1) for child in reversed(children))
+
+
 def extract_stored_body(payload: dict[str, Any], *, load_text=None) -> tuple[str, int]:
+    validate_stored_payload(payload)
     total = 0
 
     def walk(part):
         nonlocal total
         if part.get("filename"):
             return []
-        kind = str(part.get("mimeType", "")).casefold()
-        children = [walk(child) for child in part.get("parts") or [] if isinstance(child, dict)]
+        kind = part["mimeType"].casefold()
+        children = [walk(child) for child in part.get("parts", [])]
         if kind == "multipart/alternative":
             return select_stored_alternative(children)
         if children:
             return [body for child in children for body in child]
         if kind not in {"text/plain", "text/html"}:
             return []
-        body = part.get("body") or {}
+        body = part.get("body", {})
+        if body.get("size", 0) > MAX_STORED_BODY_INPUT_CHARS:
+            raise StoredBodyInvalid("Message text part exceeds the safe input limit")
         data = body.get("data")
         if not isinstance(data, str):
             if not body.get("attachmentId"):
@@ -220,10 +276,8 @@ def extract_stored_body(payload: dict[str, Any], *, load_text=None) -> tuple[str
                 raise StoredBodyInvalid("Message text part was not retrieved")
             data = load_text(part)
         header = Message()
-        for item in part.get("headers") or []:
-            if (isinstance(item, dict)
-                    and str(item.get("name", "")).casefold() == "content-type"
-                    and isinstance(item.get("value"), str)):
+        for item in part.get("headers", []):
+            if item["name"].casefold() == "content-type":
                 header["Content-Type"] = item["value"]
                 break
         text = _decode(data, charset=header.get_content_charset() or "utf-8", strict=True)

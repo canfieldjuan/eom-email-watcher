@@ -115,6 +115,7 @@ test("a failed watchlist-changing operation still reloads, keeping its error", a
   // The watchlist write may have committed before the database step failed.
   assert.equal(vendorReloadAfter(false, true), "keep_error");
   assert.equal(vendorReloadAfter(false, false), "none");
+  assert.equal(vendorReloadAfter(false, false, "inbox_removal_held"), "keep_error");
 });
 
 test("vendor drafts survive re-renders and are dropped with their vendor", async () => {

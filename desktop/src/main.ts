@@ -21,6 +21,7 @@ import {
 import { automationOutcomeIdentity, automationOutcomeStatus } from "./automationOutcome";
 import { hasInboxAutomationConfirmation, inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
+import { inboxClearView, type InboxClearResult } from "./inboxRemoval";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import { mailAccountDetail } from "./mailAccountDetail";
 import {
@@ -2638,17 +2639,27 @@ async function clearInboxHistory(): Promise<void> {
   setInboxControlsBusy(true);
   renderInbox(inboxItems);
   try {
-    const deleted = await invoke<number>("inbox_clear");
-    expandedInboxMessages.clear();
-    inboxPageState = "loaded";
-    inboxItems = [];
-    inboxNextCursor = null;
-    inboxCapabilityUnavailableCount = 0;
-    clearMessageOwnedUiState();
-    inboxLoadMore.hidden = true;
+    const result = await invoke<InboxClearResult>("inbox_clear");
+    const view = inboxClearView(inboxItems, result);
+    const retained = new Set(view.retained.map(item => item.message_id));
+    for (const item of inboxItems) {
+      if (!retained.has(item.message_id)) {
+        expandedInboxMessages.delete(item.message_id);
+        clearMessageOwnedUiState(item.message_id);
+      }
+    }
+    inboxItems = view.retained;
+    if (result.outcome === "completed") {
+      expandedInboxMessages.clear();
+      inboxPageState = "loaded";
+      inboxNextCursor = null;
+      inboxCapabilityUnavailableCount = 0;
+      clearMessageOwnedUiState();
+      inboxLoadMore.hidden = true;
+    }
     renderInbox(inboxItems);
-    inboxStatus.textContent = `Cleared ${deleted} local message${deleted === 1 ? "" : "s"}. Source email was not changed.`;
-    inboxStatus.dataset.kind = "success";
+    inboxStatus.textContent = view.text;
+    inboxStatus.dataset.kind = view.kind;
   } catch (error) {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
@@ -4848,12 +4859,14 @@ async function vendorOperation(
   // are in flight and an older list can never land after a newer one.
   try {
     let message: string | null = null;
+    let failureCode: string | undefined;
     try {
       message = await operation();
     } catch (error) {
+      failureCode = errorCode(error) ?? undefined;
       vendorFailure(error);
     }
-    const reload = vendorReloadAfter(message !== null, changesWatchlist);
+    const reload = vendorReloadAfter(message !== null, changesWatchlist, failureCode);
     if (reload !== "none") await loadVendors(reload === "with_message" ? message : null);
     if (changesWatchlist) await loadSenders();
   } finally {

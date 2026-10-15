@@ -43,6 +43,8 @@ from .mailbox import (
     validate_operation_timeout,
 )
 from .mime import (
+    MAX_MIME_DEPTH,
+    MAX_MIME_PARTS,
     AttachmentDescriptor,
     StoredBodyInvalid,
     bounded_body_text,
@@ -72,8 +74,6 @@ RECIPIENT_HEADER_FIELDS = "TO CC"
 REPLY_HEADER_FIELDS = "IN-REPLY-TO REFERENCES"
 _HEADER_FIELDS = re.compile(rb"HEADER\.FIELDS \(([^)]*)\)", re.IGNORECASE)
 MAX_BODYSTRUCTURE_BYTES = 1024 * 1024
-MAX_MIME_DEPTH = 100
-MAX_MIME_PARTS = 1000
 MAX_BODYSTRUCTURE_TOKENS = MAX_MIME_PARTS * 32
 MAX_ATTACHMENT_FILENAME_BYTES = 1024
 MAX_ATTACHMENT_FILENAME_TOTAL_BYTES = 64 * 1024

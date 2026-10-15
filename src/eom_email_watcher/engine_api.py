@@ -90,6 +90,7 @@ from .db import (
     ConnectQueueFull,
     GmailLabelSelector,
     GmailLabelStoreError,
+    LocalRemovalHeld,
     MailAccount,
     MailboxIdentityChanged,
     MessageSource,
@@ -2725,7 +2726,16 @@ def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
             "Local inbox changes require native operation locking",
         )
     with operation_lock(lock_path, "Another watcher operation is already running"):
-        deleted = runtime.store.clear_messages()
+        try:
+            deleted = runtime.store.clear_messages()
+        except LocalRemovalHeld as exc:
+            return {
+                "outcome": "partial" if exc.deleted else "refused",
+                "deleted": exc.deleted,
+                "refused": len(exc.message_ids),
+                "held_message_ids": list(exc.message_ids),
+                "message": str(exc),
+            }
     return {"deleted": deleted}
 
 
@@ -6313,6 +6323,13 @@ def _response(request: object) -> dict[str, object]:
             error["retryable"] = exc.retryable
         return {
             "error": error,
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except LocalRemovalHeld as exc:
+        return {
+            "error": {"code": "inbox_removal_held", "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

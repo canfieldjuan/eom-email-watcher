@@ -903,9 +903,9 @@ class Microsoft365Gateway:
     def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
         document = self._content_document(message_id, scope, prefer_text=False)
         body = document.get("body")
-        if not isinstance(body, dict) or not isinstance(body.get("content"), str):
-            raise Microsoft365Error("Microsoft message body response is invalid")
         try:
+            if not isinstance(body, dict) or not isinstance(body.get("content"), str):
+                raise StoredBodyInvalid("Microsoft message body response is invalid")
             return stored_body_text(
                 body["content"],
                 is_html=str(body.get("contentType", "")).casefold() == "html",

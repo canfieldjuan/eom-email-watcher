@@ -1102,8 +1102,6 @@ class GmailGateway:
 
         def load_text(part):
             body = part["body"]
-            if isinstance(body.get("size"), int) and body["size"] > MAX_STORED_BODY_INPUT_CHARS:
-                raise StoredBodyInvalid("Gmail text part exceeds the safe input limit")
             request = (
                 self.service.users()
                 .messages()
@@ -1116,14 +1114,13 @@ class GmailGateway:
                 raise _message_fetch_error(exc, message_id, "text part") from exc
             data = response.get("data")
             if not isinstance(data, str):
-                raise GmailError("Gmail text part response did not contain data")
+                raise StoredBodyInvalid("Gmail text part response contained invalid data")
             if len(data) > (MAX_STORED_BODY_INPUT_CHARS + 2) // 3 * 4:
                 raise StoredBodyInvalid("Gmail text part exceeds the safe input limit")
-            _decode_attachment_data(data)
             return data
 
         try:
-            return extract_stored_body(message.get("payload") or {}, load_text=load_text)
+            return extract_stored_body(message.get("payload"), load_text=load_text)
         except StoredBodyInvalid as exc:
             raise MailboxMessageInvalid("gmail_body_invalid", str(exc)) from exc
 

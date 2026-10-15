@@ -181,6 +181,8 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/full/nsis-compiler.json
             ${{ runner.temp }}/ew-source-cutover/full/release-sources.json
             ${{ runner.temp }}/ew-source-cutover/full/parity.json
+            ${{ runner.temp }}/ew-source-cutover/full/*-base-library.zip
+            ${{ runner.temp }}/ew-source-cutover/full/base-library-diff.json
             ${{ runner.temp }}/ew-source-cutover/full/qualification.json
             ${{ runner.temp }}/ew-source-cutover/full/operations.jsonl
             ${{ runner.temp }}/ew-source-cutover/full/greenmail.log

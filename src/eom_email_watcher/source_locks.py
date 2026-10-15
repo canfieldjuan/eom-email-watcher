@@ -127,6 +127,11 @@ def selection_path(database_path: Path) -> Path:
     return database_path.parent / ".connect-locks" / "source-protocol-selection-v1.lock"
 
 
+def cleanup_held(*, ready: bool, row_count: int, legacy_limit: int) -> bool:
+    """One admission rule for indivisible cleanup before protocol qualification."""
+    return not ready and row_count > legacy_limit
+
+
 @contextmanager
 def selected_source_locks(
     store: Store,
@@ -176,7 +181,7 @@ def selected_source_locks(
             ready = protocol_ready(db)
         require_selected_protocol(ready)
         if not ready:
-            if len(ids) > legacy_limit:
+            if cleanup_held(ready=ready, row_count=len(ids), legacy_limit=legacy_limit):
                 # The owner tells cleanup to preserve this indivisible unit.
                 yield False
                 return

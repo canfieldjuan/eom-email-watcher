@@ -99,7 +99,8 @@ def record(store, message_id, body, *, fetched_at, reason=None):
 
 
 def recompute(db):
-    from .db import _effective_message_identity_sql
+    from . import source_locks
+    from .db import SOURCE_CLEANUP_LOCK_BATCH_SIZE, _effective_message_identity_sql, _unit_rows
 
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_bodies'").fetchone():
         return
@@ -108,8 +109,28 @@ def recompute(db):
         AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
         AND f.thread_key=m.thread_key
         WHERE f.followed=1"""
+    held = []
+    # This runs in the same write transaction as follow/attribution, so the
+    # protocol marker cannot change between the admission read and cleanup.
+    ready = source_locks.protocol_ready(db)
+    if not ready:
+        for (message_id,) in db.execute(
+            f"SELECT message_id FROM message_bodies WHERE message_id NOT IN ({eligible}) "
+            f"UNION SELECT message_id FROM message_body_unavailable "
+            f"WHERE message_id NOT IN ({eligible})"
+        ).fetchall():
+            if source_locks.cleanup_held(
+                ready=ready, row_count=len(_unit_rows(db, (message_id,))),
+                legacy_limit=SOURCE_CLEANUP_LOCK_BATCH_SIZE,
+            ):
+                held.append(message_id)
+    db._held_body_cleanup = tuple(held)
     for table in ("message_bodies", "message_body_unavailable"):
-        db.execute(f"DELETE FROM {table} WHERE message_id NOT IN ({eligible})")
+        db.execute(
+            f"DELETE FROM {table} WHERE message_id NOT IN ({eligible}) "
+            "AND message_id NOT IN (SELECT value FROM json_each(?))",
+            (json.dumps(held),),
+        )
     if db.execute(
         "SELECT 1 FROM sqlite_temp_master WHERE name='derived_returned_sources'"
     ).fetchone():
