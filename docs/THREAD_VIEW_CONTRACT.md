@@ -242,7 +242,7 @@ Each definition is the only place its rule is stated.
 
 ### D-removal: deferred local deletions
 
-This schema-36 contract for issue #260 replaces the schema-35 refusal in #255. The contract-only PR is stacked on #255 and cannot merge before it. Operator acceptance of this contract PR is required before implementation; the earlier accepted behavior and reviewed storage plan do not waive that gate.
+This schema-36 contract for issue #260 replaces the schema-35 refusal in #255. PR #261 is stacked on #255 and cannot merge before it. The operator accepted the contract at `acfb6d8` through issuecomment-6184564040; the decision is recorded in the revision log below. Implementation follows this definition and the reviewed schema-36 plan.
 
 - **One removal owner.** A local message deletion, clear-history request, or body cleanup caused by unfollow uses the source-exclusion owner in `docs/CONTRACTS.md`. Targets that can be locked are removed immediately using the existing suppression and content-cleanup owners.
 
@@ -582,3 +582,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-15 UTC: the operator answered the scope-freeze question, verbatim, "Split: stopgap now (Recommended)" (relay #255 issuecomment-6183774906). D-removal owns the schema-35 refusal in #255 and the unchanged accepted deferred-removal behavior reserved for follow-up #260.
 
 - 2026-10-15 UTC: the operator answered the committed-unfollow wording question, verbatim, "Saved + notice (Recommended)" (relay #255 issuecomment-6184184429). D-removal records the success notice and automatic body cleanup at qualification; delete and clear refusal semantics are unchanged.
+- 2026-10-15 UTC: the operator accepted PR #261's contract at `acfb6d8`, verbatim, "Accept #261 (Recommended)" (relay #261 issuecomment-6184564040). The option read: "Codex records your acceptance in its own commit, then builds it on top of #255. Any change to #255 gets merged in, with no history rewriting." Acceptance releases implementation per D-removal and the reviewed schema-36 plan. #255 remains first priority; #261 merges only after #255. A change beyond the accepted schema plan or an owner requiring more than the declared refusal remains a STOP-and-ask boundary.

@@ -1,6 +1,6 @@
 # Schema 36 — durable deferred-removal targets
 
-Status: contract-only proposal for issue #260, stacked on #255; it cannot merge before #255. STOP: operator acceptance of this contract PR is required before any schema or runtime implementation. The operator chose "Split: stopgap now (Recommended)" in #255 issuecomment-6183774906. #255 ships schema 35 with held delete/clear refusal and saved-unfollow notice: no schema-36 code, intent table or logical barrier. This plan and its transition map are carried here for the follow-up, not part of #255's implementation. The accepted behavior is owned only by `docs/THREAD_VIEW_CONTRACT.md`, D-removal; this plan does not redefine it.
+Status: accepted for implementation in PR #261, stacked on #255; it cannot merge before #255. The operator acceptance and forward-only integration decision are recorded in `docs/THREAD_VIEW_CONTRACT.md`'s revision log (relay #261 issuecomment-6184564040). STOP and ask before any schema detail beyond this plan or any source owner needing more than the declared refusal. #255 ships schema 35 with held delete/clear refusal and saved-unfollow notice: no schema-36 code, intent table or logical barrier. This plan and its transition map belong to the follow-up, not #255's implementation. The accepted behavior is owned only by D-removal; this plan does not redefine it.
 
 ## Contract and source inventory
 
@@ -75,4 +75,4 @@ The content delivery channels are desktop notification and ntfy HTTP push in the
 
 ## Gap audit
 
-NOT DONE: the schema shape and source-transition map have oversight readthrough, including the outbound and reader audit additions above. This contract-only PR still requires explicit operator acceptance before implementation; #255 qualification/merge is also outstanding. Compatibility interleavings, fail-first tests, migration/source/API/UI implementation and final exact-head qualification remain required. No live database, installed app, account/profile or other repository change.
+NOT DONE: contract acceptance is recorded in D-removal's revision log, and the schema shape/source-transition map have oversight readthrough, including the outbound and reader audit additions above. #255 qualification/merge is outstanding. Compatibility interleavings, fail-first tests, migration/source/API/UI implementation and final exact-head qualification remain required. No live database, installed app, account/profile or other repository change.
