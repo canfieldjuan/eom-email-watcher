@@ -19,6 +19,12 @@ The inventory baseline is #255 implementation head `4a25a9425d495c2bf292e17f5594
 
 No messages-table rebuild, row renaming, body rewrite or migration-time deletion. Legacy NULL identity uses the existing effective-identity/continuity owner; do not invent a mailbox identity during migration or acceptance.
 
+### Request-key expiry owner
+
+Oversight readthrough 9e6b0e97 approves fixed expiry in the opaque request key to meet the operator-approved retention condition. One issuer/parser binds the expiry, random identity, kind and canonical-parameter hash; modified or malformed keys are rejected. Its local signing material is operational state in the existing private maintenance owner, never request/intent/target content or provider credentials. A known retained request returns its frozen status even beyond expiry. An unknown expired key returns the existing `invalid_request` without mutation; retirement cannot discard its receipt before that fixed expiry or before every child settles and passes retention. A later retention-setting change cannot make the expired key fresh again. A deliberate new operation obtains a new key.
+
+Tests cover known retained keys beyond expiry, unknown expired keys with unchanged storage, retention-setting changes after retirement, and forged/malformed keys. This clarifies the request owner and changes no table shape or version. No implementation preceded this recorded readthrough.
+
 ## Migration and recovery owners
 
 - Extend the existing backup owner with an explicit target-schema parameter to implement the allocation owner's guarantees; do not add another snapshot path. The existing upgrade lock covers both snapshot and migration, with the backup preceding the upgrade chain. Incomplete newly created backups are removed by the same owner.
