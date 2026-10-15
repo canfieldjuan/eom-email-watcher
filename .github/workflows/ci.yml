@@ -179,6 +179,8 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/native-integration.xml
             ${{ runner.temp }}/ew-source-cutover/full/build-inventory.json
             ${{ runner.temp }}/ew-source-cutover/full/release-engine.exe
+            ${{ runner.temp }}/ew-source-cutover/full/release-payload/**/eom-email-watcher-desktop.exe
+            ${{ runner.temp }}/ew-source-cutover/full/qualification-payload/**/eom-email-watcher-desktop.exe
             desktop/src-tauri/binaries/eom-mail-engine-x86_64-pc-windows-msvc.exe
             ${{ runner.temp }}/ew-source-cutover/full/nsis-compiler.json
             ${{ runner.temp }}/ew-source-cutover/full/release-sources.json
