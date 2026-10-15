@@ -746,6 +746,134 @@ def test_fixture_authority_signs_tests_and_is_rejected_for_release(tmp_path, mon
         validate_entitlement_keyring(keyring)
 
 
+@pytest.fixture
+def mail_startup(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import windows_cutover_fixture as fixture
+
+    jar = b"public startup fixture"
+    (tmp_path / "greenmail.jar").write_bytes(jar)
+    monkeypatch.setattr(fixture, "GREENMAIL_SHA256", hashlib.sha256(jar).hexdigest())
+    state = SimpleNamespace(
+        clock=0.0,
+        argv=[],
+        terminated=False,
+        waited=False,
+        attempts=0,
+        startup_log="",
+        exit_code=None,
+        ready_at=3.0,
+        folders=[],
+        error=fixture.imaplib.IMAP4.error("LOGIN failed"),
+    )
+
+    def launch(argv, *, stdout, stderr):
+        state.argv = argv
+        stdout.write(state.startup_log)
+        stdout.flush()
+        return SimpleNamespace(
+            poll=lambda: state.exit_code,
+            terminate=lambda: setattr(state, "terminated", True),
+            wait=lambda timeout: setattr(state, "waited", True),
+        )
+
+    monkeypatch.setattr(
+        fixture,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda *a, **kw: SimpleNamespace(stdout="public java", stderr=""),
+            Popen=launch,
+            STDOUT=fixture.subprocess.STDOUT,
+        ),
+    )
+
+    @contextmanager
+    def probe():
+        yield SimpleNamespace(bind=lambda address: None)
+
+    monkeypatch.setattr(fixture, "socket", SimpleNamespace(socket=probe))
+    monkeypatch.setattr(
+        fixture,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: state.clock,
+            sleep=lambda seconds: setattr(state, "clock", state.clock + seconds),
+        ),
+    )
+
+    @contextmanager
+    def connection(self):
+        state.attempts += 1
+        if state.clock < state.ready_at:
+            raise state.error
+
+        def create(folder):
+            state.folders.append(folder)
+            return ("OK", [])
+
+        yield SimpleNamespace(create=create)
+
+    monkeypatch.setattr(fixture.MailFixture, "connection", connection)
+    return fixture.MailFixture(tmp_path), state
+
+
+@pytest.mark.parametrize("error", [OSError("not listening"), "login"])
+def test_mail_startup_budget_and_transient_readiness(mail_startup, error):
+    mail, state = mail_startup
+    if error != "login":
+        state.error = error
+    with mail as ready:
+        assert ready is mail
+        options = [a for a in state.argv if a.startswith("-Dgreenmail.startup.timeout=")]
+        assert options == ["-Dgreenmail.startup.timeout=25000"]
+        assert state.argv.index(options[0]) < state.argv.index("-jar")
+        assert state.clock >= 3 and state.folders == ["Sent"]
+    assert state.terminated and state.waited and mail.log.closed
+    assert not mail.model_thread.is_alive()
+
+
+def test_mail_startup_exception_preserves_origin_and_cleans_up(mail_startup):
+    mail, state = mail_startup
+    state.ready_at = float("inf")
+    state.startup_log = (
+        'Exception in thread "main" java.lang.IllegalStateException: '
+        "Could not start mail server imaps:127.0.0.1:3993, "
+        "try to set server startup timeout > 2000\n"
+    )
+    with (
+        pytest.raises(RuntimeError, match="GreenMail startup failed:.*Could not start mail server"),
+        mail,
+    ):
+        pytest.fail("half-started server accepted")
+    assert state.clock == 0 and state.attempts <= 1
+    assert state.terminated and state.waited and mail.log.closed
+    assert not mail.model_thread.is_alive()
+
+
+@pytest.mark.parametrize("exited", [False, True])
+def test_mail_startup_readiness_deadline_and_process_exit(mail_startup, exited):
+    mail, state = mail_startup
+    state.ready_at = float("inf")
+    state.startup_log = "public ordinary startup message\n"
+    state.exit_code = 1 if exited else None
+    with (
+        pytest.raises(RuntimeError, match="GreenMail TLS/login did not become ready"),
+        mail,
+    ):
+        pytest.fail("unready server accepted")
+    if exited:
+        assert state.clock == 0
+    else:
+        assert 30 <= state.clock < 30.2
+        budget = [a for a in state.argv if a.startswith("-Dgreenmail.startup.timeout=")]
+        assert len(budget) == 1
+        assert int(budget[0].split("=", 1)[1]) < state.clock * 1000
+    assert state.terminated and state.waited and mail.log.closed
+    assert not mail.model_thread.is_alive()
+
+
 def test_public_model_peer_exercises_real_analysis_client():
     import threading
     from datetime import UTC, datetime

@@ -215,6 +215,8 @@ class MailFixture:
                 [
                     "java",
                     "-Dgreenmail.setup.test.imaps",
+                    # Allow TLS startup within the readiness budget below.
+                    "-Dgreenmail.startup.timeout=25000",
                     "-Dgreenmail.hostname=127.0.0.1",
                     f"-Dgreenmail.tls.keystore.file={keystore}",
                     "-Dgreenmail.tls.keystore.password=changeit",
@@ -228,6 +230,13 @@ class MailFixture:
             )
             deadline = time.monotonic() + 30
             while True:
+                for line in (
+                    (self.output / "greenmail.log")
+                    .read_text(encoding="utf-8", errors="replace")
+                    .splitlines()
+                ):
+                    if "java.lang.IllegalStateException: Could not start mail server " in line:
+                        raise RuntimeError(f"GreenMail startup failed: {line.strip()}")
                 try:
                     with self.connection() as client:
                         assert client.create("Sent")[0] == "OK"
