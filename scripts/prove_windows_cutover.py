@@ -38,6 +38,46 @@ PREDECESSOR = "43a850d8b00cddfdad2a767b7b27fc792707b010"
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def package_program_paths(payload, hooks):
+    """Resolve only NSIS OUTDIR aliases established by the packaged hooks."""
+    saved = set(re.findall(r'(?m)^\s*StrCpy\s+(\$\w+)\s+"\$OUTDIR"\s*$', hooks))
+    restored = set(re.findall(r'(?m)^\s*SetOutPath\s+"(\$\w+)"\s*$', hooks))
+    aliases = saved & restored
+    programs = set()
+    for raw in payload:
+        name = raw.replace("\\", "/")
+        if not name.casefold().endswith(".exe"):
+            continue
+        if name.startswith("$PLUGINSDIR/"):
+            continue
+        parts = name.split("/")
+        if parts[0] in aliases:
+            parts = parts[1:]
+        if not parts or any(p in {"", ".", ".."} or "$" in p or ":" in p for p in parts):
+            raise ValueError("Unresolved installer program destination: " + raw)
+        relative = "/".join(parts).casefold()
+        if relative in programs:
+            raise ValueError("Colliding installer program destinations: " + raw)
+        programs.add(relative)
+    return programs
+
+
+def verify_package_programs(payload, catalog_lines, hooks, receipt_path):
+    packaged_programs = package_program_paths(payload, hooks)
+    assert catalog_lines[0] == "EW-PACKAGE-FILES-V1"
+    catalog_programs = {
+        name.replace("\\", "/").casefold()
+        for name in catalog_lines[1:]
+        if name.casefold().endswith(".exe") and not name.startswith("EW-APP-IMAGE|")
+    }
+    receipt_path.write_text(json.dumps({
+        "package": sorted(packaged_programs), "catalog": sorted(catalog_programs),
+    }, indent=2))
+    assert catalog_programs == packaged_programs, (
+        "Owned programs differ from the actual installer payload"
+    )
+
+
 def powershell(script: str, *, timeout: int = 40, **values: str) -> str:
     # Data travels through environment, never interpolated as PowerShell code.
     result = subprocess.run(
@@ -528,29 +568,10 @@ def run_case(
             == hashlib.sha256(installed_catalog.read_bytes()).hexdigest()
         )
         payload = installer_manifest(installer, folder / "package-payload")
-        packaged_programs = {
-            name.replace("\\", "/").casefold()
-            for name in payload
-            if name.casefold().endswith(".exe") and not name.startswith("$PLUGINSDIR/")
-        }
         catalog_lines = installed_catalog.read_text(encoding="utf-16").splitlines()
-        assert catalog_lines[0] == "EW-PACKAGE-FILES-V1"
-        catalog_programs = {
-            name.replace("\\", "/").casefold()
-            for name in catalog_lines[1:]
-            if name.casefold().endswith(".exe") and not name.startswith("EW-APP-IMAGE|")
-        }
-        (folder / "package-programs.json").write_text(
-            json.dumps(
-                {
-                    "package": sorted(packaged_programs),
-                    "catalog": sorted(catalog_programs),
-                },
-                indent=2,
-            )
-        )
-        assert catalog_programs == packaged_programs, (
-            "Owned programs differ from the actual installer payload"
+        verify_package_programs(
+            payload, catalog_lines, (ROOT / "desktop/src-tauri/windows/hooks.nsh").read_text(),
+            folder / "package-programs.json",
         )
         view = _request(
             engine,

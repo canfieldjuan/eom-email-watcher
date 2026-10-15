@@ -81,6 +81,95 @@ foreach ($assignment in $assignments) {
     assert "HANDLE_OWNER_BOUNDARIES_PASS" in result.splitlines()
 
 
+def test_restore_opens_handle_before_identity_check():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    ).read_text()
+    restore = source[source.index("if ($Phase -eq 'Restore')") :]
+    assert restore.index("Open-CutoverProcessHandle $installer") < restore.index(
+        "$installer.StartTime"
+    ), "Restore validates identity before opening its persistent handle"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual product Restore AST with public CLR process")
+@pytest.mark.parametrize("mode", ["match", "mismatch", "denied"])
+def test_native_restore_identity_uses_opened_handle(tmp_path, mode):
+    from pathlib import Path
+
+    import prove_windows_cutover as proof
+
+    code = r'''
+$ErrorActionPreference='Stop'
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:EW_PRODUCT_SOURCE,[ref]$tokens,[ref]$errors)
+if ($errors.Count) { throw 'Product script does not parse' }
+$owner=$ast.Find({param($n)
+    $n -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Open-CutoverProcessHandle'
+},$true)
+. ([scriptblock]::Create($owner.Extent.Text))
+$restore=$ast.Find({param($n)
+    $n -is [Management.Automation.Language.IfStatementAst] -and
+    $n.Clauses[0].Item1.Extent.Text -eq "$('$')Phase -eq 'Restore'"
+},$true)
+if (!$restore) { throw 'Restore owner missing' }
+$entry=($restore.Clauses[0].Item2.Statements | Select-Object -First 2 |
+    ForEach-Object { $_.Extent.Text }) -join "`n"
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+public class PublicRestoreProcess {
+    public string Mode; public bool Held; public bool Waited;
+    public IntPtr Handle { get {
+        if (Mode == "denied") throw new Win32Exception(5);
+        Held=true; return new IntPtr(1234);
+    } }
+    public DateTime StartTime { get {
+        if (!Held) throw new InvalidOperationException("Identity read before stable handle");
+        return new DateTime(Mode == "mismatch" ? 101 : 100, DateTimeKind.Utc);
+    } }
+    public void WaitForExit() {
+        if (!Held) throw new InvalidOperationException("Wait without stable handle");
+        Waited=true;
+    }
+}
+'@
+$probe=New-Object PublicRestoreProcess;$probe.Mode=$env:EW_RESTORE_MODE
+function Get-Process { param($Id,$ErrorAction) return $probe }
+$InstallerPid=1234;$InstallerStarted=100;$restoreReady=$env:EW_RESTORE_READY
+$caught=$false
+try { . ([scriptblock]::Create($entry)) }
+catch {
+    $base=$_.Exception.GetBaseException()
+    if ($probe.Mode -ne 'denied' -or $base -isnot [ComponentModel.Win32Exception] -or
+        $base.NativeErrorCode -ne 5) { throw }
+    $caught=$true
+}
+$ready=Test-Path -LiteralPath $restoreReady
+if ($probe.Mode -eq 'match') {
+    if (!$probe.Held -or !$probe.Waited -or !$ready -or $caught) {
+        throw 'Installer not recognized'
+    }
+} elseif ($ready -or $probe.Waited -or ($caught -ne ($probe.Mode -eq 'denied'))) {
+    throw 'Unauthenticated installer became ready or waited'
+}
+'RESTORE_IDENTITY_BOUNDARIES_PASS'
+'''
+    output = proof.probe_output(f"restore-identity-{mode}", tmp_path)
+    result = proof.powershell(
+        code,
+        EW_PRODUCT_SOURCE=str(
+            Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+        ),
+        EW_RESTORE_MODE=mode, EW_RESTORE_READY=str(output / "restore.ready"),
+    )
+    (output / "restore-identity.txt").write_text(result)
+    assert "RESTORE_IDENTITY_BOUNDARIES_PASS" in result.splitlines()
+
+
 def test_cutover_normalizes_paths_and_prepares_recovery_before_mutation():
     from pathlib import Path
 

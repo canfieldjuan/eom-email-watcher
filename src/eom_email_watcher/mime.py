@@ -86,14 +86,18 @@ class AttachmentDescriptor:
     source_provider_message_id: str | None = None
 
 
-def _decode(data: str, *, charset: str = "utf-8") -> str:
+def _decode(data: str, *, charset: str = "utf-8", strict: bool = False) -> str:
     try:
-        raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+        raw = base64.b64decode(
+            data + "=" * (-len(data) % 4), altchars=b"-_", validate=strict
+        )
         try:
             return raw.decode(charset, errors="replace")
         except (LookupError, UnicodeError):
             return raw.decode("utf-8", errors="replace")
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        if strict:
+            raise StoredBodyInvalid("Message body has invalid base64 encoding") from exc
         return ""
 
 
@@ -222,7 +226,7 @@ def extract_stored_body(payload: dict[str, Any], *, load_text=None) -> tuple[str
                     and isinstance(item.get("value"), str)):
                 header["Content-Type"] = item["value"]
                 break
-        text = _decode(data, charset=header.get_content_charset() or "utf-8")
+        text = _decode(data, charset=header.get_content_charset() or "utf-8", strict=True)
         total += len(text)
         if total > MAX_STORED_BODY_INPUT_CHARS:
             raise StoredBodyInvalid("Message body exceeds the safe normalization input limit")

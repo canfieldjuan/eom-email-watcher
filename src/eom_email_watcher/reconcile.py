@@ -3,6 +3,7 @@
 import imaplib
 import logging
 import time
+from collections import deque
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -258,6 +259,7 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
             refresh_known=True,
         )
 
+    body_candidates = None
     try:
         with budget_session(watcher.gateway, budget):
             while True:
@@ -268,27 +270,34 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                 stage = payload["stage"]
                 units = payload["units"]
                 if stage == "derived":
-                    with watcher.store.connection() as db:
-                        pending = body_state.pending(db, state.scope, cutoff=cutoff, now=start)
-                    if not pending:
+                    retries = payload.setdefault("body_retries", {})
+                    if body_candidates is None:
+                        waiting = [
+                            m for m, retry in retries.items()
+                            if datetime.fromisoformat(retry["retry_at"]) > datetime.now(UTC)
+                        ]
+                        with watcher.store.connection() as db:
+                            body_candidates = deque(body_state.pending(
+                                db, state.scope, cutoff=cutoff, now=start,
+                                limit=budget.maximum, exclude=waiting,
+                            ))
+                    if not body_candidates:
+                        # Exhaustion is not completion: a bounded slice may leave
+                        # later work, a backoff, or a newly invalidated body.
+                        with watcher.store.connection() as db:
+                            remains = body_state.pending(
+                                db, state.scope, cutoff=cutoff, now=start, limit=1
+                            )
+                        if remains:
+                            break
                         if resume_catchup():
+                            body_candidates = None
                             if payload["stage"] == "catchup_wait":
                                 break
                             continue
                         state.complete(progress)
                         break
-                    retries = payload.setdefault("body_retries", {})
-                    message_id = next(
-                        (
-                            m
-                            for m in pending
-                            if m not in retries
-                            or datetime.fromisoformat(retries[m]["retry_at"]) <= datetime.now(UTC)
-                        ),
-                        None,
-                    )
-                    if message_id is None:
-                        break
+                    message_id = body_candidates.popleft()
                     try:
                         with watcher.store.connection() as db:
                             copies = body_state.sources(

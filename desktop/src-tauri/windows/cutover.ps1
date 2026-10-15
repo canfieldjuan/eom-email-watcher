@@ -183,10 +183,12 @@ function Restore-Tasks {
 if ($Phase -eq 'Restore') {
     # Keep the original process object/handle, not a PID that can be reused.
     $installer = Get-Process -Id $InstallerPid -ErrorAction SilentlyContinue
-    if ($installer -and $installer.StartTime.ToUniversalTime().Ticks -eq $InstallerStarted) {
+    if ($installer) {
         $handle = Open-CutoverProcessHandle $installer
-        Set-Content -LiteralPath $restoreReady -Value 'ready' -Encoding ASCII
-        $installer.WaitForExit()
+        if ($installer.StartTime.ToUniversalTime().Ticks -eq $InstallerStarted) {
+            Set-Content -LiteralPath $restoreReady -Value 'ready' -Encoding ASCII
+            $installer.WaitForExit()
+        }
     }
     # Serialize restoration with every installer transaction. An older worker
     # cannot re-enable a task while the next update is stopping its owners.

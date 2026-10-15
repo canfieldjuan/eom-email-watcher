@@ -1,5 +1,7 @@
 """Local body state; D-derived owns invalidation and reconcile owns fetching."""
 
+import json
+
 from .mime import MAX_STORED_BODY_CHARS
 
 
@@ -26,7 +28,7 @@ def ensure_schema(db):
         db.execute(statement)
 
 
-def pending(db, scope, *, cutoff, now):
+def pending(db, scope, *, cutoff, now, limit=None, exclude=()):
     from .db import _effective_message_identity_sql, _logical_messages_past_cutoff_sql
 
     expired, parameters = _logical_messages_past_cutoff_sql(
@@ -42,8 +44,10 @@ def pending(db, scope, *, cutoff, now):
         WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=? AND f.followed=1
         AND m.message_id NOT IN (SELECT message_id FROM message_bodies)
         AND m.message_id NOT IN (SELECT message_id FROM message_body_unavailable)
-        AND m.message_id NOT IN ({expired}) ORDER BY m.message_id""",
-            (*scope, *parameters),
+        AND m.message_id NOT IN ({expired})
+        AND m.message_id NOT IN (SELECT value FROM json_each(?))
+        ORDER BY m.message_id LIMIT ?""",
+            (*scope, *parameters, json.dumps(list(exclude)), -1 if limit is None else limit),
         )
     ]
 

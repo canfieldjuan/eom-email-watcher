@@ -438,7 +438,8 @@ class ReconcileState:
 
             start = datetime.fromisoformat(progress["started_at"])
             if body_state.pending(
-                db, self.scope, cutoff=start - timedelta(days=progress["retention_days"]), now=start
+                db, self.scope, cutoff=start - timedelta(days=progress["retention_days"]),
+                now=start, limit=1,
             ):
                 raise RuntimeError("reconcile body work remains pending")
             db.execute(
@@ -484,4 +485,4 @@ def coverage_current(db, scope, *, now, retention_days=None):
     ).fetchone():
         return False
     days = retention_days if retention_days is not None else row["retention_days"]
-    return not body_state.pending(db, scope, cutoff=now - timedelta(days=days), now=now)
+    return not body_state.pending(db, scope, cutoff=now - timedelta(days=days), now=now, limit=1)
