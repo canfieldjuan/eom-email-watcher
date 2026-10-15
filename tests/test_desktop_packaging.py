@@ -25,6 +25,66 @@ def _load_builder() -> ModuleType:
 build_desktop_sidecar = _load_builder()
 
 
+@pytest.fixture(scope="module")
+def desktop_build_script(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Execute the real build owner; stub only Tauri's resource-generation work."""
+    directory = tmp_path_factory.mktemp("desktop-build-owner")
+    dependency = directory / "tauri_build.rs"
+    dependency.write_text('pub fn build() { println!("TAURI_BUILD_CALLED"); }\n')
+    library = directory / "libtauri_build.rlib"
+    binary = directory / ("build-script.exe" if os.name == "nt" else "build-script")
+    subprocess.run(
+        ["rustc", "--edition=2024", "--crate-name", "tauri_build", "--crate-type", "rlib",
+         str(dependency), "-o", str(library)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["rustc", "--edition=2024", str(Path(__file__).parents[1] / "desktop/src-tauri/build.rs"),
+         "--extern", f"tauri_build={library}", "-o", str(binary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return binary
+
+
+def _desktop_build_output(binary: Path, target_os, target_env, config="{}") -> list[str]:
+    environment = os.environ.copy()
+    for key, value in (("CARGO_CFG_TARGET_OS", target_os), ("CARGO_CFG_TARGET_ENV", target_env)):
+        environment.pop(key, None)
+        if value is not None:
+            environment[key] = value
+    environment["TAURI_CONFIG"] = config
+    result = subprocess.run(
+        [str(binary)], env=environment, check=True, capture_output=True, text=True,
+    )
+    lines = result.stdout.splitlines()
+    assert lines.count("TAURI_BUILD_CALLED") == 1
+    return [line for line in lines if line.startswith("cargo:rustc-link-arg")]
+
+
+@pytest.mark.parametrize("phase", ["release", "qualification"])
+def test_desktop_build_owner_emits_reproducible_msvc_link(desktop_build_script, phase):
+    config = "{}" if phase == "release" else json.dumps({"build": {"beforeBuildCommand": ""}})
+    assert _desktop_build_output(desktop_build_script, "windows", "msvc", config) == [
+        "cargo:rustc-link-arg-bin=eom-email-watcher-desktop=/Brepro"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("target_os", "target_env"),
+    [("linux", "gnu"), ("macos", ""), ("windows", "gnu"), ("windows", "gnullvm"),
+     ("linux", "msvc"), (None, None), ("", ""), ("windows", ""), ("", "msvc"),
+     ("windows", "MSVC"), ("windows", "msvc-other")],
+)
+def test_desktop_build_owner_leaves_other_targets_unchanged(
+    desktop_build_script, target_os, target_env,
+):
+    assert _desktop_build_output(desktop_build_script, target_os, target_env) == []
+
+
 def _build_data(arguments: list[str]) -> list[tuple[Path, str]]:
     return [
         (Path(source), destination)
