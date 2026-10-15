@@ -175,7 +175,8 @@ function Start-RestorationOwner {
 function Restore-Tasks {
     if (Test-Path -LiteralPath $pending) {
         $failures = @()
-        foreach ($saved in @(Get-Content -LiteralPath $pending -Raw | ConvertFrom-Json)) {
+        $savedTasks = Get-Content -LiteralPath $pending -Raw | ConvertFrom-Json
+        foreach ($saved in $savedTasks) {
             try {
                 if ($saved.Enabled) { Enable-ScheduledTask -TaskPath $saved.TaskPath -TaskName $saved.TaskName | Out-Null }
             } catch {
