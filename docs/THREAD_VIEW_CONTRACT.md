@@ -163,12 +163,12 @@ Each definition is the only place its rule is stated.
   - the stored invoice records and the record mapping version ([D-claims](#d-claims-claims-and-comparability)): storing a record, or a new mapping version, is a change to this input, and the selected records' claims follow in that transaction;
   - the stored attachment inventory, including descriptors and embedded status (consumer integration, I-scope, in Dependencies);
   - the stored attachment classification evidence and its recorded selection provenance ([D-claims](#d-claims-claims-and-comparability)), from which record eligibility is computed. A change to that evidence is a change to this input.
-  - pending logical-target status in the reserved schema-36 follow-up ([D-removal](#d-removal-held-local-deletions)).
+  - pending logical-target status in schema 36 ([D-removal](#d-removal-deferred-local-deletions)).
 
   All of them live in the database. Mail-capture admission provenance and discovery order are never inputs.
 - **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`). I-order's serialized admission and outcome transactions (attachment inspection, in Dependencies) are the exception: they hold the lane then source locks in the order `docs/CONTRACTS.md` fixes and recompute in their own `BEGIN IMMEDIATE` transaction, which serializes them with every other writer. This includes prepared-source hash invalidation, cache-hit settlement and Connect/job-join settlement; none reacquires the operation lock while holding the lane/source locks.
   - The paths include capture, a recorded location, deletion, purge, an IMAP merge, a vendor record change, and a verified identity being added or changed. That list is illustrative; the rule is not.
-- **Only local work happens in that transaction.** It recomputes state and deletes what a definition no longer allows. Physical removal held by source exclusion follows [D-removal](#d-removal-held-local-deletions); that exception does not postpone the follow or attribution transition. Anything that needs a provider or the model, such as a body to fetch or claims to extract, is left to the reconcile pass ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)).
+- **Only local work happens in that transaction.** It recomputes state and deletes what a definition no longer allows. Physical removal held by source exclusion follows [D-removal](#d-removal-deferred-local-deletions); that exception does not postpone the follow or attribution transition. Anything that needs a provider or the model, such as a body to fetch or claims to extract, is left to the reconcile pass ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)).
 
 ### D-reconcile: coverage and the reconcile pass
 
@@ -200,7 +200,7 @@ Each definition is the only place its rule is stated.
 
 ### D-body: stored bodies
 
-- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage, so a thread that stops being followed loses its bodies ([D-derived](#d-derived-derived-state-and-invalidation)), subject to the physical-removal exception in [D-removal](#d-removal-held-local-deletions).
+- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage, so a thread that stops being followed loses its bodies ([D-derived](#d-derived-derived-state-and-invalidation)), subject to the physical-removal exception in [D-removal](#d-removal-deferred-local-deletions).
 - **What is stored:**
   - the normalized text, from `bounded_body_text` with a named storage cap larger than `body_char_limit`;
   - the pre-cut length;
@@ -240,15 +240,11 @@ Each definition is the only place its rule is stated.
     - Addresses left watched keep today's `exact_sender` admission.
 - **Two stores.** The watchlist is a separate file, so no operation changes it and the database in one transaction. An operation that changes both writes the watchlist first, in one write, then the database. An interruption therefore leaves either an extra watched address or a vendor address shown `watched: false`, and a retry completes the operation.
 
-### D-removal: held local deletions
+### D-removal: deferred local deletions
+
+This schema-36 contract for issue #260 replaces the schema-35 refusal in #255. The contract-only PR is stacked on #255 and cannot merge before it. Operator acceptance of this contract PR is required before implementation; the earlier accepted behavior and reviewed storage plan do not waive that gate.
 
 - **One removal owner.** A local message deletion, clear-history request, or body cleanup caused by unfollow uses the source-exclusion owner in `docs/CONTRACTS.md`. Targets that can be locked are removed immediately using the existing suppression and content-cleanup owners.
-- **Schema-35 release boundary (#255).** A held delete or clear unit is refused and changes nothing for that unit. The API reports an explicit held/refused outcome, with truthful completed and refused counts for a partial clear; it never maps a held unit to `not_found` or reports it removed or cleared. The desktop says "Can't delete this yet, the local upgrade is still finishing; try again later". Held body-only unfollow cleanup is likewise not reported complete; its follow and attribution transition is unchanged. This release accepts no deferred operation and creates no intent table or logical barrier.
-- **Refusal verification.** An unqualified 33-row logical unit is refused with unchanged bytes; a smaller non-held unit is deleted. A partial clear preserves every held unit and reports the completed and refused portions through the API and desktop, including the stated wording. Qualification allows a later explicit retry through the same removal owner.
-
-#### Reserved follow-up: deferred removal (schema 36, issue #260)
-
-The following accepted behavior belongs to a contract-first follow-up stacked on #255, which cannot merge before #255. It replaces the schema-35 refusal; it is not implemented or shipped by #255.
 
 - **Logical-target barrier.** From acceptance of a pending delete or clear-history request, one durable logical-target owner excludes its targets from every message reader and pipeline: feed, search, thread view, model input, export, claims and attribution, reconcile fetch and capture. A target cannot be recaptured or re-stored while its intent remains pending; only physical byte removal waits. This barrier is reconciled with source exclusion and the shared message projection, rather than per-reader filters or a change to capture-suppression expiry. Unfollow remains body-only: its retained headers are not deletion targets.
 - **Storage gate.** The logical-target owner requires schema 36, adding durable removal-intent and target state while the existing message/content tables retain held bytes. This migration is explicitly subject to oversight review before implementation; this amendment does not implement it.
