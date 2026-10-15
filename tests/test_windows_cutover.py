@@ -93,6 +93,91 @@ def test_restore_opens_handle_before_identity_check():
     ), "Restore validates identity before opening its persistent handle"
 
 
+def test_restore_tasks_contains_per_task_failure_boundary():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+    ).read_text()
+    owner = source.split("function Restore-Tasks {", 1)[1].split("if ($Phase -eq 'Restore')", 1)[0]
+    assert "catch" in owner, "First restoration failure aborts the remaining saved tasks"
+    assert owner.index("catch") < owner.index("Remove-Item -LiteralPath $pending")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="actual PowerShell restoration loop")
+def test_native_restore_attempts_all_tasks_and_keeps_pending_on_failure(tmp_path):
+    from pathlib import Path
+
+    import prove_windows_cutover as proof
+
+    code = r'''
+$ErrorActionPreference='Stop'
+$pending=Join-Path $env:EW_RESTORE_ROOT 'pending.json'
+$tasks=@(
+    @{TaskPath='\';TaskName='bad-first';Enabled=$true},
+    @{TaskPath='\';TaskName='good';Enabled=$true},
+    @{TaskPath='\';TaskName='bad-last';Enabled=$true},
+    @{TaskPath='\';TaskName='disabled';Enabled=$false}
+)
+$script:attempts=[Collections.Generic.List[string]]::new()
+$script:fail=$true
+function Enable-ScheduledTask {
+    param($TaskPath,$TaskName)
+    $script:attempts.Add($TaskName)
+    if ($script:fail -and $TaskName.StartsWith('bad-')) { throw ($TaskName+' denied') }
+}
+# Frozen f2e5768 control must exhibit the original first-failure behavior.
+function Restore-Tasks {
+    if (Test-Path -LiteralPath $pending) {
+        foreach ($saved in @(Get-Content -LiteralPath $pending -Raw | ConvertFrom-Json)) {
+            if ($saved.Enabled) {
+                Enable-ScheduledTask -TaskPath $saved.TaskPath -TaskName $saved.TaskName | Out-Null
+            }
+        }
+        Remove-Item -LiteralPath $pending
+    }
+}
+ConvertTo-Json -InputObject $tasks | Set-Content -LiteralPath $pending
+try { Restore-Tasks;throw 'Legacy control unexpectedly restored every task' }
+catch { if ($_.Exception.Message -notmatch 'bad-first denied') { throw } }
+if (($attempts -join ',') -ne 'bad-first' -or !(Test-Path -LiteralPath $pending)) {
+    throw 'Frozen first-failure control did not reproduce'
+}
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile($env:EW_PRODUCT_SOURCE,[ref]$tokens,[ref]$errors)
+if ($errors.Count) { throw 'Product script did not parse' }
+$owner=$ast.Find({param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Restore-Tasks'
+},$true)
+if (!$owner) { throw 'Restoration owner missing' }
+. ([scriptblock]::Create($owner.Extent.Text))
+$attempts.Clear();$failure=$null
+try { Restore-Tasks } catch { $failure=$_.Exception.Message }
+if (!$failure -or $failure -notmatch 'bad-first denied' -or $failure -notmatch 'bad-last denied') {
+    throw 'Restoration did not aggregate both failures'
+}
+if (($attempts -join ',') -ne 'bad-first,good,bad-last' -or !(Test-Path -LiteralPath $pending)) {
+    throw 'Restoration skipped a saved task or discarded the pending file'
+}
+$script:fail=$false;$attempts.Clear()
+Restore-Tasks
+if (($attempts -join ',') -ne 'bad-first,good,bad-last' -or (Test-Path -LiteralPath $pending)) {
+    throw 'Successful retry did not finish every saved task'
+}
+'RESTORE_ALL_AND_RETRY_PASS'
+'''
+    output = proof.probe_output("restore-all-tasks", tmp_path)
+    result = proof.powershell(
+        code,
+        EW_RESTORE_ROOT=str(output),
+        EW_PRODUCT_SOURCE=str(
+            Path(__file__).resolve().parents[1] / "desktop/src-tauri/windows/cutover.ps1"
+        ),
+    )
+    assert "RESTORE_ALL_AND_RETRY_PASS" in result.splitlines()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="actual product Restore AST with public CLR process")
 @pytest.mark.parametrize("mode", ["match", "mismatch", "denied"])
 def test_native_restore_identity_uses_opened_handle(tmp_path, mode):

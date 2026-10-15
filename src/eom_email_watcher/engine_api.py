@@ -5868,10 +5868,13 @@ def _vendors_addresses_remove(request: dict[str, object]) -> dict[str, object]:
         if unwatch:
             _unwatch_all(request, [address])
         try:
-            store.remove_vendor_address(vendor_id, address)
+            outcome = store.remove_vendor_address(vendor_id, address)
         except KeyError as exc:
             raise ApiError("not_found", "Vendor was not found") from exc
-        return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+        result = {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+        if outcome.notice:
+            result["notice"] = outcome.notice
+        return result
 
     return _with_watchlist_mutation(request, remove)
 
@@ -5889,10 +5892,13 @@ def _vendors_delete(request: dict[str, object]) -> dict[str, object]:
         if unwatch:
             _unwatch_all(request, listed)
         try:
-            addresses = store.delete_vendor(vendor_id)
+            outcome = store.delete_vendor(vendor_id)
         except KeyError as exc:
             raise ApiError("not_found", "Vendor was not found") from exc
-        return {"deleted": True, "vendor_id": vendor_id, "addresses": addresses}
+        result = {"deleted": True, "vendor_id": vendor_id, "addresses": list(outcome.addresses)}
+        if outcome.notice:
+            result["notice"] = outcome.notice
+        return result
 
     return _with_watchlist_mutation(request, delete)
 

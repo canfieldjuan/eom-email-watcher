@@ -10,6 +10,7 @@ export interface Vendor {
   vendor_id: string;
   display_name: string;
   addresses: VendorAddress[];
+  notice?: string | null;
 }
 
 export const VENDORS_LOCKED_NOTICE = "Connect required to update";
@@ -124,15 +125,12 @@ export function latestRequestFence() {
 // After a vendor operation, what the view reloads (D-ops, two stores). A
 // success reloads with its message. A failure of an operation that can change
 // the watchlist may follow a committed watchlist write, so it reloads too but
-// keeps the error showing. A held body cleanup also follows a committed
-// follow transition, so that refusal must reload while preserving the error.
+// keeps the error showing; any other failure changed nothing.
 export type VendorReload = "with_message" | "keep_error" | "none";
 
-export function vendorReloadAfter(
-  succeeded: boolean, changesWatchlist: boolean, errorCode?: string,
-): VendorReload {
+export function vendorReloadAfter(succeeded: boolean, changesWatchlist: boolean): VendorReload {
   if (succeeded) return "with_message";
-  return changesWatchlist || errorCode === "inbox_removal_held" ? "keep_error" : "none";
+  return changesWatchlist ? "keep_error" : "none";
 }
 
 export interface VendorDraft {

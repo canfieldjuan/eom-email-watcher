@@ -769,6 +769,8 @@ pub struct Vendor {
     pub vendor_id: String,
     pub display_name: String,
     pub addresses: Vec<VendorAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -776,6 +778,8 @@ pub struct VendorDeleted {
     pub deleted: bool,
     pub vendor_id: String,
     pub addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -1654,6 +1658,7 @@ struct VendorItems {
 #[derive(Deserialize)]
 struct VendorItem {
     item: Vendor,
+    notice: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2817,7 +2822,9 @@ impl Engine {
             .mailbox_operation_gate
             .lock()
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        let item = self.request::<VendorItem>(operation, payload)?.item;
+        let result = self.request::<VendorItem>(operation, payload)?;
+        let mut item = result.item;
+        item.notice = result.notice;
         if vendor_id.is_some_and(|expected| item.vendor_id != expected) {
             return Err(EngineError::host(
                 "engine_protocol_error",
@@ -3684,6 +3691,50 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
         assert_eq!(webview["outcome"], "partial");
         assert_eq!(webview["refused"], 1);
         assert_eq!(webview["held_message_ids"], json!(["held"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vendor_removal_notice_reaches_webview() {
+        let notice = "Saved. Removing this thread's stored email text is waiting for the local upgrade to finish; it will finish automatically.";
+        for operation in ["vendors.addresses.remove", "vendors.delete"] {
+            for held in [false, true] {
+                let mut data = if operation == "vendors.delete" {
+                    json!({"deleted": true, "vendor_id": "vendor", "addresses": []})
+                } else {
+                    json!({"item": {"vendor_id": "vendor", "display_name": "Vendor", "addresses": []}})
+                };
+                if held {
+                    data["notice"] = json!(notice);
+                }
+                let response =
+                    json!({"protocol": 1, "ok": true, "operation": operation, "data": data});
+                let engine = Engine::with_command(
+                    "python3",
+                    vec![
+                        OsString::from("-c"),
+                        OsString::from("import sys; sys.stdin.read(); print(sys.argv[1])"),
+                        OsString::from(response.to_string()),
+                    ],
+                    PathBuf::from("unused.toml"),
+                );
+                let webview = if operation == "vendors.delete" {
+                    serde_json::to_value(engine.delete_vendor("vendor".into(), false).unwrap())
+                } else {
+                    serde_json::to_value(
+                        engine
+                            .remove_vendor_address("vendor".into(), "a@example.com".into(), false)
+                            .unwrap(),
+                    )
+                }
+                .unwrap();
+                if held {
+                    assert_eq!(webview["notice"], notice);
+                } else {
+                    assert!(webview.get("notice").is_none());
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

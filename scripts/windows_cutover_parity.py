@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import json
 import subprocess
-import zipfile
 from pathlib import Path
 
 from windows_cutover_fixture import write_private
@@ -77,44 +75,6 @@ def sidecar_manifest(binary: Path) -> dict:
     return manifest
 
 
-def base_library_evidence(release: Path, qualification: Path, output: Path) -> None:
-    """Retain the exact native archives and byte-level member comparison."""
-    from PyInstaller.archive.readers import CArchiveReader
-
-    sides = {}
-    for label, binary in (("release", release), ("qualification", qualification)):
-        data = CArchiveReader(str(binary)).extract("base_library.zip")
-        write_private(output / f"{label}-base-library.zip", data)
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = archive.namelist()
-            if len(names) != len(set(names)):
-                raise ValueError("Duplicate stdlib ZIP member")
-            sides[label] = {
-                "archive_sha256": hashlib.sha256(data).hexdigest(),
-                "order": names,
-                "members": {
-                    name: {
-                        "size": len(archive.read(name)),
-                        "sha256": hashlib.sha256(archive.read(name)).hexdigest(),
-                        "header_hex": archive.read(name)[:16].hex(),
-                        "timestamp": archive.getinfo(name).date_time,
-                    } for name in names
-                },
-            }
-    a, b = (sides[side]["members"] for side in ("release", "qualification"))
-    report = {
-        "sides": sides,
-        "member_names_equal": a.keys() == b.keys(),
-        "changed_member_bytes": sorted(
-            name for name in a.keys() & b.keys() if a[name]["sha256"] != b[name]["sha256"]
-        ),
-        "raw_archive_equal": (
-            sides["release"]["archive_sha256"] == sides["qualification"]["archive_sha256"]
-        ),
-    }
-    write_private(output / "base-library-diff.json", json.dumps(report, indent=2).encode())
-
-
 def installer_manifest(installer: Path, destination: Path) -> dict:
     destination.mkdir(mode=0o700)
     result = subprocess.run(
@@ -148,7 +108,6 @@ def verify(output: Path, installer: Path, engine: Path) -> dict:
         output / "release-installer.exe",
         output / "release-engine.exe",
     )
-    base_library_evidence(release_engine, engine, output)
     engines = {
         "release": sidecar_manifest(release_engine),
         "qualification": sidecar_manifest(engine),

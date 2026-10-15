@@ -34,6 +34,8 @@ def build_test_sidecar(keyring: Path) -> Path:
         os.environ.get("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE"),
         os.environ.get("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE"),
         content,
+        build_directory=keyring.parent / "qualification-build",
+        output_directory=keyring.parent / "qualification-binaries",
     )
 
 
@@ -60,8 +62,11 @@ def main():
         shutil.copy2(source, output / name)
     keyring, _ = fixture_authority(output)
     built = build_test_sidecar(keyring)
-    if built.resolve() != args.engine.resolve():
-        raise RuntimeError("Qualification builder published an unexpected sidecar")
+    if built.resolve() == args.engine.resolve():
+        raise RuntimeError("Qualification build reused the production output")
+    # Tauri consumes this staging path; the independent build output above and
+    # the preserved production sidecar remain separate and unchanged.
+    shutil.copy2(built, args.engine)
     write_private(
         output / "qualification-config.json",
         json.dumps(

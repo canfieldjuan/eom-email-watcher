@@ -13,11 +13,16 @@ def leaf():
     return {"mimeType": "text/plain", "body": {"data": "YWJj", "size": 3}}
 
 
-def gateway(payload):
+def gateway(payload, external=None):
     return GmailGateway(SimpleNamespace(users=lambda: SimpleNamespace(messages=lambda:
-        SimpleNamespace(get=lambda **_: SimpleNamespace(execute=lambda: {
-            "labelIds": ["INBOX"], "payload": payload,
-        }))
+        SimpleNamespace(
+            get=lambda **_: SimpleNamespace(execute=lambda: {
+                "labelIds": ["INBOX"], "payload": payload,
+            }),
+            attachments=lambda: SimpleNamespace(get=lambda **_: SimpleNamespace(
+                execute=lambda: external,
+            )),
+        )
     )))
 
 
@@ -29,7 +34,8 @@ def test_malformed_parts_are_terminal(bad):
 
 
 @pytest.mark.parametrize("body", [None, [], "bad", {"data": 7}, {"size": True},
-                                  {"size": -1}, {"size": 3}, {"attachmentId": 7}])
+                                  {"size": -1}, {"size": 3}, {"attachmentId": 7},
+                                  {"data": "!!!", "size": 1}, {"data": "é", "size": 1}])
 def test_malformed_body_is_terminal(body):
     payload = leaf()
     payload["body"] = body
@@ -68,6 +74,29 @@ def test_large_binary_attachment_does_not_reject_valid_text():
         "body": {"size": 60 * 1024 * 1024, "attachmentId": "attachment"},
     }]}
     assert gateway(payload).stored_body("m", scope=frozenset({"inbox"})) == ("abc", 3)
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("data,size", [("", 3), ("YQ", 3), ("8J-YgA", 5)])
+def test_short_decoded_body_is_invalid_at_stored_entry(external, data, size):
+    payload = leaf()
+    payload["body"] = {"size": size, **(
+        {"attachmentId": "external"} if external else {"data": data}
+    )}
+    with pytest.raises(MailboxMessageInvalid):
+        gateway(payload, {"data": data}).stored_body("m", scope=frozenset({"inbox"}))
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("data,size,text", [("", 0, ""), ("YQ", 1, "a"), ("8J-YgA", 4, "😀")])
+def test_declared_body_size_counts_bytes_not_characters(external, data, size, text):
+    payload = leaf()
+    payload["body"] = {"size": size, **(
+        {"attachmentId": "external"} if external else {"data": data}
+    )}
+    assert gateway(payload, {"data": data}).stored_body("m", scope=frozenset({"inbox"})) == (
+        text, len(text),
+    )
 
 
 @pytest.mark.parametrize("payload", [None, [], "", False, 0])
