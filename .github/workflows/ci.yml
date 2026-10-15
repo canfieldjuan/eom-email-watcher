@@ -178,6 +178,8 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/*/package-programs.json
             ${{ runner.temp }}/ew-source-cutover/native-integration.xml
             ${{ runner.temp }}/ew-source-cutover/full/build-inventory.json
+            ${{ runner.temp }}/ew-source-cutover/full/release-engine.exe
+            desktop/src-tauri/binaries/eom-mail-engine-x86_64-pc-windows-msvc.exe
             ${{ runner.temp }}/ew-source-cutover/full/nsis-compiler.json
             ${{ runner.temp }}/ew-source-cutover/full/release-sources.json
             ${{ runner.temp }}/ew-source-cutover/full/parity.json
