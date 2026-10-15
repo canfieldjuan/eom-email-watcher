@@ -1042,7 +1042,7 @@ def test_qualification_reuses_release_packaging_owner(tmp_path, monkeypatch):
     assert snapshots[0][0] == snapshots[1][0]
     assert snapshots[0][2] != snapshots[1][2]
     assert snapshots[0][4].isdisjoint(snapshots[1][4])
-    assert snapshots[0][3] == snapshots[1][3] == "0", "stdlib ZIP producer order is not pinned"
+    assert snapshots[0][3] == snapshots[1][3] == "random", "packager overrides the caller hash seed"
     key = "connect_automate_data/connect-entitlement-keyring.json"
     assert snapshots[0][1][key] != snapshots[1][1][key]
     assert {k: v for k, v in snapshots[0][1].items() if k != key} == {

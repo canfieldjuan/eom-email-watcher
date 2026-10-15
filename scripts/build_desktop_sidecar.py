@@ -380,9 +380,6 @@ def _package_sidecar(
         pyinstaller_arguments.append(str(PROJECT_DIRECTORY / "packaging" / "engine_entry.py"))
         build_environment = os.environ.copy()
         build_environment["PYINSTALLER_CONFIG_DIR"] = str(build_directory / "cache")
-        # PyInstaller's stdlib ZIP preserves module-graph iteration order.
-        # Both release and qualification must start with the same hash seed.
-        build_environment["PYTHONHASHSEED"] = "0"
         subprocess.run(
             pyinstaller_arguments,
             check=True,

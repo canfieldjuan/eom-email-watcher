@@ -1,9 +1,14 @@
 """Receipt boundaries; installer/process qualification runs in windows-package."""
 
 import hashlib
+import io
 import json
 import os
+import struct
 import sys
+import warnings
+import zipfile
+import zlib
 
 import pytest
 from windows_qualification_environment import encoded_powershell_script, powershell_environment
@@ -553,6 +558,139 @@ def test_sidecar_parity_reads_real_archives_and_rejects_changed_module(tmp_path)
     changed = archive("changed", b"test authority", b"changed module")
     with pytest.raises(ValueError, match="Unexpected payload differences"):
         compare_manifests(release, changed, {KEYRING})
+
+
+def _stdlib_zip(members, *, date=(2020, 1, 2, 3, 4, 6), metadata=None, comment=b""):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.comment = comment
+        for name, content in members:
+            info = zipfile.ZipInfo(name, date)
+            if metadata is not None:
+                metadata(info)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Duplicate name:", category=UserWarning)
+                archive.writestr(info, content)
+    return output.getvalue()
+
+
+def _sidecar_with_zip(tmp_path, label, content, *, member_name="base_library.zip"):
+    from PyInstaller.archive.writers import CArchiveWriter
+    from windows_cutover_parity import KEYRING, sidecar_manifest
+
+    payload, ring = tmp_path / (label + ".zip"), tmp_path / (label + ".ring")
+    payload.write_bytes(content)
+    ring.write_bytes(label.encode())
+    binary = tmp_path / (label + ".pkg")
+    CArchiveWriter(
+        str(binary),
+        [(member_name, str(payload), True, "x"), (KEYRING, str(ring), True, "x")],
+        "python313.dll",
+    )
+    return sidecar_manifest(binary)
+
+
+def test_base_library_parity_accepts_reordered_members(tmp_path):
+    from windows_cutover_parity import KEYRING, compare_manifests
+
+    members = [("alpha.pyc", b"plumless"), ("beta.pyc", b"beta")]
+    first, second = _stdlib_zip(members), _stdlib_zip(list(reversed(members)))
+    assert first != second
+    release = _sidecar_with_zip(tmp_path, "release", first)
+    qualified = _sidecar_with_zip(tmp_path, "qualification", second)
+    assert compare_manifests(release, qualified, {KEYRING}) == [KEYRING]
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["name", "missing", "extra", "size", "sha256", "date", "comment", "extra_field",
+     "permissions", "compression", "archive_comment"],
+)
+def test_base_library_parity_rejects_member_changes(tmp_path, change):
+    from windows_cutover_parity import KEYRING, compare_manifests
+
+    members = [("alpha.pyc", b"plumless"), ("beta.pyc", b"beta")]
+    changed = list(members)
+    options = {}
+    if change == "name":
+        changed[0] = ("renamed.pyc", changed[0][1])
+    elif change == "missing":
+        changed.pop()
+    elif change == "extra":
+        changed.append(("extra.pyc", b"extra"))
+    elif change == "size":
+        changed[0] = (changed[0][0], b"longer content")
+    elif change == "sha256":
+        assert len(b"plumless") == len(b"buckeroo")
+        assert zlib.crc32(b"plumless") == zlib.crc32(b"buckeroo")
+        changed[0] = (changed[0][0], b"buckeroo")
+    elif change == "date":
+        options["date"] = (2022, 1, 2, 3, 4, 6)
+    elif change == "archive_comment":
+        options["comment"] = b"changed archive comment"
+    else:
+        attribute, value = {
+            "comment": ("comment", b"changed member comment"),
+            "extra_field": ("extra", b"\xfe\xca\x01\x00x"),
+            "permissions": ("external_attr", 0o100700 << 16),
+            "compression": ("compress_type", zipfile.ZIP_DEFLATED),
+        }[change]
+        options["metadata"] = lambda info: setattr(info, attribute, value)
+    release = _sidecar_with_zip(tmp_path, "release", _stdlib_zip(members))
+    qualified = _sidecar_with_zip(tmp_path, "qualification", _stdlib_zip(changed, **options))
+    with pytest.raises(ValueError, match="Unexpected payload differences"):
+        compare_manifests(release, qualified, {KEYRING})
+
+
+@pytest.mark.parametrize(
+    "damage", ["duplicate", "not_zip", "truncated", "crc", "encrypted", "unsupported"]
+)
+def test_base_library_parity_rejects_invalid_archives(tmp_path, damage):
+    members = [("alpha.pyc", b"plumless")]
+    if damage == "duplicate":
+        content = _stdlib_zip(members + members)
+    elif damage == "not_zip":
+        content = b"not a ZIP archive"
+    elif damage == "truncated":
+        content = _stdlib_zip(members)[:-12]
+    elif damage == "crc":
+        content = _stdlib_zip(members).replace(b"plumless", b"plumlesz")
+    else:
+        content = bytearray(_stdlib_zip(members))
+        central = content.index(b"PK\x01\x02")
+        local_offset, central_offset, value = (
+            (6, 8, 1) if damage == "encrypted" else (8, 10, 99)
+        )
+        struct.pack_into("<H", content, local_offset, value)
+        struct.pack_into("<H", content, central + central_offset, value)
+    with pytest.raises(ValueError, match="base_library.zip"):
+        _sidecar_with_zip(tmp_path, "invalid", content)
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    ["nested/base_library.zip", "base_library.zip.bak", "BASE_LIBRARY.ZIP", "other.zip"],
+)
+def test_base_library_normalization_is_exact_entry_only(tmp_path, member_name):
+    from windows_cutover_parity import KEYRING, compare_manifests
+
+    members = [("alpha.pyc", b"a"), ("beta.pyc", b"b")]
+    release = _sidecar_with_zip(tmp_path, "release", _stdlib_zip(members), member_name=member_name)
+    qualified = _sidecar_with_zip(
+        tmp_path, "qualification", _stdlib_zip(list(reversed(members))), member_name=member_name
+    )
+    with pytest.raises(ValueError, match="Unexpected payload differences"):
+        compare_manifests(release, qualified, {KEYRING})
+
+
+@pytest.mark.parametrize("members", [[], [("one.pyc", b"one")]])
+def test_base_library_parity_accepts_unchanged_boundary_archives(tmp_path, members):
+    from windows_cutover_parity import KEYRING, compare_manifests
+
+    content = _stdlib_zip(members)
+    release = _sidecar_with_zip(tmp_path, "release", content)
+    qualified = _sidecar_with_zip(tmp_path, "qualification", content)
+    assert compare_manifests(release, qualified, {KEYRING}) == [KEYRING]
 
 
 def test_predecessor_actor_setup_reuses_seeded_account(tmp_path, monkeypatch):
