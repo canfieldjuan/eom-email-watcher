@@ -312,6 +312,49 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                 )
                 == 2
             )
+            # Persist the opaque key before the mutation. Discard its returned
+            # receipt, then recover solely from that key through a fresh client.
+            expected_clear = scalar(database, "SELECT COUNT(*) FROM logical_messages")
+            assert expected_clear >= 2, "The populated removal proof needs retained messages"
+            prepared = new.call("inbox.removal.prepare", {"kind": "clear"})
+            request_file = folder / "removal-request.json"
+            write_private(request_file, json.dumps(prepared).encode())
+            new.call("inbox.clear", prepared)
+            recovered_key = json.loads(request_file.read_text())["request_id"]
+            resumed = Engine(engine, config, folder, environment)
+            frozen = resumed.call(
+                "inbox.removal.status", {"request_id": recovered_key, "kind": "clear"}
+            )
+            assert frozen["outcome"] == "completed", frozen
+            assert (frozen["requested"], frozen["completed"], frozen["pending"]) == (
+                expected_clear, expected_clear, 0
+            ), frozen
+            assert frozen["request_id"] == recovered_key
+            assert frozen["intent_ids"], frozen
+            assert scalar(database, "SELECT COUNT(*) FROM messages") == 0
+            assert scalar(database, "SELECT COUNT(*) FROM message_bodies") == 0
+            assert scalar(database, "SELECT COUNT(*) FROM message_body_unavailable") == 0
+            empty_key = resumed.call("inbox.removal.prepare", {"kind": "clear"})
+            empty = resumed.call("inbox.clear", empty_key)
+            assert (empty["requested"], empty["completed"], empty["pending"]) == (0, 0, 0)
+            assert empty["intent_ids"] == [] and empty["outcome"] == "completed"
+            mail.append("after-frozen-clear")
+            resumed.call("watcher.check")
+            assert scalar(
+                database, "SELECT COUNT(*) FROM messages WHERE subject=?", ("after-frozen-clear",)
+            ) == 1
+            assert scalar(database, "SELECT COUNT(*) FROM messages") == 1
+            assert resumed.call("inbox.clear", {"request_id": recovered_key}) == {
+                **frozen, "deleted": expected_clear
+            }
+            assert resumed.call("inbox.clear", empty_key) == empty
+            assert scalar(
+                database, "SELECT COUNT(*) FROM messages WHERE subject=?", ("after-frozen-clear",)
+            ) == 1, "A retained request selected a later arrival"
+            assert resumed.call(
+                "inbox.removal.status", {"request_id": recovered_key}
+            ) == frozen
+            assert provider.post_attempt_count() == 2, "Receipt retry submitted source work"
             new.call("health.get")
             result = {
                 "result": "PASS",
@@ -323,6 +366,7 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                 "orphan_posts": provider.submission_count(old_job_id),
                 "total_posts": provider.post_attempt_count(),
                 "poll": check,
+                "removal_receipts": {"populated": frozen, "empty": empty},
                 "proof": [
                     "TLS IMAP Inbox/Sent",
                     "local analysis",
@@ -331,6 +375,9 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                     "orphan GET without second POST",
                     "new installed Connect POST",
                     "receipt-gated timeout and retry",
+                    "opaque removal key persisted before mutation",
+                    "removal status after discarded response and client restart",
+                    "populated and zero-target retries exclude later arrivals",
                 ],
                 "build_inventory": inventory,
             }
