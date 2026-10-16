@@ -453,6 +453,50 @@ def _accept_in_transaction(db, key, kind, parameters, message_ids, *, now, autho
     return outcome(db, key, kind=kind, fingerprint=fingerprint), True
 
 
+class _OperationOwner:
+    def __init__(self):
+        raise TypeError("Runtime operation authority is minted by its acquiring scope")
+
+    def require(self, path):
+        if (
+            getattr(self, "_identity", None) is not self
+            or not getattr(self, "live", False)
+            or self.execution != (os.getpid(), threading.get_ident())
+            or self.path != Path(path).resolve()
+        ):
+            raise RuntimeError("A live runtime operation owner is required")
+
+    @contextmanager
+    def acceptance(self):
+        from . import source_locks
+
+        self.require(self.path)
+        if source_locks.source_context_active():
+            raise OperationLockBusy("Source-lock protocol is being selected")
+        if self._segment is not None:
+            raise RuntimeError("Runtime operation already has an acceptance segment")
+        with ExitStack() as guard:
+            guard.enter_context(source_locks.protocol_guard(
+                source_locks.selection_path(self.database_path),
+                "Source-lock protocol is being selected",
+                timeout_seconds=source_locks.SOURCE_LOCK_WAIT_SECONDS,
+            ))
+            capability = object.__new__(_RuntimeAcceptance)
+            capability._identity = capability
+            capability.operation = self
+            capability.path = self.path
+            capability.execution = self.execution
+            capability.live = True
+            capability._transaction = None
+            capability._guard = guard
+            self._segment = capability
+            try:
+                yield capability
+            finally:
+                capability.live = False
+                self._segment = None
+
+
 class _RuntimeAcceptance:
     def __init__(self):
         raise TypeError("Runtime acceptance authority is minted by its acquiring scope")
@@ -465,6 +509,7 @@ class _RuntimeAcceptance:
             or self.path != Path(path).resolve()
         ):
             raise RuntimeError("A live runtime acceptance capability is required")
+        self.operation.require(self.path)
 
     @contextmanager
     def transaction(self, store):
@@ -524,33 +569,35 @@ def require_runtime_acceptance(capability, path):
 
 
 @contextmanager
-def acceptance_scope(store):
-    """Acquire operation then acceptance guard once; pass authority explicitly."""
+def operation_scope(database_path):
+    """One native operation acquisition; acceptance segments are explicit."""
     from . import source_locks
 
-    with (
-        connect_operation_lock(
-            source_locks.operation_lock_path(store.path),
-            "Another watcher operation is already running",
-        ),
-        ExitStack() as guard,
+    if source_locks.source_context_active():
+        raise OperationLockBusy("Source-lock protocol is being selected")
+    database_path = Path(database_path).absolute()
+    with connect_operation_lock(
+        source_locks.operation_lock_path(database_path),
+        "Another watcher operation is already running",
     ):
-        guard.enter_context(source_locks.protocol_guard(
-            source_locks.selection_path(store.path),
-            "Source-lock protocol is being selected",
-            timeout_seconds=source_locks.SOURCE_LOCK_WAIT_SECONDS,
-        ))
-        capability = object.__new__(_RuntimeAcceptance)
-        capability._identity = capability
-        capability.path = store.path.resolve()
-        capability.execution = (os.getpid(), threading.get_ident())
-        capability.live = True
-        capability._transaction = None
-        capability._guard = guard
+        owner = object.__new__(_OperationOwner)
+        owner._identity = owner
+        owner.path = database_path.resolve()
+        owner.database_path = database_path
+        owner.execution = (os.getpid(), threading.get_ident())
+        owner.live = True
+        owner._segment = None
         try:
-            yield capability
+            yield owner
         finally:
-            capability.live = False
+            owner.live = False
+
+
+@contextmanager
+def acceptance_scope(store):
+    """The public single-acceptance entry uses the same operation owner."""
+    with operation_scope(store.path) as operation, operation.acceptance() as acceptance:
+        yield acceptance
 
 
 def accept(store, key, kind, parameters, *, now, acceptance):

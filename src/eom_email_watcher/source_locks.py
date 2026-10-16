@@ -57,6 +57,14 @@ def operation_lock_path(database_path: Path) -> Path:
     return database_path.with_name(f"{database_path.name}.check.lock")
 
 
+def source_context_active() -> bool:
+    """Read the existing source owners; never mint or reuse their authority."""
+    return any(
+        held is not None and held[0] == os.getpid()
+        for held in (getattr(_selection, "held", None), getattr(_context, "held", None))
+    )
+
+
 def source_lock_path(database_path: Path, message_id: str) -> Path:
     return stripe_path(database_path, source_lock_stripe(message_id))
 
@@ -278,10 +286,7 @@ def qualify_protocol(store: Store, *, fresh: bool) -> None:
         ) from exc
     # Never invert operation→source ordering or expand a frozen source set.
     # The ordinary operation entry point resumes after this owner releases it.
-    if any(
-        held is not None and held[0] == os.getpid()
-        for held in (getattr(_selection, "held", None), getattr(_context, "held", None))
-    ):
+    if source_context_active():
         return
     with store.connection() as db:
         has_requests = removal.has_schema(db)

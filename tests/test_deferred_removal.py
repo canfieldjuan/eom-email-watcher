@@ -3368,3 +3368,187 @@ def test_alias_delete_missing_pending_and_retained_key_controls(tmp_path, monkey
         store, "request_removal", "delete", parameters, request_id=key, now=NOW,
     )
     assert complete.requested == complete.completed == 1 and complete.pending == 0
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_acceptance_entry_refuses_inside_source_scope_before_guard_and_allows_after_exit(
+    tmp_path, monkeypatch, qualified
+):
+    from contextlib import contextmanager
+
+    from connect_automate.locking import OperationLockBusy
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal, source_locks
+
+    store, _, _ = followed(tmp_path)
+    if not qualified:
+        with store.connection() as db:
+            db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    with store.connection() as db:
+        assert source_locks.protocol_ready(db) is qualified
+    monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    original_guard = source_locks.protocol_guard
+    attempts = []
+
+    @contextmanager
+    def observed_guard(*args, **kwargs):
+        attempts.append(args[0])
+        with original_guard(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(source_locks, "protocol_guard", observed_guard)
+    before = snapshot(store)
+    with store._source_cleanup_locks(("m",)) as acquired:
+        assert acquired
+        attempts.clear()
+        with pytest.raises(OperationLockBusy), removal.acceptance_scope(store):
+            pytest.fail("Source-held acceptance was admitted")
+        assert attempts == [], "Acceptance attempted its guard after source locks"
+        assert snapshot(store) == before
+    with removal.acceptance_scope(store) as acceptance, acceptance.transaction(store) as db:
+        db._removal_transaction.require(db)
+    assert len(attempts) == 1
+    assert snapshot(store) == before
+
+
+def test_operation_owner_segments_use_one_acquisition_and_expire_on_release(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from connect_automate.locking import OperationLockBusy
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal, source_locks
+
+    store, _, _ = followed(tmp_path)
+    before = snapshot(store)
+    acquired = []
+    native_operation = removal.connect_operation_lock
+
+    @contextmanager
+    def observed_operation(path, *args, **kwargs):
+        with native_operation(path, *args, **kwargs):
+            acquired.append(path)
+            yield
+
+    monkeypatch.setattr(removal, "connect_operation_lock", observed_operation)
+    with removal.operation_scope(store.path) as operation:
+        with operation.acceptance() as first, first.transaction(store) as db:
+            db._removal_transaction.require(db)
+        with pytest.raises(RuntimeError, match="runtime acceptance"):
+            removal.require_runtime_acceptance(first, store.path)
+        with store._source_cleanup_locks(("m",)) as locked:
+            assert locked
+        with operation.acceptance() as second, second.transaction(store) as db:
+            db._removal_transaction.require(db)
+        assert first is not second
+        # A new operation entry is never a reentrancy route around the native lock.
+        with pytest.raises(OperationLockBusy), removal.operation_scope(store.path):
+            pytest.fail("Operation scope reacquired its own native lock")
+    assert acquired == [source_locks.operation_lock_path(store.path)]
+    with pytest.raises(RuntimeError, match="runtime operation owner"), operation.acceptance():
+        pytest.fail("Released operation owner minted a segment")
+    assert snapshot(store) == before
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_operation_segment_refuses_source_scope_before_guard_and_allows_after_exit(
+    tmp_path, monkeypatch, qualified
+):
+    from contextlib import contextmanager
+
+    from connect_automate.locking import OperationLockBusy
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal, source_locks
+
+    store, _, _ = followed(tmp_path)
+    if not qualified:
+        with store.connection() as db:
+            db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    native_guard = source_locks.protocol_guard
+    attempts = []
+
+    @contextmanager
+    def observed_guard(*args, **kwargs):
+        attempts.append(args[0])
+        with native_guard(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(source_locks, "protocol_guard", observed_guard)
+    before = snapshot(store)
+    with removal.operation_scope(store.path) as operation:
+        with store._source_cleanup_locks(("m",)) as acquired:
+            assert acquired
+            attempts.clear()
+            with pytest.raises(OperationLockBusy), operation.acceptance():
+                pytest.fail("Source-held segment was admitted")
+            assert attempts == [], "Segment attempted its guard after source locks"
+            assert snapshot(store) == before
+        with operation.acceptance() as acceptance, acceptance.transaction(store) as db:
+            db._removal_transaction.require(db)
+        assert len(attempts) == 1
+    assert snapshot(store) == before
+
+
+def test_operation_owner_rejects_forgery_execution_and_path_before_guard(tmp_path, monkeypatch):
+    import copy
+    from concurrent.futures import ThreadPoolExecutor
+
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    before = snapshot(store)
+    with pytest.raises(TypeError, match="acquiring scope"):
+        removal._OperationOwner()
+    with removal.operation_scope(store.path) as operation:
+        with pytest.raises(RuntimeError, match="runtime operation owner"):
+            copy.copy(operation).require(store.path)
+        with pytest.raises(RuntimeError, match="runtime operation owner"):
+            operation.require(tmp_path / "other.db")
+        with pytest.raises(RuntimeError, match="runtime acceptance"):
+            store.request_removal("clear", {}, acceptance=operation, now=NOW)
+
+        def another_execution():
+            with operation.acceptance():
+                pytest.fail("Cross-thread operation owner minted a segment")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            error = pool.submit(another_execution).exception(timeout=5)
+        assert isinstance(error, RuntimeError), repr(error)
+        assert "runtime operation owner" in str(error)
+        with monkeypatch.context() as other_process:
+            other_process.setattr(removal.os, "getpid", lambda: operation.execution[0] + 1)
+            with pytest.raises(RuntimeError, match="runtime operation owner"):
+                operation.require(store.path)
+    with pytest.raises(RuntimeError, match="runtime operation owner"):
+        operation.require(store.path)
+    assert snapshot(store) == before
+
+
+def test_operation_segment_retains_bounded_native_legacy_guard_fallback(tmp_path, monkeypatch):
+    from connect_automate.locking import OperationLockBusy
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal, source_locks
+
+    store, _, _ = followed(tmp_path)
+    with store.connection() as db:
+        db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    before = snapshot(store)
+    monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    with (
+        removal.operation_scope(store.path) as operation,
+        store._source_cleanup_locks(("m",)) as acquired,
+    ):
+        assert acquired
+        # A legacy holder in another execution has no local signal. Native
+        # guard exclusion still refuses within its existing bounded wait.
+        with monkeypatch.context() as no_local_signal:
+            no_local_signal.setattr(source_locks, "source_context_active", lambda: False)
+            with pytest.raises(OperationLockBusy), operation.acceptance():
+                pytest.fail("Native legacy guard was bypassed")
+    assert snapshot(store) == before
