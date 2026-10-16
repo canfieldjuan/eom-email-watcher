@@ -17,9 +17,9 @@ ADMISSION_KINDS = (
 )
 
 
-def write_backup(path: Path, db: sqlite3.Connection) -> Path:
+def write_backup(path: Path, db: sqlite3.Connection, *, target_schema: int = 33) -> Path:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    target = path.with_name(f"{path.name}.pre-v33.{stamp}.{uuid.uuid4().hex}.bak")
+    target = path.with_name(f"{path.name}.pre-v{target_schema}.{stamp}.{uuid.uuid4().hex}.bak")
     # VACUUM INTO accepts an empty file. Exclusive creation establishes privacy
     # before SQLite writes any data and cannot overwrite an existing backup.
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -32,8 +32,8 @@ def write_backup(path: Path, db: sqlite3.Connection) -> Path:
     return target
 
 
-def cleanup_backups(path: Path, *, success: bool) -> None:
-    prefix = f"{path.name}.pre-v33."
+def cleanup_backups(path: Path, *, success: bool, target_schema: int = 33) -> None:
+    prefix = f"{path.name}.pre-v{target_schema}."
     backups = sorted(
         entry
         for entry in path.parent.iterdir()

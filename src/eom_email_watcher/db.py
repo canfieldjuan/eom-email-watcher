@@ -55,7 +55,7 @@ from .mime import AttachmentDescriptor, body_was_truncated
 from .text import within_utf8_bytes
 from .thread_state import VendorIndex, vendor_index
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 
 class LocalRemovalHeld(RuntimeError):
@@ -5876,6 +5876,7 @@ class Store:
             try:
                 connection.execute("PRAGMA recursive_triggers = ON")
                 connection.execute("PRAGMA secure_delete = ON")
+                connection.execute("PRAGMA foreign_keys = ON")
                 connection.row_factory = sqlite3.Row
                 connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
                 connection.create_function(
@@ -5966,6 +5967,7 @@ class Store:
             timeout_seconds=-1,
         ):
             fresh = not self.path.exists()
+            backup_target = SCHEMA_VERSION if SCHEMA_VERSION >= 36 else 33
             if self.path.exists():
                 with self.connection() as source:
                     version = source.execute("PRAGMA user_version").fetchone()[0]
@@ -5973,14 +5975,20 @@ class Store:
                         "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
                     ).fetchone()
                     fresh = retained is None
-                    if retained is not None and version < 33:
-                        thread_migration.write_backup(self.path, source)
+                    if retained is not None and version < backup_target:
+                        thread_migration.write_backup(
+                            self.path, source, target_schema=backup_target,
+                        )
             try:
                 self._initialize_locked()
             except Exception:
-                thread_migration.cleanup_backups(self.path, success=False)
+                thread_migration.cleanup_backups(
+                    self.path, success=False, target_schema=backup_target,
+                )
                 raise
-            thread_migration.cleanup_backups(self.path, success=True)
+            thread_migration.cleanup_backups(
+                self.path, success=True, target_schema=backup_target,
+            )
             if SCHEMA_VERSION >= 35:
                 try:
                     source_locks.qualify_protocol(self, fresh=fresh)
@@ -6370,6 +6378,11 @@ class Store:
             reconcile_state.ensure_schema(db)
             if version < 35:
                 db.execute("DELETE FROM reconcile_coverage")
+            if SCHEMA_VERSION >= 36:
+                from . import removal
+
+                removal.ensure_schema(db)
+                thread_migration.check_database(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
