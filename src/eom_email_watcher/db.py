@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from connect_automate import connect
 from connect_automate.locking import connect_operation_lock
 
-from . import body_state, deployment, reconcile_state, source_locks, thread_migration
+from . import body_state, deployment, reconcile_state, removal, source_locks, thread_migration
 from .automation.rules import (
     MAX_AUTOMATION_ATTACHMENTS,
     MAX_AUTOMATION_RULES,
@@ -574,12 +574,9 @@ _CONNECT_TABLE_TRIGGER_NAMES = (
     "connect_jobs_delete_linked_automation_fires",
 )
 
-_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL = """
-CREATE TRIGGER messages_delete_connect_attachment_jobs
-AFTER DELETE ON messages
-BEGIN
+_CONNECT_SOURCE_UNAVAILABLE_SQL = """
     DELETE FROM connect_attachment_jobs
-    WHERE message_id = OLD.message_id
+    WHERE message_id = {message_id}
       AND (
         protocol_version = 1
         OR (
@@ -618,10 +615,15 @@ BEGIN
     SET source_available = 0,
         updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
     WHERE job_id IN (
-        SELECT job_id FROM connect_attachment_jobs WHERE message_id = OLD.message_id
+        SELECT job_id FROM connect_attachment_jobs WHERE message_id = {message_id}
     );
-END
 """
+
+_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL = (
+    "CREATE TRIGGER messages_delete_connect_attachment_jobs AFTER DELETE ON messages BEGIN\n"
+    + _CONNECT_SOURCE_UNAVAILABLE_SQL.format(message_id="OLD.message_id")
+    + "END"
+)
 
 _AUTOMATE_CORE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS automation_rule_set (
@@ -1825,6 +1827,10 @@ def _mark_automation_sources_unavailable(
 ) -> int:
     if not message_ids:
         return 0
+    for message_id in message_ids:
+        _execute_transactional_script(
+            db, _CONNECT_SOURCE_UNAVAILABLE_SQL.format(message_id="?"), (message_id,)
+        )
     transitioned = 0
     for offset in range(0, len(message_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
         chunk = message_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
@@ -3292,14 +3298,14 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
     db.execute(_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL)
 
 
-def _execute_transactional_script(db: sqlite3.Connection, script: str) -> None:
+def _execute_transactional_script(db: sqlite3.Connection, script: str, parameters=()) -> None:
     """Execute complete SQL statements without executescript's implicit commit."""
     pending: list[str] = []
     for line in script.splitlines():
         pending.append(line)
         statement = "\n".join(pending).strip()
         if statement and sqlite3.complete_statement(statement):
-            db.execute(statement)
+            db.execute(statement, parameters)
             pending.clear()
     if "\n".join(pending).strip():
         raise RuntimeError("automation schema script ended with an incomplete statement")
@@ -3984,8 +3990,9 @@ def _refresh_logical_messages_view(db: sqlite3.Connection) -> None:
     always the current ones.
     """
     db.execute("DROP VIEW IF EXISTS logical_messages")
+    eligible = " AND " + removal.available_sql("messages") if removal.has_schema(db) else ""
     db.execute(
-        "CREATE VIEW logical_messages AS SELECT * FROM messages WHERE logical_of IS NULL"
+        "CREATE VIEW logical_messages AS SELECT * FROM messages WHERE logical_of IS NULL" + eligible
     )
 
 
@@ -5558,6 +5565,8 @@ DERIVED_INPUT_TABLES = frozenset(
         "vendors",
         "vendor_addresses",
         "vendor_domains",
+        "message_removal_intents",
+        "message_removal_targets",
     }
 )
 
@@ -6366,6 +6375,8 @@ class Store:
             _migrate_sent_capture(db, migration_observed_at)
             if version < 31:
                 _migrate_source_observations(db, migration_observed_at)
+            if SCHEMA_VERSION >= 36:
+                removal.ensure_schema(db)
             _refresh_logical_messages_view(db)
             if version < 33:
                 thread_migration.rebuild_messages(db)
@@ -6379,9 +6390,6 @@ class Store:
             if version < 35:
                 db.execute("DELETE FROM reconcile_coverage")
             if SCHEMA_VERSION >= 36:
-                from . import removal
-
-                removal.ensure_schema(db)
                 thread_migration.check_database(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
@@ -9358,7 +9366,7 @@ class Store:
                 _stored_source_membership_sql() + " LIMIT 1",
                 (provider, account_id, mailbox_identity_key, metadata.message_id),
             ).fetchone()
-            if row is None:
+            if row is None or not removal.message_available(db, row["logical_id"]):
                 return
             logical_id = row["logical_id"]
             _record_locations(
@@ -9463,8 +9471,27 @@ class Store:
         )
         return (canonical, *others)
 
+    def source_start(
+        self, message_id=None, *, provider=None, account_id=None,
+        mailbox_identity_key=None, provider_message_id=None, include_unfollow=False,
+    ) -> bool:
+        """Serialize source admission with acceptance; release before external work."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if message_id is not None:
+                return removal.message_available(db, message_id, include_unfollow=include_unfollow)
+            return not removal.has_schema(db) or removal.source_available(
+                db, provider=provider, account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=provider_message_id,
+                include_unfollow=include_unfollow,
+            )
+
     def message_source(self, message_id: str) -> MessageSource:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             row = db.execute(
                 """SELECT message_id, provider, account_id, provider_message_id,
                     received_at, discovered_at, mailbox_identity_key
@@ -9926,7 +9953,7 @@ class Store:
                 f"{_stored_source_membership_sql()} LIMIT 1",
                 (provider, account_id, mailbox_identity_key, provider_message_id),
             ).fetchone()
-            if row is None:
+            if row is None or not removal.message_available(db, row["logical_id"]):
                 return 0
             recorded = _record_locations(
                 db,
@@ -10109,145 +10136,23 @@ class Store:
                 raise KeyError(vendor_id)
         return VendorRemoval(True, tuple(addresses), db._held_body_cleanup)
 
-    def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
-        """Delete a logical message as one unit (contract D-identity).
-
-        The canonical row, every row pointing to it through logical_of, and a
-        suppression for each recorded source identity go together, so no copy is
-        recaptured after a cursor recovery.
-        """
+    def request_removal(self, kind, parameters, *, request_id=None, retention_days=30, now=None):
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
-        with self.connection() as db:
-            unit = _logical_unit(db, message_id)
-        if unit is None:
+        if request_id is None:
+            request_id = removal.issue_key(
+                self, kind, parameters, retention_days=retention_days, now=stamp
+            )
+        return removal.accept(self, request_id, kind, parameters, now=stamp)
+
+    def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
+        try:
+            result = self.request_removal("delete", {"message_id": message_id}, now=now)
+            return bool(result.requested)
+        except KeyError:
             return False
-        with self._source_cleanup_locks(unit.rows) as acquired, self.connection() as db:
-            if not acquired:
-                raise LocalRemovalHeld((message_id,))
-            db.execute("BEGIN IMMEDIATE")
-            unit = _logical_unit(db, message_id)
-            if unit is None:
-                return False
-            db.executemany(
-                """INSERT INTO suppressed_messages(
-                        provider, account_id, message_key, expires_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(provider, account_id, message_key)
-                    DO UPDATE SET expires_at = excluded.expires_at""",
-                [
-                    (
-                        source.provider,
-                        source.account_id,
-                        _message_suppression_key(
-                            source.provider,
-                            source.account_id,
-                            source.provider_message_id,
-                            source.mailbox_identity_key,
-                        ),
-                        _suppression_expiry(source.received_at, stamp),
-                    )
-                    for source in unit.sources
-                ],
-            )
-            _mark_automation_sources_unavailable(db, unit.rows, updated_at=stamp.isoformat())
-            placeholders = ", ".join("?" for _ in unit.rows)
-            cursor = db.execute(
-                f"DELETE FROM messages WHERE message_id IN ({placeholders})", tuple(unit.rows)
-            )
-            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
-        return cursor.rowcount >= 1
 
     def clear_messages(self, *, now: datetime | None = None) -> int:
-        """Delete every message, each logical message as one unit (contract D-identity).
-
-        A unit's rows are locked, suppressed, marked, and counted together; the
-        delete trigger removes the rows pointing at each canonical.
-        """
-        stamp = (now or datetime.now(UTC)).astimezone(UTC)
-        with self.connection() as db:
-            canonicals = [
-                str(row["message_id"])
-                for row in db.execute(
-                    "SELECT message_id FROM logical_messages ORDER BY message_id"
-                ).fetchall()
-            ]
-        deleted = 0
-        held: list[str] = []
-        for offset in range(0, len(canonicals), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
-            initial = canonicals[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
-            with self.connection() as db:
-                units = {key: _unit_rows(db, (key,)) for key in initial}
-            for chunk, unit_rows in self._source_cleanup_groups(units):
-                if not unit_rows:
-                    continue
-                with self._source_cleanup_locks(unit_rows) as acquired, self.connection() as db:
-                    if not acquired:
-                        held.extend(chunk)
-                        continue
-                    db.execute("BEGIN IMMEDIATE")
-                    current_rows = _unit_rows(db, chunk)
-                    if not current_rows:
-                        continue
-                    row_placeholders = ", ".join("?" for _ in current_rows)
-                    rows = db.execute(
-                        f"""SELECT message_id, provider, account_id, mailbox_identity_key,
-                            provider_message_id, received_at FROM messages
-                            WHERE message_id IN ({row_placeholders})""",
-                        tuple(current_rows),
-                    ).fetchall()
-                    # Recorded locations are source identities too (contract D-identity).
-                    located = db.execute(
-                        f"""SELECT m.provider, m.account_id, l.mailbox_identity_key,
-                            l.provider_message_id,
-                            COALESCE(l.received_at, m.received_at) AS received_at
-                        FROM message_locations AS l
-                        JOIN messages AS m ON m.message_id = l.message_id
-                        WHERE l.message_id IN ({row_placeholders})""",
-                        tuple(current_rows),
-                    ).fetchall()
-                    db.executemany(
-                        """INSERT INTO suppressed_messages(
-                                provider, account_id, message_key, expires_at
-                            ) VALUES (?, ?, ?, ?)
-                            ON CONFLICT(provider, account_id, message_key)
-                            DO UPDATE SET expires_at = excluded.expires_at""",
-                        [
-                            (
-                                str(row["provider"]),
-                                str(row["account_id"]),
-                                _message_suppression_key(
-                                    str(row["provider"]),
-                                    str(row["account_id"]),
-                                    str(row["provider_message_id"]),
-                                    (
-                                        str(row["mailbox_identity_key"])
-                                        if row["mailbox_identity_key"] is not None
-                                        else None
-                                    ),
-                                ),
-                                _suppression_expiry(str(row["received_at"]), stamp),
-                            )
-                            for row in (*rows, *located)
-                        ],
-                    )
-                    _mark_automation_sources_unavailable(
-                        db,
-                        current_rows,
-                        updated_at=stamp.isoformat(),
-                    )
-                    current_canonicals = [m for m in chunk if m in set(current_rows)]
-                    canonical_placeholders = ", ".join("?" for _ in current_canonicals)
-                    db.execute(
-                        f"DELETE FROM messages WHERE message_id IN ({canonical_placeholders})",
-                        tuple(current_canonicals),
-                    )
-                    deleted += len(current_rows)
-        if held:
-            raise LocalRemovalHeld(held, deleted=deleted)
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
-        return deleted
+        return self.request_removal("clear", {}, now=now).completed
 
     def replace_attachments(
         self,
@@ -13259,6 +13164,8 @@ class Store:
         context_at = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             row = db.execute(
                 """SELECT status, analysis_request_id, analysis_context_at,
                 analysis_body_char_limit FROM messages WHERE message_id = ?""",
@@ -14268,6 +14175,7 @@ class Store:
         polled_scope: tuple[str, str, str] | None = None,
     ) -> PurgeOutcome:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
+        removal.retire(self, retention_days, now=stamp)
         cutoff = stamp - timedelta(days=retention_days)
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         stamp_epoch = (stamp - epoch).total_seconds()
@@ -14277,6 +14185,11 @@ class Store:
         expired_units, expiry_parameters = _logical_messages_past_cutoff_sql(
             cutoff_epoch, stamp_epoch
         )
+        # Age alone is not cleanup authority for a pending logical removal.
+        # Both retention paths select through the shared eligibility projection;
+        # the completion owner settles its frozen targets and bytes together.
+        expired_units = f"""SELECT expired.canonical FROM ({expired_units}) expired
+            JOIN logical_messages visible ON visible.message_id=expired.canonical"""
         followed_expired_units = expired_units
         expired_units = f"""SELECT canonical FROM ({expired_units}) WHERE NOT EXISTS (
             SELECT 1 FROM messages m JOIN thread_follow f

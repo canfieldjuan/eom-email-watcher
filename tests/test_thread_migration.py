@@ -10,7 +10,28 @@ import pytest
 from test_db import Store
 from test_thread_derived import derived, follow, seed
 
+from eom_email_watcher import db as database
 from eom_email_watcher import thread_migration
+
+
+@pytest.fixture
+def schema35_binary(monkeypatch):
+    """Keep the original rebuild/backup oracle before the additive v36 lift."""
+    monkeypatch.setattr(database, "SCHEMA_VERSION", 35)
+
+    def current_binary():
+        monkeypatch.setattr(database, "SCHEMA_VERSION", 36)
+
+    return current_binary
+
+
+def assert_empty_schema36(store):
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        for table in ("message_removal_requests", "message_removal_intents",
+                      "message_removal_targets"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def legacy_store(tmp_path: Path) -> Store:
@@ -55,7 +76,9 @@ def snapshot(path):
         )
 
 
-def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatch):
+def test_upgrade_preserves_records_and_schema_and_backfills(
+    tmp_path, monkeypatch, schema35_binary,
+):
     store = legacy_store(tmp_path)
     before = snapshot(store.path)
     rebuild = thread_migration.rebuild_messages
@@ -81,9 +104,16 @@ def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatc
     assert not list(tmp_path.glob("mail.db.pre-v33.*.bak"))
     store.initialize()
     assert observed == [True]
+    schema35_binary()
+    store.initialize()
+    assert_empty_schema36(store)
+    assert snapshot(store.path)[1:4] == before[1:4]
+    assert observed == [True]
 
 
-def test_failed_rebuild_rolls_back_and_keeps_newest_backup(tmp_path, monkeypatch):
+def test_failed_rebuild_rolls_back_and_keeps_newest_backup(
+    tmp_path, monkeypatch, schema35_binary,
+):
     store = legacy_store(tmp_path)
     before = snapshot(store.path)
     with store.connection() as db:
@@ -122,21 +152,34 @@ def test_backup_full_disk_does_not_start_migration(tmp_path, monkeypatch):
     assert snapshot(store.path) == before
 
 
-def test_simultaneous_initializers_rebuild_once(tmp_path, monkeypatch):
+def test_simultaneous_initializers_rebuild_once(tmp_path, monkeypatch, schema35_binary):
     store = legacy_store(tmp_path)
     rebuild = thread_migration.rebuild_messages
     observed = []
+    backup = thread_migration.write_backup
+    backup_targets = []
+
+    def track_backup(path, db, *, target_schema=33):
+        backup_targets.append(target_schema)
+        return backup(path, db, target_schema=target_schema)
 
     def count_rebuild(db):
         observed.append(True)
         rebuild(db)
 
     monkeypatch.setattr(thread_migration, "rebuild_messages", count_rebuild)
+    monkeypatch.setattr(thread_migration, "write_backup", track_backup)
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _: Store(store.path).initialize(), range(2)))
     assert observed == [True]
     assert snapshot(store.path)[0] == 35
     assert derived(store)["vendor_id"] is not None
+    schema35_binary()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: Store(store.path).initialize(), range(2)))
+    assert_empty_schema36(store)
+    assert observed == [True]
+    assert backup_targets == [33, 36]
 
 
 @pytest.mark.parametrize(

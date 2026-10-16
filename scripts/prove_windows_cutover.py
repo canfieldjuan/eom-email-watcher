@@ -591,7 +591,12 @@ def run_case(
             environment=environment,
         )
         with sqlite3.connect(database) as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 35
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+            for table in (
+                "message_removal_requests", "message_removal_intents", "message_removal_targets"
+            ):
+                assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            assert db.execute("PRAGMA foreign_key_check").fetchall() == []
             assert (
                 db.execute(
                     "SELECT value FROM maintenance_state WHERE key='source_lock_protocol'"

@@ -27,6 +27,7 @@ from .runtime import (
     mail_provider_connection_available,
 )
 from .service import run_watcher_check
+from .source_locks import operation_lock_path
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -72,7 +73,7 @@ def _runtime(config_path: Path) -> tuple[object, Store, ModelRuntime]:
 
 @contextmanager
 def _production_check_lock(database_file: Path):
-    lock_path = database_file.with_name(f"{database_file.name}.check.lock")
+    lock_path = operation_lock_path(database_file)
     with operation_lock(lock_path, "Another production check is already running"):
         yield
 

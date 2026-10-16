@@ -99,7 +99,7 @@ def record(store, message_id, body, *, fetched_at, reason=None):
 
 
 def recompute(db):
-    from . import source_locks
+    from . import removal, source_locks
     from .db import SOURCE_CLEANUP_LOCK_BATCH_SIZE, _effective_message_identity_sql, _unit_rows
 
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_bodies'").fetchone():
@@ -109,7 +109,14 @@ def recompute(db):
         AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
         AND f.thread_key=m.thread_key
         WHERE f.followed=1"""
+    # A durable target remains physical until the completion owner acquires its
+    # source locks; hiding it from the projection is not deletion authority.
     held = []
+    if removal.has_schema(db):
+        eligible_content = removal.available_sql("m", include_unfollow=True)
+        held = [r[0] for r in db.execute(
+            f"SELECT m.message_id FROM messages m WHERE NOT ({eligible_content})"
+        )]
     # This runs in the same write transaction as follow/attribution, so the
     # protocol marker cannot change between the admission read and cleanup.
     ready = source_locks.protocol_ready(db)

@@ -30,7 +30,7 @@ from connect_automate.locking import (
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from . import deployment, source_locks
+from . import deployment, removal, source_locks
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -394,7 +394,7 @@ def _host_notification_intent_count(runtime: Runtime) -> int:
 
 
 def _production_check_lock_path(config: Config) -> Path:
-    return config.database_file.with_name(f"{config.database_file.name}.check.lock")
+    return source_locks.operation_lock_path(config.database_file)
 
 
 def _host_operation_lock(request: dict[str, object]) -> dict[str, object]:
@@ -2695,29 +2695,15 @@ def _calendar_automation_decide(request: dict[str, object]) -> dict[str, object]
 
 
 def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"message_id"})
+    payload = _payload(request, {"message_id", "request_id"})
     message_id = payload.get("message_id")
     if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 512:
         raise ApiError(
             "invalid_request",
             "message_id must be a non-empty string of at most 512 characters",
         )
-    runtime = _runtime(request)
-    lock_path = _production_check_lock_path(runtime.config)
-    if not operation_lock_supported(lock_path):
-        raise ApiError(
-            "unsupported_platform",
-            "Local inbox changes require native operation locking",
-        )
-    with operation_lock(lock_path, "Another watcher operation is already running"):
-        deleted = runtime.store.delete_message(message_id)
-    if not deleted:
-        raise ApiError("not_found", "Message was not found")
-    return {"deleted": True, "message_id": message_id}
-
-
-def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
-    _payload(request)
+    if "request_id" in payload and not isinstance(payload["request_id"], str):
+        raise ApiError("invalid_request", "request_id must be a string")
     runtime = _runtime(request)
     lock_path = _production_check_lock_path(runtime.config)
     if not operation_lock_supported(lock_path):
@@ -2727,16 +2713,37 @@ def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
         )
     with operation_lock(lock_path, "Another watcher operation is already running"):
         try:
-            deleted = runtime.store.clear_messages()
-        except LocalRemovalHeld as exc:
-            return {
-                "outcome": "partial" if exc.deleted else "refused",
-                "deleted": exc.deleted,
-                "refused": len(exc.message_ids),
-                "held_message_ids": list(exc.message_ids),
-                "message": str(exc),
-            }
-    return {"deleted": deleted}
+            result = runtime.store.request_removal(
+                "delete", {"message_id": message_id}, request_id=payload.get("request_id"),
+                retention_days=runtime.config.retention_days,
+            )
+        except KeyError as exc:
+            raise ApiError("not_found", "Message was not found") from exc
+        except removal.RemovalRequestInvalid as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+    return {**result.data(), "deleted": bool(result.completed), "message_id": message_id}
+
+
+def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"request_id"})
+    if "request_id" in payload and not isinstance(payload["request_id"], str):
+        raise ApiError("invalid_request", "request_id must be a string")
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Local inbox changes require native operation locking",
+        )
+    with operation_lock(lock_path, "Another watcher operation is already running"):
+        try:
+            result = runtime.store.request_removal(
+                "clear", {}, request_id=payload.get("request_id"),
+                retention_days=runtime.config.retention_days,
+            )
+        except removal.RemovalRequestInvalid as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+    return {**result.data(), "deleted": result.completed}
 
 
 def _analysis_requeue(request: dict[str, object]) -> dict[str, object]:

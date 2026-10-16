@@ -2555,6 +2555,11 @@ class Watcher:
         batch = set(message_ids)
         candidates = (*message_ids, *(i for i in known_locations if i not in batch))
         for provider_message_id in candidates:
+            if not self.store.source_start(
+                provider=self.mailbox.provider, account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key, provider_message_id=provider_message_id,
+            ):
+                continue
             if self.store.has_seen_message(
                 provider_message_id,
                 provider=self.mailbox.provider,
@@ -3220,6 +3225,10 @@ def run_watcher_check(
     dry_run: bool = False,
     deliver_notifications: bool = True,
 ) -> dict[str, int | bool | str]:
+    if not dry_run:
+        from . import removal
+
+        removal.resume(store)
     recovery_backoff = _gmail_recovery_backoff_admission(store)
     if recovery_backoff is not None:
         if not dry_run:

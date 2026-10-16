@@ -24,7 +24,7 @@ from connect_automate.locking import (
 )
 from connect_automate.locking import connect_operation_lock as protocol_guard
 
-from . import body_state, deployment
+from . import body_state, deployment, removal
 
 if TYPE_CHECKING:
     from .db import Store
@@ -50,6 +50,11 @@ def source_lock_stripe(message_id: str) -> int:
         int.from_bytes(hashlib.sha256(("source\0" + message_id).encode()).digest(), "big")
         % SOURCE_LOCK_STRIPE_COUNT
     )
+
+
+def operation_lock_path(database_path: Path) -> Path:
+    """The existing watcher operation exclusion, shared by all entry points."""
+    return database_path.with_name(f"{database_path.name}.check.lock")
 
 
 def source_lock_path(database_path: Path, message_id: str) -> Path:
@@ -271,6 +276,18 @@ def qualify_protocol(store: Store, *, fresh: bool) -> None:
         raise SourceProtocolUnavailable(
             "Source-lock upgrade deferred; a native source owner remains active"
         ) from exc
+    with store.connection() as db:
+        has_requests = removal.has_schema(db)
+    if has_requests:
+        try:
+            with connect_operation_lock(
+                operation_lock_path(store.path), "Another watcher operation is already running"
+            ):
+                removal.resume(store)
+        except OperationLockBusy:
+            # An existing operation keeps its exclusion. Its ordinary-check
+            # entry point resumes through the same completion owner.
+            pass
 
 
 def _qualify_protocol(store: Store, *, fresh: bool) -> None:

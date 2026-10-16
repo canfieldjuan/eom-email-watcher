@@ -578,9 +578,14 @@ def legacy_body_store(tmp_path, monkeypatch):
 
 def test_schema35_upgrade_retains_mail_and_invalidates_coverage_once(tmp_path, monkeypatch):
     from eom_email_watcher import body_state
+    from eom_email_watcher import db as database
 
     store = legacy_body_store(tmp_path, monkeypatch)
-    store.initialize()
+    # Prove the original schema-35 boundary explicitly, then its additive v36
+    # successor. Neither open may invalidate coverage after the one-time lift.
+    with monkeypatch.context() as prior:
+        prior.setattr(database, "SCHEMA_VERSION", 35)
+        store.initialize()
     with store.connection() as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 35
         assert db.execute("SELECT message_id FROM messages").fetchone()[0] == "m"
@@ -595,6 +600,15 @@ def test_schema35_upgrade_retains_mail_and_invalidates_coverage_once(tmp_path, m
         )
     store.initialize()
     with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        for table in ("message_removal_requests", "message_removal_intents",
+                      "message_removal_targets"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert db.execute("SELECT message_id FROM messages").fetchone()[0] == "m"
+        assert db.execute("SELECT 1 FROM reconcile_coverage").fetchone()
+    store.initialize()
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
         assert db.execute("SELECT 1 FROM reconcile_coverage").fetchone()
 
 
