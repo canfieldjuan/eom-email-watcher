@@ -6,6 +6,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
@@ -1306,7 +1307,7 @@ def _deliver_automation_review_intent(
         return False
     label = sender_names.get(intent.sender) or intent.sender_name or intent.sender
     try:
-        send_review(
+        delivery = send_review(
             label,
             intent.subject,
             intent.summary or "A scheduling mention needs manual review.",
@@ -1314,16 +1315,23 @@ def _deliver_automation_review_intent(
             ntfy_url=config.ntfy_url,
             ntfy_content_disclosure_acknowledged=(config.ntfy_content_disclosure_acknowledged),
             dry_run=dry_run,
+            source_start=lambda: store.notification_source_start(
+                intent.subject_type, intent.subject_id
+            ),
         )
+        if not delivery.delivered:
+            return False
         if not dry_run:
-            store.acknowledge_notification(
-                message_id=intent.message_id,
-                kind=intent.kind,
-                analysis_at=intent.analysis_at,
-                subject_type=intent.subject_type,
-                subject_id=intent.subject_id,
-                revision=intent.revision,
-            )
+            # The send began first; accepted removal owns any later state.
+            with suppress(KeyError):
+                store.acknowledge_notification(
+                    message_id=intent.message_id,
+                    kind=intent.kind,
+                    analysis_at=intent.analysis_at,
+                    subject_type=intent.subject_type,
+                    subject_id=intent.subject_id,
+                    revision=intent.revision,
+                )
         return True
     except NotificationError as exc:
         logger.warning("Automation review notification unavailable: %s", exc)
@@ -2898,7 +2906,7 @@ class Watcher:
         if not self.config.notifications_enabled or getattr(message, "fallback_notified_at", None):
             return 0
         try:
-            send_fallback(
+            delivery = send_fallback(
                 self._label(message),
                 message.subject,
                 ntfy_topic=self.config.ntfy_topic,
@@ -2907,7 +2915,13 @@ class Watcher:
                     self.config.ntfy_content_disclosure_acknowledged
                 ),
                 dry_run=dry_run,
+                source_start=lambda: self.store.notification_source_start(
+                    getattr(message, "subject_type", "message"),
+                    getattr(message, "subject_id", message.message_id),
+                ),
             )
+            if not delivery.delivered:
+                return 0
             if not dry_run:
                 self.store.mark_fallback_notified(message.message_id)
             return 1
@@ -2940,7 +2954,7 @@ class Watcher:
                 self.store.mark_delivery_complete(message.message_id, notified=False)
             return 0
         try:
-            send_analysis(
+            delivery = send_analysis(
                 self._label(message),
                 message.subject,
                 analysis,
@@ -2951,7 +2965,13 @@ class Watcher:
                 ),
                 partial_summary=partial_summary,
                 dry_run=dry_run,
+                source_start=lambda: self.store.notification_source_start(
+                    getattr(message, "subject_type", "message"),
+                    getattr(message, "subject_id", message.message_id),
+                ),
             )
+            if not delivery.delivered:
+                return 0
         except NotificationError as exc:
             logger.warning("Message %s notification unavailable: %s", message.message_id, exc)
             fallback = self._send_fallback(message, dry_run)

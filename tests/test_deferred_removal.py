@@ -542,6 +542,15 @@ def test_accepted_target_refuses_connect_resubmission(tmp_path, monkeypatch):
         "transition_connect_job",
         "reconcile_source",
         "connect_job",
+        "notification_source_start",
+        "notification_review_start",
+        "notification_intents",
+        "notification_intent_count",
+        "mark_fallback_notified",
+        "mark_delivery_complete",
+        "acknowledge_analysis",
+        "acknowledge_fallback",
+        "acknowledge_review",
     ],
 )
 def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, owner):
@@ -560,7 +569,16 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
     from eom_email_watcher.config import exact_sender_selector_id
     from eom_email_watcher.mime import AttachmentDescriptor
 
-    seeded = held_runtime(tmp_path, monkeypatch)
+    if owner in {
+        "notification_review_start",
+        "notification_intents",
+        "notification_intent_count",
+        "acknowledge_review",
+    }:
+        _, seeded, notification, target_id = review_notification_fixture(tmp_path, monkeypatch)
+    else:
+        seeded = held_runtime(tmp_path, monkeypatch)
+        target_id = "m"
     main_thread = threading.get_ident()
     reached, release = threading.Event(), threading.Event()
     observation_timeouts = []
@@ -584,14 +602,20 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
                     ):
 
                         class DecisionCursor:
-                            def fetchone(self):
+                            def _decision(self, fetch):
                                 # Pause after SQLite made the real decision, not
                                 # before the SELECT could observe acceptance.
-                                row = cursor.fetchone()
+                                result = fetch()
                                 reached.set()
                                 if not release.wait(10):
                                     observation_timeouts.append(sql)
-                                return row
+                                return result
+
+                            def fetchone(self):
+                                return self._decision(cursor.fetchone)
+
+                            def fetchall(self):
+                                return self._decision(cursor.fetchall)
 
                         return DecisionCursor()
                     return cursor
@@ -603,9 +627,25 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
                     db.execute = execute
 
     store = ProbeStore(seeded.path)
+    if owner in {"mark_delivery_complete", "acknowledge_analysis"}:
+        store.mark_analyzed(
+            target_id,
+            FakeModel().analyze().model_dump(),
+            mailbox_identity_key=KEY,
+            body_chars=12,
+            body_source_chars=12,
+            now=NOW,
+        )
+    if owner in {"mark_fallback_notified", "acknowledge_fallback"}:
+        store.record_failure(target_id, "public failure", 0)
+    if owner in {"acknowledge_analysis", "acknowledge_fallback"}:
+        kind = "analysis" if owner == "acknowledge_analysis" else "fallback"
+        notification = next(
+            item for item in store.notification_intents(kind=kind) if item.subject_id == target_id
+        )
     if owner == "create_connect_job":
         store.replace_attachments(
-            "m",
+            target_id,
             (
                 AttachmentDescriptor(
                     "2",
@@ -618,7 +658,7 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
             ),
         )
     if owner == "mark_analyzed":
-        store.reserve_analysis_request("m", 100, now=NOW)
+        store.reserve_analysis_request(target_id, 100, now=NOW)
     if owner in {
         "connect_dispatch",
         "claim_connect_lane_head",
@@ -652,9 +692,33 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
                 provider_app_id=selected.app_id,
                 provider_instance_id=selected.instance_id,
             )
-    key = removal.issue_key(store, "delete", {"message_id": "m"}, retention_days=30, now=NOW)
+    key = removal.issue_key(store, "delete", {"message_id": target_id}, retention_days=30, now=NOW)
 
     def start():
+        if owner in {"notification_intents", "notification_intent_count"}:
+            return getattr(store, owner)()
+        if owner == "notification_source_start":
+            return store.notification_source_start("message", target_id)
+        if owner == "notification_review_start":
+            return store.notification_source_start("automation_run", notification.subject_id)
+        if owner == "mark_fallback_notified":
+            return store.mark_fallback_notified(target_id)
+        if owner == "mark_delivery_complete":
+            return store.mark_delivery_complete(target_id, True)
+        if owner in {"acknowledge_analysis", "acknowledge_fallback", "acknowledge_review"}:
+            return store.acknowledge_notification(
+                **{
+                    name: getattr(notification, name)
+                    for name in (
+                        "message_id",
+                        "kind",
+                        "analysis_at",
+                        "subject_type",
+                        "subject_id",
+                        "revision",
+                    )
+                }
+            )
         if owner == "connect_job":
             from types import SimpleNamespace
 
@@ -662,7 +726,7 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
 
             return engine_api._selected_connect_output(
                 dict(
-                    message_id="m",
+                    message_id=target_id,
                     part_id="2",
                     job_id=source_job.job_id,
                     artifact_id=source_output.artifact_id,
@@ -670,7 +734,7 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
                 SimpleNamespace(store=store),
             )
         if owner == "reconcile_source":
-            return store.reconcile_source("gmail", "mailbox", KEY, "m")
+            return store.reconcile_source("gmail", "mailbox", KEY, target_id)
         if owner == "transition_connect_job":
             return store.transition_connect_job(
                 job_id=source_job.job_id,
@@ -694,12 +758,12 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
                 provider_instance_id=selected.instance_id,
             )
         if owner == "source_start":
-            return store.source_start("m")
+            return store.source_start(target_id)
         if owner == "message_source":
-            return store.message_source("m")
+            return store.message_source(target_id)
         if owner == "mark_analyzed":
             return store.mark_analyzed(
-                "m",
+                target_id,
                 FakeModel().analyze().model_dump(),
                 mailbox_identity_key=KEY,
                 body_chars=12,
@@ -709,7 +773,7 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
         if owner == "create_connect_job":
             return store.create_connect_job(
                 job_id=str(uuid.uuid4()),
-                message_id="m",
+                message_id=target_id,
                 part_id="2",
                 capability_id="document.summarize",
                 capability_version="1.0",
@@ -751,7 +815,7 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
             ):
                 store.request_removal(
                     "delete",
-                    {"message_id": "m"},
+                    {"message_id": target_id},
                     request_id=key,
                     now=NOW,
                 )
@@ -760,7 +824,7 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
         future.result(timeout=10)
     assert not observation_timeouts
     with operation_lock(source_locks.operation_lock_path(store.path), "public operation"):
-        result = store.request_removal("delete", {"message_id": "m"}, request_id=key, now=NOW)
+        result = store.request_removal("delete", {"message_id": target_id}, request_id=key, now=NOW)
     assert result.pending == 1 and result.completed == 0
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
@@ -1527,3 +1591,309 @@ def test_content_reader_refuses_start_after_acceptance(tmp_path, monkeypatch, ow
     assert not response["ok"] and response["error"]["code"] == "not_found", response
     if owner == "output_export":
         assert not list(destination.iterdir())
+
+
+def review_notification_fixture(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from test_service import admit_scheduling_run, config
+
+    from eom_email_watcher import engine_api
+
+    cfg = config(tmp_path)
+    store = database.Store(cfg.database_file)
+    store.initialize()
+    _, run = admit_scheduling_run(store, monkeypatch)
+    reviewed = store.transition_automation_to_review(
+        run.run_id,
+        run.state_version,
+        next_state="manual_review",
+        failure_code="source_invalid",
+    )
+    intent = next(
+        item
+        for item in store.notification_intents(kind="automation_review")
+        if item.subject_id == reviewed.run_id
+    )
+    with store.connection() as db:
+        source_id = db.execute("SELECT message_id FROM messages").fetchone()[0]
+    retain_legacy_aliases(store, source_id)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg))
+    return cfg, store, intent, source_id
+
+
+@pytest.mark.parametrize("kind", ["fallback", "analysis", "automation_review"])
+@pytest.mark.parametrize("accept_at", ["never", "before", "desktop", "desktop_failure"])
+def test_each_notification_channel_rechecks_accepted_source(tmp_path, monkeypatch, kind, accept_at):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from test_removal_refusal import held_runtime
+    from test_service import FakeModel
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api, notifications, service
+
+    model_result = FakeModel().analyze()
+    if kind == "automation_review":
+        cfg, store, intent, source_id = review_notification_fixture(tmp_path, monkeypatch)
+        cfg = replace(
+            cfg,
+            notifications_enabled=True,
+            ntfy_topic="public-fixture-topic",
+            ntfy_content_disclosure_acknowledged=True,
+        )
+        monkeypatch.setattr(
+            engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg)
+        )
+    else:
+        store = held_runtime(tmp_path, monkeypatch)
+        watcher = engine_api._runtime({})
+        cfg = replace(
+            watcher.config,
+            notifications_enabled=True,
+            ntfy_topic="public-fixture-topic",
+            ntfy_content_disclosure_acknowledged=True,
+        )
+        watcher.config = cfg
+        message = store.pending()[0]
+        source_id = "m"
+        if kind == "analysis":
+            database.Store(store.path).mark_analyzed(
+                "m",
+                model_result.model_dump(),
+                mailbox_identity_key=KEY,
+                body_chars=12,
+                body_source_chars=12,
+                now=NOW,
+            )
+    delivered = []
+    accepted = []
+    acknowledgements = []
+    fallback_retries = []
+    ack_name = {
+        "fallback": "mark_fallback_notified",
+        "analysis": "mark_delivery_complete",
+        "automation_review": "acknowledge_notification",
+    }[kind]
+    original_ack = getattr(store, ack_name)
+
+    def acknowledge(*args, **kwargs):
+        acknowledgements.append(True)
+        return original_ack(*args, **kwargs)
+
+    monkeypatch.setattr(store, ack_name, acknowledge)
+    if kind == "analysis":
+        original_fallback = watcher._send_fallback
+
+        def fallback(*args, **kwargs):
+            fallback_retries.append(True)
+            return original_fallback(*args, **kwargs)
+
+        monkeypatch.setattr(watcher, "_send_fallback", fallback)
+
+    def accept():
+        reply = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "inbox.delete",
+                "payload": {"message_id": source_id},
+            }
+        )
+        assert reply["ok"] and reply["data"]["pending"] == 1, reply
+        accepted.append(reply)
+
+    def desktop(*args, **kwargs):
+        delivered.append("desktop")
+        if accept_at in {"desktop", "desktop_failure"}:
+            accept()
+        if accept_at == "desktop_failure":
+            raise notifications.NotificationError("public desktop transport failure")
+
+    def ntfy(*args, **kwargs):
+        delivered.append("ntfy")
+
+    monkeypatch.setattr(notifications, "_send_desktop", desktop)
+    monkeypatch.setattr(notifications, "_send_ntfy", ntfy)
+    if accept_at == "before":
+        accept()
+    if kind == "automation_review":
+        outcome = service._deliver_automation_review_intent(cfg, store, intent, {}, dry_run=False)
+    elif kind == "fallback":
+        outcome = watcher._send_fallback(message, False)
+    else:
+        outcome = watcher._deliver_analysis(message, model_result, False, partial_summary=False)
+    expected = (
+        ["desktop", "ntfy"]
+        if accept_at == "never"
+        else ([] if accept_at == "before" else ["desktop"])
+    )
+    assert delivered == expected
+    actual_delivery = accept_at in {"never", "desktop"}
+    assert len(acknowledgements) == int(actual_delivery)
+    assert not fallback_retries
+    if kind != "analysis":
+        assert outcome == actual_delivery
+    assert len(accepted) == int(accept_at != "never")
+    with store.connection() as db:
+        if kind == "automation_review":
+            acknowledged = db.execute(
+                "SELECT review_notified_at FROM automation_runs WHERE run_id=?",
+                (intent.subject_id,),
+            ).fetchone()[0]
+        else:
+            row = db.execute(
+                "SELECT notified_at,fallback_notified_at FROM messages WHERE message_id=?",
+                (source_id,),
+            ).fetchone()
+            acknowledged = row[0] if kind == "analysis" else row[1]
+        assert (acknowledged is not None) is (accept_at == "never")
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_native_notification_queue_excludes_only_accepted_review_source(
+    tmp_path, monkeypatch, missing
+):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from test_service import admit_scheduling_run, config
+
+    from eom_email_watcher import engine_api
+
+    cfg = replace(config(tmp_path), notifications_enabled=True, ntfy_topic=None)
+    store = database.Store(cfg.database_file)
+    store.initialize()
+    _, first = admit_scheduling_run(store, monkeypatch)
+    store.transition_automation_to_review(
+        first.run_id,
+        first.state_version,
+        next_state="manual_review",
+        failure_code="source_invalid",
+    )
+    with store.connection() as db:
+        first_message = db.execute("SELECT message_id FROM messages").fetchone()[0]
+    _, second = admit_scheduling_run(store, monkeypatch, provider_message_id="other-schedule")
+    store.transition_automation_to_review(
+        second.run_id,
+        second.state_version,
+        next_state="manual_review",
+        failure_code="source_invalid",
+    )
+    with store.connection() as db:
+        second_message = db.execute(
+            "SELECT message_id FROM messages WHERE provider_message_id=?", ("other-schedule",)
+        ).fetchone()[0]
+    initial = store.notification_intents()
+    assert {item.subject_id for item in initial} == {
+        first_message,
+        first.run_id,
+        second_message,
+        second.run_id,
+    }
+    assert store.notification_intent_count() == len(initial)
+    retain_legacy_aliases(store, first_message)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg))
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": first_message},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    if missing:
+        with store.connection() as db:
+            db.execute(
+                "DELETE FROM messages WHERE message_id=? OR logical_of=?",
+                (first_message, first_message),
+            )
+    response = engine_api._response(
+        {"protocol": 1, "operation": "notifications.pending", "payload": {}}
+    )
+    assert response["ok"], response
+    assert {item["subject_id"] for item in response["data"]["items"]} == {
+        second_message,
+        second.run_id,
+    }
+    assert store.notification_intent_count() == len(response["data"]["items"])
+    assert {item.subject_id for item in store.notification_intents(kind="automation_review")} == {
+        second.run_id
+    }
+
+
+@pytest.mark.parametrize("kind", ["fallback", "analysis", "automation_review"])
+@pytest.mark.parametrize("accept", [False, True])
+def test_public_notification_ack_uses_accepted_source(tmp_path, monkeypatch, kind, accept):
+    from dataclasses import replace
+
+    from test_removal_refusal import held_runtime
+    from test_service import FakeModel
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api
+
+    if kind == "automation_review":
+        _, store, intent, source_id = review_notification_fixture(tmp_path, monkeypatch)
+    else:
+        store = held_runtime(tmp_path, monkeypatch)
+        watcher = engine_api._runtime({})
+        watcher.config = replace(watcher.config, notifications_enabled=True, ntfy_topic=None)
+        source_id = "m"
+        if kind == "analysis":
+            database.Store(store.path).mark_analyzed(
+                source_id,
+                FakeModel().analyze().model_dump(),
+                mailbox_identity_key=KEY,
+                body_chars=12,
+                body_source_chars=12,
+                now=NOW,
+            )
+        else:
+            store.record_failure(source_id, "public failure", 0)
+        intent = next(
+            item for item in store.notification_intents(kind=kind) if item.subject_id == source_id
+        )
+    if accept:
+        accepted = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "inbox.delete",
+                "payload": {"message_id": source_id},
+            }
+        )
+        assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    response = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "notifications.ack",
+            "payload": {
+                name: getattr(intent, name)
+                for name in (
+                    "message_id",
+                    "kind",
+                    "analysis_at",
+                    "subject_type",
+                    "subject_id",
+                    "revision",
+                )
+            },
+        }
+    )
+    if accept:
+        assert not response["ok"] and response["error"]["code"] == "not_found", response
+    else:
+        assert response["ok"] and response["data"]["status"] == "acknowledged", response
+    with store.connection() as db:
+        if kind == "automation_review":
+            acknowledged = db.execute(
+                "SELECT review_notified_at FROM automation_runs WHERE run_id=?",
+                (intent.subject_id,),
+            ).fetchone()[0]
+        else:
+            row = db.execute(
+                "SELECT notified_at,fallback_notified_at FROM messages WHERE message_id=?",
+                (source_id,),
+            ).fetchone()
+            acknowledged = row[0] if kind == "analysis" else row[1]
+        assert (acknowledged is not None) is (not accept)

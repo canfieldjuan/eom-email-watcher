@@ -2875,6 +2875,49 @@ def _certificate_assert_projection(
             raise RuntimeError("Stored certificate policy projection is inconsistent")
 
 
+def _automation_source_available_sql(alias: str) -> str:
+    """Resolve the existing run source key through live and frozen bindings."""
+    return f"""NOT EXISTS (
+        SELECT 1 FROM (
+            SELECT message_id,provider,account_id,mailbox_identity_key,provider_message_id,
+                mailbox_identity_key AS binding_key FROM messages
+            UNION ALL
+            SELECT t.message_id,t.provider,t.account_id,t.stored_identity_key,
+                t.provider_message_id,i.mailbox_identity_key
+            FROM message_removal_targets t
+            JOIN message_removal_intents i ON i.intent_id=t.intent_id
+            UNION ALL
+            SELECT t.message_id,json_extract(s.value,'$.provider'),
+                json_extract(s.value,'$.account_id'),
+                json_extract(s.value,'$.mailbox_identity_key'),
+                json_extract(s.value,'$.provider_message_id'),
+                json_extract(s.value,'$.mailbox_identity_key')
+            FROM message_removal_targets t JOIN json_each(t.source_identities_json) s
+        ) source
+        LEFT JOIN automation_run_source_identities identity ON identity.run_id={alias}.run_id
+        WHERE source.provider={alias}.provider AND source.account_id={alias}.account_id
+          AND (
+            (identity.mailbox_identity_key IS NOT NULL
+             AND source.binding_key IS identity.mailbox_identity_key
+             AND message_source_key(source.provider,source.account_id,
+                    source.provider_message_id,identity.mailbox_identity_key)
+                    ={alias}.source_message_key)
+            OR (identity.mailbox_identity_key IS NULL
+                AND source.mailbox_identity_key IS NULL
+                AND message_source_key(source.provider,source.account_id,
+                        source.provider_message_id)={alias}.source_message_key)
+          ) AND NOT ({removal.available_sql("source")})
+    )"""
+
+
+def _automation_source_available(db: sqlite3.Connection, run_id: str) -> bool:
+    eligible = _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+    row = db.execute(
+        f"SELECT ({eligible}) FROM automation_runs r WHERE r.run_id=?", (run_id,),
+    ).fetchone()
+    return row is not None and bool(row[0])
+
+
 def _connect_source_available(db: sqlite3.Connection, job: ConnectJob) -> bool:
     """The retained Connect binding feeds the shared eligibility owner."""
     bindings = db.execute(
@@ -13352,6 +13395,9 @@ class Store:
 
     def mark_fallback_notified(self, message_id: str) -> None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                return
             db.execute(
                 "UPDATE messages SET fallback_notified_at = ? WHERE message_id = ?",
                 (datetime.now(UTC).isoformat(), message_id),
@@ -13568,11 +13614,23 @@ class Store:
 
     def mark_delivery_complete(self, message_id: str, notified: bool) -> None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                return
             db.execute(
                 """UPDATE messages SET status='summarized', next_retry_at=NULL,
                 last_error=NULL, notified_at=? WHERE message_id=?""",
                 (datetime.now(UTC).isoformat() if notified else None, message_id),
             )
+
+    def notification_source_start(self, subject_type: str, subject_id: str) -> bool:
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if subject_type == "message":
+                return removal.message_available(db, subject_id)
+            if subject_type == "automation_run":
+                return _automation_source_available(db, subject_id)
+            raise ValueError("Notification subject is invalid")
 
     def notification_intents(
         self,
@@ -13581,6 +13639,10 @@ class Store:
         kind: str | None = None,
     ) -> list[NotificationIntent]:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            source_eligible = (
+                _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+            )
             rows = db.execute(
                 f"""SELECT subject_type, subject_id, revision, message_id, kind,
                     sender, sender_name, subject, analysis_at, priority, summary,
@@ -13644,6 +13706,7 @@ class Store:
                 WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
                   AND r.review_notified_at IS NULL
                   AND NOT {_RUN_OF_A_CHILD_ROW}
+                  AND ({source_eligible})
                 ) AS intents
                 WHERE (? IS NULL OR kind = ?)
                 ORDER BY sort_at LIMIT ?""",
@@ -13653,6 +13716,10 @@ class Store:
 
     def notification_intent_count(self) -> int:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            source_eligible = (
+                _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+            )
             row = db.execute(
                 f"""SELECT
                     (SELECT COUNT(*) FROM logical_messages
@@ -13663,7 +13730,8 @@ class Store:
                     (SELECT COUNT(*) FROM automation_runs AS r
                      WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
                        AND r.review_notified_at IS NULL
-                       AND NOT {_RUN_OF_A_CHILD_ROW}) AS count"""
+                       AND NOT {_RUN_OF_A_CHILD_ROW}
+                       AND ({source_eligible})) AS count"""
             ).fetchone()
         return int(row["count"])
 
@@ -13696,6 +13764,8 @@ class Store:
             stamp = datetime.now(UTC).isoformat()
             with self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
+                if not _automation_source_available(db, run_id):
+                    raise KeyError(run_id)
                 row = db.execute(
                     """SELECT state, state_version, review_notified_at
                     FROM automation_runs WHERE run_id = ?""",
@@ -13725,6 +13795,8 @@ class Store:
         stamp = datetime.now(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             row = db.execute(
                 """SELECT status, analysis_at, fallback_notified_at, notified_at, last_error
                 FROM messages WHERE message_id = ?""",
