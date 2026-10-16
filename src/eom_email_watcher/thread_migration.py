@@ -65,6 +65,10 @@ class _MigrationOwner:
             raise RuntimeError("Database initialization requires its native upgrade owner")
         try:
             with store.connection() as db:
+                # Runtime TEMP triggers reference the live messages schema. A
+                # migration owns its full recomputation and may replace that
+                # schema, so runtime tracking must never enter this connection.
+                db._derived_enabled = False
                 db.execute("PRAGMA journal_mode=WAL")
                 db.execute("BEGIN IMMEDIATE")
                 self.connection = db

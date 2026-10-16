@@ -14,6 +14,32 @@ from eom_email_watcher import db as database
 from eom_email_watcher import thread_migration
 
 
+def test_migration_owner_excludes_runtime_tracking_during_messages_rebuild(tmp_path):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    seed(store)
+    with store.connection() as db:
+        before = [tuple(row) for row in db.execute("SELECT * FROM messages ORDER BY message_id")]
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        # A migration can update an input before replacing its schema. Runtime
+        # TEMP triggers must never span the DROP/RENAME intermediate state.
+        db.execute("UPDATE mail_accounts SET active=active")
+        thread_migration.rebuild_messages(db)
+        database._recompute_derived(db, database.DERIVED_INPUT_TABLES)
+        thread_migration.check_database(db)
+    store.initialize()
+    with store.connection() as db:
+        assert [tuple(row) for row in db.execute(
+            "SELECT * FROM messages ORDER BY message_id"
+        )] == before
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
 @pytest.fixture
 def schema35_binary(monkeypatch):
     """Keep the original rebuild/backup oracle before the additive v36 lift."""

@@ -573,7 +573,54 @@ _CONNECT_TABLE_TRIGGER_NAMES = (
     "connect_jobs_delete_linked_automation_fires",
 )
 
-_CONNECT_SOURCE_UNAVAILABLE_SQL = """
+# Bind provider-admitted attempts before either logical or physical source removal.
+# The physical-delete trigger and deferred invalidation consume this same rule.
+_AUTOMATION_SOURCE_BINDING_SQL = """
+    UPDATE automation_fire_attempts
+    SET job_id = dispatch_request_id
+    WHERE job_id IS NULL
+      AND fire_id IN (
+        SELECT fire_id FROM automation_fires
+        WHERE message_id = {message_id}
+          AND state IN ('pending_dispatch', 'entitlement_paused')
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM connect_attachment_jobs AS job
+        JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
+        WHERE job.job_id = automation_fire_attempts.dispatch_request_id
+          AND job.protocol_version = 2
+          AND job.status IN ('requested', 'accepted', 'processing', 'completed', 'failed')
+          AND dispatch.capability_authority_known = 1
+          AND NOT (
+            dispatch.state = 'waiting' AND dispatch.submission_possible = 0
+          )
+      );
+    UPDATE automation_fires
+    SET state = 'submitted',
+        state_version = state_version + 1,
+        reason = 'source_removed_after_provider_admission',
+        job_id = (
+            SELECT attempt.job_id
+            FROM automation_fire_attempts AS attempt
+            WHERE attempt.fire_id = automation_fires.fire_id
+              AND attempt.attempt_no = automation_fires.current_attempt_no
+        ),
+        pending_since = NULL,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    WHERE message_id = {message_id}
+      AND state IN ('pending_dispatch', 'entitlement_paused')
+      AND job_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM automation_fire_attempts AS attempt
+        WHERE attempt.fire_id = automation_fires.fire_id
+          AND attempt.attempt_no = automation_fires.current_attempt_no
+          AND attempt.job_id IS NOT NULL
+      );
+"""
+
+_CONNECT_SOURCE_UNAVAILABLE_SQL = _AUTOMATION_SOURCE_BINDING_SQL + """
     DELETE FROM connect_attachment_jobs
     WHERE message_id = {message_id}
       AND (
@@ -775,48 +822,7 @@ CREATE TABLE IF NOT EXISTS automation_run_source_identities (
 CREATE TRIGGER IF NOT EXISTS messages_delete_pending_automation_fires
 BEFORE DELETE ON messages
 BEGIN
-    UPDATE automation_fire_attempts
-    SET job_id = dispatch_request_id
-    WHERE job_id IS NULL
-      AND fire_id IN (
-        SELECT fire_id FROM automation_fires
-        WHERE message_id = OLD.message_id
-          AND state IN ('pending_dispatch', 'entitlement_paused')
-      )
-      AND EXISTS (
-        SELECT 1
-        FROM connect_attachment_jobs AS job
-        JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
-        WHERE job.job_id = automation_fire_attempts.dispatch_request_id
-          AND job.protocol_version = 2
-          AND job.status IN ('requested', 'accepted', 'processing', 'completed', 'failed')
-          AND dispatch.capability_authority_known = 1
-          AND NOT (
-            dispatch.state = 'waiting' AND dispatch.submission_possible = 0
-          )
-      );
-    UPDATE automation_fires
-    SET state = 'submitted',
-        state_version = state_version + 1,
-        reason = 'source_removed_after_provider_admission',
-        job_id = (
-            SELECT attempt.job_id
-            FROM automation_fire_attempts AS attempt
-            WHERE attempt.fire_id = automation_fires.fire_id
-              AND attempt.attempt_no = automation_fires.current_attempt_no
-        ),
-        pending_since = NULL,
-        updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
-    WHERE message_id = OLD.message_id
-      AND state IN ('pending_dispatch', 'entitlement_paused')
-      AND job_id IS NULL
-      AND EXISTS (
-        SELECT 1
-        FROM automation_fire_attempts AS attempt
-        WHERE attempt.fire_id = automation_fires.fire_id
-          AND attempt.attempt_no = automation_fires.current_attempt_no
-          AND attempt.job_id IS NOT NULL
-      );
+""" + _AUTOMATION_SOURCE_BINDING_SQL.format(message_id="OLD.message_id") + """
     DELETE FROM automation_fire_confirmations
     WHERE fire_id IN (
         SELECT fire_id FROM automation_fires
