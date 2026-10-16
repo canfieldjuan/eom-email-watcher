@@ -6340,7 +6340,7 @@ with open(sys.argv[1],'a') as output: output.write(json.dumps(payload)+'\n')
             let worker = thread::spawn(move || {
                 delivery.deliver_with_cancellation(
                     &worker_engine,
-                    Duration::from_secs(30),
+                    crate::STARTUP_DELIVERY_TIMEOUT,
                     CancellationToken::new(),
                 )
             });
@@ -6357,13 +6357,17 @@ with open(sys.argv[1],'a') as output: output.write(json.dumps(payload)+'\n')
                 // Release before assertions, so an unexpected acceptance cannot
                 // strand the controlled helper or its delivery worker.
                 fs::write(&release, b"release").unwrap();
-                let delivered = worker.join().unwrap().unwrap();
+                let delivered = worker.join().unwrap();
                 assert!(started.exists());
                 assert_eq!(
-                    result.unwrap_err().code,
+                    result
+                        .expect_err(
+                            "Acceptance must not enter between queue selection and send/ack"
+                        )
+                        .code,
                     "runtime_error",
-                    "Acceptance must not enter between queue selection and send/ack"
                 );
+                let delivered = delivered.unwrap();
                 assert_eq!(delivered.delivered, 2);
                 assert_eq!(delivered.failed, 0);
                 assert_eq!(delivered.remaining, 0);
