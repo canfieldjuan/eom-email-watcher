@@ -629,35 +629,61 @@ def accept(store, key, kind, parameters, *, now, acceptance):
 def convert_saved_unfollow(db, migration_owner, *, now):
     """Represent retained pre-36 unfollowed bodies in the upgrade snapshot."""
     from . import thread_migration
-    from .config import MAX_RETENTION_DAYS
-    from .db import _effective_message_identity_sql, _logical_unit
+    from .db import _followed_message_sql
 
     thread_migration.require_migration_owner(migration_owner, db)
     candidates = [r[0] for r in db.execute(
         f"""SELECT m.message_id FROM messages m
         WHERE NOT EXISTS (SELECT 1 FROM thread_follow f
-            WHERE f.provider=m.provider AND f.account_id=m.account_id
-            AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
-            AND f.thread_key=m.thread_key AND f.followed=1) AND (
+            WHERE {_followed_message_sql("m")}) AND (
             EXISTS(SELECT 1 FROM message_bodies b WHERE b.message_id=m.message_id)
             OR EXISTS(SELECT 1 FROM message_body_unavailable b WHERE b.message_id=m.message_id))
         ORDER BY m.message_id"""
     )]
+    accept_unfollow_units(db, candidates, now=now, authority=migration_owner)
+
+
+def accept_unfollow_units(db, candidates, *, now, authority):
+    """One retained-content selection and issuer for derived/migration unfollow."""
+    from .config import MAX_RETENTION_DAYS
+    from .db import _followed_message_sql, _logical_unit
+
     selected = {}
     for message_id in candidates:
         unit = _logical_unit(db, message_id)
-        if unit is None:
+        if unit is None or unit.rows in selected:
+            continue
+        row = db.execute(
+            "SELECT COALESCE(logical_of,message_id) FROM messages WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        canonical = row[0]
+        if db.execute(
+            f"""SELECT 1 FROM messages m JOIN thread_follow f
+            ON {_followed_message_sql("m")} WHERE m.message_id=?""",
+            (canonical,),
+        ).fetchone():
             continue
         if any(not message_available(db, row_id, include_unfollow=True) for row_id in unit.rows):
             continue
+        if not db.execute(
+            "SELECT 1 FROM message_bodies WHERE message_id IN (SELECT value FROM json_each(?)) "
+            "UNION ALL SELECT 1 FROM message_body_unavailable "
+            "WHERE message_id IN (SELECT value FROM json_each(?)) LIMIT 1",
+            (json.dumps(unit.rows), json.dumps(unit.rows)),
+        ).fetchone():
+            continue
         selected[unit.rows] = message_id
     if not selected:
-        return
+        return None
+    if authority is None:
+        raise RuntimeError("Fresh unfollow requires its guarded write transaction")
     parameters = {"message_ids": sorted(selected.values())}
     key = _issue_key(db, "unfollow", parameters, retention_days=MAX_RETENTION_DAYS, now=now)
     _accept_in_transaction(
-        db, key, "unfollow", parameters, selected.values(), now=now, authority=migration_owner,
+        db, key, "unfollow", parameters, selected.values(), now=now, authority=authority,
     )
+    return key
 
 
 def resume(store, *, now=None):

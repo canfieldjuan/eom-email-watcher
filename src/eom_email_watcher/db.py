@@ -3584,6 +3584,13 @@ def _effective_message_identity_sql(alias: str) -> str:
     ))"""
 
 
+def _followed_message_sql(alias: str, follow: str = "f") -> str:
+    """D-derived's followed membership, shared by body and transition owners."""
+    return f"""{follow}.provider={alias}.provider AND {follow}.account_id={alias}.account_id
+        AND {follow}.mailbox_identity_key={_effective_message_identity_sql(alias)}
+        AND {follow}.thread_key={alias}.thread_key AND {follow}.followed=1"""
+
+
 def _logical_message_rank_sql(alias: str) -> str:
     """Prefer completed work, then canonical source order, during lookup and upgrade."""
     return f"""CASE
@@ -3997,6 +4004,10 @@ def _unit_rows(db: sqlite3.Connection, canonicals: Sequence[str]) -> list[str]:
     return sorted(rows)
 
 
+def _logical_unit_members_sql(alias: str, canonical: str) -> str:
+    return f"({alias}.message_id={canonical} OR {alias}.logical_of={canonical})"
+
+
 def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | None:
     """The rows and source identities that are one logical message (D-identity)."""
     row = db.execute(
@@ -4007,9 +4018,10 @@ def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | Non
         return None
     canonical = str(row["canonical"])
     members = db.execute(
-        """SELECT message_id, provider, account_id, mailbox_identity_key,
+        f"""SELECT message_id, provider, account_id, mailbox_identity_key,
             provider_message_id, received_at
-        FROM messages WHERE message_id = ? OR logical_of = ? ORDER BY message_id""",
+        FROM messages member WHERE {_logical_unit_members_sql("member", "?")}
+        ORDER BY message_id""",
         (canonical, canonical),
     ).fetchall()
     sources = {
@@ -5672,15 +5684,57 @@ THREAD_DERIVED_SCHEMA = (
 )
 
 
+def _derived_record_scopes_sql(table: str, record: str) -> str:
+    """The one OLD/NEW scope selection for both sides of a local input write."""
+    def columns(row):
+        return (
+            f"{row}.provider AS provider,{row}.account_id AS account_id,"
+            f"{_effective_message_identity_sql(row)} AS identity,{row}.thread_key AS thread_key"
+        )
+    if table == "messages":
+        return (f"SELECT {columns(record)} UNION "
+                f"SELECT {columns('canonical')} FROM messages canonical "
+                f"WHERE canonical.message_id={record}.logical_of")
+    return f"""SELECT {columns('a')} FROM messages a
+        WHERE a.message_id={record}.message_id OR a.message_id=(
+            SELECT logical_of FROM messages WHERE message_id={record}.message_id)"""
+
+
+def _derived_scope_match_sql(message: str, scope: str) -> str:
+    return f"""{message}.provider={scope}.provider AND {message}.account_id={scope}.account_id
+        AND {_effective_message_identity_sql(message)} IS {scope}.identity
+        AND {message}.thread_key={scope}.thread_key"""
+
+
+def _capture_followed_content_sql(scopes: str | None) -> str:
+    """Before evidence: complete units bearing retained content, never body text."""
+    condition = "1" if scopes is None else (
+        f"EXISTS (SELECT 1 FROM ({scopes}) scope "
+        f"WHERE {_derived_scope_match_sql('m', 'scope')})"
+    )
+    return f"""INSERT OR IGNORE INTO derived_previous_followed
+        SELECT member.message_id FROM (
+            SELECT DISTINCT COALESCE(content.logical_of,content.message_id) AS canonical
+            FROM (SELECT message_id FROM message_bodies UNION
+                  SELECT message_id FROM message_body_unavailable) retained
+            JOIN messages content ON content.message_id=retained.message_id
+        ) unit JOIN messages m ON m.message_id=unit.canonical
+        JOIN thread_follow f ON {_followed_message_sql('m')}
+        JOIN messages member ON {_logical_unit_members_sql('member', 'm.message_id')}
+        WHERE {condition};"""
+
+
 def _track_derived_rows(db: sqlite3.Connection) -> None:
     """Connection-local row evidence; no extra persistent state or writer lists."""
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_derived'").fetchone():
         return
     db.execute("CREATE TEMP TABLE derived_changed_messages(message_id TEXT PRIMARY KEY)")
+    db.execute("CREATE TEMP TABLE derived_previous_followed(message_id TEXT PRIMARY KEY)")
     db.execute("""CREATE TEMP TABLE derived_changed_threads (
         provider TEXT, account_id TEXT, identity TEXT, thread_key TEXT,
         UNIQUE(provider, account_id, identity, thread_key))""")
     db.execute("CREATE TEMP TABLE derived_changed_config(table_name TEXT PRIMARY KEY)")
+    capture = removal.has_schema(db)
     coverage = reconcile_state.track_coverage_inputs(db)
     global_inputs = DERIVED_INPUT_TABLES - {"messages", "message_locations", "message_recipients"}
     for table in sorted(global_inputs):
@@ -5689,6 +5743,14 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
         ).fetchone():
             continue
         for event in ("INSERT", "DELETE", "UPDATE"):
+            if capture:
+                # Config changes already cause FULL recomputation. Mirror it once,
+                # starting from content-bearing units, without per-config rules.
+                db.execute(f"""CREATE TEMP TRIGGER derived_before_{table}_{event}
+                    BEFORE {event} ON main.{table}
+                    WHEN NOT EXISTS (SELECT 1 FROM derived_changed_config)
+                    BEGIN {_capture_followed_content_sql(None)}
+                    INSERT OR IGNORE INTO derived_changed_config VALUES ('{table}'); END""")
             evidence = reconcile_state.coverage_input_sql(table, event) if coverage else ""
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
                 AFTER {event} ON main.{table} BEGIN
@@ -5699,20 +5761,30 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
             ("DELETE", ("OLD",)),
             ("UPDATE", ("OLD", "NEW")),
         ):
-            statements = []
-            for record in records:
-                statements.append(
-                    f"INSERT OR IGNORE INTO derived_changed_messages VALUES ({record}.message_id);"
-                )
-                if table == "messages":
-                    statements.append(f"""INSERT OR IGNORE INTO derived_changed_threads VALUES (
-                        {record}.provider, {record}.account_id,
-                        {_effective_message_identity_sql(record)}, {record}.thread_key);""")
+            scopes = " UNION ".join(_derived_record_scopes_sql(table, r) for r in records)
+            statements = [
+                f"INSERT OR IGNORE INTO derived_changed_messages VALUES ({r}.message_id);"
+                for r in records
+            ]
+            statements.append("INSERT OR IGNORE INTO derived_changed_threads " + scopes + ";")
             update = (
                 " OF " + ",".join(sorted(DERIVED_MESSAGE_COLUMNS))
                 if event == "UPDATE" and table == "messages"
                 else ""
             )
+            if capture:
+                fresh_scopes = f"""SELECT * FROM ({scopes}) scope WHERE NOT EXISTS (
+                    SELECT 1 FROM derived_changed_threads seen WHERE seen.provider=scope.provider
+                    AND seen.account_id=scope.account_id AND seen.identity IS scope.identity
+                    AND seen.thread_key IS scope.thread_key)"""
+                # Existing changed-thread evidence is also the once-per-scope
+                # boundary. A prior FULL capture covers every local scope.
+                db.execute(f"""CREATE TEMP TRIGGER derived_before_{table}_{event}
+                    BEFORE {event}{update} ON main.{table}
+                    WHEN NOT EXISTS (SELECT 1 FROM derived_changed_config)
+                      AND EXISTS ({fresh_scopes})
+                    BEGIN {_capture_followed_content_sql(fresh_scopes)}
+                    INSERT OR IGNORE INTO derived_changed_threads {scopes}; END""")
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
                 AFTER {event}{update} ON main.{table} BEGIN {"".join(statements)} END""")
 
@@ -5767,23 +5839,14 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
     index = vendor_index(db)
     scopes: set[tuple[str, str, str, str]] = set()
     if tracked and not full:
-        # Locations and recipients name storage rows; resolve their canonical and
-        # include the complete affected thread so deletions can change its owner.
-        db.execute(f"""INSERT OR IGNORE INTO derived_changed_threads
-            SELECT m.provider, m.account_id, {_effective_message_identity_sql("m")}, m.thread_key
-            FROM messages m WHERE m.message_id IN (SELECT message_id FROM derived_changed_messages)
-               OR m.message_id IN (SELECT COALESCE(logical_of, message_id) FROM messages
-                   WHERE message_id IN (SELECT message_id FROM derived_changed_messages))""")
         scopes = {
             tuple(row)
             for row in db.execute("SELECT * FROM derived_changed_threads")
             if row[2] is not None
         }
         condition = f"""WHERE m.message_id IN (SELECT message_id FROM derived_changed_messages)
-            OR EXISTS (SELECT 1 FROM derived_changed_threads t WHERE t.provider=m.provider
-                AND t.account_id=m.account_id
-                AND t.identity IS {_effective_message_identity_sql("m")}
-                AND t.thread_key=m.thread_key)"""
+            OR EXISTS (SELECT 1 FROM derived_changed_threads t
+                WHERE {_derived_scope_match_sql("m", "t")})"""
     else:
         condition = ""
     rows = db.execute(f"""SELECT m.*, {_effective_message_identity_sql("m")} AS identity
@@ -5890,6 +5953,14 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
         AND f.mailbox_identity_key=thread_watermarks.mailbox_identity_key
         AND f.thread_key=thread_watermarks.thread_key AND f.followed=1)""")
 
+    if tracked and removal.has_schema(db):
+        # Only units followed before one of this transaction's input writes
+        # can become fresh unfollows. The shared helper tests current membership,
+        # retained content and pending targets, then uses the one issuer/freeze.
+        db._accepted_unfollow = removal.accept_unfollow_units(
+            db, [r[0] for r in db.execute("SELECT message_id FROM derived_previous_followed")],
+            now=datetime.now(UTC), authority=getattr(db, "_removal_transaction", None),
+        )
     body_state.recompute(db)
 
 class _DerivedCursor(sqlite3.Cursor):
@@ -5912,6 +5983,7 @@ class _DerivedConnection(sqlite3.Connection):
     _derived_ready = False
     _derived_input_seen = False
     _held_body_cleanup: tuple[str, ...] = ()
+    _accepted_unfollow: str | None = None
 
     def _prepare_derived_write(self, sql, parameters):
         if not self._derived_enabled or self._derived_ready:
@@ -5952,6 +6024,17 @@ class Store:
         removal.require_operation_owner(operation, self.path)
         with operation.acceptance() as acceptance, acceptance.transaction(self) as db:
             yield db
+        if db._accepted_unfollow:
+            # The segment's transaction and guard have fully exited. Keep the
+            # existing native operation owner while physical work takes sources.
+            removal.resume(self)
+            with self.connection() as settled:
+                db._held_body_cleanup = tuple(r[0] for r in settled.execute(
+                    "SELECT t.message_id FROM message_removal_targets t "
+                    "JOIN message_removal_intents i ON i.intent_id=t.intent_id "
+                    "WHERE i.request_id=? AND t.state='pending' ORDER BY t.message_id",
+                    (db._accepted_unfollow,),
+                ))
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

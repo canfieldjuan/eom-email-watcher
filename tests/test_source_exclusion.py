@@ -325,6 +325,62 @@ print('REAL_PURGE_1101_ROWS_RLIMIT_1024',flush=True)
     assert completed.stdout.strip() == "REAL_PURGE_1101_ROWS_RLIMIT_1024"
 
 
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file limit")
+def test_bodied_followed_thread_captures_each_scope_once_under_service_file_limit(tmp_path):
+    import inspect
+
+    from eom_email_watcher import db as database
+
+    owner_source = inspect.getsource(database._track_derived_rows)
+    script = """
+import json,resource,sys,time
+from contextlib import contextmanager
+from pathlib import Path
+sys.path.insert(0,sys.argv[2])
+from test_thread_bodies import followed
+from test_thread_reconcile import NOW,seed
+from eom_email_watcher import db as database,removal
+exec(sys.argv[3],database.__dict__)
+started=time.monotonic()
+store,state,_=followed(Path(sys.argv[1]))
+for i in range(1100):seed(store,str(i),thread_id='vendor-thread')
+with store.connection() as db:
+ db.execute("INSERT INTO message_bodies SELECT message_id,'body',4,4,? FROM messages",
+  (NOW.isoformat(),))
+captures=[]
+original_sql=database._capture_followed_content_sql
+def observed_sql(scopes):return "SELECT capture_probe();"+original_sql(scopes)
+database._capture_followed_content_sql=observed_sql
+connection=store.connection
+@contextmanager
+def observed_connection():
+ with connection() as db:
+  db.create_function('capture_probe',0,lambda:captures.append(1) or 0)
+  yield db
+store.connection=observed_connection
+resource.setrlimit(resource.RLIMIT_NOFILE,(1024,1024))
+with removal.operation_scope(store.path) as operation,store.derived_connection(operation) as db:
+ db.executemany("UPDATE messages SET received_at=received_at WHERE message_id=?",
+  ((str(i),) for i in range(1100)))
+ assert db.execute('SELECT COUNT(*) FROM derived_previous_followed').fetchone()[0]==1100
+assert len(captures)==1,('repeated capture of the same scope',len(captures))
+with store.connection() as db:
+ assert db.execute('SELECT COUNT(*) FROM message_bodies').fetchone()[0]==1101
+ assert not db.execute('SELECT 1 FROM message_removal_requests').fetchone()
+result={'bodies':1101,'captures':len(captures),'seconds':time.monotonic()-started}
+print('BODIED_FOLLOWED_SCOPE_ONCE '+json.dumps(result),flush=True)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(ROOT / "tests"), owner_source],
+        env=dict(os.environ, PYTHONPATH=str(ROOT / "src")), capture_output=True, text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("BODIED_FOLLOWED_SCOPE_ONCE ")
+    print(completed.stdout, end="")
+
+
 def test_unknown_protocol_never_gets_overwritten(tmp_path):
     from eom_email_watcher import source_locks as locks
 

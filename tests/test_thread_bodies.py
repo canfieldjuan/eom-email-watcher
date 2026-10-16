@@ -68,7 +68,10 @@ def test_unfollow_deletes_body_and_sets_durable_checkpoint(tmp_path):
 
     store, state, vendor = followed(tmp_path)
     body_state.record(store, "m", ("local text", 10), fetched_at=NOW)
-    store.remove_vendor_address(vendor, "vendor@example.com")
+    from eom_email_watcher.removal import operation_scope
+
+    with operation_scope(store.path) as operation:
+        store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
     with store.connection() as db:
         assert db.execute("PRAGMA secure_delete").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM message_bodies").fetchone()[0] == 0

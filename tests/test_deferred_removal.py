@@ -3851,3 +3851,486 @@ def test_recovery_completion_uses_same_derived_write_owner(tmp_path, monkeypatch
         assert observed == [owner]
     assert store.gmail_recovery_state("gmail-default") is None
     assert store.state(provider="gmail", account_id="gmail-default")[0] == "replacement-history"
+
+
+@pytest.mark.parametrize("change", ["address", "vendor"])
+@pytest.mark.parametrize("marker", [False, True])
+def test_fresh_unfollow_uses_signed_body_only_receipt(tmp_path, change, marker):
+    from eom_email_watcher import removal
+
+    store, _, vendor = followed(tmp_path)
+    body_state.record(store, "m", ("retained body", 13), fetched_at=NOW,
+                      reason="source_gone" if marker else None)
+    with removal.operation_scope(store.path) as operation:
+        if change == "address":
+            changed = store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
+        else:
+            changed = store.delete_vendor(vendor, operation=operation)
+    assert changed.notice is None, "Settled cleanup must not be described as pending"
+    with store.connection() as db:
+        requests = db.execute("SELECT * FROM message_removal_requests").fetchall()
+        assert len(requests) == 1, "Fresh unfollow must retain its signed acceptance receipt"
+        request = requests[0]
+        assert request["kind"] == "unfollow"
+        removal._parse_key(db, request["request_id"], "unfollow", request["parameters_sha256"])
+        result = removal.outcome(db, request["request_id"])
+        assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
+
+
+def test_ownerless_fresh_unfollow_rolls_back_all_input_and_derived_state(tmp_path):
+    from test_removal_refusal import snapshot
+
+    store, _, vendor = followed(tmp_path)
+    body_state.record(store, "m", ("retained body", 13), fetched_at=NOW)
+    before = snapshot(store)
+    with pytest.raises(RuntimeError, match="guarded write transaction"):
+        store.remove_vendor_address(vendor, "vendor@example.com")
+    assert snapshot(store) == before
+
+
+def test_fresh_unfollow_preserves_before_evidence_when_legacy_identity_is_lost(tmp_path):
+    from test_db import _upgraded_completed_legacy_message
+
+    from eom_email_watcher import removal
+
+    store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+    with store.connection() as db:
+        address = db.execute(
+            "SELECT sender FROM messages WHERE message_id=?", (root,),
+        ).fetchone()[0]
+    vendor = store.create_vendor("Legacy vendor")
+    store.add_vendor_address(vendor, address)
+    body_state.record(store, root, ("retained legacy body", 20), fetched_at=NOW)
+    with store.connection() as db:
+        assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == 1
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "retained legacy body"
+    with removal.operation_scope(store.path) as operation:
+        store.reconcile_mailbox_identity("imap", "imap-account", "b" * 64,
+                                         legacy_status="replacement", operation=operation)
+    with store.connection() as db:
+        requests = db.execute("SELECT * FROM message_removal_requests").fetchall()
+        assert len(requests) == 1, "Losing effective identity must not lose the unfollow receipt"
+        result = removal.outcome(db, requests[0]["request_id"])
+        assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+        assert not db.execute("SELECT 1 FROM thread_follow WHERE followed=1").fetchone()
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
+        row = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id=?", (root,),
+        ).fetchone()
+        assert row[0] is None
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("writer", [
+    "location", "headers", "own_address", "other_account_address",
+])
+def test_derived_input_unfollow_is_bounded_and_keeps_unrelated_body(tmp_path, monkeypatch, writer):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from test_thread_reconcile import KEY, seed
+
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    other_vendor = store.create_vendor("Unrelated vendor")
+    store.add_vendor_address(other_vendor, "other@example.com")
+    seed(store, "unrelated", sender="other@example.com", thread_id="other-thread")
+    body_state.record(store, "m", ("retained body", 13), fetched_at=NOW)
+    body_state.record(store, "unrelated", ("unrelated body", 14), fetched_at=NOW)
+    wrapper = store.derived_connection
+    before_ids = []
+
+    @contextmanager
+    def observe_before(owner=None):
+        with wrapper(owner) as db:
+            yield db
+            before_ids.append({
+                r[0] for r in db.execute("SELECT message_id FROM derived_previous_followed")
+            })
+
+    monkeypatch.setattr(store, "derived_connection", observe_before)
+    with removal.operation_scope(store.path) as operation:
+        if writer == "location":
+            store.record_message_location(
+                provider="gmail", account_id="mailbox", mailbox_identity_key=KEY,
+                provider_message_id="m", locations=frozenset({"sent"}),
+                to=("unknown@example.com",), headers_observed=True, now=NOW, operation=operation,
+            )
+        elif writer == "headers":
+            store.record_reconcile_headers(
+                "gmail", "mailbox", KEY,
+                SimpleNamespace(message_id="m", to=("unknown@example.com",), cc=(),
+                                received_at=NOW.isoformat()),
+                locations=frozenset({"sent"}), observed_at=NOW, scope_complete=True,
+                operation=operation,
+            )
+        elif writer == "own_address":
+            store.update_mail_account_identity(
+                "gmail", "mailbox", display_name="Mailbox", address="vendor@example.com",
+                operation=operation,
+            )
+        else:
+            store.register_mail_account(
+                "gmail", "another-account", display_name="Another account",
+                address="vendor@example.com", operation=operation,
+            )
+    assert before_ids == (
+        [{"m", "unrelated"}] if writer in {"own_address", "other_account_address"} else [{"m"}]
+    )
+    with store.connection() as db:
+        request = db.execute("SELECT * FROM message_removal_requests").fetchone()
+        assert request is not None
+        result = removal.outcome(db, request["request_id"])
+        assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+        assert [r[0] for r in db.execute("SELECT text FROM message_bodies")] == ["unrelated body"]
+        assert {r[0] for r in db.execute("SELECT message_id FROM logical_messages")} == {
+            "m", "unrelated",
+        }
+        assert {r[0] for r in db.execute("SELECT message_id FROM message_removal_targets")} == {"m"}
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("marker", [False, True])
+def test_fresh_held_unfollow_freezes_whole_unit_and_refollow_does_not_cancel(
+    tmp_path, monkeypatch, marker,
+):
+    from test_removal_refusal import held_runtime
+
+    from eom_email_watcher import removal, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    with store.connection() as db:
+        vendor = db.execute("SELECT vendor_id FROM vendor_addresses").fetchone()[0]
+        if marker:
+            db.execute("DELETE FROM message_bodies")
+            db.execute("INSERT INTO message_body_unavailable VALUES('copy-00','source_gone')")
+    with removal.operation_scope(store.path) as operation:
+        changed = store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
+        assert changed.notice
+        with store.connection() as db:
+            request = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
+            result = removal.outcome(db, request)
+            assert (result.requested, result.completed, result.pending) == (1, 0, 1)
+            assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
+            assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+            assert not removal.message_available(db, "m", include_unfollow=True)
+            assert not removal.message_available(db, "copy-00", include_unfollow=True)
+            assert db.execute(
+                "SELECT COUNT(*) FROM message_bodies",
+            ).fetchone()[0] == int(not marker)
+            assert db.execute(
+                "SELECT COUNT(*) FROM message_body_unavailable",
+            ).fetchone()[0] == int(marker)
+        store.add_vendor_address(vendor, "vendor@example.com", operation=operation)
+        # A second true->false transition cannot duplicate an unsettled target.
+        store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
+        store.add_vendor_address(vendor, "vendor@example.com", operation=operation)
+        store.rename_vendor(vendor, "Renamed vendor", operation=operation)
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert removal.outcome(db, request).pending == 1
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        result = removal.outcome(db, request)
+        assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
+
+
+
+def test_reconcile_keeps_first_recipients_and_does_not_invent_unfollow(tmp_path):
+    from types import SimpleNamespace
+
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    store.record_message_location(
+        provider="gmail", account_id="mailbox", mailbox_identity_key=KEY,
+        provider_message_id="m", locations=frozenset({"sent"}),
+        to=("vendor@example.com",), headers_observed=True, now=NOW,
+    )
+    body_state.record(store, "m", ("retained body", 13), fetched_at=NOW)
+    with removal.operation_scope(store.path) as operation:
+        store.record_reconcile_headers(
+            "gmail", "mailbox", KEY,
+            SimpleNamespace(message_id="m", to=("unknown@example.com",), cc=(),
+                            received_at=NOW.isoformat()),
+            locations=frozenset({"sent"}), observed_at=NOW, scope_complete=True,
+            operation=operation,
+        )
+    with store.connection() as db:
+        assert [r[0] for r in db.execute("SELECT address FROM message_recipients")] == [
+            "vendor@example.com",
+        ]
+        assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == 1
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "retained body"
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+
+
+
+def test_fresh_unfollow_acceptance_failure_rolls_back_inputs_and_derived_state(
+    tmp_path, monkeypatch,
+):
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal
+
+    store, _, vendor = followed(tmp_path)
+    body_state.record(store, "m", ("retained body", 13), fetched_at=NOW)
+    before = snapshot(store)
+    accept = removal._accept_in_transaction
+    called = []
+
+    def fail_after_accept(db, key, kind, *args, **kwargs):
+        accept(db, key, kind, *args, **kwargs)
+        assert kind == "unfollow"
+        called.append(key)
+        raise RuntimeError("injected failure after unfollow acceptance")
+
+    monkeypatch.setattr(removal, "_accept_in_transaction", fail_after_accept)
+    with (
+        removal.operation_scope(store.path) as operation,
+        pytest.raises(RuntimeError, match="injected failure after unfollow acceptance"),
+    ):
+        store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
+    assert len(called) == 1
+    assert snapshot(store) == before
+
+
+@pytest.mark.parametrize("kind", ["delete", "clear"])
+def test_public_removal_accepts_only_new_unfollow_content_outside_its_targets(tmp_path, kind):
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    seed(store, "reply", sender="unknown@example.com")
+    body_state.record(store, "m", ("root body", 9), fetched_at=NOW)
+    body_state.record(store, "reply", ("reply body", 10), fetched_at=NOW)
+    result = local_removal(
+        store, "request_removal", kind, {"message_id": "m"} if kind == "delete" else {},
+    )
+    expected = 1 if kind == "delete" else 2
+    assert (result.requested, result.completed, result.pending) == (expected, expected, 0)
+    with store.connection() as db:
+        requests = db.execute("SELECT request_id,kind FROM message_removal_requests").fetchall()
+        assert sorted(r["kind"] for r in requests) == (["delete", "unfollow"] if kind == "delete"
+                                                    else ["clear"])
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert [r[0] for r in db.execute("SELECT message_id FROM logical_messages")] == (
+            ["reply"] if kind == "delete" else []
+        )
+        if kind == "delete":
+            key = next(r["request_id"] for r in requests if r["kind"] == "unfollow")
+            unfollow = removal.outcome(db, key)
+            assert (unfollow.requested, unfollow.completed, unfollow.pending) == (1, 1, 0)
+            assert [r[0] for r in db.execute(
+                "SELECT t.message_id FROM message_removal_targets t "
+                "JOIN message_removal_intents i ON i.intent_id=t.intent_id WHERE i.kind='unfollow'",
+            )] == ["reply"]
+
+
+def test_thread_relocation_uses_old_scope_without_removing_still_followed_unit(tmp_path):
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    seed(store, "reply", sender="unknown@example.com")
+    body_state.record(store, "m", ("root body", 9), fetched_at=NOW)
+    body_state.record(store, "reply", ("reply body", 10), fetched_at=NOW)
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET thread_key='moved-root' WHERE message_id='m'")
+        assert {r[0] for r in db.execute(
+            "SELECT message_id FROM derived_previous_followed",
+        )} == {"m", "reply"}
+    with store.connection() as db:
+        request = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
+        result = removal.outcome(db, request)
+        assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+        assert [r[0] for r in db.execute("SELECT message_id FROM message_removal_targets")] == [
+            "reply",
+        ]
+        assert [tuple(r) for r in db.execute("SELECT message_id,text FROM message_bodies")] == [
+            ("m", "root body"),
+        ]
+        assert {r[0] for r in db.execute("SELECT message_id FROM logical_messages")} == {
+            "m", "reply",
+        }
+
+
+
+@pytest.mark.parametrize("scope", ["global", "local"])
+def test_derived_before_capture_matches_scope_and_only_retained_content(tmp_path, scope):
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import removal
+
+    store, _, vendor = followed(tmp_path)
+    seed(store, "bodyless")
+    seed(store, "unrelated", thread_id="unrelated-thread")
+    body_state.record(store, "m", ("root body", 9), fetched_at=NOW)
+    body_state.record(store, "unrelated", ("other body", 10), fetched_at=NOW)
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        if scope == "global":
+            db.execute("UPDATE vendors SET display_name='Renamed' WHERE vendor_id=?", (vendor,))
+        else:
+            db.execute("UPDATE messages SET received_at=received_at WHERE message_id='m'")
+        previous = {r[0] for r in db.execute("SELECT message_id FROM derived_previous_followed")}
+        assert previous == ({"m", "unrelated"} if scope == "global" else {"m"})
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM message_bodies").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("remove_all", [False, True])
+def test_domain_add_owner_move_keeps_before_content_and_does_not_invent_unfollow(
+    tmp_path, remove_all,
+):
+    from test_thread_reconcile import seed, state_store
+
+    from eom_email_watcher import removal
+
+    store, _ = state_store(tmp_path)
+    old_vendor = store.create_vendor("Old domain owner")
+    new_vendor = store.create_vendor("New domain owner")
+    with store.connection() as db:
+        db.execute("CREATE TABLE vendor_domains(domain TEXT PRIMARY KEY, vendor_id TEXT)")
+        db.execute("INSERT INTO vendor_domains VALUES('old.example',?)", (old_vendor,))
+    seed(store, sender="sender@old.example", received_at=(NOW-timedelta(days=1)).isoformat())
+    seed(store, "early", sender="sender@new.example",
+         received_at=(NOW-timedelta(days=2)).isoformat())
+    body_state.record(store, "m", ("retained body", 13), fetched_at=NOW)
+    with store.connection() as db:
+        assert db.execute("SELECT owner_vendor_id FROM thread_follow").fetchone()[0] == old_vendor
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("INSERT INTO vendor_domains VALUES('new.example',?)", (new_vendor,))
+        assert {r[0] for r in db.execute("SELECT message_id FROM derived_previous_followed")} == {
+            "m",
+        }
+    with store.connection() as db:
+        assert db.execute("SELECT owner_vendor_id FROM thread_follow").fetchone()[0] == new_vendor
+        assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == 1
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "retained body"
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("DELETE FROM vendor_domains WHERE domain='new.example'")
+        if remove_all:
+            db.execute("DELETE FROM vendor_domains WHERE domain='old.example'")
+    with store.connection() as db:
+        assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == int(not remove_all)
+        assert db.execute("SELECT COUNT(*) FROM message_bodies").fetchone()[0] == (
+            int(not remove_all)
+        )
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == (
+            int(remove_all)
+        )
+        if remove_all:
+            key = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
+            result = removal.outcome(db, key)
+            assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+
+
+
+def test_logical_reparent_accepts_new_unfollow_through_original_body_owner(tmp_path):
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    seed(store, "new-root", sender="unknown@example.com", thread_id="other-thread")
+    body_state.record(store, "m", ("root body", 9), fetched_at=NOW)
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        # Match the existing coalescing/promoting owner's actual order.
+        db.execute("UPDATE messages SET logical_of='new-root' WHERE message_id='m'")
+        database._reparent_logical_sources(db, "m", "new-root")
+    with store.connection() as db:
+        key = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
+        result = removal.outcome(db, key)
+        assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+        assert {r[0] for r in db.execute("SELECT message_id FROM message_removal_targets")} == {
+            "m", "new-root",
+        }
+        assert [r[0] for r in db.execute("SELECT message_id FROM logical_messages")] == ["new-root"]
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
+
+
+
+def test_full_before_capture_runs_once_and_covers_later_local_writes(tmp_path, monkeypatch):
+    from eom_email_watcher import removal
+
+    store, _, vendor = followed(tmp_path)
+    body_state.record(store, "m", ("retained body", 13), fetched_at=NOW)
+    capture = database._capture_followed_content_sql
+    calls = []
+    monkeypatch.setattr(database, "_capture_followed_content_sql",
+                        lambda scopes: "SELECT capture_probe();" + capture(scopes))
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.create_function("capture_probe", 0, lambda: calls.append(1) or 0)
+        db.executemany("UPDATE vendors SET display_name=? WHERE vendor_id=?",
+                       ((name, vendor) for name in ("First", "Second", "Third")))
+        db.execute("UPDATE messages SET received_at=received_at WHERE message_id='m'")
+        assert calls == [1]
+        assert {r[0] for r in db.execute("SELECT message_id FROM derived_previous_followed")} == {
+            "m",
+        }
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "retained body"
+
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_followed_purge_completes_without_fresh_unfollow_acceptance(tmp_path, qualified):
+    from test_thread_reconcile import KEY, seed
+
+    store, state, _ = followed(tmp_path)
+    seed(store, "older", received_at=(NOW-timedelta(days=40)).isoformat())
+    body_state.record(store, "m", ("root body", 9), fetched_at=NOW)
+    later = NOW+timedelta(days=35)
+    progress = state.load_or_start(later, 30, {"stage": "derived", "units": []})
+    with store.connection() as db:
+        db.execute(
+            "INSERT INTO thread_watermarks SELECT provider,account_id,mailbox_identity_key,"
+            "thread_key,? FROM thread_follow WHERE followed=1", (later.isoformat(),),
+        )
+        if not qualified:
+            db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    state.complete(progress)
+    assert store.purge(30, now=later, after_poll=True, polled_scope=("gmail", "mailbox", KEY)) == 2
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
