@@ -1,34 +1,34 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const message = "Can't delete this yet, the local upgrade is still finishing; try again later";
-
-test("a partial clear keeps held messages and displays the engine refusal", async () => {
-  const owner = await import("../src/inboxRemoval.ts").catch(() => ({}));
-  assert.equal(typeof owner.inboxClearView, "function", "clear must project refused units");
-  const result = owner.inboxClearView([{ message_id: "held" }, { message_id: "deleted" }], {
-    deleted: 1, refused: 1, held_message_ids: ["held"], outcome: "partial", message,
-  });
-  assert.deepEqual(result.retained, [{ message_id: "held" }]);
-  assert.equal(result.kind, "error");
-  assert.match(result.text, /Deleted 1 local message/);
-  assert.ok(result.text.includes(message));
-  assert.ok(!result.text.includes("Cleared"));
+test("completed clear retains message counts and source-email wording", async () => {
+  const { inboxClearView } = await import("../src/inboxRemoval.ts");
+  for (const completed of [0, 1, 2]) {
+    const result = inboxClearView([{ message_id: "removed" }], {
+      request_id: "saved-signed-key", intent_ids: completed ? ["saved-intent"] : [],
+      deleted: completed, requested: completed, completed, pending: 0,
+      outcome: "completed", message: null,
+    });
+    assert.deepEqual(result.retained, []);
+    assert.equal(result.kind, "success");
+    assert.equal(result.text, `Cleared ${completed} local message${completed === 1 ? "" : "s"}. Source email was not changed.`);
+  }
 });
 
-test("a refused clear changes no displayed held message and completed clear keeps its wording", async () => {
-  const { inboxClearView } = await import("../src/inboxRemoval.ts").catch(() => ({}));
-  assert.equal(typeof inboxClearView, "function");
-  const items = [{ message_id: "held" }];
-  const refused = inboxClearView(items, {
-    deleted: 0, refused: 1, held_message_ids: ["held"], outcome: "refused", message,
+for (const completed of [0, 1]) {
+  test(`deferred clear hides every accepted target and reports ${completed} completed separately`, async () => {
+    const { inboxClearView } = await import("../src/inboxRemoval.ts");
+    const result = inboxClearView([{ message_id: "held" }, { message_id: "deleted" }], {
+      request_id: "saved-signed-key", intent_ids: ["saved-intent"],
+      deleted: completed, requested: 2, completed, pending: 2 - completed,
+      outcome: "deferred", message: "Deletion pending until the local upgrade completes",
+    });
+    assert.deepEqual(result.retained, []);
+    assert.equal(result.kind, "pending");
+    assert.match(result.text, new RegExp(`${completed} completed`));
+    assert.match(result.text, new RegExp(`${2 - completed} pending`));
+    assert.ok(result.text.includes("Deletion pending until the local upgrade completes"));
+    assert.ok(!result.text.includes("refused"));
+    assert.ok(!result.text.includes("Cleared"));
   });
-  assert.deepEqual(refused.retained, items);
-  assert.equal(refused.text, message);
-  const completed = inboxClearView(items, {
-    deleted: 1, refused: 0, held_message_ids: [], outcome: "completed", message: null,
-  });
-  assert.deepEqual(completed.retained, []);
-  assert.equal(completed.kind, "success");
-  assert.equal(completed.text, "Cleared 1 local message. Source email was not changed.");
-});
+}

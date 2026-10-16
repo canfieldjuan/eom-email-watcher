@@ -3552,3 +3552,43 @@ def test_operation_segment_retains_bounded_native_legacy_guard_fallback(tmp_path
             with pytest.raises(OperationLockBusy), operation.acceptance():
                 pytest.fail("Native legacy guard was bypassed")
     assert snapshot(store) == before
+
+
+@pytest.mark.parametrize("refollow", [False, True])
+def test_unfollow_during_inflight_body_fetch_uses_current_adoption_eligibility(
+    tmp_path, refollow
+):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    store, _, vendor = followed(tmp_path)
+    started, land = threading.Event(), threading.Event()
+
+    def fetch_and_adopt():
+        assert store.source_start("m", include_unfollow=True)
+        started.set()
+        assert land.wait(5), "Body fetch was not released"
+        body_state.record(store, "m", ("late local body", 15), fetched_at=NOW)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fetching = pool.submit(fetch_and_adopt)
+        try:
+            assert started.wait(5), "Body fetch did not start while followed"
+            store.remove_vendor_address(vendor, "vendor@example.com")
+            with store.connection() as db:
+                assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == 0
+                assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+                assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+                assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+            if refollow:
+                store.add_vendor_address(vendor, "vendor@example.com")
+        finally:
+            land.set()
+        fetching.result(timeout=5)
+    with store.connection() as db:
+        bodies = [r[0] for r in db.execute("SELECT text FROM message_bodies")]
+        assert bodies == (["late local body"] if refollow else [])
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+        assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == int(refollow)
