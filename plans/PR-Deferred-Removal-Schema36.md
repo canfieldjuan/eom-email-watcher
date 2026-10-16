@@ -167,3 +167,14 @@ Required proof: stale/forged/wrong-execution operation owners refuse; source-hel
 
 
 The lexical operation scope accepts the existing database path, so an entry can retain its original native-operation exclusion before runtime initialization without constructing an uninitialized Store. The runtime factory remains the only production Store constructor; initialization still completes before any acceptance segment or Store is handed to source work.
+
+
+### Accepted lost Clear lifecycle
+
+Operator decision, relayed verbatim in [issuecomment-6220700441](https://github.com/canfieldjuan/eom-email-watcher/pull/261#issuecomment-6220700441): **"Tell me, don't redo (Recommended)"**. The accepted option says: "Show a plain note: 'Your last Clear didn't go through; nothing was deleted.' The normal Clear button stays; clicking it is a fresh Clear of what's there now. A Clear that DID go through just shows its pending/done status — never sent twice."
+
+The client durably saves only the opaque signed key plus kind and parameters before its mutation RPC. After a lost reply or restart it reads status for that saved key; it never submits that request again. A found receipt shows its deferred/completed status and counts. A valid unknown key returning `not_found` shows exactly "Your last Clear didn't go through; nothing was deleted.", discards that key, and leaves the normal Clear button. Malformed/forged/expired-key errors retain the existing backend error semantics; `not_found` is not inferred from another error.
+
+Every later explicit Clear click is a new request with a new key and a new frozen selection. Earlier pending receipts remain separate and are shown separately. There is no automatic resend or retry button. Counts and message content are never copied into the saved-key journal.
+
+Required controls: a lost reply after commit followed by restart reads status with zero resubmits; a lost reply before commit shows the approved note, and a later explicit Clear uses a new key; another Clear while an earlier receipt is pending keeps both receipts and selects later arrivals correctly. This records the accepted policy before the desktop action implementation; it is not proof that the UI is wired or durably persists keys yet.
