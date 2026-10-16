@@ -4015,7 +4015,9 @@ def test_delete_message_waits_for_cross_process_source_handoff(tmp_path: Path) -
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
     seed_pdf_attachment(store)
-    lock_path = locking.connect_source_lock_path(store.path, "m1")
+    from eom_email_watcher.source_locks import source_lock_path
+
+    lock_path = source_lock_path(store.path, "m1")
 
     with locking.connect_operation_lock(lock_path, "source busy"):
         cleanup = subprocess.Popen(
@@ -4110,6 +4112,8 @@ def test_clear_messages_bounds_simultaneously_held_source_locks(
             subject="Bounded cleanup",
             received_at="2026-09-01T00:00:00+00:00",
         )
+    from eom_email_watcher import source_locks
+
     active = 0
     maximum = 0
 
@@ -4125,7 +4129,7 @@ def test_clear_messages_bounds_simultaneously_held_source_locks(
 
     monkeypatch.setattr(db_module, "SOURCE_CLEANUP_LOCK_BATCH_SIZE", 2)
     monkeypatch.setattr(
-        db_module,
+        source_locks,
         "connect_operation_lock",
         lambda *args, **kwargs: TrackingLock(),
     )
@@ -6335,10 +6339,10 @@ def test_vendor_records_enforce_one_vendor_per_address(tmp_path: Path) -> None:
         ("Other Co", []),
     ]
     assert store.vendor_for_address("billing@acme.com")["vendor_id"] == acme
-    assert store.remove_vendor_address(acme, "billing@acme.com") is True
-    assert store.remove_vendor_address(acme, "billing@acme.com") is False
+    assert store.remove_vendor_address(acme, "billing@acme.com").removed is True
+    assert store.remove_vendor_address(acme, "billing@acme.com").removed is False
     assert store.add_vendor_address(other, "billing@acme.com") is True
-    assert store.delete_vendor(other) == ["billing@acme.com"]
+    assert store.delete_vendor(other).addresses == ("billing@acme.com",)
     assert store.vendor_for_address("billing@acme.com") is None
     with pytest.raises(KeyError):
         store.delete_vendor(other)
@@ -6602,9 +6606,9 @@ def test_vendor_address_removal_records_a_dismissal_that_leaves_with_its_vendor(
             rows = db.execute("SELECT vendor_id, address FROM vendor_address_dismissals")
             return [(row["vendor_id"], row["address"]) for row in rows.fetchall()]
 
-    assert store.remove_vendor_address(acme, "other@acme.com") is False
+    assert store.remove_vendor_address(acme, "other@acme.com").removed is False
     assert dismissals() == []
-    assert store.remove_vendor_address(acme, "billing@acme.com") is True
+    assert store.remove_vendor_address(acme, "billing@acme.com").removed is True
     assert dismissals() == [(acme, "billing@acme.com")]
     store.delete_vendor(acme)
     assert dismissals() == []

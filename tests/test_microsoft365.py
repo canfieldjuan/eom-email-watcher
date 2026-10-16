@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from fixture_toml import toml_path_literal
 
 from eom_email_watcher import microsoft365
 from eom_email_watcher.mailbox import (
@@ -53,11 +54,11 @@ def write_public_client(path: Path, *, tenant: str = "organizations") -> None:
 
 def write_config(path: Path) -> None:
     path.write_text(
-        f'''gmail_credentials_file = "{path.parent / "google.json"}"
-microsoft_credentials_file = "{path.parent / "microsoft.json"}"
-gmail_token_file = "{path.parent / "gmail-token.json"}"
-gmail_send_token_file = "{path.parent / "gmail-send-token.json"}"
-database_file = "{path.parent / "watcher.sqlite3"}"
+        f'''gmail_credentials_file = {toml_path_literal(path.parent / "google.json")}
+microsoft_credentials_file = {toml_path_literal(path.parent / "microsoft.json")}
+gmail_token_file = {toml_path_literal(path.parent / "gmail-token.json")}
+gmail_send_token_file = {toml_path_literal(path.parent / "gmail-send-token.json")}
+database_file = {toml_path_literal(path.parent / "watcher.sqlite3")}
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "local-model"
 model_require_auth = false

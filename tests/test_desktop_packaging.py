@@ -25,6 +25,66 @@ def _load_builder() -> ModuleType:
 build_desktop_sidecar = _load_builder()
 
 
+@pytest.fixture(scope="module")
+def desktop_build_script(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Execute the real build owner; stub only Tauri's resource-generation work."""
+    directory = tmp_path_factory.mktemp("desktop-build-owner")
+    dependency = directory / "tauri_build.rs"
+    dependency.write_text('pub fn build() { println!("TAURI_BUILD_CALLED"); }\n')
+    library = directory / "libtauri_build.rlib"
+    binary = directory / ("build-script.exe" if os.name == "nt" else "build-script")
+    subprocess.run(
+        ["rustc", "--edition=2024", "--crate-name", "tauri_build", "--crate-type", "rlib",
+         str(dependency), "-o", str(library)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["rustc", "--edition=2024", str(Path(__file__).parents[1] / "desktop/src-tauri/build.rs"),
+         "--extern", f"tauri_build={library}", "-o", str(binary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return binary
+
+
+def _desktop_build_output(binary: Path, target_os, target_env, config="{}") -> list[str]:
+    environment = os.environ.copy()
+    for key, value in (("CARGO_CFG_TARGET_OS", target_os), ("CARGO_CFG_TARGET_ENV", target_env)):
+        environment.pop(key, None)
+        if value is not None:
+            environment[key] = value
+    environment["TAURI_CONFIG"] = config
+    result = subprocess.run(
+        [str(binary)], env=environment, check=True, capture_output=True, text=True,
+    )
+    lines = result.stdout.splitlines()
+    assert lines.count("TAURI_BUILD_CALLED") == 1
+    return [line for line in lines if line.startswith("cargo:rustc-link-arg")]
+
+
+@pytest.mark.parametrize("phase", ["release", "qualification"])
+def test_desktop_build_owner_emits_reproducible_msvc_link(desktop_build_script, phase):
+    config = "{}" if phase == "release" else json.dumps({"build": {"beforeBuildCommand": ""}})
+    assert _desktop_build_output(desktop_build_script, "windows", "msvc", config) == [
+        "cargo:rustc-link-arg-bin=eom-email-watcher-desktop=/Brepro"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("target_os", "target_env"),
+    [("linux", "gnu"), ("macos", ""), ("windows", "gnu"), ("windows", "gnullvm"),
+     ("linux", "msvc"), (None, None), ("", ""), ("windows", ""), ("", "msvc"),
+     ("windows", "MSVC"), ("windows", "msvc-other")],
+)
+def test_desktop_build_owner_leaves_other_targets_unchanged(
+    desktop_build_script, target_os, target_env,
+):
+    assert _desktop_build_output(desktop_build_script, target_os, target_env) == []
+
+
 def _build_data(arguments: list[str]) -> list[tuple[Path, str]]:
     return [
         (Path(source), destination)
@@ -919,7 +979,9 @@ def _configure_fake_sidecar_build(
         if "PyInstaller" in arguments:
             for source_path, _destination in _credential_data(arguments):
                 staged_files.append((source_path.name, source_path.read_bytes()))
-            built = build_directory / "dist" / build_desktop_sidecar.ENGINE_NAME
+            built = Path(arguments[arguments.index("--distpath") + 1]) / (
+                build_desktop_sidecar.ENGINE_NAME
+            )
             built.write_bytes(b"engine")
         return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
 
@@ -941,6 +1003,120 @@ def test_development_build_remains_credential_free(
         "--expected-entitlement-state",
         "authority_unavailable",
     ]
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_qualification_preserves_release_and_refuses_output_reuse(tmp_path, monkeypatch, reuse):
+    from types import SimpleNamespace
+
+    import build_windows_cutover_qualification as qualification
+    import connect_automate.connect_windows as windows
+
+    output = tmp_path / "qualification"
+    output.mkdir()
+    receipt = {"source_head": "public fixture"}
+    (output / "release-sources.json").write_text(json.dumps(receipt))
+    engine, installer = tmp_path / "engine.exe", tmp_path / "installer.exe"
+    engine.write_bytes(b"release engine")
+    installer.write_bytes(b"release installer")
+    independent = tmp_path / "independent.exe"
+    independent.write_bytes(b"qualification engine")
+    keyring = tmp_path / "keyring"
+    keyring.write_bytes(b"public fixture")
+    monkeypatch.setattr(qualification, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(windows, "_protect_windows_directory", lambda _: None)
+    monkeypatch.setattr(qualification, "source_receipt", lambda: receipt)
+    monkeypatch.setattr(qualification, "fixture_authority", lambda _: (keyring, None))
+    monkeypatch.setattr(
+        qualification, "build_test_sidecar", lambda _: engine if reuse else independent,
+    )
+    monkeypatch.setattr(qualification.sys, "argv", [
+        "qualification", str(output), str(engine), str(installer),
+    ])
+    if reuse:
+        with pytest.raises(RuntimeError, match="reused the production output"):
+            qualification.main()
+        assert engine.read_bytes() == b"release engine"
+    else:
+        qualification.main()
+        assert engine.read_bytes() == independent.read_bytes() == b"qualification engine"
+        assert json.loads((output / "qualification-config.json").read_text()) == {
+            "build": {"beforeBuildCommand": ""},
+        }
+        inventory = json.loads((output / "build-inventory.json").read_text())
+        assert inventory["release_engine_sha256"] != inventory["qualification_engine_sha256"]
+    assert (output / "release-engine.exe").read_bytes() == b"release engine"
+    assert (output / "release-installer.exe").read_bytes() == b"release installer"
+
+
+def test_qualification_reuses_release_packaging_owner(tmp_path, monkeypatch):
+    import build_windows_cutover_qualification as qualification
+    from windows_cutover_fixture import fixture_authority
+
+    google, microsoft, release_ring = (
+        tmp_path / name for name in ("google.json", "microsoft.json", "release.json")
+    )
+    _write_oauth_client(google)
+    _write_microsoft_oauth_client(microsoft)
+    _write_entitlement_keyring(release_ring)
+    calls, _ = _configure_fake_sidecar_build(
+        tmp_path, monkeypatch, google=google, microsoft=microsoft, keyring=release_ring
+    )
+    monkeypatch.setattr(qualification, "builder", build_desktop_sidecar, raising=False)
+    monkeypatch.setenv("PYTHONHASHSEED", "random")
+    snapshots = []
+    run = build_desktop_sidecar.subprocess.run
+
+    def capture(arguments, **kwargs):
+        if "PyInstaller" in arguments:
+            build_root = Path(kwargs["env"]["PYINSTALLER_CONFIG_DIR"]).parent
+            assert all(source.is_relative_to(build_root) for source, _ in _build_data(arguments))
+            normalized = list(arguments)
+            for index, argument in enumerate(arguments):
+                if argument == "--add-data":
+                    source, destination = arguments[index + 1].rsplit(os.pathsep, 1)
+                    normalized[index + 1] = Path(source).name + os.pathsep + destination
+                if argument in {"--distpath", "--workpath", "--specpath"}:
+                    normalized[index + 1] = argument
+            snapshots.append(
+                (
+                    normalized,
+                    {
+                        destination + "/" + source.name: source.read_bytes()
+                        for source, destination in _build_data(arguments)
+                    },
+                    kwargs["env"]["PYINSTALLER_CONFIG_DIR"],
+                    kwargs["env"].get("PYTHONHASHSEED"),
+                    {Path(arguments[arguments.index(flag) + 1]) for flag in (
+                        "--distpath", "--workpath", "--specpath",
+                    )},
+                )
+            )
+        return run(arguments, **kwargs)
+
+    monkeypatch.setattr(build_desktop_sidecar.subprocess, "run", capture)
+    release = build_desktop_sidecar.build_sidecar()
+    test_ring, _ = fixture_authority(tmp_path / "qualification")
+    qualified = qualification.build_test_sidecar(test_ring)
+    assert qualified != release, "Independent builds share the published output path"
+    assert snapshots[0][0] == snapshots[1][0]
+    assert snapshots[0][2] != snapshots[1][2]
+    assert snapshots[0][4].isdisjoint(snapshots[1][4])
+    assert snapshots[0][3] == snapshots[1][3] == "random", "packager overrides the caller hash seed"
+    key = "connect_automate_data/connect-entitlement-keyring.json"
+    assert snapshots[0][1][key] != snapshots[1][1][key]
+    assert {k: v for k, v in snapshots[0][1].items() if k != key} == {
+        k: v for k, v in snapshots[1][1].items() if k != key
+    }
+    assert calls[1][:2] == calls[3][:2]
+    assert calls[1][3:] == calls[3][3:]  # Same smoke contract, distinct binary outputs.
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="labelled qualification"):
+        qualification.build_test_sidecar(release_ring)
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="non-production"):
+        build_desktop_sidecar.validate_entitlement_keyring(test_ring)
+    monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, "public")
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="not a public build"):
+        qualification.build_test_sidecar(test_ring)
 
 
 def test_public_build_accepts_complete_provider_identity_set(

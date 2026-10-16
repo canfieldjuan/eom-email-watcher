@@ -23,7 +23,6 @@ from connect_automate.locking import (
     OperationLockBusy,
     connect_lane_lock_path,
     connect_operation_lock,
-    connect_source_lock_path,
     operation_lock,
     operation_lock_supported,
     operation_lock_uses_soft_fallback,
@@ -31,7 +30,7 @@ from connect_automate.locking import (
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from . import deployment
+from . import deployment, source_locks
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -91,6 +90,7 @@ from .db import (
     ConnectQueueFull,
     GmailLabelSelector,
     GmailLabelStoreError,
+    LocalRemovalHeld,
     MailAccount,
     MailboxIdentityChanged,
     MessageSource,
@@ -447,6 +447,12 @@ def _mail_account_public(runtime: Runtime, account: MailAccount) -> dict[str, ob
         "provider": account.provider,
         # Contract D-scope: whether this account's Sent folder is in scope. An
         # account this build cannot poll is not polled, whatever it last recorded.
+        "source_lock_notice": runtime.store.source_lock_notice(),
+        "sent_poll_failure": (
+            runtime.store.sent_poll_failure(account.provider, account.account_id)
+            if connected
+            else None
+        ),
         "sent_scope": (
             runtime.store.sent_scope(account.provider, account.account_id)
             if connected
@@ -2720,7 +2726,16 @@ def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
             "Local inbox changes require native operation locking",
         )
     with operation_lock(lock_path, "Another watcher operation is already running"):
-        deleted = runtime.store.clear_messages()
+        try:
+            deleted = runtime.store.clear_messages()
+        except LocalRemovalHeld as exc:
+            return {
+                "outcome": "partial" if exc.deleted else "refused",
+                "deleted": exc.deleted,
+                "refused": len(exc.message_ids),
+                "held_message_ids": list(exc.message_ids),
+                "message": str(exc),
+            }
     return {"deleted": deleted}
 
 
@@ -3763,16 +3778,6 @@ def _require_generic_connect_lane_lock(
     return lock_path
 
 
-def _require_generic_connect_source_lock(runtime: Runtime, message_id: str) -> Path:
-    lock_path = connect_source_lock_path(runtime.store.path, message_id)
-    if not operation_lock_supported(lock_path):
-        raise ApiError(
-            "connect_queue_unavailable",
-            "Connect attachment handoff requires native operation locking.",
-        )
-    return lock_path
-
-
 def _fail_generic_connect_source(
     runtime: Runtime,
     job_id: str,
@@ -3818,10 +3823,9 @@ def _submit_generic_connect_job(
     inactive_dispatch_state: str,
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
-    source_lock = _require_generic_connect_source_lock(runtime, message_id)
     busy_message = "The Connect source attachment is being changed"
     try:
-        with connect_operation_lock(source_lock, busy_message):
+        with runtime.store.source_locks((message_id,), busy_message=busy_message):
             dispatch = runtime.store.connect_dispatch(tracked.job_id)
             if dispatch is None:
                 raise RuntimeError("Connect source handoff is missing dispatch state")
@@ -4635,7 +4639,6 @@ def _prepare_or_create_generic_connect_job(
             "The selected capability requires explicit confirmation.",
         )
     _require_generic_connect_lane_lock(runtime, capability)
-    source_lock = _require_generic_connect_source_lock(runtime, message_id)
 
     def attachment_content() -> bytes:
         return _generic_attachment_content(
@@ -4645,10 +4648,7 @@ def _prepare_or_create_generic_connect_job(
             operation_deadline=operation_deadline,
         )
 
-    with connect_operation_lock(
-        source_lock,
-        "The Connect source attachment is being changed",
-    ):
+    with runtime.store.source_locks((message_id,)):
         locked_source = _retained_connect_message_source(runtime, message_id)
         try:
             locked_attachment = runtime.store.attachment(message_id, part_id)
@@ -5868,10 +5868,13 @@ def _vendors_addresses_remove(request: dict[str, object]) -> dict[str, object]:
         if unwatch:
             _unwatch_all(request, [address])
         try:
-            store.remove_vendor_address(vendor_id, address)
+            outcome = store.remove_vendor_address(vendor_id, address)
         except KeyError as exc:
             raise ApiError("not_found", "Vendor was not found") from exc
-        return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+        result = {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+        if outcome.notice:
+            result["notice"] = outcome.notice
+        return result
 
     return _with_watchlist_mutation(request, remove)
 
@@ -5889,10 +5892,13 @@ def _vendors_delete(request: dict[str, object]) -> dict[str, object]:
         if unwatch:
             _unwatch_all(request, listed)
         try:
-            addresses = store.delete_vendor(vendor_id)
+            outcome = store.delete_vendor(vendor_id)
         except KeyError as exc:
             raise ApiError("not_found", "Vendor was not found") from exc
-        return {"deleted": True, "vendor_id": vendor_id, "addresses": addresses}
+        result = {"deleted": True, "vendor_id": vendor_id, "addresses": list(outcome.addresses)}
+        if outcome.notice:
+            result["notice"] = outcome.notice
+        return result
 
     return _with_watchlist_mutation(request, delete)
 
@@ -6327,6 +6333,13 @@ def _response(request: object) -> dict[str, object]:
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
         }
+    except LocalRemovalHeld as exc:
+        return {
+            "error": {"code": "inbox_removal_held", "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
     except ConfigError as exc:
         return {
             "error": {"code": "configuration_error", "message": str(exc)},
@@ -6446,6 +6459,13 @@ def _response(request: object) -> dict[str, object]:
     except DeploymentError as exc:
         return {
             "error": {"code": "deployment_refused", "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except source_locks.SourceProtocolUnavailable as exc:
+        return {
+            "error": {"code": "connect_queue_unavailable", "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

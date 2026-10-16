@@ -164,7 +164,7 @@ def test_parse_metadata_rejects_malformed_label_ids(label_ids: object) -> None:
 
 def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> None:
     gateway = GmailGateway(None)
-    gateway._history_changes = lambda cursor: (["m1", "m2"], "next-cursor", {})
+    gateway._history_changes = lambda cursor: (["m1", "m2"], "next-cursor", {}, True)
     gateway.search_since = lambda addresses, since: ["recovered"]
     gateway.profile_history_id = lambda: "recovery-cursor"
     gateway._full_message = lambda message_id: {

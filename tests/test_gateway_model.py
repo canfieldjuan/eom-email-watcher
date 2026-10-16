@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fixture_toml import toml_path_literal
 
 from eom_email_watcher import engine_api
 from eom_email_watcher import model as model_module
@@ -125,11 +126,11 @@ def write_gateway_config(tmp_path: Path) -> Path:
     config_path.write_text(
         f'''model_backend = "gateway"
 model_base_url = "https://inference.office.internal:8443"
-model_api_token_file = "{tmp_path / "gateway-token"}"
-model_ca_file = "{tmp_path / "gateway-ca.pem"}"
-database_file = "{tmp_path / "watcher.sqlite3"}"
-gmail_credentials_file = "{tmp_path / "credentials.json"}"
-gmail_token_file = "{tmp_path / "token.json"}"
+model_api_token_file = {toml_path_literal(tmp_path / "gateway-token")}
+model_ca_file = {toml_path_literal(tmp_path / "gateway-ca.pem")}
+database_file = {toml_path_literal(tmp_path / "watcher.sqlite3")}
+gmail_credentials_file = {toml_path_literal(tmp_path / "credentials.json")}
+gmail_token_file = {toml_path_literal(tmp_path / "token.json")}
 ''',
         encoding="utf-8",
     )

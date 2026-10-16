@@ -21,6 +21,7 @@ import {
 import { automationOutcomeIdentity, automationOutcomeStatus } from "./automationOutcome";
 import { hasInboxAutomationConfirmation, inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
+import { inboxClearView, type InboxClearResult } from "./inboxRemoval";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import { mailAccountDetail } from "./mailAccountDetail";
 import {
@@ -307,6 +308,8 @@ interface MailAccountStatus {
   active: boolean;
   last_check: string | null;
   sent_scope?: "available" | "unavailable" | "not_polled" | null;
+  sent_poll_failure?: "unreadable" | null;
+  source_lock_notice?: string | null;
 }
 
 interface GmailLabelCatalogItem {
@@ -819,7 +822,7 @@ app.innerHTML = `
           <span>Start Email Watcher when I sign in</span>
         </label>
         <p id="autostart-settings-note" class="settings-note">Checking start-on-login status…</p>
-        <p class="settings-note">Polling cadence changes apply after the app restarts. Retention changes remove expired local history immediately. Source email is never deleted.</p>
+        <p class="settings-note">Polling cadence changes apply after the app restarts. Retention changes remove expired unfollowed local history immediately. Followed vendor threads are kept until their newest message is older than this. Their removal also waits for a completed check and current mailbox coverage. Source email is never deleted.</p>
         <button type="submit">Save settings</button>
       </form>
       <section id="gmail-label-settings" class="settings-form" hidden>
@@ -2636,17 +2639,27 @@ async function clearInboxHistory(): Promise<void> {
   setInboxControlsBusy(true);
   renderInbox(inboxItems);
   try {
-    const deleted = await invoke<number>("inbox_clear");
-    expandedInboxMessages.clear();
-    inboxPageState = "loaded";
-    inboxItems = [];
-    inboxNextCursor = null;
-    inboxCapabilityUnavailableCount = 0;
-    clearMessageOwnedUiState();
-    inboxLoadMore.hidden = true;
+    const result = await invoke<InboxClearResult>("inbox_clear");
+    const view = inboxClearView(inboxItems, result);
+    const retained = new Set(view.retained.map(item => item.message_id));
+    for (const item of inboxItems) {
+      if (!retained.has(item.message_id)) {
+        expandedInboxMessages.delete(item.message_id);
+        clearMessageOwnedUiState(item.message_id);
+      }
+    }
+    inboxItems = view.retained;
+    if (result.outcome === "completed") {
+      expandedInboxMessages.clear();
+      inboxPageState = "loaded";
+      inboxNextCursor = null;
+      inboxCapabilityUnavailableCount = 0;
+      clearMessageOwnedUiState();
+      inboxLoadMore.hidden = true;
+    }
     renderInbox(inboxItems);
-    inboxStatus.textContent = `Cleared ${deleted} local message${deleted === 1 ? "" : "s"}. Source email was not changed.`;
-    inboxStatus.dataset.kind = "success";
+    inboxStatus.textContent = view.text;
+    inboxStatus.dataset.kind = view.kind;
   } catch (error) {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
@@ -4903,7 +4916,7 @@ async function removeVendorAddress(
   }
   await vendorOperation(`Removing ${address}…`, async () => {
     const vendor = await invoke<Vendor>("vendors_address_remove", { vendorId, address, unwatch });
-    return `${address} was removed from ${vendor.display_name}.`;
+    return vendor.notice ?? `${address} was removed from ${vendor.display_name}.`;
   }, unwatch);
 }
 
@@ -4920,8 +4933,10 @@ async function deleteVendor(
     return;
   }
   await vendorOperation(`Deleting ${vendorName}…`, async () => {
-    await invoke("vendors_delete", { vendorId, unwatchAddresses });
-    return `${vendorName} was deleted.`;
+    const result = await invoke<{ notice?: string | null }>("vendors_delete", {
+      vendorId, unwatchAddresses,
+    });
+    return result.notice ?? `${vendorName} was deleted.`;
   }, unwatchAddresses);
 }
 

@@ -8,8 +8,9 @@ push via [ntfy](https://ntfy.sh)).
 Email content is never sent to a cloud model. Optional ntfy phone notifications are a separate,
 explicitly acknowledged disclosure to the configured ntfy service, described below. Mailbox grants
 are read-only, attachment content is downloaded only when the user explicitly opens it or requests
-an available local capability, non-matching message metadata is not stored, and message bodies are
-discarded after each local inference request.
+an available local capability, and non-matching message metadata is not stored. Temporary inference
+buffers are discarded after each request. With paid Connect, followed vendor threads retain
+normalized bodies locally under the retention behavior described below.
 
 ## Behavior
 
@@ -29,8 +30,10 @@ discarded after each local inference request.
   capability at runtime. For a compatible PDF, an explicit Summarize action fetches only that
   attachment and streams its bytes to the selected authenticated exact-loopback provider. It does
   not transfer mailbox paths, sender, subject, message ID, email body, or mailbox credentials.
-- Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
-  are never stored.
+- Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days.
+  With paid Connect, followed vendor threads also store normalized bodies locally. Followed vendor
+  threads are kept until their newest message is older than this. Their purge waits for current
+  mailbox coverage. Email bodies never go to a cloud service.
 - Deduplicates by mail provider, local account, and provider message ID. Existing single-account
   Gmail history retains its original local identifiers during the offline schema migration.
 - Recovers an expired provider cursor beginning five minutes before the last successful check,

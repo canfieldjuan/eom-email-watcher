@@ -1740,7 +1740,7 @@ async fn inbox_clear(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
-) -> Result<u64, EngineError> {
+) -> Result<engine::InboxClear, EngineError> {
     let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();

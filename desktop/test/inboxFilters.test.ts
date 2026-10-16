@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxActionState.ts";
+import { inboxClearView } from "../src/inboxRemoval.ts";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
@@ -103,7 +104,58 @@ test("inbox first-page and clear-history success record loaded before rendering"
   const success = inboxLoad.slice(inboxLoad.indexOf("if (!append) {\n    attachmentCapabilities"));
   assert.match(success, /if \(!append\) \{[^}]*inboxPageState = "loaded";[^}]*\} else \{[^}]*\}[\s\S]*renderInbox\(inboxItems\)/, "first-page success must record loaded before rendering");
   const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
-  assert.match(clear, /await invoke<number>\("inbox_clear"\);[^}]*inboxPageState = "loaded";[^}]*renderInbox\(inboxItems\)/, "successful history clear must record loaded before rendering");
+  assert.match(clear, /const result = await invoke<InboxClearResult>\("inbox_clear"\);\s+const view = inboxClearView\(inboxItems, result\);/);
+  assert.match(clear, /inboxItems = view.retained;\s+if \(result.outcome === "completed"\) \{\s+expandedInboxMessages.clear\(\);\s+inboxPageState = "loaded";[^}]*\}\s+renderInbox\(inboxItems\);/, "only completed history clear must clear expansion and record loaded before rendering retained rows");
+});
+
+test("clear handler renders retained state for partial and refused results, and resets completed state", async () => {
+  const handler = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0]
+    .replace("(): Promise<void>", "()")
+    .replace("invoke<InboxClearResult>", "invoke");
+  const refusal = "Can't delete this yet, the local upgrade is still finishing; try again later";
+  for (const outcome of ["partial", "refused", "completed"] as const) {
+    const held = outcome === "refused" ? ["held", "deleted"] : ["held"];
+    const result = { outcome, deleted: outcome === "refused" ? 0 : 1,
+      refused: outcome === "completed" ? 0 : held.length,
+      held_message_ids: outcome === "completed" ? [] : held,
+      message: outcome === "completed" ? null : refusal };
+    const observed = JSON.parse(await runInNewContext(`(async () => {
+      let inboxItems = [{ message_id: "held" }, { message_id: "deleted" }];
+      const expandedInboxMessages = new Set(["held", "deleted"]);
+      let inboxPageState = "failed", inboxNextCursor = "next", inboxCapabilityUnavailableCount = 3;
+      let inboxClearInFlight = false, inboxRequestGeneration = 0;
+      const inboxLoadMore = { hidden: false }, inboxStatus = { textContent: "", dataset: {} };
+      const renders = [], cleared = [];
+      const window = { confirm: () => true }, inboxMutationInFlight = () => false;
+      const setInboxControlsBusy = () => {}, resumeInboxReloadAfterMutation = () => {};
+      const clearMessageOwnedUiState = id => cleared.push(id ?? "all");
+      const renderInbox = items => renders.push({ ids: items.map(item => item.message_id),
+        state: inboxPageState, expanded: [...expandedInboxMessages] });
+      const invoke = async () => result;
+      ${handler}
+      await clearInboxHistory();
+      return JSON.stringify({ renders, cleared, inboxNextCursor, inboxCapabilityUnavailableCount,
+        inboxLoadMore, inboxStatus, inboxClearInFlight });
+    })()`, { result, inboxClearView }));
+    const completed = outcome === "completed";
+    for (const render of observed.renders.slice(1)) {
+      assert.deepEqual(render.ids, completed ? [] : held);
+      assert.deepEqual(render.expanded, completed ? [] : held);
+      assert.equal(render.state, completed ? "loaded" : "failed");
+    }
+    assert.equal(observed.renders.length, 3);
+    assert.deepEqual(observed.cleared, completed ? ["held", "deleted", "all"] : outcome === "partial" ? ["deleted"] : []);
+    assert.equal(observed.inboxNextCursor, completed ? null : "next");
+    assert.equal(observed.inboxCapabilityUnavailableCount, completed ? 0 : 3);
+    assert.equal(observed.inboxLoadMore.hidden, completed);
+    assert.equal(observed.inboxStatus.dataset.kind, completed ? "success" : "error");
+    assert.equal(observed.inboxClearInFlight, false);
+    if (completed) assert.match(observed.inboxStatus.textContent, /^Cleared 1 local message\./);
+    else {
+      assert.ok(observed.inboxStatus.textContent.includes(refusal));
+      assert.doesNotMatch(observed.inboxStatus.textContent, /Cleared/);
+    }
+  }
 });
 
 test("inbox empty text checks pending loading and failed before existing query texts", () => {
@@ -170,7 +222,9 @@ test("expansion survives renders and first-page reloads until query, delete, or 
   const load = source.match(/async function loadInbox\([\s\S]*?\n\}/)![0];
   assert.doesNotMatch(load, /expandedInboxMessages/);
   assert.match(source, /await invoke<void>\("inbox_delete"[^\n]+\n\s+expandedInboxMessages.delete\(item.message_id\)/);
-  assert.match(source, /await invoke<number>\("inbox_clear"\);\s+expandedInboxMessages.clear\(\)/);
+  const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
+  assert.match(clear, /if \(!retained.has\(item.message_id\)\) \{\s+expandedInboxMessages.delete\(item.message_id\)/);
+  assert.match(clear, /if \(result.outcome === "completed"\) \{\s+expandedInboxMessages.clear\(\)/);
 });
 
 test("collapsed row feeds only projected states and the render clock to one chip", () => {

@@ -58,6 +58,7 @@ from .mailbox import (
     SENT_LOCATION,
     SENT_SCOPE_AVAILABLE,
     SENT_SCOPE_NOT_POLLED,
+    SENT_SCOPE_UNAVAILABLE,
     FolderObservation,
     MailboxAccountUnavailable,
     MailboxChanges,
@@ -1471,6 +1472,10 @@ class Watcher:
         reason: str | None = None,
     ) -> dict[str, int | bool | str]:
         purged = 0 if dry_run else store.purge(config.retention_days)
+        if not dry_run:
+            from .body_state import checkpoint
+
+            checkpoint(store)
         result: dict[str, int | bool | str] = {
             "active": False,
             "discovered": 0,
@@ -1503,6 +1508,28 @@ class Watcher:
             result["recovery_next_retry_at"] = state.next_retry_at
         return result
 
+    def _record_sent_poll_outcome(
+        self,
+        scope: str | None,
+        *,
+        mailbox_identity_key: str | None,
+        dry_run: bool,
+        checked_at: datetime,
+    ) -> None:
+        if dry_run:
+            return
+        if scope is None:
+            self.store.record_sent_poll_failure(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                now=checked_at,
+            )
+        else:
+            self.store.set_sent_scope(
+                self.mailbox.provider, self.mailbox.account_id, scope, now=checked_at
+            )
+
     def _settle_sent(
         self,
         *,
@@ -1519,7 +1546,8 @@ class Watcher:
         the folder's current position: taken before the Inbox poll, so mail sent while
         the Inbox is polled is after it and reaches this check's Sent poll. Returns
         the scope, or None when Sent could not be read: a Sent error never stops the
-        Inbox check, and the scope stays as last recorded. A dry run records nothing.
+        Inbox check. Failure is recorded separately from the last confirmed scope.
+        A dry run records nothing.
         """
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
@@ -1527,6 +1555,12 @@ class Watcher:
         if resolved_scope is not _UNRESOLVED_SENT_SCOPE:
             scope = resolved_scope
             if scope is None:
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
                 return None
             assert isinstance(scope, str)
         elif SENT_LOCATION not in folders:
@@ -1537,15 +1571,32 @@ class Watcher:
         else:
             scope_reader = getattr(self.gateway, "sent_scope", None)
             if not callable(scope_reader):
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
                 return None
             try:
                 scope = scope_reader()
             except MailboxError as exc:
                 logger.warning("Sent folder could not be read; the Inbox goes on: %s", exc)
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
                 return None
         if dry_run:
             return scope
-        self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
+        self._record_sent_poll_outcome(
+            scope,
+            mailbox_identity_key=mailbox_identity_key,
+            dry_run=dry_run,
+            checked_at=checked_at,
+        )
         if scope != SENT_SCOPE_AVAILABLE or provider == "gmail" or mailbox_identity_key is None:
             return scope
         folder_scope = {
@@ -1561,12 +1612,23 @@ class Watcher:
                 )
             except MailboxError as exc:
                 logger.warning("Sent folder position unread; the next check retries: %s", exc)
+                self._record_sent_poll_outcome(
+                    None,
+                    mailbox_identity_key=mailbox_identity_key,
+                    dry_run=dry_run,
+                    checked_at=checked_at,
+                )
+                return None
         return scope
 
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True,
         _gated_allowed: bool | None = None,
     ) -> dict[str, int | bool | str]:
+        if not dry_run:
+            from .body_state import checkpoint
+
+            checkpoint(self.store)
         gated_allowed = self._gated_class_allowed() if _gated_allowed is None else _gated_allowed
         vendor_snapshot = self.store.vendor_index() if gated_allowed else None
         vendor_records = bool(vendor_snapshot and vendor_snapshot.vendor_ids)
@@ -2142,6 +2204,7 @@ class Watcher:
         reconcile_label_selectors=(),
         reconcile_vendor_snapshot=None,
         sent_scope: str | None = None,
+        polling_complete: bool = False,
     ) -> dict[str, int | bool | str]:
         if not dry_run and reconcile_allowed:
             from .reconcile import run
@@ -2164,7 +2227,15 @@ class Watcher:
             mailbox_identity_key=mailbox_identity_key,
         )
         if not dry_run:
-            purged += self.store.purge(self.config.retention_days, now=checked_at)
+            purged += self.store.purge(
+                self.config.retention_days,
+                now=checked_at,
+                after_poll=polling_complete,
+                polled_scope=(self.mailbox.provider, self.mailbox.account_id, mailbox_identity_key),
+            )
+            from .body_state import checkpoint
+
+            checkpoint(self.store)
         result: dict[str, int | bool | str] = {
             "active": True,
             "discovered": added,
@@ -2256,6 +2327,7 @@ class Watcher:
                     retention_cutoff=recovery_retention_cutoff,
                     mailbox_identity_key=mailbox_identity_key,
                     recovery_status=pending_recovery,
+                    polling_complete=completed,
                     reconcile_allowed=gated_allowed,
                     sent_scope=sent_scope,
                     reconcile_label_selectors=label_selectors,
@@ -2389,6 +2461,7 @@ class Watcher:
                     retention_cutoff=retention_cutoff,
                     mailbox_identity_key=mailbox_identity_key,
                     recovery_status=pending_recovery,
+                    polling_complete=completed,
                     reconcile_allowed=gated_allowed,
                     sent_scope=sent_scope,
                     reconcile_label_selectors=label_selectors,
@@ -2419,7 +2492,7 @@ class Watcher:
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             )
-        added += self._poll_sent_folder(
+        sent_added, sent_complete = self._poll_sent_folder(
             mailbox_identity_key=mailbox_identity_key,
             label_selectors=label_selectors,
             gated_allowed=gated_allowed,
@@ -2431,6 +2504,7 @@ class Watcher:
             dry_run=dry_run,
             dry_run_messages=dry_run_messages,
         )
+        added += sent_added
         return self._finish_active_result(
             scope=folders,
             added=added,
@@ -2446,6 +2520,7 @@ class Watcher:
             sent_scope=sent_scope,
             reconcile_label_selectors=label_selectors,
                     reconcile_vendor_snapshot=vendor_snapshot,
+            polling_complete=sent_complete and changes.drained and not recovery_incomplete,
             recovery_incomplete=recovery_incomplete,
             recovery_reason=recovery_reason,
         )
@@ -2734,15 +2809,17 @@ class Watcher:
         sent_scope: str | None,
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Poll the Sent folder this check's _settle_sent found available (D-scope).
 
         Gmail's one mailbox-wide cursor already carries SENT events, so only the other
         providers keep a Sent cursor of their own. A dry run previews Sent as it
         previews the Inbox: it reads, and moves no cursor.
         """
-        if sent_scope != SENT_SCOPE_AVAILABLE or self.mailbox.provider == "gmail":
-            return 0
+        if SENT_LOCATION not in folders or self.mailbox.provider == "gmail":
+            return 0, True
+        if sent_scope != SENT_SCOPE_AVAILABLE:
+            return 0, sent_scope == SENT_SCOPE_UNAVAILABLE
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
         folder_scope = {
@@ -2755,7 +2832,7 @@ class Watcher:
         if state is None:
             # No position yet: a dry run records none, and _settle_sent retries one
             # it could not read on the next check.
-            return 0
+            return 0, False
         # A Sent folder error never stops the Inbox check; the next check retries.
         try:
             try:
@@ -2783,10 +2860,16 @@ class Watcher:
             )
             if not dry_run:
                 self.store.set_folder_state(changes.cursor, at=checked_at, **folder_scope)
-            return added
+            return added, changes.drained
         except MailboxError as exc:
             logger.warning("Sent folder poll failed; the Inbox check is unaffected: %s", exc)
-            return 0
+            self._record_sent_poll_outcome(
+                None,
+                mailbox_identity_key=mailbox_identity_key,
+                dry_run=dry_run,
+                checked_at=checked_at,
+            )
+            return 0, False
 
     def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender
@@ -3139,6 +3222,10 @@ def run_watcher_check(
 ) -> dict[str, int | bool | str]:
     recovery_backoff = _gmail_recovery_backoff_admission(store)
     if recovery_backoff is not None:
+        if not dry_run:
+            from .body_state import checkpoint
+
+            checkpoint(store)
         return {
             **Watcher.recovery_backoff_result(recovery_backoff),
             "automation_processed": 0,

@@ -27,6 +27,7 @@ from connect_reference_provider import (
     TRANSLATE_CAPABILITY_ID,
     ReferenceProvider,
 )
+from fixture_toml import toml_path_literal
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount
@@ -336,10 +337,10 @@ class FixtureGmail:
 def write_config(path: Path) -> None:
     path.write_text(
         f'''timezone = "America/Chicago"
-gmail_credentials_file = "{path.parent / "credentials.json"}"
-gmail_token_file = "{path.parent / "token.json"}"
-gmail_send_token_file = "{path.parent / "send-token.json"}"
-database_file = "{path.parent / "watcher.sqlite3"}"
+gmail_credentials_file = {toml_path_literal(path.parent / "credentials.json")}
+gmail_token_file = {toml_path_literal(path.parent / "token.json")}
+gmail_send_token_file = {toml_path_literal(path.parent / "send-token.json")}
+database_file = {toml_path_literal(path.parent / "watcher.sqlite3")}
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "local-model"
 model_require_auth = false

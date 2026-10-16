@@ -35,6 +35,7 @@ from .mailbox import (
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
+    MailboxMessageOutsideScope,
     MailboxMessageUnavailable,
     MessageContent,
     MessageMetadata,
@@ -45,7 +46,7 @@ from .mailbox import (
     validate_content_scope,
     validate_operation_timeout,
 )
-from .mime import extract_body
+from .mime import MAX_STORED_BODY_INPUT_CHARS, StoredBodyInvalid, extract_body, extract_stored_body
 from .text import within_utf8_bytes
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
@@ -117,6 +118,14 @@ class MessageUnavailable(GmailError, MailboxMessageUnavailable):
     """A specific message could not be fetched -- e.g. it was deleted or
     expunged after the history event that referenced it. Recoverable: the
     caller should skip this one message, not fail the whole run."""
+
+
+def _message_fetch_error(exc: HttpError, message_id: str, operation: str) -> GmailError:
+    """A missing message resource is terminal across every content fetch path."""
+    status = getattr(exc.resp, "status", None)
+    if status == 404:
+        return MessageUnavailable(f"Gmail message {message_id} unavailable (HTTP 404)")
+    return GmailError(f"Gmail {operation} fetch failed (HTTP {status})")
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -527,9 +536,11 @@ def _received_at(message: dict[str, Any], headers: dict[str, str]) -> str:
         return ""
 
 
-def _validated_label_ids(message: dict[str, Any]) -> frozenset[str]:
+def _validated_label_ids(
+    message: dict[str, Any], *, require_complete: bool = False
+) -> frozenset[str]:
     raw_labels = message.get("labelIds")
-    if raw_labels is None:
+    if raw_labels is None and not require_complete:
         raw_labels = []
     if not isinstance(raw_labels, list) or len(raw_labels) > MAX_GMAIL_LABEL_COUNT:
         raise MailboxMessageInvalid(
@@ -916,12 +927,12 @@ class GmailGateway:
             ) from exc
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
-        ids, newest, _locations = self._history_changes(start_history_id)
+        ids, newest, _locations, _drained = self._history_changes(start_history_id)
         return ids, newest
 
     def _history_changes(
         self, start_history_id: str
-    ) -> tuple[list[str], str, dict[str, FolderObservation]]:
+    ) -> tuple[list[str], str, dict[str, FolderObservation], bool]:
         """The changed ids, the newest cursor, and each record's admitted folders.
 
         A history record says which folders a message was added to, so a known
@@ -1004,6 +1015,7 @@ class GmailGateway:
                                     ids,
                                     _history_continuation_cursor(request_start_history_id, prefix),
                                     hints.snapshot(drained=False),
+                                    False,
                                 )
                             ids.append(message_id)
                 page_token = response.get("nextPageToken")
@@ -1027,11 +1039,11 @@ class GmailGateway:
         # Every id whose record this call saw keeps its observation, the replayed
         # prefix included: a later event for an id returned in an earlier batch
         # arrives here only, so it travels as an observation outside the batch.
-        return ids, newest, hints.snapshot(drained=True)
+        return ids, newest, hints.snapshot(drained=True), True
 
     def changes_since(self, cursor: str) -> MailboxChanges:
-        message_ids, newest, locations = self._history_changes(cursor)
-        return MailboxChanges(tuple(message_ids), newest, locations)
+        message_ids, newest, locations, drained = self._history_changes(cursor)
+        return MailboxChanges(tuple(message_ids), newest, locations, drained=drained)
 
     def metadata(
         self,
@@ -1052,47 +1064,70 @@ class GmailGateway:
             )
             message = self._execute_request(request, timeout_seconds=timeout_seconds)
         except HttpError as exc:
-            if getattr(exc.resp, "status", None) == 404:
-                raise MessageUnavailable(
-                    f"Gmail message {message_id} unavailable (HTTP 404)"
-                ) from exc
-            raise GmailError(f"Gmail metadata fetch failed (HTTP {exc.resp.status})") from exc
+            raise _message_fetch_error(exc, message_id, "metadata") from exc
         except (TimeoutError, OSError, httplib2.HttpLib2Error) as exc:
             raise GmailError("Gmail metadata fetch timed out or failed") from exc
         return parse_metadata(message)
 
     def _full_message(self, message_id: str) -> dict[str, Any]:
         try:
-            message = (
+            request = (
                 self.service.users()
                 .messages()
                 .get(userId="me", id=message_id, format="full")
-                .execute()
             )
+            message = self._execute_request(request)
         except HttpError as exc:
-            if getattr(exc.resp, "status", None) == 404:
-                raise MessageUnavailable(
-                    f"Gmail message {message_id} unavailable (HTTP 404)"
-                ) from exc
-            raise GmailError(f"Gmail body fetch failed (HTTP {exc.resp.status})") from exc
+            raise _message_fetch_error(exc, message_id, "body") from exc
         return message
 
     def full_payload(self, message_id: str) -> dict[str, Any]:
         return self._full_message(message_id).get("payload") or {}
 
-    def content(
-        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
-    ) -> MessageContent:
+    def _scoped_full_message(self, message_id: str, scope: frozenset[str]):
         scope = validate_content_scope(scope)
         message = self._full_message(message_id)
         try:
-            labels = _validated_label_ids(message)
+            labels = _validated_label_ids(message, require_complete=True)
         except MailboxMessageInvalid as exc:
             raise MessageUnavailable("Gmail body response has invalid folder evidence") from exc
         if not (locations_from_labels(labels) & scope):
-            raise MessageUnavailable(
+            raise MailboxMessageOutsideScope(
                 f"Gmail message {message_id} is outside the active folder scope"
             )
+        return message
+
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
+        message = self._scoped_full_message(message_id, scope)
+
+        def load_text(part):
+            body = part["body"]
+            request = (
+                self.service.users()
+                .messages()
+                .attachments()
+                .get(userId="me", messageId=message_id, id=body["attachmentId"])
+            )
+            try:
+                response = self._execute_request(request)
+            except HttpError as exc:
+                raise _message_fetch_error(exc, message_id, "text part") from exc
+            data = response.get("data")
+            if not isinstance(data, str):
+                raise StoredBodyInvalid("Gmail text part response contained invalid data")
+            if len(data) > (MAX_STORED_BODY_INPUT_CHARS + 2) // 3 * 4:
+                raise StoredBodyInvalid("Gmail text part exceeds the safe input limit")
+            return data
+
+        try:
+            return extract_stored_body(message.get("payload"), load_text=load_text)
+        except StoredBodyInvalid as exc:
+            raise MailboxMessageInvalid("gmail_body_invalid", str(exc)) from exc
+
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
+        message = self._scoped_full_message(message_id, scope)
         body, attachment_names, attachments, body_source_chars = extract_body(
             message.get("payload") or {}, body_char_limit
         )
@@ -1109,11 +1144,7 @@ class GmailGateway:
                     .execute()
                 )
             except HttpError as exc:
-                if getattr(exc.resp, "status", None) == 404:
-                    raise MessageUnavailable(
-                        f"Gmail message {message_id} attachment unavailable (HTTP 404)"
-                    ) from exc
-                raise GmailError(f"Gmail attachment fetch failed (HTTP {exc.resp.status})") from exc
+                raise _message_fetch_error(exc, message_id, "attachment") from exc
             return _decode_attachment_data(response.get("data"))
 
         part = _find_part(self.full_payload(message_id), part_id)

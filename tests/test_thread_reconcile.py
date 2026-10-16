@@ -280,6 +280,9 @@ class Pages:
         self.provider = provider
         self._delta_folders = {}
 
+    def stored_body(self, source, *, scope):
+        return "stored quote", 12
+
     def reconcile_page(self, unit, *, start, cutoff):
         self.calls.append((unit["name"], unit["token"], start, cutoff))
         if unit["token"] == "next" and self.rejected:
@@ -606,6 +609,9 @@ def test_imap_interrupted_search_preserves_partial_uid_state():
 
 def test_imap_merge_resyncs_survivor_from_cutoff(tmp_path, monkeypatch):
     class ImapPages:
+        def stored_body(self, source, *, scope):
+            return "stored quote", 12
+
         calls = []
         fetched = False
 
@@ -793,6 +799,9 @@ def test_generation_change_during_page_discards_token_on_next_check(tmp_path, mo
 def test_aged_imap_reply_header_gap_waits_for_retention_raise(tmp_path, monkeypatch):
     class GapMailbox:
         fetched = []
+
+        def stored_body(self, source, *, scope):
+            return "stored quote", 12
 
         def reconcile_snapshot(self, folder):
             return dict(validity=1, highest=1, folder_key=None)

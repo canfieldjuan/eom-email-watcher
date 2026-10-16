@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
 
 const acme = {
   vendor_id: "1b4e28ba-2fa1-4d2e-8e7a-2f5d3c1f0a11",
@@ -9,6 +11,29 @@ const acme = {
     { address: "rep@gmail.com", watched: false },
   ],
 };
+
+test("vendor removal handlers display the saved notice or their ordinary success message", async () => {
+  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const notice = "Saved. Removing this thread's stored email text is waiting for the local upgrade to finish; it will finish automatically.";
+  for (const name of ["removeVendorAddress", "deleteVendor"]) {
+    const handler = source.match(new RegExp(`async function ${name}\\([\\s\\S]*?\\n\\}`, "u"))![0]
+      .replace(/async function \w+\([\s\S]*?\): Promise<void>/, `async function ${name}()`)
+      .replace(/invoke<(?:Vendor|\{ notice\?: string \| null \})>/g, "invoke");
+    for (const held of [false, true]) {
+      let shown: string | null = null;
+      await runInNewContext(`(async () => { ${handler}; await ${name}(); })()`, {
+        vendorId: acme.vendor_id, vendorName: acme.display_name, address: "billing@acme.com",
+        unwatch: false, unwatchAddresses: false, addressCount: 2,
+        vendorsBusy: () => false, window: { confirm: () => true },
+        removeAddressConfirmText: () => "confirm", deleteVendorConfirmText: () => "confirm",
+        invoke: async () => ({ ...acme, notice: held ? notice : null }),
+        vendorOperation: async (_pending: string, operation: () => Promise<string>) => { shown = await operation(); },
+      });
+      assert.equal(shown, held ? notice : name === "deleteVendor"
+        ? "Acme Supply was deleted." : "billing@acme.com was removed from Acme Supply.");
+    }
+  }
+});
 
 async function vendors() {
   const module = await import("../src/vendors.ts").catch(() => ({}));

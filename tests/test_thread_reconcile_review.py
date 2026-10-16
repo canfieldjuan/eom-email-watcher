@@ -416,6 +416,9 @@ def test_graph_thread_watermark_waits_for_both_sync_folders(tmp_path, monkeypatc
     watcher, state = runner(tmp_path, monkeypatch, gateway, "microsoft365")
     reconcile.observe(watcher, KEY, True, "available", NOW)
     seed(watcher.store, provider="microsoft365")
+    from eom_email_watcher import body_state
+
+    body_state.record(watcher.store, "m", ("existing", 8), fetched_at=NOW)
     state.complete(state.load_or_start(NOW, 30, {}))
     original = gateway.reconcile_page
 

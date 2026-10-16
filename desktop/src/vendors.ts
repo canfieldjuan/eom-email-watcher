@@ -10,6 +10,7 @@ export interface Vendor {
   vendor_id: string;
   display_name: string;
   addresses: VendorAddress[];
+  notice?: string | null;
 }
 
 export const VENDORS_LOCKED_NOTICE = "Connect required to update";

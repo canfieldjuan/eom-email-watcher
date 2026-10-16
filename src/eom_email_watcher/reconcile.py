@@ -3,11 +3,18 @@
 import imaplib
 import logging
 import time
+from collections import deque
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from .mailbox import MailboxError, MailboxMessageInvalid, MailboxMessageUnavailable
+from . import body_state
+from .mailbox import (
+    MailboxError,
+    MailboxMessageInvalid,
+    MailboxMessageOutsideScope,
+    MailboxMessageUnavailable,
+)
 from .reconcile_state import WHERE, ReconcileState
 
 logger = logging.getLogger(__name__)
@@ -188,6 +195,17 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
     budget = ReconcileBudget(allowed)
     added = 0
 
+    def resume_catchup():
+        if any(not t["watermark"] for t in state.threads()):
+            progress["payload"].update(stage="sync_init", units=[])
+            state.save(progress)
+            return True
+        if state.catchup_pending(progress):
+            progress["payload"]["stage"] = "catchup_wait"
+            state.save(progress)
+            return True
+        return False
+
     def fetch(item, *, gap=False, since=cutoff):
         nonlocal added
         source = watcher.store.reconcile_source(*state.scope, item["source_id"])
@@ -241,6 +259,7 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
             refresh_known=True,
         )
 
+    body_candidates = None
     try:
         with budget_session(watcher.gateway, budget):
             while True:
@@ -250,6 +269,86 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                 payload = progress["payload"]
                 stage = payload["stage"]
                 units = payload["units"]
+                if stage == "derived":
+                    retries = payload.setdefault("body_retries", {})
+                    if body_candidates is None:
+                        waiting = [
+                            m for m, retry in retries.items()
+                            if datetime.fromisoformat(retry["retry_at"]) > datetime.now(UTC)
+                        ]
+                        with watcher.store.connection() as db:
+                            body_candidates = deque(body_state.pending(
+                                db, state.scope, cutoff=cutoff, now=start,
+                                limit=budget.maximum, exclude=waiting,
+                            ))
+                    if not body_candidates:
+                        # Exhaustion is not completion: a bounded slice may leave
+                        # later work, a backoff, or a newly invalidated body.
+                        with watcher.store.connection() as db:
+                            remains = body_state.pending(
+                                db, state.scope, cutoff=cutoff, now=start, limit=1
+                            )
+                        if remains:
+                            break
+                        if resume_catchup():
+                            body_candidates = None
+                            if payload["stage"] == "catchup_wait":
+                                break
+                            continue
+                        state.complete(progress)
+                        break
+                    message_id = body_candidates.popleft()
+                    try:
+                        with watcher.store.connection() as db:
+                            copies = body_state.sources(
+                                db, message_id, state.scope, frozenset(folders)
+                            )
+                        work = payload.setdefault("body_work", {}).setdefault(
+                            message_id, dict(skipped=[], outside=False)
+                        )
+                        outside = work["outside"] or not copies
+                        result = None
+                        for copy in copies:
+                            source_id = copy[0]
+                            if copy in work["skipped"]:
+                                continue
+                            if not getattr(watcher.gateway, "reconcile_transport_budget", False):
+                                budget.before_call()
+                            try:
+                                result = watcher.gateway.stored_body(
+                                    source_id, scope=frozenset(folders)
+                                )
+                                break
+                            except MailboxMessageOutsideScope:
+                                outside = True
+                            except (MailboxMessageUnavailable, MailboxMessageInvalid):
+                                pass
+                            work["outside"] = outside
+                            work["skipped"].append(copy)
+                            state.save(progress)
+                        body_state.record(
+                            watcher.store,
+                            message_id,
+                            result,
+                            fetched_at=datetime.now(UTC),
+                            reason=None
+                            if result is not None
+                            else ("outside_folders" if outside else "source_gone"),
+                        )
+                        retries.pop(message_id, None)
+                        payload["body_work"].pop(message_id, None)
+                    except MailboxError:
+                        attempts = retries.get(message_id, {}).get("attempts", 0) + 1
+                        retries[message_id] = dict(
+                            attempts=attempts,
+                            retry_at=(
+                                datetime.now(UTC)
+                                + timedelta(minutes=min(15, 2 ** min(attempts, 4)))
+                            ).isoformat(),
+                        )
+                        logger.warning("Reconcile body deferred after provider failure")
+                    state.save(progress)
+                    continue
                 if all(unit["done"] for unit in units):
                     if stage == "snapshot":
                         payload.update(
@@ -395,20 +494,13 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                             )
                         state.save(progress)
                         continue
-                    missing = [t for t in state.threads() if not t["watermark"]]
-                    if missing:
-                        payload.update(stage="sync_init", units=[])
-                        state.save(progress)
+                    if resume_catchup():
+                        if payload["stage"] == "catchup_wait":
+                            break
                         continue
-                    if state.catchup_pending(progress):
-                        payload["stage"] = "catchup_wait"
-                        state.save(progress)
-                        break
                     payload["stage"] = "derived"
                     state.save(progress)
-                    # All body/claim work belongs to later milestones.
-                    state.complete(progress)
-                    break
+                    continue
                 unit = next(
                     (
                         u

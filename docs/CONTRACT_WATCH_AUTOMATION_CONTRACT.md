@@ -158,7 +158,7 @@ Expected provider boundary probes:
   input identity, effect flags, and required confirmation form the authority
   checked at admission. The dispatcher must not silently select another
   provider or capability when the rule's pinned identity is unavailable.
-- Fetch and verify source bytes under the existing per-message source lock
+- Fetch and verify source bytes under Source exclusion (`docs/CONTRACTS.md`)
   immediately before confirmation preparation or queue admission. Do not store
   attachment bytes in the automation tables. Definitive source loss or drift
   settles as `source_unavailable`; transient mailbox or lock failure remains

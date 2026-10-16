@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from connect_automate import connect
+from fixture_toml import toml_path_literal
 
 from eom_email_watcher import config as config_module
 from eom_email_watcher import engine_api
@@ -2834,6 +2835,8 @@ def test_mail_account_list_adopts_existing_gmail_token_without_exposing_paths(
                 "last_check": None,
                 "provider": "gmail",
                 "sent_scope": "not_polled",
+                "sent_poll_failure": None,
+            "source_lock_notice": None,
             }
         ],
         "providers": [
@@ -2909,6 +2912,8 @@ def test_mail_account_connect_installs_private_token_and_initializes_identity(
         "last_check": "<checked>",
         "provider": "gmail",
         "sent_scope": "not_polled",
+        "sent_poll_failure": None,
+            "source_lock_notice": None,
     }
     runtime = load_runtime(config_path)
     assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "private readonly token"
@@ -5747,8 +5752,8 @@ def test_settings_reports_gateway_model_as_read_only_and_rejects_mutation(
         config_path,
         extra_settings=(
             'model_backend = "gateway"\n'
-            f'model_api_token_file = "{tmp_path / "model-token"}"\n'
-            f'model_ca_file = "{tmp_path / "gateway-ca.pem"}"'
+            f'model_api_token_file = {toml_path_literal(tmp_path / "model-token")}\n'
+            f'model_ca_file = {toml_path_literal(tmp_path / "gateway-ca.pem")}'
         ),
     )
     gateway_config = (

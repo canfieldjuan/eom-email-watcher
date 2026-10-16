@@ -34,6 +34,10 @@ class MailboxMessageUnavailable(MailboxError):
     """A source message disappeared after it was discovered."""
 
 
+class MailboxMessageOutsideScope(MailboxMessageUnavailable):
+    """The source exists, but its response is outside admitted folders."""
+
+
 class MailboxMessageInvalid(MailboxError):
     """A source message cannot be processed and must not retry forever."""
 
@@ -75,6 +79,8 @@ class MailboxChanges:
     # Per id, what the change record says about its folders. An id absent here
     # came with no folder information.
     locations: Mapping[str, FolderObservation] = field(default_factory=dict)
+    # A bounded poll can leave later events unread; it cannot authorize retention.
+    drained: bool = True
 
 
 @dataclass(frozen=True)
@@ -290,6 +296,8 @@ class MailboxGateway(Protocol):
     def content(
         self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
     ) -> MessageContent: ...
+
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]: ...
 
     def attachment_bytes(
         self, message_id: str, part_id: str, attachment_id: str | None

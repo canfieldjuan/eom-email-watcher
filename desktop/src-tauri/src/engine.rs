@@ -769,6 +769,8 @@ pub struct Vendor {
     pub vendor_id: String,
     pub display_name: String,
     pub addresses: Vec<VendorAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -776,6 +778,8 @@ pub struct VendorDeleted {
     pub deleted: bool,
     pub vendor_id: String,
     pub addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -1246,9 +1250,20 @@ struct InboxDeletion {
     message_id: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-struct InboxClear {
-    deleted: u64,
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxClear {
+    pub deleted: u64,
+    #[serde(default)]
+    pub refused: u64,
+    #[serde(default)]
+    pub held_message_ids: Vec<String>,
+    #[serde(default = "completed_removal_outcome")]
+    pub outcome: String,
+    pub message: Option<String>,
+}
+
+fn completed_removal_outcome() -> String {
+    "completed".to_owned()
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1312,6 +1327,10 @@ pub struct MailAccountStatus {
     /// or `not_polled` (thread view contract, D-scope). Absent from older engines.
     #[serde(default)]
     pub sent_scope: Option<String>,
+    #[serde(default)]
+    pub sent_poll_failure: Option<String>,
+    #[serde(default)]
+    pub source_lock_notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1639,6 +1658,7 @@ struct VendorItems {
 #[derive(Deserialize)]
 struct VendorItem {
     item: Vendor,
+    notice: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1910,9 +1930,8 @@ impl Engine {
         ))
     }
 
-    pub fn clear_inbox(&self) -> Result<u64, EngineError> {
+    pub fn clear_inbox(&self) -> Result<InboxClear, EngineError> {
         self.request::<InboxClear>("inbox.clear", json!({}))
-            .map(|response| response.deleted)
     }
 
     pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
@@ -2803,7 +2822,9 @@ impl Engine {
             .mailbox_operation_gate
             .lock()
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        let item = self.request::<VendorItem>(operation, payload)?.item;
+        let result = self.request::<VendorItem>(operation, payload)?;
+        let mut item = result.item;
+        item.notice = result.notice;
         if vendor_id.is_some_and(|expected| item.vendor_id != expected) {
             return Err(EngineError::host(
                 "engine_protocol_error",
@@ -3013,6 +3034,39 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_account_sent_failure_transport_preserves_and_clears_reason() {
+        let mut input = json!({
+            "provider": "imap", "account_id": "account", "display_name": "IMAP",
+            "address": null, "active": true, "connected": true, "last_check": null,
+            "sent_scope": "available", "sent_poll_failure": "unreadable",
+            "source_lock_notice": "Source-lock upgrade pending"
+        });
+        let status: MailAccountStatus = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(status.sent_poll_failure.as_deref(), Some("unreadable"));
+        assert_eq!(
+            status.source_lock_notice.as_deref(),
+            Some("Source-lock upgrade pending")
+        );
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized["sent_poll_failure"], "unreadable");
+        assert_eq!(
+            serialized["source_lock_notice"],
+            "Source-lock upgrade pending"
+        );
+        input["sent_poll_failure"] = serde_json::Value::Null;
+        input["source_lock_notice"] = serde_json::Value::Null;
+        let recovered: MailAccountStatus = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(recovered.sent_poll_failure, None);
+        assert_eq!(recovered.source_lock_notice, None);
+        input.as_object_mut().unwrap().remove("sent_poll_failure");
+        input.as_object_mut().unwrap().remove("source_lock_notice");
+        let legacy: MailAccountStatus = serde_json::from_value(input).unwrap();
+        assert_eq!(legacy.sent_poll_failure, None);
+        assert_eq!(legacy.source_lock_notice, None);
+    }
+
     use std::fs;
     #[cfg(windows)]
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -3624,6 +3678,63 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
         let cleared: InboxClear =
             serde_json::from_value(json!({"deleted": 3})).expect("deserialize inbox clear result");
         assert_eq!(cleared.deleted, 3);
+        assert_eq!(cleared.outcome, "completed");
+        let partial: InboxClear = serde_json::from_value(json!({
+            "deleted": 1,
+            "refused": 1,
+            "held_message_ids": ["held"],
+            "outcome": "partial",
+            "message": "Can't delete this yet, the local upgrade is still finishing; try again later"
+        }))
+        .expect("deserialize held clear");
+        let webview = serde_json::to_value(partial).expect("serialize clear for webview");
+        assert_eq!(webview["outcome"], "partial");
+        assert_eq!(webview["refused"], 1);
+        assert_eq!(webview["held_message_ids"], json!(["held"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vendor_removal_notice_reaches_webview() {
+        let notice = "Saved. Removing this thread's stored email text is waiting for the local upgrade to finish; it will finish automatically.";
+        for operation in ["vendors.addresses.remove", "vendors.delete"] {
+            for held in [false, true] {
+                let mut data = if operation == "vendors.delete" {
+                    json!({"deleted": true, "vendor_id": "vendor", "addresses": []})
+                } else {
+                    json!({"item": {"vendor_id": "vendor", "display_name": "Vendor", "addresses": []}})
+                };
+                if held {
+                    data["notice"] = json!(notice);
+                }
+                let response =
+                    json!({"protocol": 1, "ok": true, "operation": operation, "data": data});
+                let engine = Engine::with_command(
+                    "python3",
+                    vec![
+                        OsString::from("-c"),
+                        OsString::from("import sys; sys.stdin.read(); print(sys.argv[1])"),
+                        OsString::from(response.to_string()),
+                    ],
+                    PathBuf::from("unused.toml"),
+                );
+                let webview = if operation == "vendors.delete" {
+                    serde_json::to_value(engine.delete_vendor("vendor".into(), false).unwrap())
+                } else {
+                    serde_json::to_value(
+                        engine
+                            .remove_vendor_address("vendor".into(), "a@example.com".into(), false)
+                            .unwrap(),
+                    )
+                }
+                .unwrap();
+                if held {
+                    assert_eq!(webview["notice"], notice);
+                } else {
+                    assert!(webview.get("notice").is_none());
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -5581,7 +5692,8 @@ timezone = "UTC"
         assert_eq!(
             engine
                 .clear_inbox()
-                .expect("released host lock is reusable"),
+                .expect("released host lock is reusable")
+                .deleted,
             0
         );
         assert_eq!(
@@ -5696,7 +5808,7 @@ timezone = "UTC"
                 .items,
             vec![]
         );
-        assert_eq!(engine.clear_inbox().expect("clear empty inbox"), 0);
+        assert_eq!(engine.clear_inbox().expect("clear empty inbox").deleted, 0);
         assert_eq!(
             engine
                 .delete_inbox_item("missing-message".into())

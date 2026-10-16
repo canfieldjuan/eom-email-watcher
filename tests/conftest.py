@@ -101,3 +101,17 @@ def paired_deployment(tmp_path, monkeypatch):
         return binary, records, calls, directory
 
     return build
+
+
+@pytest.fixture
+def tmp_path(tmp_path, request):
+    """Route every native qualification module through the same evidence owner."""
+    if request.module.__name__ not in {
+        "test_windows_context_probe",
+        "test_windows_cutover",
+        "test_windows_cutover_round9",
+    }:
+        return tmp_path
+    from prove_windows_cutover import probe_output
+
+    return probe_output(request.node.name, tmp_path)
