@@ -3669,6 +3669,77 @@ def test_pending_certificate_replay_and_join_preserve_only_existing_evidence(
     assert store.list_certificate_expiry_ledger(today="2026-09-20") == []
 
 
+@pytest.mark.parametrize("accept_at", ["submit", "terminal"])
+def test_v1_late_summary_is_not_adopted_after_real_acceptance(tmp_path, monkeypatch, accept_at):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from connect_automate import connect
+    from test_connect_engine_api import provider, summary, update
+    from test_connect_v2_engine_api import PDF, seeded_runtime
+
+    from eom_email_watcher import engine_api, source_locks
+
+    _, runtime = seeded_runtime(tmp_path)
+    store = runtime.store
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    monkeypatch.setattr(connect, "require_connect_entitlement", lambda: None)
+    monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        connect, "discover_summary_capability",
+        lambda **kwargs: connect.CapabilityDiscovery(provider()),
+    )
+    monkeypatch.setattr(engine_api, "_verified_mailbox_attachment_bytes", lambda *a, **k: PDF)
+    with store.connection() as db:
+        db.execute("UPDATE messages SET received_at=?", (NOW.isoformat(),))
+    receipts = []
+
+    def accept():
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            accepted = pool.submit(engine_api._response, {
+                "protocol": 1, "operation": "inbox.delete",
+                "payload": {"message_id": "message-1"},
+            }).result(timeout=10)
+        assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+        receipts.append(accepted["data"])
+
+    class LateClient:
+        def __init__(self, selected):
+            assert selected == provider()
+
+        def submit(self, job, content):
+            assert content == PDF
+            if accept_at == "submit":
+                accept()
+                return update(job, "completed", result=summary(job))
+            return update(job, "accepted")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            assert initial.status == "accepted"
+            accept()
+            terminal = update(job, "completed", result=summary(job))
+            on_update(terminal)
+            return terminal
+
+    monkeypatch.setattr(connect, "ConnectClient", LateClient)
+    reply = engine_api._response({
+        "protocol": 1, "operation": "connect.attachment.summarize",
+        "payload": {"message_id": "message-1", "part_id": "2"},
+    })
+    assert len(receipts) == 1
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
+        assert not db.execute(
+            "SELECT 1 FROM connect_attachment_jobs WHERE summary_text IS NOT NULL "
+            "OR warnings_json IS NOT NULL OR result_json IS NOT NULL"
+        ).fetchone(), "Late v1 summary was adopted after accepted removal"
+    assert not reply["ok"], reply
+    # Main's late-adoption owner already reports this bounded failure after
+    # immediate deletion. Pre-start refusal has a different existing code.
+    assert reply["error"]["code"] == "runtime_error", reply
+    assert reply["error"]["message"] == "Connect job disappeared before its status could persist"
+
+
 
 def test_vendor_writer_uses_owning_operation_segment_before_its_write(tmp_path, monkeypatch):
     from contextlib import contextmanager
