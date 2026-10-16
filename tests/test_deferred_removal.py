@@ -3592,3 +3592,78 @@ def test_unfollow_during_inflight_body_fetch_uses_current_adoption_eligibility(
         assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
         assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
         assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == int(refollow)
+
+
+@pytest.mark.parametrize(
+    "owner,projection_missing", [("join", False), ("join", True), ("replay", False)],
+)
+@pytest.mark.parametrize("paused", [False, True])
+@pytest.mark.parametrize("physical_missing", [False, True])
+def test_pending_certificate_replay_and_join_preserve_only_existing_evidence(
+    tmp_path, monkeypatch, owner, projection_missing, paused, physical_missing
+):
+    from test_certificate_expiry_ledger import (
+        INSTANCE_A,
+        _certificate_job,
+        _certificate_pending_fires,
+        _record,
+        _result,
+    )
+    from test_connect_v2_engine_api import seeded_runtime
+
+    from eom_email_watcher import engine_api
+
+    _, runtime = seeded_runtime(tmp_path)
+    store = runtime.store
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    fires = _certificate_pending_fires(store, count=2)
+    job_id = store.automation_fire_attempts(fires[0].fire_id)[0].dispatch_request_id
+    _certificate_job(store, job_id)
+    store.transition_automation_fire(
+        fire_id=fires[0].fire_id, expected_state=fires[0].state,
+        expected_version=fires[0].state_version, next_state="submitted",
+        reason="connect_admitted", job_id=job_id,
+    )
+    result = _result(_record())
+    store.transition_connect_job(
+        job_id=job_id, expected_state="requested", next_state="completed",
+        provider_app_id="invoice-processor", provider_instance_id=INSTANCE_A, result=result,
+    )
+    joined = store.transition_automation_fire(
+        fire_id=fires[1].fire_id, expected_state=fires[1].state,
+        expected_version=fires[1].state_version, next_state="submitted",
+        reason="connect_admitted", job_id=job_id,
+    )
+    if paused:
+        store.transition_automation_fire(
+            fire_id=joined.fire_id, expected_state=joined.state,
+            expected_version=joined.state_version, next_state="entitlement_paused",
+            reason="entitlement_inactive", job_id=job_id,
+        )
+    retain_legacy_aliases(store, "message-1")
+    accepted = engine_api._response({
+        "protocol": 1, "operation": "inbox.delete", "payload": {"message_id": "message-1"},
+    })
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    with store.connection() as db:
+        if projection_missing:
+            db.execute("DELETE FROM certificate_records WHERE connect_job_id=?", (job_id,))
+        if physical_missing:
+            db.execute("DELETE FROM messages")
+        parents = [tuple(r) for r in db.execute("SELECT * FROM certificate_records")]
+        policies = [tuple(r) for r in db.execute("SELECT * FROM certificate_policy_rows")]
+        assert bool(parents) is not projection_missing
+    if owner == "join":
+        store.reconcile_certificate_completed_join(job_id=job_id)
+    else:
+        store.reconcile_certificate_completed_replay(
+            job_id=job_id, provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A, result=result,
+        )
+    with store.connection() as db:
+        assert [tuple(r) for r in db.execute("SELECT * FROM certificate_records")] == parents
+        assert [tuple(r) for r in db.execute("SELECT * FROM certificate_policy_rows")] == policies
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == (
+            0 if physical_missing else 33
+        )
+    assert store.list_certificate_expiry_ledger(today="2026-09-20") == []
