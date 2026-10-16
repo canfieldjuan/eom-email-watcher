@@ -5942,6 +5942,18 @@ class Store:
         self.path = path
 
     @contextmanager
+    def derived_connection(self, operation=None):
+        """The derived writer's explicit segment opens before its transaction."""
+        if operation is None:
+            with self.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                yield db
+            return
+        removal.require_operation_owner(operation, self.path)
+        with operation.acceptance() as acceptance, acceptance.transaction(self) as db:
+            yield db
+
+    @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         with database_admission():
             connection = sqlite3.connect(self.path, factory=_DerivedConnection)
@@ -6806,12 +6818,12 @@ class Store:
         display_name: str,
         address: str | None = None,
         active: bool = False,
+        operation=None,
     ) -> MailAccount:
         if not provider or not account_id or not display_name:
             raise ValueError("Mail account identity and display name must be non-empty")
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             if active:
                 db.execute(
                     "UPDATE mail_accounts SET active = 0, updated_at = ? WHERE active = 1",
@@ -6835,9 +6847,10 @@ class Store:
         *,
         display_name: str,
         address: str,
+        operation=None,
     ) -> MailAccount:
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
+        with self.derived_connection(operation) as db:
             cursor = db.execute(
                 """UPDATE mail_accounts
                 SET display_name = ?, address = ?, updated_at = ?
@@ -6858,13 +6871,13 @@ class Store:
         *,
         legacy_status: str | None = None,
         preserve_cursor: bool = False,
+        operation=None,
     ) -> MailAccount:
         _require_mailbox_identity_key(mailbox_identity_key)
         if legacy_status not in {None, "continuity_proven", "replacement", "unresolved"}:
             raise ValueError("legacy mailbox identity status is invalid")
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             row = db.execute(
                 """SELECT mailbox_identity_key, legacy_identity_status,
                     legacy_identity_key FROM mail_accounts
@@ -7875,6 +7888,7 @@ class Store:
         admission: AdmissionProvenance | None = None,
         metadata_label_ids: frozenset[str] | None = None,
         now: datetime | None = None,
+        operation=None,
     ) -> bool:
         """Advance one terminal candidate, atomically inserting an admitted message."""
         _require_mailbox_identity_key(mailbox_identity_key)
@@ -7896,8 +7910,7 @@ class Store:
             # was admitted from; _record_locations refuses any other folder.
             raise ValueError("admitted recovery metadata must name an admitted folder")
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _row, state = self._require_current_gmail_recovery(
                 db,
                 account_id=account_id,
@@ -8012,10 +8025,10 @@ class Store:
         mailbox_identity_key: str,
         *,
         now: datetime | None = None,
+        operation=None,
     ) -> str:
         _require_mailbox_identity_key(mailbox_identity_key)
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _row, state = self._require_current_gmail_recovery(
                 db,
                 account_id=account_id,
@@ -8977,10 +8990,11 @@ class Store:
             raise RuntimeError("Automation fire disappeared after retry")
         return _automation_fire(updated)
 
-    def activate_mail_account(self, provider: str, account_id: str) -> MailAccount:
+    def activate_mail_account(
+        self, provider: str, account_id: str, *, operation=None,
+    ) -> MailAccount:
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             if (
                 db.execute(
                     "SELECT 1 FROM mail_accounts WHERE provider = ? AND account_id = ?",
@@ -9434,9 +9448,9 @@ class Store:
         locations,
         observed_at,
         scope_complete,
+        operation=None,
     ):
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             row = db.execute(
                 _stored_source_membership_sql() + " LIMIT 1",
                 (provider, account_id, mailbox_identity_key, metadata.message_id),
@@ -9488,9 +9502,12 @@ class Store:
         mailbox_identity_key: str,
         *,
         now: datetime | None = None,
+        operation=None,
     ) -> None:
         """Record an account's polling gap through the source-observation owner."""
-        reconcile_state.ReconcileState(self, (provider, account_id, mailbox_identity_key)).gap(
+        reconcile_state.ReconcileState(
+            self, (provider, account_id, mailbox_identity_key), operation=operation,
+        ).gap(
             now=now
         )
 
@@ -9846,10 +9863,10 @@ class Store:
         scope_complete: bool = True,
         capture_timezone: str | None = None,
         observed_at: datetime | None = None,
+        operation=None,
     ) -> bool:
         stamp = (observed_at or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             return self._insert_message_in_transaction(
                 db,
                 message_id=message_id,
@@ -10022,6 +10039,7 @@ class Store:
         scope_complete: bool = True,
         headers_observed: bool,
         now: datetime | None = None,
+        operation=None,
     ) -> int:
         """Record an observation of a stored source identity's folders; new rows.
 
@@ -10031,8 +10049,7 @@ class Store:
         Only accepted header observations may fill missing recipients.
         """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             # A source identity is known through its row or a recorded location, the
             # same two places has_seen_message reads (contract D-identity).
             row = db.execute(
@@ -10139,10 +10156,12 @@ class Store:
             name = next(row["display_name"] for row in rows if row["vendor_id"] == winner[2])
             return (key, str(name))
 
-    def create_vendor(self, display_name: str, *, now: datetime | None = None) -> str:
+    def create_vendor(
+        self, display_name: str, *, now: datetime | None = None, operation=None,
+    ) -> str:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         vendor_id = str(uuid.uuid4())
-        with self.connection() as db:
+        with self.derived_connection(operation) as db:
             db.execute(
                 """INSERT INTO vendors(vendor_id, display_name, created_at, updated_at)
                 VALUES (?, ?, ?, ?)""",
@@ -10151,10 +10170,11 @@ class Store:
         return vendor_id
 
     def rename_vendor(
-        self, vendor_id: str, display_name: str, *, now: datetime | None = None
+        self, vendor_id: str, display_name: str, *, now: datetime | None = None,
+        operation=None,
     ) -> None:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
+        with self.derived_connection(operation) as db:
             updated = db.execute(
                 "UPDATE vendors SET display_name = ?, updated_at = ? WHERE vendor_id = ?",
                 (display_name, stamp, vendor_id),
@@ -10163,12 +10183,12 @@ class Store:
             raise KeyError(vendor_id)
 
     def add_vendor_address(
-        self, vendor_id: str, address: str, *, now: datetime | None = None
+        self, vendor_id: str, address: str, *, now: datetime | None = None,
+        operation=None,
     ) -> bool:
         """Link an address; False if this vendor already has it."""
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _require_vendor(db, vendor_id)
             owner = db.execute(
                 """SELECT a.vendor_id, v.display_name FROM vendor_addresses AS a
@@ -10186,12 +10206,12 @@ class Store:
         return True
 
     def remove_vendor_address(
-        self, vendor_id: str, address: str, *, now: datetime | None = None
+        self, vendor_id: str, address: str, *, now: datetime | None = None,
+        operation=None,
     ) -> VendorRemoval:
         """Unlink an address and report the committed change and any held body cleanup."""
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _require_vendor(db, vendor_id)
             removed = db.execute(
                 "DELETE FROM vendor_addresses WHERE vendor_id = ? AND address = ?",
@@ -10206,10 +10226,9 @@ class Store:
             )
         return VendorRemoval(True, held_message_ids=db._held_body_cleanup)
 
-    def delete_vendor(self, vendor_id: str) -> VendorRemoval:
+    def delete_vendor(self, vendor_id: str, *, operation=None) -> VendorRemoval:
         """Delete a vendor and report its addresses and any held body cleanup."""
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             addresses = [
                 str(row["address"])
                 for row in db.execute(

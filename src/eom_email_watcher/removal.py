@@ -562,6 +562,12 @@ class _RuntimeTransaction:
             raise RuntimeError("Runtime acceptance belongs to another database")
 
 
+def require_operation_owner(operation, path):
+    if type(operation) is not _OperationOwner:
+        raise RuntimeError("A live runtime operation owner is required")
+    operation.require(path)
+
+
 def require_runtime_acceptance(capability, path):
     if type(capability) is not _RuntimeAcceptance:
         raise RuntimeError("A live runtime acceptance capability is required")
@@ -569,7 +575,9 @@ def require_runtime_acceptance(capability, path):
 
 
 @contextmanager
-def operation_scope(database_path):
+def operation_scope(
+    database_path, *, busy_message="Another watcher operation is already running",
+):
     """One native operation acquisition; acceptance segments are explicit."""
     from . import source_locks
 
@@ -578,7 +586,7 @@ def operation_scope(database_path):
     database_path = Path(database_path).absolute()
     with connect_operation_lock(
         source_locks.operation_lock_path(database_path),
-        "Another watcher operation is already running",
+        busy_message,
     ):
         owner = object.__new__(_OperationOwner)
         owner._identity = owner

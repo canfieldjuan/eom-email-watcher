@@ -869,3 +869,40 @@ def test_imap_closed_socket_restore_preserves_the_provider_failure():
     finally:
         left.close()
         right.close()
+
+def test_real_reconcile_carries_operation_to_each_derived_writer(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from eom_email_watcher import removal
+
+    gateway = Pages()
+    watcher, state = runner(tmp_path, monkeypatch, gateway)
+    store = watcher.store
+    wrapper = store.derived_connection
+    seen = []
+
+    @contextmanager
+    def require_owner(owner=None):
+        assert owner is watcher.operation
+        removal.require_operation_owner(owner, store.path)
+        with wrapper(owner) as db:
+            db._removal_transaction.require(db)
+            seen.append(owner)
+            yield db
+
+    monkeypatch.setattr(store, "derived_connection", require_owner)
+    with removal.operation_scope(store.path) as owner:
+        watcher.operation = owner
+        for index in range(8):
+            reconcile.run(
+                watcher, KEY, "unavailable", label_selectors=(),
+                now=NOW + timedelta(hours=index),
+            )
+            if not state.stale():
+                break
+        assert seen and all(item is owner for item in seen)
+    assert gateway.fetches
+    assert not state.stale()
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] > 0
+        assert db.execute("SELECT COUNT(*) FROM message_bodies").fetchone()[0] > 0

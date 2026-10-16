@@ -1365,6 +1365,7 @@ def reconcile_mailbox_session_identity(
     mailbox: MailboxSession,
     *,
     dry_run: bool,
+    operation=None,
 ) -> str:
     """Verify or atomically reconcile the identity of an open mailbox session."""
     account = store.mail_account(mailbox.provider, mailbox.account_id)
@@ -1404,6 +1405,7 @@ def reconcile_mailbox_session_identity(
         mailbox_identity_key,
         legacy_status=legacy_status,
         preserve_cursor=preserve_cursor,
+        operation=operation,
     )
     return mailbox_identity_key
 
@@ -1426,7 +1428,9 @@ class Watcher:
         store: Store,
         mailbox: MailboxGateway | MailboxSession,
         model: ModelRuntime,
+        *, operation=None,
     ):
+        self.operation = operation
         self.config = config
         self.store = store
         self.mailbox = (
@@ -1483,6 +1487,7 @@ class Watcher:
                 mailbox_identity_key,
                 legacy_status="replacement",
                 preserve_cursor=self.mailbox.provider == IMAP_PROVIDER,
+                operation=self.operation,
             )
             cursor = self.gateway.initial_cursor()
             self.store.set_state(
@@ -1704,6 +1709,7 @@ class Watcher:
                 self.store,
                 self.mailbox,
                 dry_run=dry_run,
+                operation=self.operation,
             )
             recovery_state = (
                 self.store.gmail_recovery_state(self.mailbox.account_id)
@@ -2093,6 +2099,7 @@ class Watcher:
                         self.mailbox.account_id,
                         mailbox_identity_key,
                         now=checked_at,
+                        operation=self.operation,
                     )
                     return added, True
                 continue
@@ -2115,12 +2122,14 @@ class Watcher:
                     locations=frozenset(),
                     scope_complete=False,
                     headers_observed=False,
+                    operation=self.operation,
                 )
                 self.store.finish_gmail_recovery_candidate(
                     self.mailbox.account_id,
                     mailbox_identity_key,
                     provider_message_id,
                     now=checked_at,
+                    operation=self.operation,
                 )
                 terminal += 1
                 continue
@@ -2139,6 +2148,7 @@ class Watcher:
                     mailbox_identity_key,
                     provider_message_id,
                     now=checked_at,
+                    operation=self.operation,
                 )
                 terminal += 1
                 continue
@@ -2178,6 +2188,7 @@ class Watcher:
                     mailbox_identity_key,
                     provider_message_id,
                     now=checked_at,
+                    operation=self.operation,
                 )
             else:
                 inserted = self.store.finish_gmail_recovery_candidate(
@@ -2209,6 +2220,7 @@ class Watcher:
                     admission=admission.provenance(),
                     metadata_label_ids=metadata.labels,
                     now=metadata_observed_at,
+                    operation=self.operation,
                 )
                 added += int(inserted)
             terminal += 1
@@ -2399,7 +2411,8 @@ class Watcher:
                 # A gap in polling: folder changes may have gone unobserved, so every
                 # observation of the account is incomplete until discovery looks.
                 self.store.clear_location_stamps(
-                    self.mailbox.provider, self.mailbox.account_id, mailbox_identity_key
+                    self.mailbox.provider, self.mailbox.account_id, mailbox_identity_key,
+                    operation=self.operation,
                 )
             if self.mailbox.provider == "gmail" and dry_run:
                 replacement_cursor = self.gateway.initial_cursor()
@@ -2695,6 +2708,7 @@ class Watcher:
                 locations=locations,
                 observed_at=metadata_observed_at,
                 scope_complete=_scope_complete(folders),
+                operation=self.operation,
             )
             return 0
         admission = match_mailbox_admission(
@@ -2763,6 +2777,7 @@ class Watcher:
             capture_timezone=self.config.timezone,
             observed_at=metadata_observed_at,
             scope_complete=_scope_complete(folders),
+            operation=self.operation,
         ):
             added += 1
         return added
@@ -2829,6 +2844,7 @@ class Watcher:
             scope_complete=_scope_complete(folders) and observed.complete,
             headers_observed=False,
             now=observed_at,
+            operation=self.operation,
         )
 
     def _poll_sent_folder(
@@ -2876,7 +2892,9 @@ class Watcher:
                 # Like the Inbox: recover the interval since the last success first.
                 logger.warning("Sent folder cursor expired (%s); recovering the gap", exc)
                 if not dry_run:
-                    self.store.clear_location_stamps(provider, account_id, mailbox_identity_key)
+                    self.store.clear_location_stamps(
+                        provider, account_id, mailbox_identity_key, operation=self.operation,
+                    )
                 changes = self.gateway.sent_recover_since(
                     _recovery_since(state[1], retention_cutoff)
                 )
@@ -3260,6 +3278,7 @@ def run_watcher_check(
     *,
     dry_run: bool = False,
     deliver_notifications: bool = True,
+    operation=None,
 ) -> dict[str, int | bool | str]:
     if not dry_run:
         from . import removal
@@ -3289,7 +3308,7 @@ def run_watcher_check(
             result = Watcher.inactive_result(config, store, dry_run=True)
         else:
             mailbox = load_configured_mailbox(config, store)
-            result = Watcher(config, store, mailbox, model).check(
+            result = Watcher(config, store, mailbox, model, operation=operation).check(
                 dry_run=True,
                 deliver_notifications=deliver_notifications,
                 _gated_allowed=gated_allowed,
@@ -3305,7 +3324,7 @@ def run_watcher_check(
     before_proposals = process_scheduling_proposals(config, store)
     if watch_configured:
         mailbox = load_configured_mailbox(config, store)
-        result = Watcher(config, store, mailbox, model).check(
+        result = Watcher(config, store, mailbox, model, operation=operation).check(
             dry_run=False,
             deliver_notifications=deliver_notifications,
             _gated_allowed=gated_allowed,

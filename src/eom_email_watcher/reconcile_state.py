@@ -121,13 +121,13 @@ def flush_coverage_inputs(db) -> None:
 
 
 class ReconcileState:
-    def __init__(self, store, scope: Scope):
+    def __init__(self, store, scope: Scope, *, operation=None):
+        self.operation = operation
         self.store = store
         self.scope = scope
 
     def observe(self, *, active: bool, retention_days: int, sent_folder: str | None, now=None):
-        with self.store.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.store.derived_connection(self.operation) as db:
             db.execute(
                 f"INSERT OR IGNORE INTO coverage_generation({KEY},generation) VALUES (?,?,?,0)",
                 self.scope,
@@ -165,8 +165,7 @@ class ReconcileState:
             _bump_coverage_generation(db, self.scope, clear_watermarks=True)
             self.store._clear_location_stamps(db, *self.scope, now=now)
             return
-        with self.store.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.store.derived_connection(self.operation) as db:
             self.gap(now=now, db=db)
 
     def generation(self):

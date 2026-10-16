@@ -3667,3 +3667,187 @@ def test_pending_certificate_replay_and_join_preserve_only_existing_evidence(
             0 if physical_missing else 33
         )
     assert store.list_certificate_expiry_ledger(today="2026-09-20") == []
+
+
+
+def test_vendor_writer_uses_owning_operation_segment_before_its_write(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from eom_email_watcher import removal, source_locks
+
+    store, _, vendor = followed(tmp_path)
+    events = []
+    native_guard = source_locks.protocol_guard
+    connection = store.connection
+
+    @contextmanager
+    def observed_guard(*args, **kwargs):
+        with native_guard(*args, **kwargs):
+            events.append("guard")
+            try:
+                yield
+            finally:
+                events.append("release")
+
+    @contextmanager
+    def observed_connection():
+        with connection() as db:
+            writes = []
+
+            def trace(sql):
+                if sql.startswith("UPDATE vendors SET"):
+                    if not writes:
+                        events.append("write")
+                    writes.append(sql)
+
+            db.set_trace_callback(trace)
+            yield db
+            if writes:
+                db._removal_transaction.require(db)
+                assert events == ["guard", "write"], events
+
+    monkeypatch.setattr(source_locks, "protocol_guard", observed_guard)
+    monkeypatch.setattr(store, "connection", observed_connection)
+    with removal.operation_scope(store.path) as operation:
+        store.rename_vendor(vendor, "Renamed Vendor", operation=operation)
+        operation.require(store.path)
+        assert events == ["guard", "write", "release"]
+        with store._source_cleanup_locks(("m",)) as acquired:
+            assert acquired
+    assert store.vendor(vendor)["display_name"] == "Renamed Vendor"
+
+
+
+@pytest.mark.parametrize("invalid", ["forged", "copied", "stale", "wrong_path"])
+def test_derived_writer_refuses_invalid_operation_without_mutation(tmp_path, invalid):
+    import copy
+
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal
+
+    store, _, vendor = followed(tmp_path)
+    before = snapshot(store)
+    path = tmp_path / "other.db" if invalid == "wrong_path" else store.path
+    with removal.operation_scope(path) as live:
+        owner = live
+        if invalid == "forged":
+            owner = object()
+        elif invalid == "copied":
+            owner = copy.copy(live)
+        if invalid != "stale":
+            with pytest.raises(RuntimeError, match="runtime operation owner"):
+                store.rename_vendor(vendor, "Forbidden rename", operation=owner)
+    if invalid == "stale":
+        with pytest.raises(RuntimeError, match="runtime operation owner"):
+            store.rename_vendor(vendor, "Forbidden rename", operation=owner)
+    assert snapshot(store) == before
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_derived_writer_refuses_source_held_segment_and_allows_after_exit(
+    tmp_path, qualified
+):
+    from connect_automate.locking import OperationLockBusy
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal
+
+    store, _, vendor = followed(tmp_path)
+    if not qualified:
+        with store.connection() as db:
+            db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+    before = snapshot(store)
+    with removal.operation_scope(store.path) as owner:
+        with store._source_cleanup_locks(("m",)) as acquired:
+            assert acquired
+            with pytest.raises(OperationLockBusy):
+                store.rename_vendor(vendor, "Forbidden rename", operation=owner)
+            assert snapshot(store) == before
+        store.rename_vendor(vendor, "Allowed rename", operation=owner)
+    assert store.vendor(vendor)["display_name"] == "Allowed rename"
+
+
+@pytest.mark.parametrize("operation", [
+    "vendors.create", "vendors.rename", "vendors.addresses.add",
+    "vendors.addresses.remove", "vendors.delete", "mail.accounts.activate",
+])
+def test_public_derived_entries_never_call_ownerless_writer(tmp_path, monkeypatch, operation):
+    from contextlib import contextmanager
+
+    from connect_automate import connect
+    from test_connect_v2_engine_api import seeded_runtime
+
+    from eom_email_watcher import engine_api, removal
+
+    config_path, runtime = seeded_runtime(tmp_path)
+    store = runtime.store
+    vendor = store.create_vendor("Original Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    monkeypatch.setattr(connect, "require_connect_entitlement", lambda: None)
+    wrapper = store.derived_connection
+    observed = []
+
+    @contextmanager
+    def require_owner(owner=None):
+        removal.require_operation_owner(owner, store.path)
+        with wrapper(owner) as db:
+            db._removal_transaction.require(db)
+            observed.append(owner)
+            yield db
+
+    monkeypatch.setattr(store, "derived_connection", require_owner)
+    payload = {
+        "vendors.create": {"display_name": "New Vendor"},
+        "vendors.rename": {"vendor_id": vendor, "display_name": "Renamed Vendor"},
+        "vendors.addresses.add": {"vendor_id": vendor, "address": "other@example.com"},
+        "vendors.addresses.remove": {"vendor_id": vendor, "address": "vendor@example.com"},
+        "vendors.delete": {"vendor_id": vendor},
+        "mail.accounts.activate": {"provider": "gmail", "account_id": "gmail-default"},
+    }[operation]
+    result = engine_api._response({
+        "protocol": 1, "operation": operation, "payload": payload,
+        "config_path": str(config_path),
+    })
+    assert result["ok"], result
+    assert len(observed) == 1
+    with pytest.raises(RuntimeError, match="runtime operation owner"):
+        observed[0].require(store.path)
+
+
+
+
+
+def test_recovery_completion_uses_same_derived_write_owner(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from test_db import _gmail_selector_store
+
+    from eom_email_watcher import removal
+
+    store, identity = _gmail_selector_store(tmp_path)
+    store.create_gmail_recovery_state(
+        "gmail-default", identity, 0, [], [], 1, 2, "replacement-history",
+    )
+    store.store_gmail_recovery_page("gmail-default", identity, [], None)
+    assert store.finish_gmail_recovery_page("gmail-default", identity)
+    wrapper = store.derived_connection
+    observed = []
+
+    @contextmanager
+    def require_owner(owner=None):
+        removal.require_operation_owner(owner, store.path)
+        with wrapper(owner) as db:
+            db._removal_transaction.require(db)
+            observed.append(owner)
+            yield db
+
+    monkeypatch.setattr(store, "derived_connection", require_owner)
+    with removal.operation_scope(store.path) as owner:
+        assert store.complete_gmail_recovery(
+            "gmail-default", identity, operation=owner,
+        ) == "replacement-history"
+        assert observed == [owner]
+    assert store.gmail_recovery_state("gmail-default") is None
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == "replacement-history"

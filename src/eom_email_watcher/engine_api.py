@@ -381,6 +381,12 @@ def _runtime(request: dict[str, object]) -> Runtime:
     return load_runtime(_config_path(request))
 
 
+def _runtime_with_operation(request, owner):
+    runtime = _runtime(request)
+    removal.require_operation_owner(owner, runtime.store.path)
+    return Runtime(runtime.config, runtime.store, runtime.model, operation=owner)
+
+
 def _host_notification_intents(runtime: Runtime, limit: int) -> list[NotificationIntent]:
     if not runtime.config.notifications_enabled:
         return []
@@ -540,6 +546,7 @@ def _authorize_gmail_account(
                         legacy.account_id,
                         display_name=MAIL_PROVIDER_NAMES[legacy.provider],
                         address=legacy_profile.email_address,
+                        operation=runtime.operation,
                     )
     token_file = mail_account_token_file(runtime.config, account) if account else None
     if (
@@ -574,6 +581,7 @@ def _authorize_gmail_account(
                     account.account_id,
                     display_name=MAIL_PROVIDER_NAMES[account.provider],
                     address=current_profile.email_address,
+                    operation=runtime.operation,
                 )
             if reuse_valid_token and current_profile.email_address == account.address:
                 return _finish_gmail_authorization(
@@ -622,6 +630,7 @@ def _authorize_gmail_account(
                         display_name=MAIL_PROVIDER_NAMES[DEFAULT_MAIL_PROVIDER],
                         address=profile.email_address,
                         active=False,
+                        operation=runtime.operation,
                     )
             active = runtime.store.active_mail_account()
             activate_after_connect = (
@@ -643,9 +652,12 @@ def _authorize_gmail_account(
         account.account_id,
         display_name=MAIL_PROVIDER_NAMES[account.provider],
         address=profile.email_address,
+        operation=runtime.operation,
     )
     if activate_after_connect and not account.active:
-        account = runtime.store.activate_mail_account(account.provider, account.account_id)
+        account = runtime.store.activate_mail_account(
+            account.provider, account.account_id, operation=runtime.operation,
+        )
     return _finish_gmail_authorization(
         runtime,
         account,
@@ -671,6 +683,7 @@ def _finish_gmail_authorization(
             mailbox_identity_key,
             legacy_status="replacement" if is_replacement else None,
             preserve_cursor=not is_replacement,
+            operation=runtime.operation,
         )
     return _finish_mail_authorization(runtime, account, cursor)
 
@@ -792,6 +805,7 @@ def _authorize_microsoft_account(
                 display_name=MAIL_PROVIDER_NAMES[MICROSOFT365_PROVIDER],
                 address=profile.email_address,
                 active=False,
+                operation=runtime.operation,
             )
         token_file = mail_account_token_file(runtime.config, account)
         _install_private_token(staged_token, token_file)
@@ -807,9 +821,12 @@ def _authorize_microsoft_account(
         account.account_id,
         display_name=MAIL_PROVIDER_NAMES[account.provider],
         address=profile.email_address,
+        operation=runtime.operation,
     )
     if activate_after_connect and not account.active:
-        account = runtime.store.activate_mail_account(account.provider, account.account_id)
+        account = runtime.store.activate_mail_account(
+            account.provider, account.account_id, operation=runtime.operation,
+        )
     if initialize_baseline:
         assert baseline is not None
         return _finish_mail_authorization(runtime, account, baseline)
@@ -914,6 +931,7 @@ def _connect_imap_account(
                 display_name=MAIL_PROVIDER_NAMES[IMAP_PROVIDER],
                 address=credentials.email_address,
                 active=False,
+                operation=runtime.operation,
             )
         destination = mail_account_token_file(runtime.config, account)
         _install_private_token(staged_credentials, destination)
@@ -923,9 +941,12 @@ def _connect_imap_account(
         account.account_id,
         display_name=MAIL_PROVIDER_NAMES[account.provider],
         address=credentials.email_address,
+        operation=runtime.operation,
     )
     if activate_after_connect and not account.active:
-        account = runtime.store.activate_mail_account(account.provider, account.account_id)
+        account = runtime.store.activate_mail_account(
+            account.provider, account.account_id, operation=runtime.operation,
+        )
     if mailbox_changed:
         assert baseline is not None
         runtime.store.set_state(
@@ -957,8 +978,10 @@ def _with_mail_account_mutation(
             "unsupported_platform",
             "Email account changes require native operation locking",
         )
-    with operation_lock(lock_path, "Another mailbox operation is already running"):
-        return operation(_runtime(request))
+    with removal.operation_scope(
+        runtime.config.database_file, busy_message="Another mailbox operation is already running",
+    ) as owner:
+        return operation(_runtime_with_operation(request, owner))
 
 
 def _gmail_label_account_key(payload: dict[str, object]) -> tuple[str, str]:
@@ -1045,8 +1068,10 @@ def _gmail_label_operation(
             "Gmail label settings require native operation locking",
         )
     try:
-        with operation_lock(lock_path, "Another mailbox operation is already running"):
-            return operation(_runtime(request))
+        with removal.operation_scope(
+            config.database_file, busy_message="Another mailbox operation is already running",
+        ) as owner:
+            return operation(_runtime_with_operation(request, owner))
     except OperationLockBusy as exc:
         raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
 
@@ -1068,6 +1093,7 @@ def _gmail_label_session(
                 runtime.store,
                 mailbox,
                 dry_run=False,
+                operation=runtime.operation,
             )
     except MailboxIdentityChanged as exc:
         raise ApiError("mailbox_identity_changed", "The Gmail mailbox identity changed") from exc
@@ -2168,7 +2194,9 @@ def _mail_account_activate(request: dict[str, object]) -> dict[str, object]:
             raise ApiError("account_unavailable", "Connect the email account before using it")
         return {
             "account": _mail_account_public(
-                runtime, runtime.store.activate_mail_account(provider, account_id)
+                runtime, runtime.store.activate_mail_account(
+                    provider, account_id, operation=runtime.operation,
+                ),
             )
         }
 
@@ -2209,6 +2237,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
                 active_runtime.model,
                 dry_run=dry_run,
                 deliver_notifications=False,
+                operation=active_runtime.operation,
             )
         except MailboxIdentityChanged as exc:
             raise ApiError("mailbox_identity_changed", str(exc)) from exc
@@ -2233,8 +2262,10 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             "Production watcher checks require native operation locking",
         )
     try:
-        with operation_lock(lock_path, "Another production check is already running"):
-            return run(_runtime(request))
+        with removal.operation_scope(
+            config.database_file, busy_message="Another production check is already running",
+        ) as owner:
+            return run(_runtime_with_operation(request, owner))
     except OperationLockBusy as exc:
         raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
 
@@ -2336,8 +2367,10 @@ def _with_automation_rule_mutation(
             "Automation rule changes require native operation locking",
         )
     try:
-        with operation_lock(lock_path, "Another mailbox operation is already running"):
-            return operation(_runtime(request))
+        with removal.operation_scope(
+            config.database_file, busy_message="Another mailbox operation is already running",
+        ) as owner:
+            return operation(_runtime_with_operation(request, owner))
     except OperationLockBusy as exc:
         raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
 
@@ -2365,6 +2398,7 @@ def _automation_rule_scope_identity(
                 runtime.store,
                 mailbox,
                 dry_run=False,
+                operation=runtime.operation,
             )
     except MailboxError as exc:
         raise ApiError(
@@ -5711,7 +5745,7 @@ def _sender_data(sender: Sender, *, admission_active: bool) -> dict[str, str | b
 
 def _with_watchlist_mutation(
     request: dict[str, object],
-    operation: Callable[[], dict[str, object]],
+    operation: Callable[[Runtime], dict[str, object]],
 ) -> dict[str, object]:
     config = load_config(_config_path(request))
     lock_path = _production_check_lock_path(config)
@@ -5721,8 +5755,10 @@ def _with_watchlist_mutation(
             "Watchlist changes require native operation locking",
         )
     try:
-        with operation_lock(lock_path, "Another mailbox operation is already running"):
-            return operation()
+        with removal.operation_scope(
+            config.database_file, busy_message="Another mailbox operation is already running",
+        ) as owner:
+            return operation(_runtime_with_operation(request, owner))
     except OperationLockBusy as exc:
         raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
 
@@ -5735,7 +5771,7 @@ def _watchlist_add(request: dict[str, object]) -> dict[str, object]:
         raise ApiError("invalid_request", "email must be a non-empty string")
     if name is not None and not isinstance(name, str):
         raise ApiError("invalid_request", "name must be a string or null")
-    def add() -> dict[str, object]:
+    def add(runtime: Runtime) -> dict[str, object]:
         try:
             sender = add_sender(_config_path(request), email, name)
         except ConfigAdmissionStaleError as exc:
@@ -5755,13 +5791,13 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
     if not isinstance(email, str) or not email.strip():
         raise ApiError("invalid_request", "email must be a non-empty string")
 
-    def remove() -> dict[str, object]:
+    def remove(runtime: Runtime) -> dict[str, object]:
         config = load_config(_config_path(request))
         try:
             address = normalize_validated_address(email)
         except ValueError:
             address = None  # remove_sender reports the invalid address below
-        owner = _runtime(request).store.vendor_for_address(address) if address else None
+        owner = runtime.store.vendor_for_address(address) if address else None
         if owner is not None:
             raise ApiError(
                 "conflict",
@@ -5869,9 +5905,9 @@ def _vendors_create(request: dict[str, object]) -> dict[str, object]:
     name = _vendor_name(_payload(request, {"display_name"}))
     connect.require_connect_entitlement()
 
-    def create() -> dict[str, object]:
-        store = _runtime(request).store
-        vendor_id = store.create_vendor(name)
+    def create(runtime: Runtime) -> dict[str, object]:
+        store = runtime.store
+        vendor_id = store.create_vendor(name, operation=runtime.operation)
         return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
 
     return _with_watchlist_mutation(request, create)
@@ -5883,10 +5919,10 @@ def _vendors_rename(request: dict[str, object]) -> dict[str, object]:
     vendor_id, name = _vendor_id(payload), _vendor_name(payload)
     connect.require_connect_entitlement()
 
-    def rename() -> dict[str, object]:
-        store = _runtime(request).store
+    def rename(runtime: Runtime) -> dict[str, object]:
+        store = runtime.store
         try:
-            store.rename_vendor(vendor_id, name)
+            store.rename_vendor(vendor_id, name, operation=runtime.operation)
         except KeyError as exc:
             raise ApiError("not_found", "Vendor was not found") from exc
         return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
@@ -5900,8 +5936,8 @@ def _vendors_addresses_add(request: dict[str, object]) -> dict[str, object]:
     vendor_id, address = _vendor_id(payload), _vendor_address(payload)
     connect.require_connect_entitlement()
 
-    def add() -> dict[str, object]:
-        store = _runtime(request).store
+    def add(runtime: Runtime) -> dict[str, object]:
+        store = runtime.store
         # Plan step 19: the vendor's existence, then the address conflicts.
         vendor = _vendor_or_not_found(store, vendor_id)
         if address in _mailbox_addresses(store):
@@ -5919,7 +5955,7 @@ def _vendors_addresses_add(request: dict[str, object]) -> dict[str, object]:
             except DuplicateSenderError:
                 pass
         try:
-            store.add_vendor_address(vendor_id, address)
+            store.add_vendor_address(vendor_id, address, operation=runtime.operation)
         except VendorAddressConflict as exc:
             raise ApiError("conflict", str(exc)) from exc
         except KeyError as exc:
@@ -5959,14 +5995,14 @@ def _vendors_addresses_remove(request: dict[str, object]) -> dict[str, object]:
     vendor_id, address = _vendor_id(payload), _vendor_address(payload)
     unwatch = _optional_flag(payload, "unwatch")
 
-    def remove() -> dict[str, object]:
-        store = _runtime(request).store
+    def remove(runtime: Runtime) -> dict[str, object]:
+        store = runtime.store
         if address not in _vendor_or_not_found(store, vendor_id)["addresses"]:
             raise ApiError("not_found", f"{address} is not an address of this vendor")
         if unwatch:
             _unwatch_all(request, [address])
         try:
-            outcome = store.remove_vendor_address(vendor_id, address)
+            outcome = store.remove_vendor_address(vendor_id, address, operation=runtime.operation)
         except KeyError as exc:
             raise ApiError("not_found", "Vendor was not found") from exc
         result = {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
@@ -5983,14 +6019,14 @@ def _vendors_delete(request: dict[str, object]) -> dict[str, object]:
     vendor_id = _vendor_id(payload)
     unwatch = _optional_flag(payload, "unwatch_addresses")
 
-    def delete() -> dict[str, object]:
-        store = _runtime(request).store
+    def delete(runtime: Runtime) -> dict[str, object]:
+        store = runtime.store
         listed = _vendor_or_not_found(store, vendor_id)["addresses"]
         assert isinstance(listed, list)
         if unwatch:
             _unwatch_all(request, listed)
         try:
-            outcome = store.delete_vendor(vendor_id)
+            outcome = store.delete_vendor(vendor_id, operation=runtime.operation)
         except KeyError as exc:
             raise ApiError("not_found", "Vendor was not found") from exc
         result = {"deleted": True, "vendor_id": vendor_id, "addresses": list(outcome.addresses)}

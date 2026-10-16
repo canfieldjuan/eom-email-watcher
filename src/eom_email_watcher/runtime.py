@@ -28,6 +28,7 @@ class Runtime:
     config: Config
     store: Store
     model: ModelRuntime
+    operation: object | None = None
 
 
 MAIL_PROVIDER_NAMES = {

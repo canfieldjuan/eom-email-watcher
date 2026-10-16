@@ -126,7 +126,8 @@ def sent_identity(gateway, scope):
 
 def observe(watcher, identity, active, sent_scope, now):
     state = ReconcileState(
-        watcher.store, (watcher.mailbox.provider, watcher.mailbox.account_id, identity)
+        watcher.store, (watcher.mailbox.provider, watcher.mailbox.account_id, identity),
+        operation=watcher.operation,
     )
     state.observe(
         active=active,
