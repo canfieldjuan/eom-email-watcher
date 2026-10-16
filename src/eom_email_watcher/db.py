@@ -2875,6 +2875,20 @@ def _certificate_assert_projection(
             raise RuntimeError("Stored certificate policy projection is inconsistent")
 
 
+def _connect_source_available(db: sqlite3.Connection, job: ConnectJob) -> bool:
+    """The retained Connect binding feeds the shared eligibility owner."""
+    bindings = db.execute(
+        """SELECT identity.provider,identity.account_id,identity.mailbox_identity_key
+        FROM automation_fire_source_identities identity
+        JOIN automation_fires fire ON fire.fire_id=identity.fire_id
+        WHERE fire.job_id=? AND identity.message_id=? AND identity.part_id=?""",
+        (job.job_id, job.message_id, job.part_id),
+    ).fetchall()
+    return removal.message_available(
+        db, job.message_id, require_source=False, retained_bindings=bindings,
+    )
+
+
 def _certificate_source_for_job(
     db: sqlite3.Connection,
     job: ConnectJob,
@@ -9341,7 +9355,12 @@ class Store:
 
     def reconcile_source(self, provider, account_id, mailbox_identity_key, source_id):
         with self.connection() as db:
-            db.execute("BEGIN")
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.source_available(
+                db, provider=provider, account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key, provider_message_id=source_id,
+            ):
+                return None
             row = db.execute(
                 _stored_source_membership_sql() + " LIMIT 1",
                 (provider, account_id, mailbox_identity_key, source_id),
@@ -10241,12 +10260,19 @@ class Store:
     def _connect_job(row: sqlite3.Row) -> ConnectJob:
         return ConnectJob(**dict(row))
 
-    def connect_job(self, job_id: str) -> ConnectJob | None:
+    def connect_job(self, job_id: str, *, source_start: bool = False) -> ConnectJob | None:
         with self.connection() as db:
+            if source_start:
+                db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
-        return self._connect_job(row) if row else None
+            if row is None:
+                return None
+            job = self._connect_job(row)
+            if source_start and not _connect_source_available(db, job):
+                return None
+        return job
 
     @staticmethod
     def _connect_dispatch(row: sqlite3.Row) -> ConnectDispatch:
@@ -11080,17 +11106,7 @@ class Store:
             if current is None or current["status"] != expected_state:
                 raise RuntimeError("Connect job transition lost its expected-state race")
             current_job = self._connect_job(current)
-            retained_bindings = db.execute(
-                """SELECT identity.provider,identity.account_id,identity.mailbox_identity_key
-                FROM automation_fire_source_identities identity
-                JOIN automation_fires fire ON fire.fire_id=identity.fire_id
-                WHERE fire.job_id=? AND identity.message_id=? AND identity.part_id=?""",
-                (job_id, current_job.message_id, current_job.part_id),
-            ).fetchall()
-            target_available = removal.message_available(
-                db, current_job.message_id, require_source=False,
-                retained_bindings=retained_bindings,
-            )
+            target_available = _connect_source_available(db, current_job)
             if current_job.protocol_version == 2 and (
                 current_job.provider_app_id != provider_app_id
                 or current_job.provider_instance_id != provider_instance_id

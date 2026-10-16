@@ -540,6 +540,8 @@ def test_accepted_target_refuses_connect_resubmission(tmp_path, monkeypatch):
         "claim_connect_lane_head",
         "reset_connect_job_for_resubmission",
         "transition_connect_job",
+        "reconcile_source",
+        "connect_job",
     ],
 )
 def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, owner):
@@ -622,8 +624,29 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
         "claim_connect_lane_head",
         "reset_connect_job_for_resubmission",
         "transition_connect_job",
+        "connect_job",
     }:
         selected, source_job = connect_source_job(store)
+        if owner == "connect_job":
+            from connect_automate import connect
+
+            content = b"public output"
+            source_output = connect.CapabilityOutput(
+                artifact_id=str(uuid.uuid4()),
+                media_type="text/plain",
+                display_name="public.txt",
+                byte_size=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+                payload=content,
+            )
+            store.transition_connect_job(
+                job_id=source_job.job_id,
+                expected_state="requested",
+                next_state="completed",
+                provider_app_id=selected.app_id,
+                provider_instance_id=selected.instance_id,
+                result=connect.CapabilityResult((source_output,)).store_dict(),
+            )
         if owner == "reset_connect_job_for_resubmission":
             assert store.claim_connect_lane_head(
                 provider_app_id=selected.app_id,
@@ -632,6 +655,22 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
     key = removal.issue_key(store, "delete", {"message_id": "m"}, retention_days=30, now=NOW)
 
     def start():
+        if owner == "connect_job":
+            from types import SimpleNamespace
+
+            from eom_email_watcher import engine_api
+
+            return engine_api._selected_connect_output(
+                dict(
+                    message_id="m",
+                    part_id="2",
+                    job_id=source_job.job_id,
+                    artifact_id=source_output.artifact_id,
+                ),
+                SimpleNamespace(store=store),
+            )
+        if owner == "reconcile_source":
+            return store.reconcile_source("gmail", "mailbox", KEY, "m")
         if owner == "transition_connect_job":
             return store.transition_connect_job(
                 job_id=source_job.job_id,
@@ -1202,3 +1241,289 @@ def test_missing_source_eligibility_preserves_retained_binding(tmp_path, monkeyp
             require_source=False,
             retained_bindings=(binding,),
         )
+
+
+@pytest.mark.parametrize("stage", ["headers", "body", "body_fallback"])
+def test_reconcile_queued_source_refuses_fetch_after_acceptance(tmp_path, monkeypatch, stage):
+    from test_removal_refusal import held_runtime
+    from test_thread_bodies import prepare_derived
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api, reconcile
+    from eom_email_watcher.mailbox import MailboxMessageUnavailable
+    from eom_email_watcher.reconcile_state import ReconcileState
+
+    store = held_runtime(tmp_path, monkeypatch)
+    watcher = engine_api._runtime({})
+    state = ReconcileState(store, ("gmail", "mailbox", KEY))
+    accepted = []
+    calls = []
+
+    def accept():
+        reply = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "inbox.delete",
+                "payload": {"message_id": "m"},
+            }
+        )
+        assert reply["ok"] and reply["data"]["pending"] == 1, reply
+        accepted.append(reply)
+
+    if stage == "headers":
+        unit = reconcile._unit("public")
+        unit["listed"] = True  # Its final page was already persisted with this queued item.
+        progress = state.load_or_start(
+            NOW,
+            30,
+            dict(
+                stage="discovery",
+                units=[unit],
+                folders=["inbox"],
+                replay_discovery=True,
+            ),
+        )
+        state.put_items(
+            progress, "discovery", "public", (reconcile.ReconcileItem("copy-00"),), "inbox"
+        )
+        original = ReconcileState.pending
+
+        def pending(self, *args):
+            item = original(self, *args)
+            if item is not None and not accepted:
+                accept()
+                with store.connection() as db:
+                    db.execute("DELETE FROM messages WHERE message_id='copy-00'")
+            return item
+
+        monkeypatch.setattr(ReconcileState, "pending", pending)
+
+        def forbidden(source):
+            calls.append(source)
+            pytest.fail(f"accepted queued target reached metadata/preflight: {source}")
+
+        monkeypatch.setattr(watcher.gateway, "metadata", forbidden)
+        monkeypatch.setattr(
+            watcher.gateway,
+            "reconcile_preflight",
+            lambda source, **kwargs: forbidden(source),
+            raising=False,
+        )
+    else:
+        if stage == "body_fallback":
+            from test_thread_reconcile import seed
+
+            seed(store, "z-copy", rfc_message_id="same@vendor")
+        with store.connection() as db:
+            db.execute("DELETE FROM message_bodies")
+        prepare_derived(state)
+        original = body_state.sources
+
+        def sources(*args):
+            copies = original(*args)
+            if stage == "body" and not accepted:
+                accept()
+            return copies
+
+        monkeypatch.setattr(body_state, "sources", sources)
+
+        def body(source, **kwargs):
+            calls.append(source)
+            if stage == "body_fallback" and not accepted:
+                accept()
+                raise MailboxMessageUnavailable("public source disappeared")
+            pytest.fail("accepted queued target reached stored-body fetch")
+
+        monkeypatch.setattr(watcher.gateway, "stored_body", body)
+    reconcile.run(watcher, KEY, "unavailable", label_selectors=(), now=NOW)
+    assert len(accepted) == 1
+    assert len(calls) == int(stage == "body_fallback")
+    with store.connection() as db:
+        if stage == "headers":
+            assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+        else:
+            assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+            assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+
+
+@pytest.mark.parametrize("legacy_null", [False, True])
+@pytest.mark.parametrize(
+    "changed", [None, "provider", "account_id", "mailbox_identity_key", "provider_message_id"]
+)
+def test_frozen_alias_source_membership_survives_missing_row(
+    tmp_path, monkeypatch, legacy_null, changed
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import nullcontext
+
+    from connect_automate.locking import operation_lock
+    from test_db import _upgraded_completed_legacy_message
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import source_locks
+
+    if legacy_null:
+        store, root, identity = _upgraded_completed_legacy_message(tmp_path)
+        legacy_source = store.message_source(root)
+        assert legacy_source.mailbox_identity_key is None
+        native = legacy_source.provider_message_id
+        with store.connection() as db:
+            db.execute("DELETE FROM message_locations WHERE message_id=?", (root,))
+        target_id = root
+        source = dict(
+            provider="imap",
+            account_id="imap-account",
+            mailbox_identity_key=identity,
+            provider_message_id=native,
+        )
+        held = store.source_locks((root,))
+        monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    else:
+        store = held_runtime(tmp_path, monkeypatch)
+        root, target_id = "m", "copy-00"
+        source = dict(
+            provider="gmail",
+            account_id="mailbox",
+            mailbox_identity_key=KEY,
+            provider_message_id=target_id,
+        )
+        held = nullcontext()
+    if changed:
+        before = dict(source)
+        source[changed] = "e" * 64 if changed == "mailbox_identity_key" else "unrelated"
+        assert source != before
+    assert store.source_start(**source)
+
+    def accept():
+        with operation_lock(source_locks.operation_lock_path(store.path), "public removal"):
+            return store.request_removal("delete", {"message_id": root}, now=NOW)
+
+    with held:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            reply = pool.submit(accept).result(timeout=10)
+        assert reply.pending == 1
+        assert store.source_start(**source) is (changed is not None)
+        with store.connection() as db:
+            assert db.execute(
+                "SELECT 1 FROM message_removal_targets WHERE message_id=?",
+                (target_id,),
+            ).fetchone()
+            db.execute("DELETE FROM messages WHERE message_id=?", (target_id,))
+        assert store.source_start(**source) is (changed is not None)
+
+
+def test_reconcile_source_does_not_expose_accepted_physical_target(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api
+
+    store = held_runtime(tmp_path, monkeypatch)
+    assert store.reconcile_source("gmail", "mailbox", KEY, "m") is not None
+    reply = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "m"},
+        }
+    )
+    assert reply["ok"] and reply["data"]["pending"] == 1, reply
+    assert store.reconcile_source("gmail", "mailbox", KEY, "m") is None
+
+
+@pytest.mark.parametrize("owner", ["attachment_fetch", "output_present", "output_export"])
+def test_content_reader_refuses_start_after_acceptance(tmp_path, monkeypatch, owner):
+    from test_removal_refusal import held_runtime
+
+    from eom_email_watcher import engine_api
+
+    if owner == "attachment_fetch":
+        store = held_runtime(tmp_path, monkeypatch)
+        runtime = engine_api._runtime({})
+        source = store.message_source("m")
+        accepted = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "inbox.delete",
+                "payload": {"message_id": "m"},
+            }
+        )
+        assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("accepted attachment source reached provider open")
+
+        monkeypatch.setattr(engine_api, "load_mailbox_account", forbidden)
+        with pytest.raises(engine_api.ApiError) as refused:
+            engine_api._verified_mailbox_attachment_bytes(runtime, source, "2", "public")
+        assert refused.value.code == "connect_source_unavailable"
+        return
+
+    from test_certificate_expiry_ledger import (
+        INSTANCE_A,
+        OUTPUT_ID,
+        _certificate_job,
+        _certificate_pending_fires,
+        _record,
+        _result,
+    )
+    from test_connect_v2_engine_api import seeded_runtime
+
+    _, runtime = seeded_runtime(tmp_path)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    store = runtime.store
+    fires = _certificate_pending_fires(store, count=2)
+    job_id = store.automation_fire_attempts(fires[0].fire_id)[0].dispatch_request_id
+    _certificate_job(store, job_id)
+    for index, fire in enumerate(fires):
+        store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="submitted",
+            reason="connect_admitted",
+            job_id=job_id,
+        )
+        if index == 0:
+            store.transition_connect_job(
+                job_id=job_id,
+                expected_state="requested",
+                next_state="completed",
+                provider_app_id="invoice-processor",
+                provider_instance_id=INSTANCE_A,
+                result=_result(_record()),
+            )
+    payload = dict(message_id="message-1", part_id="2", job_id=job_id, artifact_id=OUTPUT_ID)
+    before = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "connect.output.present",
+            "payload": payload,
+        }
+    )
+    assert before["ok"], before
+    retain_legacy_aliases(store, "message-1")
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "message-1"},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    assert store.connect_job(job_id) is not None  # Existing reconciliation receipt survives.
+    if owner == "output_export":
+        destination = tmp_path / "public-export"
+        destination.mkdir(mode=0o700)
+        payload["destination_dir"] = str(destination)
+    response = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "connect.output." + owner.removeprefix("output_"),
+            "payload": payload,
+        }
+    )
+    assert not response["ok"] and response["error"]["code"] == "not_found", response
+    if owner == "output_export":
+        assert not list(destination.iterdir())

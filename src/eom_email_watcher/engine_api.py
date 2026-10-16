@@ -2871,6 +2871,11 @@ def _verified_mailbox_attachment_bytes(
     *,
     source_provider_message_id: str | None = None,
 ) -> bytes:
+    if not runtime.store.source_start(source.message_id):
+        raise ApiError(
+            "connect_source_unavailable",
+            "The source attachment is no longer available for handoff.",
+        )
     mailbox = load_mailbox_account(
         runtime.config,
         runtime.store,
@@ -3217,7 +3222,7 @@ def _selected_connect_output(
         raise ApiError("invalid_request", "job_id must be a non-empty string")
     if not isinstance(artifact_id, str) or not artifact_id.strip():
         raise ApiError("invalid_request", "artifact_id must be a non-empty string")
-    job = runtime.store.connect_job(job_id)
+    job = runtime.store.connect_job(job_id, source_start=True)
     if (
         job is None
         or job.protocol_version != connect.GENERIC_PROTOCOL_VERSION

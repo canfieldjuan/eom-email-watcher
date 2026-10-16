@@ -237,6 +237,8 @@ def available_sql(alias, *, include_unfollow=False):
     Aliases are static SQL names supplied by owners, never request input. Stable
     stored identity and frozen source membership survive canonical promotion;
     neither gives an old request authority over a reused id in another binding.
+    A legacy source can lack a stored identity and location; its intent keeps
+    the effective binding for later provider starts, even after the row is gone.
     """
     kinds = "1" if include_unfollow else "i.kind IN ('delete','clear')"
     return f"""NOT EXISTS (
@@ -248,6 +250,8 @@ def available_sql(alias, *, include_unfollow=False):
             (t.message_id={alias}.message_id
              AND t.stored_identity_key IS {alias}.mailbox_identity_key
              AND t.provider_message_id={alias}.provider_message_id)
+            OR (t.provider_message_id={alias}.provider_message_id
+                AND i.mailbox_identity_key IS {alias}.mailbox_identity_key)
             OR EXISTS (SELECT 1 FROM json_each(t.source_identities_json) s
                 WHERE json_extract(s.value,'$.provider')={alias}.provider
                 AND json_extract(s.value,'$.account_id')={alias}.account_id
