@@ -485,6 +485,25 @@ def resume(store, *, now=None):
                 ).fetchall()
                 if not targets:
                     continue
+                if intent["kind"] != "unfollow":
+                    for frozen in dict.fromkeys(t["source_identities_json"] for t in targets):
+                        for source in json.loads(frozen):
+                            db.execute(
+                                "INSERT INTO suppressed_messages VALUES(?,?,?,?) "
+                                "ON CONFLICT(provider,account_id,message_key) "
+                                "DO UPDATE SET expires_at=excluded.expires_at",
+                                (
+                                    source["provider"],
+                                    source["account_id"],
+                                    _message_suppression_key(
+                                        source["provider"],
+                                        source["account_id"],
+                                        source["provider_message_id"],
+                                        source["mailbox_identity_key"],
+                                    ),
+                                    _suppression_expiry(source["received_at"], now),
+                                ),
+                            )
                 for target in targets:
                     row = db.execute(
                         "SELECT * FROM messages WHERE message_id=? AND provider=? AND account_id=? "
@@ -505,23 +524,6 @@ def resume(store, *, now=None):
                                 f"DELETE FROM {table} WHERE message_id=?", (row["message_id"],)
                             )
                     else:
-                        for source in json.loads(target["source_identities_json"]):
-                            db.execute(
-                                "INSERT INTO suppressed_messages VALUES(?,?,?,?) "
-                                "ON CONFLICT(provider,account_id,message_key) "
-                                "DO UPDATE SET expires_at=excluded.expires_at",
-                                (
-                                    source["provider"],
-                                    source["account_id"],
-                                    _message_suppression_key(
-                                        source["provider"],
-                                        source["account_id"],
-                                        source["provider_message_id"],
-                                        source["mailbox_identity_key"],
-                                    ),
-                                    _suppression_expiry(source["received_at"], now),
-                                ),
-                            )
                         db.execute("DELETE FROM messages WHERE message_id=?", (row["message_id"],))
                 if intent["kind"] != "unfollow":
                     _purge_expired_automation_tombstones(db, now=stamp)

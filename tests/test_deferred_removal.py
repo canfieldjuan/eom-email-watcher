@@ -2252,6 +2252,7 @@ def test_deferred_completion_purges_expired_automation_at_physical_owner(
     assert store.automation_run(run.run_id) is not None
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+
     class CompletionTime(database.datetime):
         @classmethod
         def now(cls, tz=None):
@@ -2268,3 +2269,88 @@ def test_deferred_completion_purges_expired_automation_at_physical_owner(
         assert result.completed == 1 and result.pending == 0
     source_locks.qualify_protocol(reopened, fresh=False)
     assert reopened.automation_run(run.run_id) is None
+
+
+@pytest.mark.parametrize("missing", [False, True, "replaced"])
+def test_completed_missing_target_preserves_frozen_source_suppression(
+    tmp_path, monkeypatch, missing
+):
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api, removal, source_locks
+    from eom_email_watcher.config import exact_sender_selector_id
+
+    store = held_runtime(tmp_path, monkeypatch)
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "m"},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    if missing:
+        with store.connection() as db:
+            db.execute("DELETE FROM messages")
+            db.execute("DELETE FROM message_locations")
+    if missing == "replaced":
+        store.register_mail_account(
+            "imap",
+            "imap-new",
+            display_name="Public fixture",
+            address="new@example.com",
+            active=False,
+        )
+        store.reconcile_mailbox_identity("imap", "imap-new", "e" * 64, legacy_status="replacement")
+        assert store.add_message(
+            message_id="m",
+            provider="imap",
+            account_id="imap-new",
+            mailbox_identity_key="e" * 64,
+            provider_message_id="new-native",
+            thread_id=None,
+            sender="new@example.com",
+            sender_name=None,
+            subject="Public replacement",
+            received_at=NOW.isoformat(),
+            admission=database.AdmissionProvenance(
+                "exact_sender",
+                exact_sender_selector_id("new@example.com"),
+                None,
+                "e" * 64,
+                NOW.isoformat(),
+            ),
+        )
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        receipt = removal.outcome(db, accepted["data"]["request_id"])
+        assert receipt.completed == 1 and receipt.pending == 0
+        if missing == "replaced":
+            assert tuple(
+                db.execute(
+                    "SELECT message_id,provider,account_id,mailbox_identity_key,"
+                    "provider_message_id FROM messages"
+                ).fetchone()
+            ) == (
+                "m",
+                "imap",
+                "imap-new",
+                "e" * 64,
+                "new-native",
+            )
+        else:
+            assert not db.execute("SELECT 1 FROM messages").fetchone()
+    for native in ("m", "copy-00"):
+        assert store.has_seen_message(
+            native, provider="gmail", account_id="mailbox", mailbox_identity_key=KEY
+        )
+    for provider, account, key, native in (
+        ("imap", "mailbox", KEY, "m"),
+        ("gmail", "other", KEY, "m"),
+        ("gmail", "mailbox", "e" * 64, "m"),
+        ("gmail", "mailbox", KEY, "other"),
+    ):
+        assert not store.has_seen_message(
+            native, provider=provider, account_id=account, mailbox_identity_key=key
+        )
