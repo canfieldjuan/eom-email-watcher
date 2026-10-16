@@ -443,7 +443,11 @@ def accept(store, key, kind, parameters, *, now):
 
 def resume(store, *, now=None):
     """One physical completion owner; caller holds the existing operation lock."""
-    from .db import _message_suppression_key, _suppression_expiry
+    from .db import (
+        _message_suppression_key,
+        _purge_expired_automation_tombstones,
+        _suppression_expiry,
+    )
 
     now = (now or datetime.now(UTC)).astimezone(UTC)
     stamp = now.isoformat()
@@ -519,6 +523,8 @@ def resume(store, *, now=None):
                                 ),
                             )
                         db.execute("DELETE FROM messages WHERE message_id=?", (row["message_id"],))
+                if intent["kind"] != "unfollow":
+                    _purge_expired_automation_tombstones(db, now=stamp)
                 db.execute(
                     "UPDATE message_removal_targets SET state='completed',settled_at=? "
                     "WHERE intent_id=? AND logical_target_id=? AND state='pending'",

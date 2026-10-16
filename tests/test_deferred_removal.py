@@ -551,6 +551,13 @@ def test_accepted_target_refuses_connect_resubmission(tmp_path, monkeypatch):
         "acknowledge_analysis",
         "acknowledge_fallback",
         "acknowledge_review",
+        "reserve_automation_extraction",
+        "record_automation_extraction",
+        "record_automation_extraction_failure",
+        "record_automation_proposal",
+        "automation_extraction_payloads",
+        "automation_proposal",
+        "automation_proposal_for_message",
     ],
 )
 def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, owner):
@@ -569,7 +576,37 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
     from eom_email_watcher.config import exact_sender_selector_id
     from eom_email_watcher.mime import AttachmentDescriptor
 
-    if owner in {
+    scheduling_owners = {
+        "reserve_automation_extraction",
+        "record_automation_extraction",
+        "record_automation_extraction_failure",
+        "record_automation_proposal",
+        "automation_extraction_payloads",
+        "automation_proposal",
+        "automation_proposal_for_message",
+    }
+    if owner in scheduling_owners:
+        from test_service import (
+            admit_scheduling_run,
+            awaiting_confirmation_run,
+            config,
+            proposing_automation_run,
+            valid_scheduling_output,
+        )
+
+        cfg = config(tmp_path)
+        seeded = database.Store(cfg.database_file)
+        seeded.initialize()
+        if owner in {"automation_proposal", "automation_proposal_for_message"}:
+            _, run, _ = awaiting_confirmation_run(cfg, seeded, monkeypatch)
+        elif owner == "record_automation_proposal":
+            _, run = proposing_automation_run(cfg, seeded, monkeypatch)
+        else:
+            _, run = admit_scheduling_run(seeded, monkeypatch)
+        with seeded.connection() as db:
+            target_id = db.execute("SELECT message_id FROM messages").fetchone()[0]
+        retain_legacy_aliases(seeded, target_id)
+    elif owner in {
         "notification_review_start",
         "notification_intents",
         "notification_intent_count",
@@ -627,6 +664,26 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
                     db.execute = execute
 
     store = ProbeStore(seeded.path)
+    if owner in scheduling_owners:
+        reservation_args = dict(
+            source_content_sha256="b" * 64,
+            context_at="2026-09-07T08:00:00-05:00",
+            timezone="America/Chicago",
+            body_char_limit=20_000,
+            organizer_address="owner@example.com",
+        )
+        if owner in {
+            "record_automation_extraction",
+            "record_automation_extraction_failure",
+            "automation_extraction_payloads",
+        }:
+            payload = store.reserve_automation_extraction(
+                run.run_id, run.state_version, **reservation_args
+            )
+            run = store.automation_run(run.run_id)
+            assert run is not None
+        if owner == "record_automation_proposal":
+            payload = store.automation_extraction_payloads(run.run_id)[0]
     if owner in {"mark_delivery_complete", "acknowledge_analysis"}:
         store.mark_analyzed(
             target_id,
@@ -695,12 +752,56 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
     key = removal.issue_key(store, "delete", {"message_id": target_id}, retention_days=30, now=NOW)
 
     def start():
+        if owner == "reserve_automation_extraction":
+            return store.reserve_automation_extraction(
+                run.run_id, run.state_version, **reservation_args
+            )
+        if owner == "record_automation_extraction":
+            result = valid_scheduling_output().encode()
+            return store.record_automation_extraction(
+                run.run_id,
+                run.state_version,
+                payload_id=payload.payload_id,
+                result_json=result,
+                result_sha256=hashlib.sha256(result).hexdigest(),
+                violations=[],
+                accepted_state="proposing",
+            )
+        if owner == "record_automation_extraction_failure":
+            return store.record_automation_extraction_failure(
+                run.run_id,
+                run.state_version,
+                payload_id=payload.payload_id,
+                error_code="model_unavailable",
+                retryable=True,
+            )
+        if owner == "record_automation_proposal":
+            from test_service import SCHEDULING_FIXTURE_NOW
+
+            return store.record_automation_proposal(
+                run.run_id,
+                run.state_version,
+                extraction_payload_id=payload.payload_id,
+                request_sha256="c" * 64,
+                subject="Public meeting",
+                attendees=("jane@example.com",),
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="Everyone is available.",
+                empty_reason=None,
+                observed_at=SCHEDULING_FIXTURE_NOW,
+            )
+        if owner == "automation_proposal_for_message":
+            return store.automation_proposal_for_message(target_id)
+        if owner in {"automation_extraction_payloads", "automation_proposal"}:
+            return getattr(store, owner)(run.run_id)
         if owner in {"notification_intents", "notification_intent_count"}:
             return getattr(store, owner)()
         if owner == "notification_source_start":
-            return store.notification_source_start("message", target_id)
+            return store.source_start(target_id)
         if owner == "notification_review_start":
-            return store.notification_source_start("automation_run", notification.subject_id)
+            return store.source_start(automation_run_id=notification.subject_id)
         if owner == "mark_fallback_notified":
             return store.mark_fallback_notified(target_id)
         if owner == "mark_delivery_complete":
@@ -1897,3 +1998,273 @@ def test_public_notification_ack_uses_accepted_source(tmp_path, monkeypatch, kin
             ).fetchone()
             acknowledged = row[0] if kind == "analysis" else row[1]
         assert (acknowledged is not None) is (not accept)
+
+
+@pytest.mark.parametrize(
+    "accept_at,model_error",
+    [
+        ("never", False),
+        ("before", False),
+        ("metadata", False),
+        ("body", False),
+        ("reservation", False),
+        ("model", False),
+        ("model", True),
+        ("model", "gateway"),
+    ],
+)
+def test_scheduling_extraction_rechecks_accepted_source(
+    tmp_path, monkeypatch, accept_at, model_error
+):
+    from types import SimpleNamespace
+
+    from test_service import (
+        SCHEDULING_FIXTURE_NOW,
+        AnyAutomationGateway,
+        ExtractionModel,
+        admit_scheduling_run,
+        allow_automation_processing,
+        config,
+        valid_scheduling_output,
+    )
+
+    from eom_email_watcher import engine_api, service
+    from eom_email_watcher.model import GatewayModel, GatewayModelError, ModelError
+
+    cfg = config(tmp_path)
+    store = database.Store(cfg.database_file)
+    store.initialize()
+    _, run = admit_scheduling_run(store, monkeypatch)
+    with store.connection() as db:
+        source_id = db.execute("SELECT message_id FROM messages").fetchone()[0]
+    retain_legacy_aliases(store, source_id)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg))
+    calls = []
+    accepted = []
+    acknowledgements = []
+
+    def accept():
+        reply = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "inbox.delete",
+                "payload": {"message_id": source_id},
+            }
+        )
+        assert reply["ok"] and reply["data"]["pending"] == 1, reply
+        accepted.append(reply)
+
+    class Gateway(AnyAutomationGateway):
+        def metadata(self, *args, **kwargs):
+            calls.append("metadata")
+            result = super().metadata(*args, **kwargs)
+            if accept_at == "metadata":
+                accept()
+            return result
+
+        def content(self, *args, **kwargs):
+            calls.append("body")
+            result = super().content(*args, **kwargs)
+            if accept_at == "body":
+                accept()
+            return result
+
+    class Model(ExtractionModel, GatewayModel):
+        def acknowledge(self, request_id, disposition):
+            with store.connection() as db:
+                rows = db.execute(
+                    "SELECT status FROM automation_extraction_payloads WHERE run_id=?",
+                    (run.run_id,),
+                ).fetchall()
+            acknowledgements.append((disposition, [row[0] for row in rows]))
+
+        def extract_scheduling(self, **kwargs):
+            calls.append("model")
+            if accept_at == "model":
+                accept()
+            return super().extract_scheduling(**kwargs)
+
+    allow_automation_processing(monkeypatch, Gateway())
+    original_page = store.recoverable_automation_runs
+
+    def page(*args, **kwargs):
+        rows = original_page(*args, **kwargs)
+        if rows and accept_at == "before" and not accepted:
+            accept()
+        return rows
+
+    monkeypatch.setattr(store, "recoverable_automation_runs", page)
+    original_reserve = store.reserve_automation_extraction
+
+    def reserve(*args, **kwargs):
+        result = original_reserve(*args, **kwargs)
+        if accept_at == "reservation":
+            accept()
+        return result
+
+    monkeypatch.setattr(store, "reserve_automation_extraction", reserve)
+    failure = None
+    try:
+        outcome = service.process_scheduling_automations(
+            cfg,
+            store,
+            Model(
+                [
+                    GatewayModelError("forbidden", retryable=False)
+                    if model_error == "gateway"
+                    else ModelError("public model unavailable")
+                    if model_error
+                    else valid_scheduling_output()
+                ]
+            ),
+            now=SCHEDULING_FIXTURE_NOW,
+        )
+    except (KeyError, RuntimeError) as exc:
+        failure = exc
+    assert failure is None, repr(failure)
+    expected = {
+        "before": [],
+        "metadata": ["metadata"],
+        "body": ["metadata", "body"],
+        "reservation": ["metadata", "body"],
+    }.get(accept_at, ["metadata", "body", "model"])
+    assert calls == expected
+    current = store.automation_run(run.run_id)
+    assert current is not None
+    if accept_at == "never":
+        assert outcome.processed == 1 and current.state == "proposing"
+        assert store.automation_extraction_payloads(run.run_id)[0].status == "accepted"
+    else:
+        assert len(accepted) == 1 and current.state == "source_unavailable"
+        assert not store.automation_extraction_payloads(run.run_id)
+
+    if accept_at == "never":
+        assert acknowledgements == [("persisted", ["accepted"])]
+    elif accept_at == "model" and not model_error:
+        assert acknowledgements == [("application_rejected", [])]
+    else:
+        assert not acknowledgements
+
+
+@pytest.mark.parametrize("accept_at", ["never", "before", "proposal"])
+def test_scheduling_proposal_rechecks_accepted_source(tmp_path, monkeypatch, accept_at):
+    from types import SimpleNamespace
+
+    from test_service import (
+        SCHEDULING_FIXTURE_NOW,
+        ProposalAuthorization,
+        config,
+        proposing_automation_run,
+    )
+
+    from eom_email_watcher import engine_api, service
+    from eom_email_watcher.microsoft_calendar import CalendarMeetingProposal, CalendarProposalResult
+
+    cfg = config(tmp_path)
+    store = database.Store(cfg.database_file)
+    store.initialize()
+    _, run = proposing_automation_run(cfg, store, monkeypatch)
+    with store.connection() as db:
+        source_id = db.execute("SELECT message_id FROM messages").fetchone()[0]
+    retain_legacy_aliases(store, source_id)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg))
+    monkeypatch.setattr(
+        service,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    accepted = []
+    calls = []
+
+    def accept():
+        reply = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "inbox.delete",
+                "payload": {"message_id": source_id},
+            }
+        )
+        assert reply["ok"] and reply["data"]["pending"] == 1, reply
+        accepted.append(reply)
+
+    original_page = store.proposable_automation_runs
+
+    def page(*args, **kwargs):
+        rows = original_page(*args, **kwargs)
+        if rows and accept_at == "before" and not accepted:
+            accept()
+        return rows
+
+    def find(*args, **kwargs):
+        calls.append(True)
+        if accept_at == "proposal":
+            accept()
+        return CalendarProposalResult(
+            CalendarMeetingProposal(
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="Everyone is available.",
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(store, "proposable_automation_runs", page)
+    monkeypatch.setattr(service, "find_meeting_time", find)
+    failure = None
+    try:
+        outcome = service.process_scheduling_proposals(cfg, store, now=SCHEDULING_FIXTURE_NOW)
+    except (KeyError, RuntimeError) as exc:
+        failure = exc
+    assert failure is None, repr(failure)
+    assert len(calls) == int(accept_at != "before")
+    current = store.automation_run(run.run_id)
+    assert current is not None
+    if accept_at == "never":
+        assert outcome.processed == 1 and current.state == "awaiting_confirmation"
+        assert store.automation_proposal(run.run_id) is not None
+    else:
+        assert len(accepted) == 1 and current.state == "source_unavailable"
+        assert store.automation_proposal(run.run_id) is None
+
+
+@pytest.mark.parametrize("kind", ["delete", "clear"])
+def test_deferred_completion_purges_expired_automation_at_physical_owner(
+    tmp_path, monkeypatch, kind
+):
+    from test_service import admit_scheduling_run, config
+
+    from eom_email_watcher import removal, source_locks
+
+    monkeypatch.setattr(database, "MAX_RETENTION_DAYS", 30)
+    cfg = config(tmp_path)
+    store = database.Store(cfg.database_file)
+    store.initialize()
+    _, run = admit_scheduling_run(store, monkeypatch)
+    with store.connection() as db:
+        source_id = db.execute("SELECT message_id FROM messages").fetchone()[0]
+    retain_legacy_aliases(store, source_id)
+    cleanup_at = database.datetime.fromisoformat(run.expires_at) + timedelta(days=1)
+    receipt = store.request_removal(
+        kind, {"message_id": source_id} if kind == "delete" else {}, now=cleanup_at
+    )
+    assert receipt.completed == 0 and receipt.pending == 1
+    assert store.automation_run(run.run_id) is not None
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+    class CompletionTime(database.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cleanup_at.astimezone(tz) if tz is not None else cleanup_at.replace(tzinfo=None)
+
+    monkeypatch.setattr(removal, "datetime", CompletionTime)
+    reopened = database.Store(store.path)
+    source_locks.qualify_protocol(reopened, fresh=False)
+    assert reopened.automation_run(run.run_id) is None
+    assert reopened.automation_events(run.run_id) == []
+    with reopened.connection() as db:
+        assert not db.execute("SELECT 1 FROM messages").fetchone()
+        result = removal.outcome(db, receipt.request_id)
+        assert result.completed == 1 and result.pending == 0
+    source_locks.qualify_protocol(reopened, fresh=False)
+    assert reopened.automation_run(run.run_id) is None

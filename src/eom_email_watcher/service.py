@@ -639,6 +639,8 @@ def process_scheduling_automations(
                         processed += 1
                         review_required += 1
                         continue
+                    if not store.source_start(automation_run_id=run.run_id):
+                        continue
                     metadata = mailbox.gateway.metadata(work.provider_message_id)
                     if (
                         metadata.message_id != work.provider_message_id
@@ -647,6 +649,8 @@ def process_scheduling_automations(
                         raise MailboxMessageUnavailable(
                             "Scheduling source is no longer in the inbox"
                         )
+                    if not store.source_start(work.message_id, include_unfollow=True):
+                        continue
                     content = mailbox.gateway.content(
                         work.provider_message_id, body_char_limit,
                         scope=frozenset({INBOX_LOCATION}),
@@ -707,6 +711,8 @@ def process_scheduling_automations(
                         body_char_limit=body_char_limit,
                         organizer_address=organizer_address,
                     )
+                except KeyError:
+                    break
                 except AutomationSourceChanged:
                     _transition_source_problem(
                         store,
@@ -718,6 +724,8 @@ def process_scheduling_automations(
                     review_required += 1
                     break
                 reserved_run = store.automation_run(current.run_id)
+                if reserved_run is not None and reserved_run.state == "source_unavailable":
+                    break
                 if (
                     reserved_run is None
                     or reserved_run.current_payload_id != reservation.payload_id
@@ -733,29 +741,35 @@ def process_scheduling_automations(
                     )
                 except GatewayModelError as exc:
                     logger.warning("Scheduling run %s extraction unavailable: %s", run.run_id, exc)
-                    failed = store.record_automation_extraction_failure(
-                        current.run_id,
-                        reserved_run.state_version,
-                        payload_id=reservation.payload_id,
-                        error_code=exc.code,
-                        retryable=exc.retryable,
-                        retry_after_seconds=exc.retry_after_seconds,
-                        now=_utc_now(),
-                    )
+                    try:
+                        failed = store.record_automation_extraction_failure(
+                            current.run_id,
+                            reserved_run.state_version,
+                            payload_id=reservation.payload_id,
+                            error_code=exc.code,
+                            retryable=exc.retryable,
+                            retry_after_seconds=exc.retry_after_seconds,
+                            now=_utc_now(),
+                        )
+                    except KeyError:
+                        break
                     if failed.state == "manual_review":
                         processed += 1
                         review_required += 1
                     break
                 except ModelError as exc:
                     logger.warning("Scheduling run %s extraction unavailable: %s", run.run_id, exc)
-                    store.record_automation_extraction_failure(
-                        current.run_id,
-                        reserved_run.state_version,
-                        payload_id=reservation.payload_id,
-                        error_code="model_unavailable",
-                        retryable=True,
-                        now=_utc_now(),
-                    )
+                    try:
+                        store.record_automation_extraction_failure(
+                            current.run_id,
+                            reserved_run.state_version,
+                            payload_id=reservation.payload_id,
+                            error_code="model_unavailable",
+                            retryable=True,
+                            now=_utc_now(),
+                        )
+                    except KeyError:
+                        break
                     break
                 accepted_state: str | None = None
                 accepted_code: str | None = None
@@ -764,19 +778,25 @@ def process_scheduling_automations(
                     accepted_state, accepted_code = _accepted_extraction_outcome(
                         result.extraction.intent
                     )
-                current = store.record_automation_extraction(
-                    current.run_id,
-                    reserved_run.state_version,
-                    payload_id=reservation.payload_id,
-                    result_sha256=result.result_sha256,
-                    result_json=result.result_json,
-                    violations=[
-                        {"code": violation.code, "path": violation.path}
-                        for violation in result.violations
-                    ],
-                    accepted_state=accepted_state,
-                    accepted_code=accepted_code,
-                )
+                try:
+                    current = store.record_automation_extraction(
+                        current.run_id,
+                        reserved_run.state_version,
+                        payload_id=reservation.payload_id,
+                        result_sha256=result.result_sha256,
+                        result_json=result.result_json,
+                        violations=[
+                            {"code": violation.code, "path": violation.path}
+                            for violation in result.violations
+                        ],
+                        accepted_state=accepted_state,
+                        accepted_code=accepted_code,
+                    )
+                except KeyError:
+                    _acknowledge_gateway_result(
+                        model, reservation.request_id, "application_rejected"
+                    )
+                    break
                 _acknowledge_gateway_result(
                     model,
                     reservation.request_id,
@@ -933,6 +953,8 @@ def process_scheduling_proposals(
                 attendees = tuple(item.email for item in extraction.attendees)
                 candidates = _proposal_candidates(extraction, observed_at=attempt_time)
                 request_sha256 = _proposal_request_sha256(attendees, candidates)
+                if not store.source_start(automation_run_id=work.run.run_id):
+                    continue
                 result = find_meeting_time(access.authorization, attendees, candidates)
             except MicrosoftAuthorizationRejected as exc:
                 logger.info(
@@ -989,6 +1011,8 @@ def process_scheduling_proposals(
                     empty_reason=result.empty_reason,
                     observed_at=result_time,
                 )
+            except KeyError:
+                continue
             except ValueError as exc:
                 logger.warning(
                     "Scheduling run %s proposal could not be persisted safely: %s",
@@ -1315,9 +1339,7 @@ def _deliver_automation_review_intent(
             ntfy_url=config.ntfy_url,
             ntfy_content_disclosure_acknowledged=(config.ntfy_content_disclosure_acknowledged),
             dry_run=dry_run,
-            source_start=lambda: store.notification_source_start(
-                intent.subject_type, intent.subject_id
-            ),
+            source_start=lambda: store.source_start(automation_run_id=intent.subject_id),
         )
         if not delivery.delivered:
             return False
@@ -2915,10 +2937,7 @@ class Watcher:
                     self.config.ntfy_content_disclosure_acknowledged
                 ),
                 dry_run=dry_run,
-                source_start=lambda: self.store.notification_source_start(
-                    getattr(message, "subject_type", "message"),
-                    getattr(message, "subject_id", message.message_id),
-                ),
+                source_start=lambda: self.store.source_start(message.message_id),
             )
             if not delivery.delivered:
                 return 0
@@ -2965,10 +2984,7 @@ class Watcher:
                 ),
                 partial_summary=partial_summary,
                 dry_run=dry_run,
-                source_start=lambda: self.store.notification_source_start(
-                    getattr(message, "subject_type", "message"),
-                    getattr(message, "subject_id", message.message_id),
-                ),
+                source_start=lambda: self.store.source_start(message.message_id),
             )
             if not delivery.delivered:
                 return 0

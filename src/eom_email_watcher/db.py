@@ -9549,10 +9549,13 @@ class Store:
     def source_start(
         self, message_id=None, *, provider=None, account_id=None,
         mailbox_identity_key=None, provider_message_id=None, include_unfollow=False,
+        automation_run_id=None,
     ) -> bool:
         """Serialize source admission with acceptance; release before external work."""
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if automation_run_id is not None:
+                return _automation_source_available(db, automation_run_id)
             if message_id is not None:
                 return removal.message_available(db, message_id, include_unfollow=include_unfollow)
             return removal.source_available(
@@ -11933,6 +11936,9 @@ class Store:
 
     def automation_extraction_payloads(self, run_id: str) -> list[AutomationExtractionPayload]:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                return []
             rows = db.execute(
                 """SELECT * FROM automation_extraction_payloads
                 WHERE run_id = ? ORDER BY attempt_no""",
@@ -12046,6 +12052,9 @@ class Store:
 
     def automation_proposal(self, run_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                return None
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
                 JOIN automation_runs AS r
@@ -12057,6 +12066,9 @@ class Store:
 
     def automation_proposal_for_message(self, message_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                return None
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
                 JOIN automation_runs AS r
@@ -12196,6 +12208,8 @@ class Store:
         created_at = stamp.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             extraction = db.execute(
                 """SELECT status FROM automation_extraction_payloads
@@ -12775,6 +12789,8 @@ class Store:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute(
                 "SELECT * FROM automation_runs WHERE run_id = ?",
                 (run_id,),
@@ -12925,6 +12941,8 @@ class Store:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute(
                 "SELECT * FROM automation_runs WHERE run_id = ?",
                 (run_id,),
@@ -13049,6 +13067,8 @@ class Store:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute(
                 "SELECT * FROM automation_runs WHERE run_id = ?",
                 (run_id,),
@@ -13622,15 +13642,6 @@ class Store:
                 last_error=NULL, notified_at=? WHERE message_id=?""",
                 (datetime.now(UTC).isoformat() if notified else None, message_id),
             )
-
-    def notification_source_start(self, subject_type: str, subject_id: str) -> bool:
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if subject_type == "message":
-                return removal.message_available(db, subject_id)
-            if subject_type == "automation_run":
-                return _automation_source_available(db, subject_id)
-            raise ValueError("Notification subject is invalid")
 
     def notification_intents(
         self,
