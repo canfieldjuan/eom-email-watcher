@@ -2354,3 +2354,293 @@ def test_completed_missing_target_preserves_frozen_source_suppression(
         assert not store.has_seen_message(
             native, provider=provider, account_id=account, mailbox_identity_key=key
         )
+
+
+@pytest.mark.parametrize("kind", ["delete", "clear"])
+def test_public_removal_request_lifecycle_survives_lost_reply_and_restart(
+    tmp_path, monkeypatch, kind
+):
+    from test_removal_refusal import held_runtime, snapshot
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import engine_api, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    watcher = engine_api._runtime({})
+    parameters = {"message_id": "m"} if kind == "delete" else {}
+    before = snapshot(store)
+    prepared = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.removal.prepare",
+            "payload": {"kind": kind, **parameters},
+        }
+    )
+    assert prepared["ok"], prepared
+    key = prepared["data"]["request_id"]
+    assert set(prepared["data"]) == {"request_id"}
+    assert isinstance(key, str) and key
+    assert snapshot(store) == before
+    status_request = {
+        "protocol": 1,
+        "operation": "inbox.removal.status",
+        "payload": {"kind": kind, "request_id": key, **parameters},
+    }
+    unaccepted = engine_api._response(status_request)
+    assert not unaccepted["ok"] and unaccepted["error"]["code"] == "not_found", unaccepted
+    assert snapshot(store) == before
+    mutation = {
+        "protocol": 1,
+        "operation": "inbox." + kind,
+        "payload": {"request_id": key, **parameters},
+    }
+    # Execute once, then discard its response as if delivery was lost.
+    accepted = engine_api._response(mutation)
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    assert accepted["data"]["deleted"] == (False if kind == "delete" else 0)
+    assert type(accepted["data"]["deleted"]) is (bool if kind == "delete" else int)
+    persisted = engine_api._response(status_request)
+    assert persisted["ok"], persisted
+    assert persisted["data"] == {
+        name: accepted["data"][name]
+        for name in (
+            "request_id",
+            "intent_ids",
+            "outcome",
+            "requested",
+            "completed",
+            "pending",
+            "message",
+        )
+    }
+    assert persisted["data"]["outcome"] == "deferred"
+    bare_status = engine_api._response(
+        {"protocol": 1, "operation": "inbox.removal.status", "payload": {"request_id": key}}
+    )
+    assert bare_status["ok"] and bare_status["data"] == persisted["data"], bare_status
+    seed(store, "later", thread_id="later", rfc_message_id="later@vendor")
+    reopened = database.Store(store.path)
+    with monkeypatch.context() as blocked:
+
+        def unavailable(*args, **kwargs):
+            raise source_locks.SourceProtocolUnavailable("public restart before lift")
+
+        blocked.setattr(source_locks, "qualify_protocol", unavailable)
+        reopened.initialize()
+    watcher.store = reopened
+    assert engine_api._response(status_request)["data"] == persisted["data"]
+    source_locks.qualify_protocol(reopened, fresh=False)
+    complete = engine_api._response(status_request)
+    assert complete["ok"], complete
+    assert complete["data"] == {
+        **persisted["data"],
+        "outcome": "completed",
+        "completed": 1,
+        "pending": 0,
+        "message": None,
+    }
+    retried = engine_api._response(mutation)
+    assert retried["ok"] and retried["data"]["completed"] == 1, retried
+    assert retried["data"]["request_id"] == key
+    with reopened.connection() as db:
+        assert [r[0] for r in db.execute("SELECT message_id FROM logical_messages")] == ["later"]
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "operation,payload",
+    [
+        *[
+            ("inbox.removal.prepare", {"kind": kind})
+            for kind in (None, False, 0, "", [], {}, "unfollow")
+        ],
+        *[
+            ("inbox.removal.prepare", {"kind": "delete", "message_id": value})
+            for value in (None, False, 0, "", " ", [], "x" * 513)
+        ],
+        ("inbox.removal.prepare", {}),
+        ("inbox.removal.prepare", {"kind": "delete"}),
+        ("inbox.removal.prepare", {"kind": "clear", "message_id": "m"}),
+        ("inbox.removal.prepare", {"kind": "clear", "request_id": "extra"}),
+        *[("inbox.removal.status", {"request_id": value}) for value in (None, False, 0, [])],
+        ("inbox.removal.status", {}),
+        ("inbox.removal.status", {"request_id": "key", "kind": False}),
+        ("inbox.removal.status", {"request_id": "key", "message_id": "m"}),
+    ],
+)
+def test_removal_lifecycle_invalid_parameters_refuse_before_runtime(
+    monkeypatch, operation, payload
+):
+    from eom_email_watcher import engine_api
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid removal parameters reached runtime access")
+
+    monkeypatch.setattr(engine_api, "_runtime", forbidden)
+    result = engine_api._response({"protocol": 1, "operation": operation, "payload": payload})
+    assert not result["ok"] and result["error"]["code"] == "invalid_request", result
+
+
+def test_removal_prepare_boundary_and_status_authentication_are_read_only(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from test_removal_refusal import snapshot
+    from test_service import config
+
+    from eom_email_watcher import engine_api, removal
+
+    cfg = config(tmp_path)
+    store = database.Store(cfg.database_file)
+    store.initialize()
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg))
+    before = snapshot(store)
+    for kind, parameters in (
+        ("delete", {"message_id": "m"}),
+        ("delete", {"message_id": "x" * 512}),
+        ("clear", {}),
+    ):
+        result = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "inbox.removal.prepare",
+                "payload": {"kind": kind, **parameters},
+            }
+        )
+        assert result["ok"] and set(result["data"]) == {"request_id"}, result
+        key = result["data"]["request_id"]
+        with store.connection() as db:
+            removal.validate_key(db, key, kind, removal.request_hash(kind, parameters), now=NOW)
+        assert snapshot(store) == before
+    key = removal.issue_key(store, "clear", {}, retention_days=1, now=NOW)
+    accepted = store.request_removal("clear", {}, request_id=key, now=NOW)
+    assert accepted.requested == accepted.completed == 0
+    retained = snapshot(store)
+    future = NOW + timedelta(days=3)
+
+    class FutureTime(database.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return future.astimezone(tz) if tz is not None else future.replace(tzinfo=None)
+
+    monkeypatch.setattr(removal, "datetime", FutureTime)
+    known = engine_api._response(
+        {"protocol": 1, "operation": "inbox.removal.status", "payload": {"request_id": key}}
+    )
+    assert known["ok"], known
+    assert known["data"] == {
+        "request_id": key,
+        "intent_ids": [],
+        "outcome": "completed",
+        "requested": 0,
+        "completed": 0,
+        "pending": 0,
+        "message": None,
+    }
+    expired = removal.issue_key(store, "delete", {"message_id": "other"}, retention_days=1, now=NOW)
+    fresh = removal.issue_key(
+        store, "delete", {"message_id": "other"}, retention_days=1, now=future
+    )
+    forged = fresh[:-1] + ("0" if fresh[-1] != "0" else "1")
+    for payload in (
+        {"request_id": expired, "kind": "delete", "message_id": "other"},
+        {"request_id": expired},
+        {"request_id": fresh},
+        {"request_id": forged, "kind": "delete", "message_id": "other"},
+        {"request_id": fresh, "kind": "delete", "message_id": "different"},
+        {"request_id": key, "kind": "delete", "message_id": "other"},
+        {"request_id": "", "kind": "clear"},
+        {"request_id": "malformed", "kind": "clear"},
+    ):
+        result = engine_api._response(
+            {"protocol": 1, "operation": "inbox.removal.status", "payload": payload}
+        )
+        assert not result["ok"] and result["error"]["code"] == "invalid_request", result
+        assert snapshot(store) == retained
+    unaccepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.removal.status",
+            "payload": {"request_id": fresh, "kind": "delete", "message_id": "other"},
+        }
+    )
+    assert not unaccepted["ok"] and unaccepted["error"]["code"] == "not_found", unaccepted
+    assert snapshot(store) == retained
+
+
+def test_removal_status_reads_one_snapshot_during_receipt_retirement(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from connect_automate.locking import operation_lock
+
+    from eom_email_watcher import engine_api, removal, source_locks
+
+    store, _, _ = followed(tmp_path)
+    key = removal.issue_key(store, "delete", {"message_id": "m"}, retention_days=1, now=NOW)
+    with operation_lock(source_locks.operation_lock_path(store.path), "public operation"):
+        result = store.request_removal("delete", {"message_id": "m"}, request_id=key, now=NOW)
+    assert result.completed == 1 and result.pending == 0
+    reached, release = threading.Event(), threading.Event()
+    main_thread = threading.get_ident()
+    timeouts = []
+
+    class ProbeStore(database.Store):
+        @contextmanager
+        def connection(self):
+            with super().connection() as db:
+                execute = db.execute
+
+                def observe(sql, parameters=()):
+                    cursor = execute(sql, parameters)
+                    if (
+                        threading.get_ident() != main_thread
+                        and not reached.is_set()
+                        and sql.startswith(
+                            "SELECT kind,parameters_sha256 FROM message_removal_requests"
+                        )
+                    ):
+
+                        class ReceiptCursor:
+                            def fetchone(self):
+                                row = cursor.fetchone()
+                                reached.set()
+                                if not release.wait(10):
+                                    timeouts.append(True)
+                                return row
+
+                        return ReceiptCursor()
+                    return cursor
+
+                db.execute = observe
+                try:
+                    yield db
+                finally:
+                    db.execute = execute
+
+    monkeypatch.setattr(
+        engine_api, "_runtime", lambda _: SimpleNamespace(store=ProbeStore(store.path))
+    )
+    request = {"protocol": 1, "operation": "inbox.removal.status", "payload": {"request_id": key}}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(engine_api._response, request)
+        try:
+            assert reached.wait(5), "Status did not read the persisted receipt"
+            with operation_lock(source_locks.operation_lock_path(store.path), "public operation"):
+                removal.retire(store, 30, now=NOW + timedelta(days=365))
+            with store.connection() as db:
+                assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        finally:
+            release.set()
+        failure = None
+        try:
+            response = future.result(timeout=10)
+        except (KeyError, RuntimeError, TypeError) as exc:
+            failure = exc
+    assert not timeouts
+    assert failure is None, repr(failure)
+    assert response["ok"], response
+    assert response["data"]["requested"] == response["data"]["completed"] == 1
+    assert response["data"]["pending"] == 0
+    assert response["data"]["request_id"] == key

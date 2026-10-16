@@ -2037,9 +2037,28 @@ def test_inbox_delete_and_clear_are_local_only_and_explicit(
     missing = engine_api._response(request(config_path, "inbox.delete", {"message_id": "missing"}))
     cleared = engine_api._response(request(config_path, "inbox.clear"))
 
-    assert deleted["data"] == {"deleted": True, "message_id": "message-1"}
+    with runtime.store.connection() as db:
+        keys = {row["kind"]: row["request_id"] for row in db.execute(
+            "SELECT kind,request_id FROM message_removal_requests"
+        )}
+        intents = {kind: [row[0] for row in db.execute(
+            "SELECT intent_id FROM message_removal_intents WHERE request_id=? ORDER BY intent_id",
+            (key,),
+        )] for kind, key in keys.items()}
+    assert set(keys) == {"delete", "clear"}
+    assert all(len(ids) == 1 for ids in intents.values())
+    assert deleted["data"] == {
+        "deleted": True, "message_id": "message-1", "request_id": keys["delete"],
+        "intent_ids": intents["delete"], "outcome": "completed", "requested": 1,
+        "completed": 1, "pending": 0, "message": None,
+    }
+    assert type(deleted["data"]["deleted"]) is bool
     assert missing["error"]["code"] == "not_found"
-    assert cleared["data"] == {"deleted": 1}
+    assert cleared["data"] == {
+        "deleted": 1, "request_id": keys["clear"], "intent_ids": intents["clear"],
+        "outcome": "completed", "requested": 1, "completed": 1, "pending": 0, "message": None,
+    }
+    assert type(cleared["data"]["deleted"]) is int
     assert runtime.store.recent(10) == []
     assert runtime.store.state()[0] == "100"
 

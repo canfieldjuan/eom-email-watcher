@@ -2694,16 +2694,70 @@ def _calendar_automation_decide(request: dict[str, object]) -> dict[str, object]
         }
 
 
+def _removal_parameters(payload: dict[str, object], kind: object) -> dict[str, str]:
+    if not isinstance(kind, str) or kind not in {"delete", "clear"}:
+        raise ApiError("invalid_request", "kind must be delete or clear")
+    if kind == "delete":
+        message_id = payload.get("message_id")
+        if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 512:
+            raise ApiError(
+                "invalid_request",
+                "message_id must be a non-empty string of at most 512 characters",
+            )
+        return {"message_id": message_id}
+    if "message_id" in payload:
+        raise ApiError("invalid_request", "message_id is only supported for delete")
+    return {}
+
+
+def _removal_request_key(payload: dict[str, object], *, required: bool = False) -> str | None:
+    value = payload.get("request_id")
+    if not required and "request_id" not in payload:
+        return None
+    if not isinstance(value, str):
+        raise ApiError("invalid_request", "request_id must be a string")
+    return value
+
+
+def _inbox_removal_prepare(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"kind", "message_id"})
+    kind = payload.get("kind")
+    parameters = _removal_parameters(payload, kind)
+    runtime = _runtime(request)
+    try:
+        key = removal.issue_key(
+            runtime.store, kind, parameters, retention_days=runtime.config.retention_days,
+        )
+    except removal.RemovalRequestInvalid as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+    return {"request_id": key}
+
+
+def _inbox_removal_status(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"request_id", "kind", "message_id"})
+    key = _removal_request_key(payload, required=True)
+    kind = payload.get("kind") if "kind" in payload else None
+    if "kind" in payload:
+        parameters = _removal_parameters(payload, kind)
+    else:
+        if "message_id" in payload:
+            raise ApiError("invalid_request", "kind is required with message_id")
+        parameters = None
+    runtime = _runtime(request)
+    try:
+        result = removal.status(runtime.store, key, kind=kind, parameters=parameters)
+    except removal.RemovalRequestInvalid as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+    if result is None:
+        raise ApiError("not_found", "Removal request was not found")
+    return result.data()
+
+
 def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"message_id", "request_id"})
-    message_id = payload.get("message_id")
-    if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 512:
-        raise ApiError(
-            "invalid_request",
-            "message_id must be a non-empty string of at most 512 characters",
-        )
-    if "request_id" in payload and not isinstance(payload["request_id"], str):
-        raise ApiError("invalid_request", "request_id must be a string")
+    parameters = _removal_parameters(payload, "delete")
+    message_id = parameters["message_id"]
+    key = _removal_request_key(payload)
     runtime = _runtime(request)
     lock_path = _production_check_lock_path(runtime.config)
     if not operation_lock_supported(lock_path):
@@ -2714,7 +2768,7 @@ def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
     with operation_lock(lock_path, "Another watcher operation is already running"):
         try:
             result = runtime.store.request_removal(
-                "delete", {"message_id": message_id}, request_id=payload.get("request_id"),
+                "delete", parameters, request_id=key,
                 retention_days=runtime.config.retention_days,
             )
         except KeyError as exc:
@@ -2726,8 +2780,7 @@ def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
 
 def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"request_id"})
-    if "request_id" in payload and not isinstance(payload["request_id"], str):
-        raise ApiError("invalid_request", "request_id must be a string")
+    key = _removal_request_key(payload)
     runtime = _runtime(request)
     lock_path = _production_check_lock_path(runtime.config)
     if not operation_lock_supported(lock_path):
@@ -2738,7 +2791,7 @@ def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
     with operation_lock(lock_path, "Another watcher operation is already running"):
         try:
             result = runtime.store.request_removal(
-                "clear", {}, request_id=payload.get("request_id"),
+                "clear", {}, request_id=key,
                 retention_days=runtime.config.retention_days,
             )
         except removal.RemovalRequestInvalid as exc:
@@ -6314,6 +6367,8 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "host.operation_lock": _host_operation_lock,
     "inbox.clear": _inbox_clear,
     "inbox.delete": _inbox_delete,
+    "inbox.removal.prepare": _inbox_removal_prepare,
+    "inbox.removal.status": _inbox_removal_status,
     "inbox.query": _query_inbox,
     "inbox.recent": _recent,
     "mail.accounts.activate": _mail_account_activate,

@@ -129,6 +129,21 @@ def outcome(db, key, *, kind=None, fingerprint=None):
     )
 
 
+def status(store, key, *, kind=None, parameters=None, now=None):
+    """Read one frozen receipt snapshot; never select targets or resume removal."""
+    fingerprint = request_hash(kind, parameters) if kind is not None else None
+    stamp = (now or datetime.now(UTC)).astimezone(UTC)
+    with store.connection() as db:
+        db.execute("BEGIN")
+        result = outcome(db, key, kind=kind, fingerprint=fingerprint)
+        if result is not None:
+            return result
+        if kind is None:
+            raise RemovalRequestInvalid("Local removal request has not been accepted")
+        validate_key(db, key, kind, fingerprint, now=stamp)
+        return None
+
+
 def retire(store, retention_days, *, now):
     """Retire complete request groups through ordinary retention maintenance."""
     cutoff = now - timedelta(days=retention_days)
