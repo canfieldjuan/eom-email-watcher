@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import subprocess
+import zipfile
+import zlib
 from pathlib import Path
 
 from windows_cutover_fixture import write_private
@@ -52,6 +55,38 @@ def compare_manifests(release: dict, qualification: dict, expected_changes: set)
     return changed
 
 
+def base_library_manifest(content: bytes) -> dict:
+    """Ignore member order only; duplicates, corruption and metadata changes fail."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = []
+            seen = set()
+            for info in sorted(archive.infolist(), key=lambda item: item.filename):
+                if info.filename in seen or info.filename != info.orig_filename:
+                    raise ValueError("Duplicate or truncated base_library.zip member name")
+                seen.add(info.filename)
+                members.append({
+                    "name": info.filename,
+                    "crc": info.CRC,
+                    "size": info.file_size,
+                    "date": info.date_time,
+                    "sha256": hashlib.sha256(archive.read(info)).hexdigest(),
+                    "metadata": {
+                        field: getattr(info, field)
+                        for field in (
+                            "compress_type", "compress_size", "create_system", "create_version",
+                            "extract_version", "reserved", "flag_bits", "volume", "internal_attr",
+                            "external_attr",
+                        )
+                    },
+                    "extra": info.extra.hex(),
+                    "comment": info.comment.hex(),
+                })
+            return {"members": members, "comment": archive.comment.hex()}
+    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, zlib.error) as error:
+        raise ValueError("Invalid base_library.zip") from error
+
+
 def sidecar_manifest(binary: Path) -> dict:
     from PyInstaller.archive.readers import CArchiveReader
 
@@ -65,8 +100,11 @@ def sidecar_manifest(binary: Path) -> dict:
         manifest[name] = {
             "type": entry[-1],
             "size": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
         }
+        if name == "base_library.zip":
+            manifest[name]["zip"] = base_library_manifest(content)
+        else:
+            manifest[name]["sha256"] = hashlib.sha256(content).hexdigest()
     for index, option in enumerate(archive.options):
         name = f"OPTION/{index}"
         if name in manifest:
