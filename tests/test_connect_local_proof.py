@@ -86,10 +86,13 @@ def test_fixture_model_serves_native_identity_and_stream() -> None:
                 "message": {"content": '{"selection":"q1"}'},
                 "done": False,
             }
+            # A real Ollama stream ends with done_reason; the PDF provider
+            # requires "stop" before it accepts the generation (issue #267).
             assert frames[1] == {
                 "model": FixtureModelHandler.model_id,
                 "message": {"content": ""},
                 "done": True,
+                "done_reason": "stop",
                 "prompt_eval_count": 1,
                 "eval_count": 1,
             }
