@@ -430,7 +430,7 @@ impl NotificationProcess {
         })
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn with_command(program: impl Into<OsString>, args: Vec<OsString>) -> Self {
         Self {
             program: program.into(),
@@ -717,7 +717,7 @@ pub struct NotificationDelivery {
 }
 
 impl NotificationDelivery {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn with_notification_command(
         program: impl Into<OsString>,
         args: Vec<OsString>,

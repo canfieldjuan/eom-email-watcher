@@ -178,3 +178,41 @@ The client durably saves only the opaque signed key plus kind and parameters bef
 Every later explicit Clear click is a new request with a new key and a new frozen selection. Earlier pending receipts remain separate and are shown separately. There is no automatic resend or retry button. Counts and message content are never copied into the saved-key journal.
 
 Required controls: a lost reply after commit followed by restart reads status with zero resubmits; a lost reply before commit shows the approved note, and a later explicit Clear uses a new key; another Clear while an earlier receipt is pending keeps both receipts and selects later arrivals correctly. This records the accepted policy before the desktop action implementation; it is not proof that the UI is wired or durably persists keys yet.
+
+### Initialization and admitted completion
+
+The startup notification worker has an existing 30-second operation deadline
+(`desktop/src-tauri/src/lib.rs`, `STARTUP_DELIVERY_TIMEOUT`). It includes the
+`host.operation_lock` RPC, which loads a runtime before returning the lock path.
+Physical removal can consume the existing 90-second source wait. Running it on
+every runtime open therefore makes even that lock-location request time out
+while a pending target's source is held. This came from the completion added to
+`source_locks.qualify_protocol` in `043ee944` and reached by `Store.initialize`.
+
+`Store.initialize` establishes the source protocol through the shared
+`source_locks.initialize_protocol` owner without running physical completion.
+The explicit `qualify_protocol` entry consumes that same protocol setup and
+retains its operation-owned completion and source-context refusal. Ordinary
+checks and accepted removals keep their existing completion entries. There is
+one physical removal implementation, `removal.resume`; its source wait, lock
+order and frozen targets stay unchanged. No host-RPC exemption, cached lock
+path, timeout increase or new retry is introduced.
+
+Required proof: opening a pending store qualifies it without calling completion
+or changing its retained bytes; explicit qualification then settles that same
+receipt. Restoring completion on initialization must fail the regression. The
+real native startup notification probe retains the production startup budget
+and uses a real source holder, covering selection before acceptance, selection
+after acceptance, and acceptance excluded through platform send and ack.
+
+### Windows privacy merge prerequisite
+
+[Issue #269](https://github.com/canfieldjuan/eom-email-watcher/issues/269) owns the
+pre-existing Windows data-directory privacy gap. It is a separate slice off main
+and a merge prerequisite for this PR. POSIX mode bits alone do not establish a
+private Windows DACL, and a test-only change cannot establish production privacy.
+The Windows backup oracle must consume the existing SDK
+`validate_private_regular_file` owner, backed by production private-directory
+establishment or validation, with permissive-ACE and reparse-point rejection.
+Keep the POSIX `0600` oracle and the full native qualification; do not skip or
+loosen a control to merge before that prerequisite lands.

@@ -277,13 +277,19 @@ def _cutover_admission() -> Iterator[None]:
         yield
 
 
-def qualify_protocol(store: Store, *, fresh: bool) -> None:
+def initialize_protocol(store: Store, *, fresh: bool) -> None:
+    """Establish source exclusion on open, without running physical removal."""
     try:
         _qualify_protocol(store, fresh=fresh)
     except OperationLockBusy as exc:
         raise SourceProtocolUnavailable(
             "Source-lock upgrade deferred; a native source owner remains active"
         ) from exc
+
+
+def qualify_protocol(store: Store, *, fresh: bool) -> None:
+    """Explicit qualification entry: establish exclusion, then resume removals."""
+    initialize_protocol(store, fresh=fresh)
     # Never invert operation→source ordering or expand a frozen source set.
     # The ordinary operation entry point resumes after this owner releases it.
     if source_context_active():

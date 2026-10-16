@@ -6159,7 +6159,7 @@ class Store:
             )
             if SCHEMA_VERSION >= 35:
                 try:
-                    source_locks.qualify_protocol(self, fresh=fresh)
+                    source_locks.initialize_protocol(self, fresh=fresh)
                 except (source_locks.SourceProtocolUnavailable, deployment.DeploymentError) as exc:
                     # The schema is available; source-protected work remains refused.
                     logging.getLogger(__name__).warning("Source-lock cutover deferred: %s", exc)

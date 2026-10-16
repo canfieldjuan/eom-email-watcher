@@ -933,6 +933,43 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
         assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
 
 
+def test_runtime_open_qualifies_without_running_physical_completion(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+
+    from eom_email_watcher import removal, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    accepted = local_removal(store, "request_removal", "delete", {"message_id": "m"})
+    assert accepted.pending == 1
+    resumed = []
+    original = removal.resume
+
+    def observe(candidate, *args, **kwargs):
+        resumed.append(candidate.path)
+        return original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(removal, "resume", observe)
+    reopened = database.Store(store.path)
+    reopened.initialize()
+    assert resumed == [], "Runtime initialization must not invoke physical completion"
+    with reopened.connection() as db:
+        assert source_locks.protocol_ready(db)
+        assert removal.outcome(db, accepted.request_id).pending == 1
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+    source_locks.qualify_protocol(reopened, fresh=False)
+    assert resumed == [store.path]
+    with reopened.connection() as db:
+        settled = removal.outcome(db, accepted.request_id).data()
+        assert (settled["completed"], settled["pending"]) == (1, 0)
+        assert not db.execute("SELECT 1 FROM messages").fetchone()
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+    reopened.initialize()
+    assert resumed == [store.path]
+    with reopened.connection() as db:
+        assert removal.outcome(db, accepted.request_id).data() == settled
+
+
 def test_restart_preserves_request_and_qualification_completes_once(tmp_path, monkeypatch):
     from test_removal_refusal import held_runtime
 
@@ -954,7 +991,7 @@ def test_restart_preserves_request_and_qualification_completes_once(tmp_path, mo
         raise source_locks.SourceProtocolUnavailable("public restart before lift")
 
     with monkeypatch.context() as blocked:
-        blocked.setattr(source_locks, "qualify_protocol", not_qualified)
+        blocked.setattr(source_locks, "initialize_protocol", not_qualified)
         reopened.initialize()
     with reopened.connection() as db:
         assert removal.outcome(db, key).pending == 1
@@ -2433,7 +2470,7 @@ def test_public_removal_request_lifecycle_survives_lost_reply_and_restart(
         def unavailable(*args, **kwargs):
             raise source_locks.SourceProtocolUnavailable("public restart before lift")
 
-        blocked.setattr(source_locks, "qualify_protocol", unavailable)
+        blocked.setattr(source_locks, "initialize_protocol", unavailable)
         reopened.initialize()
     watcher.store = reopened
     assert engine_api._response(status_request)["data"] == persisted["data"]
@@ -2684,7 +2721,7 @@ def test_saved_unfollow_conversion_is_atomic_and_body_only(tmp_path, monkeypatch
         raise source_locks.SourceProtocolUnavailable("migration conversion before native lift")
 
     with monkeypatch.context() as held:
-        held.setattr(source_locks, "qualify_protocol", unavailable)
+        held.setattr(source_locks, "initialize_protocol", unavailable)
         store.initialize()
         with store.connection() as db:
             assert db.execute("PRAGMA user_version").fetchone()[0] == 36
@@ -2741,7 +2778,7 @@ def test_saved_unfollow_conversion_failure_rolls_back_original_store(tmp_path, m
     def unavailable(*args, **kwargs):
         raise source_locks.SourceProtocolUnavailable("rollback retry before native lift")
 
-    monkeypatch.setattr(source_locks, "qualify_protocol", unavailable)
+    monkeypatch.setattr(source_locks, "initialize_protocol", unavailable)
     store.initialize()
     store.initialize()
     with store.connection() as db:
@@ -2789,7 +2826,7 @@ def test_saved_unfollow_conversion_rejects_unowned_capabilities_before_writes(
         raise source_locks.SourceProtocolUnavailable("authority fixture before native lift")
 
     monkeypatch.setattr(removal, "convert_saved_unfollow", check_authority)
-    monkeypatch.setattr(source_locks, "qualify_protocol", unavailable)
+    monkeypatch.setattr(source_locks, "initialize_protocol", unavailable)
     store.initialize()
     with store.connection() as db:
         with pytest.raises(RuntimeError, match="live migration owner"):
@@ -2838,7 +2875,7 @@ def test_converted_unfollow_refollow_cannot_adopt_a_late_body(tmp_path, monkeypa
         raise source_locks.SourceProtocolUnavailable("refollow before native lift")
 
     with monkeypatch.context() as held:
-        held.setattr(source_locks, "qualify_protocol", unavailable)
+        held.setattr(source_locks, "initialize_protocol", unavailable)
         store.initialize()
     with store.connection() as db:
         key = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
@@ -2894,7 +2931,7 @@ def test_saved_unfollow_upgrade_excludes_old_writer_and_second_runtime(tmp_path,
 
     monkeypatch.setattr(removal, "convert_saved_unfollow", pause_after_conversion)
     monkeypatch.setattr(database.Store, "initialize", observed_initialize)
-    monkeypatch.setattr(source_locks, "qualify_protocol", unavailable)
+    monkeypatch.setattr(source_locks, "initialize_protocol", unavailable)
     cfg = replace(config(tmp_path), database_file=store.path)
     with ThreadPoolExecutor(max_workers=2) as pool:
         migrating = pool.submit(store.initialize)
@@ -2947,7 +2984,7 @@ def test_saved_unfollow_conversion_freezes_complete_unit_from_retained_alias_or_
         raise source_locks.SourceProtocolUnavailable("alias conversion before native lift")
 
     with monkeypatch.context() as held:
-        held.setattr(source_locks, "qualify_protocol", unavailable)
+        held.setattr(source_locks, "initialize_protocol", unavailable)
         store.initialize()
     with store.connection() as db:
         key = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]

@@ -6221,6 +6221,202 @@ fi"#,
         .with_test_environment("LOCALAPPDATA", process_root.join("local-app-data"))
     }
 
+    #[test]
+    fn native_removal_notification_queue_keeps_the_send_acceptance_boundary() {
+        use crate::delivery::NotificationDelivery;
+        use std::thread;
+
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        for ordering in ["eligible", "accepted", "sending"] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("config.toml");
+            let database = directory.path().join("watcher.sqlite3");
+            fs::write(
+                &config,
+                format!(
+                    "database_file = {}\nmodel_base_url = \"http://127.0.0.1:9/v1\"\n\
+                     model_name = \"fixture\"\nmodel_require_auth = false\n\
+                     notifications_enabled = true\nretention_days = 100\ntimezone = \"UTC\"\n",
+                    toml_path_literal(&database),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            // Reuse the public native DB fixture adapters. The transport below
+            // still runs the production source engine, without patched gateways.
+            let fixture = Command::new("uv")
+                .args(["run", "--project"])
+                .arg(project_root)
+                .args(["python", "-c"])
+                .arg(
+                    r#"
+import json,sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1])/'tests'))
+from test_db import Store
+from test_thread_reconcile import seed,KEY,NOW
+from test_service import FakeModel
+from eom_email_watcher.source_locks import source_lock_path
+store=Store(Path(sys.argv[2]));store.initialize()
+store.register_mail_account('gmail','mailbox',display_name='Fixture')
+store.reconcile_mailbox_identity('gmail','mailbox',KEY)
+vendor=store.create_vendor('Fixture vendor');store.add_vendor_address(vendor,'vendor@example.com')
+seed(store,'m',rfc_message_id='root@fixture',subject='Private root subject')
+for i in range(32): seed(store,f'copy-{i}',rfc_message_id=f'copy-{i}@fixture')
+seed(store,'other',rfc_message_id='other@fixture',thread_id='other-thread',subject='Other subject')
+with store.connection() as db:
+ db.execute("UPDATE messages SET logical_of='m' WHERE message_id LIKE 'copy-%'")
+for message_id in ['m','other']:
+ store.mark_analyzed(message_id,FakeModel().analyze().model_dump(),now=NOW)
+assert {item.message_id for item in store.notification_intents()}=={'m','other'}
+source_lock=source_lock_path(store.path,'m')
+source_lock.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+print(json.dumps(str(source_lock)))
+"#,
+                )
+                .arg(project_root)
+                .arg(&database)
+                .output()
+                .unwrap();
+            assert!(
+                fixture.status.success(),
+                "Native notification fixture: {}",
+                String::from_utf8_lossy(&fixture.stderr)
+            );
+            let source_lock: PathBuf = serde_json::from_slice(&fixture.stdout).unwrap();
+            let _source_holder = HostOperationLock::acquire(&source_lock).unwrap();
+            let engine = real_engine(config);
+            let snapshot = engine.admission_snapshot().unwrap();
+            engine.install_admission_binding(
+                AdmissionLease::new(),
+                snapshot.token,
+                Arc::new(|_, _| {}),
+            );
+            let prepare = || {
+                engine
+                    .prepare_inbox_removal("delete".into(), Some("m".into()))
+                    .unwrap()
+                    .request_id
+            };
+            let prepared_key = prepare();
+            if ordering == "accepted" {
+                let accepted = engine
+                    .delete_inbox_item("m".into(), prepared_key.clone())
+                    .unwrap();
+                assert_eq!(accepted.removal.outcome, InboxRemovalOutcome::Deferred);
+                assert_eq!(accepted.removal.pending, 1);
+            }
+            let shown = directory.path().join("shown.jsonl");
+            let started = directory.path().join("platform-started");
+            let release = directory.path().join("platform-release");
+            if ordering != "sending" {
+                fs::write(&release, b"release").unwrap();
+            }
+            let delivery = NotificationDelivery::with_notification_command(
+                if cfg!(windows) { "python" } else { "python3" },
+                vec![
+                    "-c".into(),
+                    r#"import json,sys,time
+from pathlib import Path
+payload=json.load(sys.stdin)
+Path(sys.argv[2]).write_text('started')
+while not Path(sys.argv[3]).exists(): time.sleep(.005)
+with open(sys.argv[1],'a') as output: output.write(json.dumps(payload)+'\n')
+"#
+                    .into(),
+                    shown.clone().into_os_string(),
+                    started.clone().into_os_string(),
+                    release.clone().into_os_string(),
+                ],
+            );
+            let worker_engine = engine.clone();
+            let worker = thread::spawn(move || {
+                delivery.deliver_with_cancellation(
+                    &worker_engine,
+                    Duration::from_secs(30),
+                    CancellationToken::new(),
+                )
+            });
+            if ordering == "sending" {
+                let wait = Instant::now();
+                while !started.exists() && !worker.is_finished() {
+                    assert!(
+                        wait.elapsed() < Duration::from_secs(10),
+                        "Platform send did not start"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let result = engine.delete_inbox_item("m".into(), prepared_key);
+                // Release before assertions, so an unexpected acceptance cannot
+                // strand the controlled helper or its delivery worker.
+                fs::write(&release, b"release").unwrap();
+                let delivered = worker.join().unwrap().unwrap();
+                assert!(started.exists());
+                assert_eq!(
+                    result.unwrap_err().code,
+                    "runtime_error",
+                    "Acceptance must not enter between queue selection and send/ack"
+                );
+                assert_eq!(delivered.delivered, 2);
+                assert_eq!(delivered.failed, 0);
+                assert_eq!(delivered.remaining, 0);
+                let accepted = engine.delete_inbox_item("m".into(), prepare()).unwrap();
+                assert_eq!(accepted.removal.outcome, InboxRemovalOutcome::Deferred);
+            } else {
+                let delivered = worker.join().unwrap().unwrap();
+                assert_eq!(
+                    delivered.delivered,
+                    if ordering == "accepted" { 1 } else { 2 }
+                );
+                assert_eq!(delivered.failed, 0);
+                assert_eq!(delivered.remaining, 0);
+            }
+            let payloads: Vec<Value> = fs::read_to_string(&shown)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(payloads.len(), if ordering == "accepted" { 1 } else { 2 });
+            assert_eq!(
+                payloads
+                    .iter()
+                    .filter(|item| item["title"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Private root subject"))
+                    .count(),
+                usize::from(ordering != "accepted")
+            );
+            assert_eq!(
+                payloads
+                    .iter()
+                    .filter(|item| item["title"].as_str().unwrap().contains("Other subject"))
+                    .count(),
+                1
+            );
+            let retained = Command::new("uv")
+                .args(["run", "--project"])
+                .arg(project_root)
+                .args(["python", "-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute(\"SELECT COUNT(*) FROM messages WHERE message_id='m' OR logical_of='m'\").fetchone()[0])"])
+                .arg(&database)
+                .output()
+                .unwrap();
+            assert!(retained.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&retained.stdout).trim(),
+                "33",
+                "The queue must exclude accepted retained content, not rely on physical deletion"
+            );
+        }
+    }
+
     fn toml_path_literal(path: &Path) -> String {
         serde_json::to_string(&path.to_string_lossy()).expect("serialize test config path")
     }
