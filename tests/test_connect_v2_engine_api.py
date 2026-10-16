@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import local_removal
 from connect_automate import connect
 from fixture_toml import toml_path_literal
 
@@ -51,7 +52,11 @@ from pathlib import Path
 
 from eom_email_watcher.db import Store
 
-deleted = Store(Path(sys.argv[1])).delete_message(sys.argv[2])
+from eom_email_watcher.removal import acceptance_scope
+
+store = Store(Path(sys.argv[1]))
+with acceptance_scope(store) as acceptance:
+    deleted = store.delete_message(sys.argv[2], acceptance=acceptance)
 print("deleted" if deleted else "missing", flush=True)
 """
 
@@ -352,7 +357,7 @@ def test_source_delete_recovers_provider_owned_unbound_automation_fire(
         )
     assert runtime.store.automation_fire(fire.fire_id).job_id is None  # type: ignore[union-attr]
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
 
     retained = runtime.store.automation_fire(fire.fire_id)
     retained_attempt = runtime.store.automation_fire_attempts(fire.fire_id)
@@ -444,7 +449,7 @@ def test_source_delete_preserves_unbound_terminal_automation_outcome(
         )
     assert runtime.store.automation_fire(fire.fire_id).job_id is None  # type: ignore[union-attr]
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
 
     retained = runtime.store.automation_fire(fire.fire_id)
     retained_attempts = runtime.store.automation_fire_attempts(fire.fire_id)
@@ -2236,7 +2241,7 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     assert still_paused.state == "entitlement_paused"
     assert runtime.store.automation_fire_settlement_due() is False
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
     retained = runtime.store.automation_fire(fire.fire_id)
     assert retained is not None
     assert retained.state == "entitlement_paused"
@@ -2505,7 +2510,7 @@ def test_interactive_join_authorizes_automation_origin_job_submission(
     assert still_paused.state == "entitlement_paused"
     assert runtime.store.automation_fire_settlement_due() is False
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
     retained = runtime.store.automation_fire(fire.fire_id)
     assert retained is not None
     assert retained.state == "entitlement_paused"
@@ -2787,7 +2792,7 @@ def test_confirmed_pending_automation_is_deleted_with_its_source_and_receipt(
         )
     )
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     assert runtime.store.automation_fire(fire.fire_id) is None
     assert runtime.store.automation_fire_attempts(fire.fire_id) == []
@@ -2841,7 +2846,7 @@ def test_provider_owned_paused_fire_survives_source_delete_and_records_terminal_
         )
     runtime.store.initialize()
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     retained = runtime.store.automation_fire(fire.fire_id)
     assert retained is not None
@@ -2916,7 +2921,7 @@ def test_source_delete_preserves_unsettled_terminal_automation_outcome(
             error={"code": "PDF_MALFORMED", "message": "Invalid PDF", "retryable": False},
         )
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     settled = runtime.store.automation_fire(fire.fire_id)
     assert settled is not None
@@ -4303,7 +4308,7 @@ def test_late_terminal_after_source_cleanup_is_returned_without_persistence(
         provider_app_id=job.provider_app_id,
         provider_instance_id=job.provider_instance_id,
     )
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     class CompletingClient:
         def __init__(self, capability_value):
@@ -5636,7 +5641,7 @@ def test_source_cleanup_wins_before_retry_and_prevents_another_post(
     engine_api._response(
         api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
     )
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
 

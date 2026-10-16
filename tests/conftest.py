@@ -115,3 +115,11 @@ def tmp_path(tmp_path, request):
     from prove_windows_cutover import probe_output
 
     return probe_output(request.node.name, tmp_path)
+
+
+def local_removal(store, method, *args, **kwargs):
+    """Exercise the real Store method under its required native entry owner."""
+    from eom_email_watcher.removal import acceptance_scope
+
+    with acceptance_scope(store) as acceptance:
+        return getattr(store, method)(*args, acceptance=acceptance, **kwargs)

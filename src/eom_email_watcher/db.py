@@ -5973,9 +5973,10 @@ class Store:
 
                 def track_inputs(action, table, column, database, trigger):
                     if action == sqlite3.SQLITE_TRANSACTION and table in {"COMMIT", "ROLLBACK"}:
-                        owner = getattr(connection, "_migration_owner", None)
-                        if owner is not None:
-                            owner._invalidate()
+                        for name in ("_migration_owner", "_removal_transaction"):
+                            owner = getattr(connection, name, None)
+                            if owner is not None:
+                                owner._invalidate()
                     if (
                         action
                         in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE)
@@ -10221,23 +10222,27 @@ class Store:
                 raise KeyError(vendor_id)
         return VendorRemoval(True, tuple(addresses), db._held_body_cleanup)
 
-    def request_removal(self, kind, parameters, *, request_id=None, retention_days=30, now=None):
+    def request_removal(
+        self, kind, parameters, *, acceptance=None, request_id=None, retention_days=30, now=None,
+    ):
+        removal.require_runtime_acceptance(acceptance, self.path)
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         if request_id is None:
             request_id = removal.issue_key(
                 self, kind, parameters, retention_days=retention_days, now=stamp
             )
-        return removal.accept(self, request_id, kind, parameters, now=stamp)
+        return removal.accept(self, request_id, kind, parameters, now=stamp, acceptance=acceptance)
 
-    def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
+    def delete_message(
+        self, message_id: str, *, acceptance=None, now: datetime | None = None,
+    ) -> bool:
         try:
-            result = self.request_removal("delete", {"message_id": message_id}, now=now)
+            result = self.request_removal(
+                "delete", {"message_id": message_id}, now=now, acceptance=acceptance,
+            )
             return bool(result.requested)
         except KeyError:
             return False
-
-    def clear_messages(self, *, now: datetime | None = None) -> int:
-        return self.request_removal("clear", {}, now=now).completed
 
     def replace_attachments(
         self,

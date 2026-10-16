@@ -1,6 +1,7 @@
 """Held local removal is an explicit refusal, with no mutation of held units."""
 
 import pytest
+from conftest import local_removal
 from test_thread_bodies import body_runner
 from test_thread_reconcile import NOW, seed
 
@@ -84,7 +85,7 @@ def test_clear_reports_held_and_completed_portions(tmp_path, monkeypatch, small)
 def test_direct_store_cannot_report_held_delete_as_absent(tmp_path, monkeypatch):
     store = held_runtime(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="Can't delete this yet"):
-        store.delete_message("m")
+        local_removal(store, "delete_message", "m")
 
 
 @pytest.mark.parametrize("operation", ["vendors.addresses.remove", "vendors.delete"])

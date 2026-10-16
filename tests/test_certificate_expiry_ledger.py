@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import local_removal
 from connect_automate import connect
 from test_connect_v2_engine_api import (
     INPUT_ARTIFACT_ID,
@@ -445,7 +446,7 @@ def test_source_cleanup_cannot_complete_an_unreconciled_certificate_join(
         job_id=JOB_ID,
     )
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
     retained = runtime.store.automation_fire(submitted.fire_id)
     assert retained is not None and retained.state == "submitted"
     assert runtime.store.connect_job(JOB_ID) is not None
@@ -1063,7 +1064,7 @@ def test_provider_owned_certificate_survives_source_deletion(tmp_path: Path) -> 
         ).fetchone()[0]
     assert identity_count == 1
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
     runtime.store.transition_connect_job(
         job_id=job_id,
         expected_state="accepted",
@@ -1090,7 +1091,7 @@ def test_invalid_source_less_certificate_discards_its_terminal_job(tmp_path: Pat
         provider_app_id="invoice-processor",
         provider_instance_id=INSTANCE_A,
     )
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
     invalid = _record()
     invalid["unexpected"] = True
 
@@ -1146,7 +1147,7 @@ def test_completed_join_discards_source_less_certificate_job_after_settlement(
         job_id=job_id,
     )
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
     assert runtime.store.connect_job(job_id) is not None
     runtime.store.reconcile_certificate_completed_join(job_id=job_id)
 
@@ -1192,7 +1193,7 @@ def test_failed_terminal_replay_discards_source_less_certificate_job(tmp_path: P
         reason="connect_admitted",
         job_id=job_id,
     )
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
     conflicting = _record()
     conflicting["insured"] = _text("Different Insured LLC", "different-insured")
 
@@ -1237,7 +1238,7 @@ def test_bulk_completed_join_skips_siblings_settled_by_the_first_reconciliation(
             reason="connect_admitted",
             job_id=JOB_ID,
         )
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
 
     engine_api._settle_submitted_automation_fires(runtime, limit=2)

@@ -2765,11 +2765,11 @@ def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
             "unsupported_platform",
             "Local inbox changes require native operation locking",
         )
-    with operation_lock(lock_path, "Another watcher operation is already running"):
+    with removal.acceptance_scope(runtime.store) as acceptance:
         try:
             result = runtime.store.request_removal(
                 "delete", parameters, request_id=key,
-                retention_days=runtime.config.retention_days,
+                retention_days=runtime.config.retention_days, acceptance=acceptance,
             )
         except KeyError as exc:
             raise ApiError("not_found", "Message was not found") from exc
@@ -2788,11 +2788,11 @@ def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
             "unsupported_platform",
             "Local inbox changes require native operation locking",
         )
-    with operation_lock(lock_path, "Another watcher operation is already running"):
+    with removal.acceptance_scope(runtime.store) as acceptance:
         try:
             result = runtime.store.request_removal(
                 "clear", {}, request_id=key,
-                retention_days=runtime.config.retention_days,
+                retention_days=runtime.config.retention_days, acceptance=acceptance,
             )
         except removal.RemovalRequestInvalid as exc:
             raise ApiError("invalid_request", str(exc)) from exc

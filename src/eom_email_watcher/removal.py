@@ -3,13 +3,17 @@
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
+import threading
 import uuid
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from connect_automate.locking import OperationLockBusy
+from connect_automate.locking import OperationLockBusy, connect_operation_lock
 
 KEY = re.compile(r"rm1\.([1-9][0-9]{0,11})\.([0-9a-f]{32})\.([0-9a-f]{64})\Z")
 SIGNING_KEY = "removal_request_signing_v1"
@@ -382,7 +386,7 @@ def freeze(db, key, kind, message_ids, *, accepted_at):
             continue
         canonical = row["logical_of"] or row["message_id"]
         binding = (row["provider"], row["account_id"], row["effective_identity"])
-        groups.setdefault(binding, {})[canonical] = _logical_unit(db, canonical)
+        groups.setdefault(binding, {})[canonical] = _logical_unit(db, message_id)
     for binding, units in groups.items():
         intent_id = str(uuid.uuid4())
         db.execute(
@@ -417,7 +421,7 @@ def _accept_in_transaction(db, key, kind, parameters, message_ids, *, now, autho
     from . import thread_migration
     from .db import _mark_automation_sources_unavailable
 
-    if type(authority) is _RuntimeAcceptance:
+    if type(authority) is _RuntimeTransaction:
         authority.require(db)
     else:
         thread_migration.require_migration_owner(authority, db)
@@ -428,9 +432,7 @@ def _accept_in_transaction(db, key, kind, parameters, message_ids, *, now, autho
     validate_key(db, key, kind, fingerprint, now=now)
     if kind == "delete":
         message_ids = [parameters["message_id"]]
-        if not db.execute(
-            "SELECT 1 FROM logical_messages WHERE message_id=?", (message_ids[0],)
-        ).fetchone():
+        if not message_available(db, message_ids[0]):
             raise KeyError(message_ids[0])
     elif kind == "clear":
         message_ids = [r[0] for r in db.execute("SELECT message_id FROM logical_messages")]
@@ -452,38 +454,118 @@ def _accept_in_transaction(db, key, kind, parameters, message_ids, *, now, autho
 
 
 class _RuntimeAcceptance:
-    def __init__(self, db):
-        self.db = db
-        self.live = True
+    def __init__(self):
+        raise TypeError("Runtime acceptance authority is minted by its acquiring scope")
+
+    def require(self, path):
+        if (
+            getattr(self, "_identity", None) is not self
+            or not getattr(self, "live", False)
+            or self.execution != (os.getpid(), threading.get_ident())
+            or self.path != Path(path).resolve()
+        ):
+            raise RuntimeError("A live runtime acceptance capability is required")
+
+    @contextmanager
+    def transaction(self, store):
+        self.require(store.path)
+        if self._transaction is not None:
+            raise RuntimeError("Runtime acceptance already has an open transaction")
+        transaction = None
+        try:
+            with store.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                transaction = object.__new__(_RuntimeTransaction)
+                transaction._identity = transaction
+                transaction.scope = self
+                transaction.db = db
+                transaction.live = True
+                self._transaction = transaction
+                db._removal_transaction = transaction
+                yield db
+        finally:
+            if transaction is not None:
+                transaction._invalidate()
+            self._transaction = None
+
+    def finish_acceptance(self):
+        self.require(self.path)
+        if self._transaction is not None:
+            raise RuntimeError("Cannot finish runtime acceptance inside its transaction")
+        self.live = False
+        self._guard.close()
+
+
+class _RuntimeTransaction:
+    def __init__(self):
+        raise TypeError("Runtime transaction authority belongs to its acquiring scope")
+
+    def _invalidate(self):
+        self.live = False
 
     def require(self, db):
-        if not self.live or self.db is not db or not db.in_transaction:
+        if getattr(self, "_identity", None) is not self:
             raise RuntimeError("Removal acceptance requires its guarded write transaction")
+        self.scope.require(self.scope.path)
+        if (
+            not self.live or self.db is not db or self.scope._transaction is not self
+            or getattr(db, "_removal_transaction", None) is not self or not db.in_transaction
+        ):
+            raise RuntimeError("Removal acceptance requires its guarded write transaction")
+        main = next(row[2] for row in db.execute("PRAGMA database_list") if row[1] == "main")
+        if Path(main).resolve() != self.scope.path:
+            raise RuntimeError("Runtime acceptance belongs to another database")
 
 
-def accept(store, key, kind, parameters, *, now):
-    """Accept a frozen selection under the caller's existing operation lock."""
+def require_runtime_acceptance(capability, path):
+    if type(capability) is not _RuntimeAcceptance:
+        raise RuntimeError("A live runtime acceptance capability is required")
+    capability.require(path)
+
+
+@contextmanager
+def acceptance_scope(store):
+    """Acquire operation then acceptance guard once; pass authority explicitly."""
     from . import source_locks
 
-    fingerprint = request_hash(kind, parameters)
     with (
-        source_locks.protocol_guard(
+        connect_operation_lock(
+            source_locks.operation_lock_path(store.path),
+            "Another watcher operation is already running",
+        ),
+        ExitStack() as guard,
+    ):
+        guard.enter_context(source_locks.protocol_guard(
             source_locks.selection_path(store.path),
             "Source-lock protocol is being selected",
             timeout_seconds=source_locks.SOURCE_LOCK_WAIT_SECONDS,
-        ),
-        store.connection() as db,
-    ):
-        db.execute("BEGIN IMMEDIATE")
-        authority = _RuntimeAcceptance(db)
+        ))
+        capability = object.__new__(_RuntimeAcceptance)
+        capability._identity = capability
+        capability.path = store.path.resolve()
+        capability.execution = (os.getpid(), threading.get_ident())
+        capability.live = True
+        capability._transaction = None
+        capability._guard = guard
         try:
-            result, created = _accept_in_transaction(
-                db, key, kind, parameters, None, now=now, authority=authority,
-            )
+            yield capability
         finally:
-            authority.live = False
-        if not created:
-            return result
+            capability.live = False
+
+
+def accept(store, key, kind, parameters, *, now, acceptance):
+    """Use the entry's explicit native authority, then existing completion."""
+    require_runtime_acceptance(acceptance, store.path)
+    fingerprint = request_hash(kind, parameters)
+    with acceptance.transaction(store) as db:
+        result, created = _accept_in_transaction(
+            db, key, kind, parameters, None, now=now, authority=db._removal_transaction,
+        )
+    # Invalidate acceptance before releasing its guard. The operation lock stays
+    # with the acquiring scope while unchanged source completion takes its locks.
+    acceptance.finish_acceptance()
+    if not created:
+        return result
     resume(store, now=now)
     with store.connection() as db:
         return outcome(db, key, kind=kind, fingerprint=fingerprint)
@@ -526,6 +608,7 @@ def convert_saved_unfollow(db, migration_owner, *, now):
 def resume(store, *, now=None):
     """One physical completion owner; caller holds the existing operation lock."""
     from .db import (
+        SOURCE_CLEANUP_LOCK_BATCH_SIZE,
         _message_suppression_key,
         _purge_expired_automation_tombstones,
         _suppression_expiry,
@@ -534,102 +617,103 @@ def resume(store, *, now=None):
     now = (now or datetime.now(UTC)).astimezone(UTC)
     stamp = now.isoformat()
     with store.connection() as db:
-        groups = [
-            tuple(r)
-            for r in db.execute(
-                "SELECT DISTINCT intent_id,logical_target_id FROM message_removal_targets "
-                "WHERE state='pending' ORDER BY intent_id,logical_target_id",
-            )
-        ]
-    for intent_id, logical_id in groups:
-        with store.connection() as db:
-            ids = [
-                r[0]
-                for r in db.execute(
-                    "SELECT message_id FROM message_removal_targets WHERE intent_id=? "
-                    "AND logical_target_id=? AND state='pending'",
-                    (intent_id, logical_id),
-                )
-            ]
-        try:
-            with store._source_cleanup_locks(ids) as acquired, store.connection() as db:
-                if not acquired:
-                    continue
-                db.execute("BEGIN IMMEDIATE")
-                intent = db.execute(
-                    "SELECT * FROM message_removal_intents WHERE intent_id=?", (intent_id,)
-                ).fetchone()
-                targets = db.execute(
-                    "SELECT * FROM message_removal_targets "
-                    "WHERE intent_id=? AND logical_target_id=? "
-                    "AND state='pending'",
-                    (intent_id, logical_id),
-                ).fetchall()
-                if not targets:
-                    continue
-                if intent["kind"] != "unfollow":
-                    for frozen in dict.fromkeys(t["source_identities_json"] for t in targets):
-                        for source in json.loads(frozen):
-                            db.execute(
-                                "INSERT INTO suppressed_messages VALUES(?,?,?,?) "
-                                "ON CONFLICT(provider,account_id,message_key) "
-                                "DO UPDATE SET expires_at=excluded.expires_at",
-                                (
-                                    source["provider"],
-                                    source["account_id"],
-                                    _message_suppression_key(
-                                        source["provider"],
-                                        source["account_id"],
-                                        source["provider_message_id"],
-                                        source["mailbox_identity_key"],
-                                    ),
-                                    _suppression_expiry(source["received_at"], now),
-                                ),
-                            )
-                for target in targets:
-                    row = db.execute(
-                        "SELECT * FROM messages WHERE message_id=? AND provider=? AND account_id=? "
-                        "AND mailbox_identity_key IS ? AND provider_message_id=?",
-                        (
-                            target["message_id"],
-                            target["provider"],
-                            target["account_id"],
-                            target["stored_identity_key"],
-                            target["provider_message_id"],
-                        ),
-                    ).fetchone()
-                    if row is None:
+        units = {}
+        for intent_id, logical_id, message_id in db.execute(
+            "SELECT intent_id,logical_target_id,message_id FROM message_removal_targets "
+            "WHERE state='pending' ORDER BY intent_id,logical_target_id,message_id",
+        ):
+            units.setdefault((intent_id, logical_id), []).append(message_id)
+    keys = list(units)
+    for offset in range(0, len(keys), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+        initial = keys[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+        for chunk, ids in store._source_cleanup_groups({key: units[key] for key in initial}):
+            try:
+                with store._source_cleanup_locks(ids) as acquired, store.connection() as db:
+                    if not acquired:
                         continue
-                    if intent["kind"] == "unfollow":
-                        for table in ("message_bodies", "message_body_unavailable"):
-                            db.execute(
-                                f"DELETE FROM {table} WHERE message_id=?", (row["message_id"],)
-                            )
-                    else:
-                        db.execute("DELETE FROM messages WHERE message_id=?", (row["message_id"],))
-                if intent["kind"] != "unfollow":
-                    _purge_expired_automation_tombstones(db, now=stamp)
-                db.execute(
-                    "UPDATE message_removal_targets SET state='completed',settled_at=? "
-                    "WHERE intent_id=? AND logical_target_id=? AND state='pending'",
-                    (stamp, intent_id, logical_id),
-                )
-                completed = db.execute(
-                    "SELECT COUNT(DISTINCT logical_target_id) FROM message_removal_targets "
-                    "WHERE intent_id=? AND state='completed'",
-                    (intent_id,),
-                ).fetchone()[0]
-                settled = completed == intent["requested_count"]
-                db.execute(
-                    "UPDATE message_removal_intents SET completed_count=?,state=?,settled_at=? "
-                    "WHERE intent_id=?",
-                    (
-                        completed,
-                        "completed" if settled else "pending",
-                        stamp if settled else None,
-                        intent_id,
-                    ),
-                )
-        except OperationLockBusy:
-            # A still-active source owns its bytes; keep its receipt/barrier.
-            continue
+                    db.execute("BEGIN IMMEDIATE")
+                    for intent_id, logical_id in chunk:
+                        intent = db.execute(
+                            "SELECT * FROM message_removal_intents WHERE intent_id=?", (intent_id,)
+                        ).fetchone()
+                        targets = db.execute(
+                            "SELECT * FROM message_removal_targets "
+                            "WHERE intent_id=? AND logical_target_id=? "
+                            "AND state='pending'",
+                            (intent_id, logical_id),
+                        ).fetchall()
+                        if not targets:
+                            continue
+                        if intent["kind"] != "unfollow":
+                            for frozen in dict.fromkeys(
+                                t["source_identities_json"] for t in targets
+                            ):
+                                for source in json.loads(frozen):
+                                    db.execute(
+                                        "INSERT INTO suppressed_messages VALUES(?,?,?,?) "
+                                        "ON CONFLICT(provider,account_id,message_key) "
+                                        "DO UPDATE SET expires_at=excluded.expires_at",
+                                        (
+                                            source["provider"],
+                                            source["account_id"],
+                                            _message_suppression_key(
+                                                source["provider"],
+                                                source["account_id"],
+                                                source["provider_message_id"],
+                                                source["mailbox_identity_key"],
+                                            ),
+                                            _suppression_expiry(source["received_at"], now),
+                                        ),
+                                    )
+                        for target in targets:
+                            row = db.execute(
+                                "SELECT * FROM messages WHERE message_id=? "
+                                "AND provider=? AND account_id=? "
+                                "AND mailbox_identity_key IS ? AND provider_message_id=?",
+                                (
+                                    target["message_id"],
+                                    target["provider"],
+                                    target["account_id"],
+                                    target["stored_identity_key"],
+                                    target["provider_message_id"],
+                                ),
+                            ).fetchone()
+                            if row is None:
+                                continue
+                            if intent["kind"] == "unfollow":
+                                for table in ("message_bodies", "message_body_unavailable"):
+                                    db.execute(
+                                        f"DELETE FROM {table} WHERE message_id=?",
+                                        (row["message_id"],),
+                                    )
+                            else:
+                                db.execute(
+                                    "DELETE FROM messages WHERE message_id=?", (row["message_id"],),
+                                )
+                        if intent["kind"] != "unfollow":
+                            _purge_expired_automation_tombstones(db, now=stamp)
+                        db.execute(
+                            "UPDATE message_removal_targets SET state='completed',settled_at=? "
+                            "WHERE intent_id=? AND logical_target_id=? AND state='pending'",
+                            (stamp, intent_id, logical_id),
+                        )
+                        completed = db.execute(
+                            "SELECT COUNT(DISTINCT logical_target_id) FROM message_removal_targets "
+                            "WHERE intent_id=? AND state='completed'",
+                            (intent_id,),
+                        ).fetchone()[0]
+                        settled = completed == intent["requested_count"]
+                        db.execute(
+                            "UPDATE message_removal_intents "
+                            "SET completed_count=?,state=?,settled_at=? "
+                            "WHERE intent_id=?",
+                            (
+                                completed,
+                                "completed" if settled else "pending",
+                                stamp if settled else None,
+                                intent_id,
+                            ),
+                        )
+            except OperationLockBusy:
+                # A still-active source owns its bytes; keep its receipt/barrier.
+                continue

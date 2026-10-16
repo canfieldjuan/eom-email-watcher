@@ -5,6 +5,7 @@ import stat
 from datetime import timedelta
 
 import pytest
+from conftest import local_removal
 from test_thread_bodies import followed, legacy_body_store
 from test_thread_reconcile import NOW
 
@@ -567,12 +568,11 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import contextmanager
 
-    from connect_automate.locking import operation_lock
     from test_removal_refusal import held_runtime
     from test_service import FakeModel
     from test_thread_reconcile import KEY
 
-    from eom_email_watcher import removal, source_locks
+    from eom_email_watcher import removal
     from eom_email_watcher.config import exact_sender_selector_id
     from eom_email_watcher.mime import AttachmentDescriptor
 
@@ -911,21 +911,23 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
         try:
             assert reached.wait(5), "owner never consulted persisted target eligibility"
             with (
-                operation_lock(source_locks.operation_lock_path(store.path), "public operation"),
+                removal.acceptance_scope(store) as acceptance,
                 pytest.raises(sqlite3.OperationalError, match="locked"),
             ):
                 store.request_removal(
                     "delete",
                     {"message_id": target_id},
                     request_id=key,
-                    now=NOW,
+                    now=NOW, acceptance=acceptance,
                 )
         finally:
             release.set()
         future.result(timeout=10)
     assert not observation_timeouts
-    with operation_lock(source_locks.operation_lock_path(store.path), "public operation"):
-        result = store.request_removal("delete", {"message_id": target_id}, request_id=key, now=NOW)
+    with removal.acceptance_scope(store) as acceptance:
+        result = store.request_removal(
+            "delete", {"message_id": target_id}, request_id=key, now=NOW, acceptance=acceptance,
+        )
     assert result.pending == 1 and result.completed == 0
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
@@ -1014,7 +1016,9 @@ def test_zero_target_retry_and_retired_expiry_never_select_new_arrivals(
     store = database.Store(tmp_path / "empty.db")
     store.initialize()
     key = removal.issue_key(store, "clear", {}, retention_days=1, now=NOW)
-    empty = store.request_removal("clear", {}, request_id=key, retention_days=1, now=NOW)
+    empty = local_removal(
+        store, "request_removal", "clear", {}, request_id=key, retention_days=1, now=NOW,
+    )
     assert empty.requested == empty.completed == 0
     later = NOW + timedelta(days=2)
     if retire:
@@ -1039,10 +1043,13 @@ def test_zero_target_retry_and_retired_expiry_never_select_new_arrivals(
     if retire:
         with pytest.raises(removal.RemovalRequestInvalid, match="expired"):
             # A changed retention setting cannot extend the key's fixed expiry.
-            store.request_removal("clear", {}, request_id=key, retention_days=100, now=later)
+            local_removal(
+                store, "request_removal", "clear", {}, request_id=key,
+                retention_days=100, now=later,
+            )
     else:
         assert (
-            store.request_removal(
+            local_removal(store, "request_removal",
                 "clear",
                 {},
                 request_id=key,
@@ -1521,12 +1528,11 @@ def test_frozen_alias_source_membership_survives_missing_row(
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import nullcontext
 
-    from connect_automate.locking import operation_lock
     from test_db import _upgraded_completed_legacy_message
     from test_removal_refusal import held_runtime
     from test_thread_reconcile import KEY
 
-    from eom_email_watcher import source_locks
+    from eom_email_watcher import removal, source_locks
 
     if legacy_null:
         store, root, identity = _upgraded_completed_legacy_message(tmp_path)
@@ -1561,8 +1567,10 @@ def test_frozen_alias_source_membership_survives_missing_row(
     assert store.source_start(**source)
 
     def accept():
-        with operation_lock(source_locks.operation_lock_path(store.path), "public removal"):
-            return store.request_removal("delete", {"message_id": root}, now=NOW)
+        with removal.acceptance_scope(store) as acceptance:
+            return store.request_removal(
+                "delete", {"message_id": root}, now=NOW, acceptance=acceptance,
+            )
 
     with held:
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -2245,7 +2253,7 @@ def test_deferred_completion_purges_expired_automation_at_physical_owner(
         source_id = db.execute("SELECT message_id FROM messages").fetchone()[0]
     retain_legacy_aliases(store, source_id)
     cleanup_at = database.datetime.fromisoformat(run.expires_at) + timedelta(days=1)
-    receipt = store.request_removal(
+    receipt = local_removal(store, "request_removal",
         kind, {"message_id": source_id} if kind == "delete" else {}, now=cleanup_at
     )
     assert receipt.completed == 0 and receipt.pending == 1
@@ -2512,7 +2520,7 @@ def test_removal_prepare_boundary_and_status_authentication_are_read_only(tmp_pa
             removal.validate_key(db, key, kind, removal.request_hash(kind, parameters), now=NOW)
         assert snapshot(store) == before
     key = removal.issue_key(store, "clear", {}, retention_days=1, now=NOW)
-    accepted = store.request_removal("clear", {}, request_id=key, now=NOW)
+    accepted = local_removal(store, "request_removal", "clear", {}, request_id=key, now=NOW)
     assert accepted.requested == accepted.completed == 0
     retained = snapshot(store)
     future = NOW + timedelta(days=3)
@@ -2579,8 +2587,10 @@ def test_removal_status_reads_one_snapshot_during_receipt_retirement(tmp_path, m
 
     store, _, _ = followed(tmp_path)
     key = removal.issue_key(store, "delete", {"message_id": "m"}, retention_days=1, now=NOW)
-    with operation_lock(source_locks.operation_lock_path(store.path), "public operation"):
-        result = store.request_removal("delete", {"message_id": "m"}, request_id=key, now=NOW)
+    with removal.acceptance_scope(store) as acceptance:
+        result = store.request_removal(
+            "delete", {"message_id": "m"}, request_id=key, now=NOW, acceptance=acceptance,
+        )
     assert result.completed == 1 and result.pending == 0
     reached, release = threading.Event(), threading.Event()
     main_thread = threading.get_ident()
@@ -2954,3 +2964,407 @@ def test_saved_unfollow_conversion_freezes_complete_unit_from_retained_alias_or_
         assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
         assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
         assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
+
+
+def test_direct_acceptance_requires_runtime_capability_before_writes(tmp_path):
+    from test_removal_refusal import snapshot
+
+    store, _, _ = followed(tmp_path)
+    before = snapshot(store)
+    with pytest.raises(RuntimeError, match="runtime acceptance"):
+        store.request_removal("clear", {}, now=NOW)
+    assert snapshot(store) == before
+
+
+def test_runtime_acceptance_capability_rejects_forged_stale_cross_execution_and_path(
+    tmp_path, monkeypatch
+):
+    import copy
+    from concurrent.futures import ThreadPoolExecutor
+
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    before = snapshot(store)
+    for invalid in (None, False, True, object(), object.__new__(removal._RuntimeAcceptance)):
+        with pytest.raises(RuntimeError, match="runtime acceptance"):
+            store.request_removal("clear", {}, acceptance=invalid, now=NOW)
+        assert snapshot(store) == before
+    with pytest.raises(TypeError, match="acquiring scope"):
+        removal._RuntimeAcceptance()
+    with removal.acceptance_scope(store) as capability:
+        with pytest.raises(RuntimeError, match="runtime acceptance"):
+            store.request_removal("clear", {}, acceptance=copy.copy(capability), now=NOW)
+        with pytest.raises(RuntimeError, match="runtime acceptance"):
+            removal.require_runtime_acceptance(capability, tmp_path / "another.db")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            error = pool.submit(
+                store.request_removal, "clear", {}, acceptance=capability, now=NOW,
+            ).exception(5)
+        assert isinstance(error, RuntimeError), repr(error)
+        assert "runtime acceptance" in str(error)
+        with monkeypatch.context() as other_process:
+            other_process.setattr(removal.os, "getpid", lambda: capability.execution[0] + 1)
+            with pytest.raises(RuntimeError, match="runtime acceptance"):
+                removal.require_runtime_acceptance(capability, store.path)
+        assert snapshot(store) == before
+    with pytest.raises(RuntimeError, match="runtime acceptance"):
+        store.request_removal("clear", {}, acceptance=capability, now=NOW)
+    assert snapshot(store) == before
+
+
+def test_runtime_acceptance_refuses_outer_connection_and_native_committed_transaction(tmp_path):
+    from eom_email_watcher import removal
+
+    store, _, _ = followed(tmp_path)
+    # This connection and transaction predate the acquiring guard scope.
+    with store.connection() as outer:
+        outer.execute("BEGIN")
+        with removal.acceptance_scope(store) as capability, capability.transaction(store) as db:
+            authority = db._removal_transaction
+            authority.require(db)
+            with pytest.raises(RuntimeError, match="guarded write transaction"):
+                authority.require(outer)
+            with pytest.raises(RuntimeError, match="live migration owner"):
+                thread_migration.require_migration_owner(capability, db)
+            key = removal._issue_key(db, "clear", {}, retention_days=30, now=NOW)
+            with pytest.raises(RuntimeError, match="guarded write transaction"):
+                removal._accept_in_transaction(
+                    outer, key, "clear", {}, None, now=NOW, authority=authority,
+                )
+            assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            with pytest.raises(RuntimeError, match="guarded write transaction"):
+                authority.require(db)
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+
+
+def test_delete_api_acquires_once_before_transaction_and_releases_guard_before_completion(
+    tmp_path, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from test_service import config
+
+    from eom_email_watcher import engine_api, removal, source_locks
+
+    store, _, _ = followed(tmp_path)
+    cfg = replace(config(tmp_path), database_file=store.path)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg))
+    monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    operation_acquisitions, guard_transactions, active_connections = [], [], []
+    original_operation = removal.connect_operation_lock
+    original_guard = source_locks.protocol_guard
+    original_connection = database.Store.connection
+
+    @contextmanager
+    def observe_operation(path, *args, **kwargs):
+        operation_acquisitions.append(path)
+        with original_operation(path, *args, **kwargs):
+            yield
+
+    @contextmanager
+    def observe_connection(self):
+        with original_connection(self) as db:
+            active_connections.append(db)
+            try:
+                yield db
+            finally:
+                active_connections.remove(db)
+
+    @contextmanager
+    def observe_guard(*args, **kwargs):
+        guard_transactions.append(any(db.in_transaction for db in active_connections))
+        with original_guard(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(removal, "connect_operation_lock", observe_operation)
+    monkeypatch.setattr(database.Store, "connection", observe_connection)
+    monkeypatch.setattr(source_locks, "protocol_guard", observe_guard)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        response = pool.submit(engine_api._response, {
+            "protocol": 1, "operation": "inbox.delete", "payload": {"message_id": "m"},
+        }).result(timeout=5)
+    assert response["ok"], response
+    assert response["data"]["outcome"] == "completed"
+    assert response["data"]["completed"] == 1 and response["data"]["pending"] == 0
+    assert operation_acquisitions == [source_locks.operation_lock_path(store.path)]
+    assert len(guard_transactions) >= 2
+    assert not any(guard_transactions), "Guard acquired inside an existing transaction"
+    assert not active_connections
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM messages").fetchone()
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_completion_batches_frozen_units_without_splitting_oversized_legacy_unit(
+    tmp_path, monkeypatch, qualified
+):
+    from contextlib import contextmanager
+
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import engine_api, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    for index in range(3):
+        seed(store, f"small-{index}", rfc_message_id=f"small-{index}@vendor")
+    if qualified:
+        source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        units = {r[0]: r[1] for r in db.execute(
+            "SELECT message_id,COALESCE(logical_of,message_id) FROM messages"
+        )}
+        assert len(set(units.values())) == 4
+    original = store._source_cleanup_locks
+    acquired_groups, refused_groups = [], []
+
+    @contextmanager
+    def observed(message_ids):
+        ids = tuple(message_ids)
+        with original(ids) as acquired:
+            (acquired_groups if acquired else refused_groups).append(ids)
+            yield acquired
+
+    monkeypatch.setattr(database, "SOURCE_CLEANUP_LOCK_BATCH_SIZE", 2)
+    monkeypatch.setattr(store, "_source_cleanup_locks", observed)
+    response = engine_api._response({"protocol": 1, "operation": "inbox.clear", "payload": {}})
+    assert response["ok"], response
+    assert response["data"]["requested"] == 4
+    assert response["data"]["completed"] == (4 if qualified else 3)
+    assert response["data"]["pending"] == (0 if qualified else 1)
+    logical_widths = [len({units[row] for row in group}) for group in acquired_groups]
+    assert max(logical_widths) == 2, "Completion bypassed the existing bounded batch owner"
+    assert all(width <= 2 for width in logical_widths)
+    if qualified:
+        assert not refused_groups
+    else:
+        assert len(refused_groups) == 1
+        assert len(refused_groups[0]) == 33
+        assert {units[row] for row in refused_groups[0]} == {"m"}
+        assert max(len(group) for group in acquired_groups) == 2
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == (0 if qualified else 33)
+        if not qualified:
+            assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+
+
+@pytest.mark.parametrize("message_id", ["m", "copy-00", "copy-31"])
+def test_delete_request_resolves_any_retained_alias_through_frozen_unit(
+    tmp_path, monkeypatch, message_id
+):
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import engine_api, removal, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    parameters = {"message_id": message_id}
+    with store.connection() as db:
+        expected_targets = [tuple(r) for r in db.execute(
+            "SELECT 'm',message_id,provider,account_id,mailbox_identity_key,provider_message_id "
+            "FROM messages ORDER BY message_id"
+        )]
+    key = removal.issue_key(store, "delete", parameters, retention_days=30, now=NOW)
+    request = {
+        "protocol": 1, "operation": "inbox.delete",
+        "payload": {"request_id": key, **parameters},
+    }
+    accepted = engine_api._response(request)
+    assert accepted["ok"], accepted
+    assert accepted["data"]["request_id"] == key
+    assert accepted["data"]["requested"] == accepted["data"]["pending"] == 1
+    assert accepted["data"]["completed"] == 0 and accepted["data"]["deleted"] is False
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
+        assert [tuple(r) for r in db.execute(
+            "SELECT logical_target_id,message_id,provider,account_id,stored_identity_key,"
+            "provider_message_id FROM message_removal_targets ORDER BY message_id"
+        )] == expected_targets
+        assert [r[0] for r in db.execute(
+            "SELECT DISTINCT logical_target_id FROM message_removal_targets"
+        )] == ["m"]
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+        assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
+    seed(store, "later", rfc_message_id="later@vendor")
+    replayed = engine_api._response(request)
+    assert replayed == accepted
+    source_locks.qualify_protocol(store, fresh=False)
+    complete = engine_api._response(request)
+    assert complete["ok"], complete
+    assert complete["data"]["completed"] == 1 and complete["data"]["pending"] == 0
+    assert complete["data"]["deleted"] is True
+    with store.connection() as db:
+        assert [r[0] for r in db.execute("SELECT message_id FROM logical_messages")] == ["later"]
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+
+
+def test_freeze_resolves_selected_alias_without_a_physical_canonical_row(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+
+    from eom_email_watcher import source_locks
+
+    store = held_runtime(tmp_path, monkeypatch, copies=33)
+    with store.connection() as db:
+        db.execute("UPDATE messages SET logical_of='missing-root' WHERE logical_of='m'")
+        unit = database._logical_unit(db, "copy-00")
+        assert len(unit.rows) == 33
+        assert not db.execute("SELECT 1 FROM messages WHERE message_id='missing-root'").fetchone()
+    result = local_removal(
+        store, "request_removal", "delete", {"message_id": "copy-00"}, now=NOW,
+    )
+    assert (result.requested, result.completed, result.pending) == (1, 0, 1)
+    with store.connection() as db:
+        assert [r[0] for r in db.execute(
+            "SELECT DISTINCT logical_target_id FROM message_removal_targets"
+        )] == ["missing-root"]
+        assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
+        assert db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0] == (
+            "private body"
+        )
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        assert [r[0] for r in db.execute("SELECT message_id FROM messages")] == ["m"]
+        assert db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0] == (
+            "private body"
+        )
+
+
+@pytest.mark.parametrize(
+    "field,new_value",
+    [
+        ("provider", "microsoft365"),
+        ("account_id", "new-account"),
+        ("mailbox_identity_key", "e" * 64),
+        ("provider_message_id", "new-native-id"),
+    ],
+)
+def test_old_alias_request_preserves_reused_binding_and_new_request_freezes_its_own_unit(
+    tmp_path, monkeypatch, field, new_value
+):
+    from test_removal_refusal import held_runtime
+
+    from eom_email_watcher import removal, source_locks
+    from eom_email_watcher.config import exact_sender_selector_id
+
+    store = held_runtime(tmp_path, monkeypatch)
+    parameters = {"message_id": "copy-00"}
+    old_key = removal.issue_key(store, "delete", parameters, retention_days=30, now=NOW)
+    pending = local_removal(
+        store, "request_removal", "delete", parameters, request_id=old_key, now=NOW,
+    )
+    assert pending.requested == pending.pending == 1
+    with store.connection() as db:
+        coordinates = dict(db.execute(
+            "SELECT provider,account_id,mailbox_identity_key,provider_message_id "
+            "FROM messages WHERE message_id='copy-00'"
+        ).fetchone())
+        assert coordinates[field] != new_value
+        coordinates[field] = new_value
+        db.execute("DELETE FROM messages WHERE message_id='copy-00'")
+    with store.connection() as db:
+        registered = db.execute(
+            "SELECT 1 FROM mail_accounts WHERE provider=? AND account_id=?",
+            (coordinates["provider"], coordinates["account_id"]),
+        ).fetchone()
+    if registered is None:
+        store.register_mail_account(
+            coordinates["provider"], coordinates["account_id"], display_name="Reused scope",
+        )
+    store.reconcile_mailbox_identity(
+        coordinates["provider"], coordinates["account_id"], coordinates["mailbox_identity_key"],
+    )
+    assert store.add_message(
+        message_id="copy-00", **coordinates,
+        thread_id="new-thread", sender="vendor@example.com", sender_name=None,
+        subject="Reused source", received_at=NOW.isoformat(), rfc_message_id="reused@new",
+        admission=database.AdmissionProvenance(
+            "exact_sender", exact_sender_selector_id("vendor@example.com"), None,
+            coordinates["mailbox_identity_key"], NOW.isoformat(),
+        ),
+    )
+    new_binding = tuple(coordinates[name] for name in (
+        "provider", "account_id", "mailbox_identity_key", "provider_message_id",
+    ))
+    with store.connection() as db:
+        assert tuple(db.execute(
+            "SELECT provider,account_id,mailbox_identity_key,provider_message_id "
+            "FROM messages WHERE message_id='copy-00'"
+        ).fetchone()) == new_binding
+        assert removal.message_available(db, "copy-00")
+    assert local_removal(
+        store, "request_removal", "delete", parameters, request_id=old_key, now=NOW,
+    ) == pending
+    source_locks.qualify_protocol(store, fresh=False)
+    old_result = local_removal(
+        store, "request_removal", "delete", parameters, request_id=old_key, now=NOW,
+    )
+    assert old_result.requested == old_result.completed == 1
+    assert old_result.pending == 0
+    with store.connection() as db:
+        assert [r[0] for r in db.execute("SELECT message_id FROM messages")] == ["copy-00"]
+        assert tuple(db.execute(
+            "SELECT provider,account_id,mailbox_identity_key,provider_message_id "
+            "FROM messages WHERE message_id='copy-00'"
+        ).fetchone()) == new_binding
+        assert removal.message_available(db, "copy-00")
+    new_key = removal.issue_key(store, "delete", parameters, retention_days=30, now=NOW)
+    new_result = local_removal(
+        store, "request_removal", "delete", parameters, request_id=new_key, now=NOW,
+    )
+    assert new_result.requested == new_result.completed == 1 and new_result.pending == 0
+    assert new_result.request_id != old_result.request_id
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM messages").fetchone()
+        assert [r[0] for r in db.execute(
+            "SELECT t.logical_target_id FROM message_removal_targets t "
+            "JOIN message_removal_intents i USING(intent_id) WHERE i.request_id=?",
+            (new_key,),
+        )] == ["copy-00"]
+        assert tuple(db.execute(
+            "SELECT t.provider,t.account_id,t.stored_identity_key,t.provider_message_id "
+            "FROM message_removal_targets t JOIN message_removal_intents i USING(intent_id) "
+            "WHERE i.request_id=?", (new_key,),
+        ).fetchone()) == new_binding
+        assert removal.outcome(db, old_key) == old_result
+
+
+def test_alias_delete_missing_pending_and_retained_key_controls(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime, snapshot
+
+    from eom_email_watcher import removal, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    parameters = {"message_id": "copy-00"}
+    key = removal.issue_key(store, "delete", parameters, retention_days=30, now=NOW)
+    pending = local_removal(
+        store, "request_removal", "delete", parameters, request_id=key, now=NOW,
+    )
+    before = snapshot(store)
+    assert local_removal(
+        store, "request_removal", "delete", parameters, request_id=key, now=NOW,
+    ) == pending
+    assert snapshot(store) == before
+    for message_id in ("copy-00", "copy-31", "missing"):
+        assert local_removal(store, "delete_message", message_id, now=NOW) is False
+        assert snapshot(store) == before
+    source_locks.qualify_protocol(store, fresh=False)
+    settled = snapshot(store)
+    assert local_removal(store, "delete_message", "copy-00", now=NOW) is False
+    assert snapshot(store) == settled
+    complete = local_removal(
+        store, "request_removal", "delete", parameters, request_id=key, now=NOW,
+    )
+    assert complete.requested == complete.completed == 1 and complete.pending == 0

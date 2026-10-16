@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Barrier, Event
 
 import pytest
+from conftest import local_removal
 from test_db import Store, _coalesced_pair, _source_scope
 
 from eom_email_watcher import db as db_module
@@ -278,7 +279,7 @@ def test_source_observations_deleted_with_unit(tmp_path: Path):
     store.record_message_location(
         **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
     )
-    store.delete_message(root)
+    local_removal(store, "delete_message", root)
     with store.connection() as db:
         assert db.execute("SELECT count(*) FROM message_source_observations").fetchone()[0] == 0
 
@@ -328,7 +329,7 @@ def test_cleanup_removes_all_source_observations(tmp_path: Path, operation):
         **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
     )
     if operation == "clear":
-        store.clear_messages()
+        local_removal(store, "request_removal", "clear", {})
     else:
         store.purge_with_outcome(1, now=FIRST)
     with store.connection() as db:

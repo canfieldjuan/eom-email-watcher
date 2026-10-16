@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import local_removal
 
 from eom_email_watcher.db import Store
 
@@ -270,7 +271,7 @@ def test_post_with_refused_outcome_reconciles_without_second_post(
     before = runtime.store.connect_dispatch(job_id)
     assert before.state == "dispatching" and before.submission_possible
     if cleanup_before_reconcile:
-        assert runtime.store.delete_message("message-1")
+        assert local_removal(runtime.store, "delete_message", "message-1")
         assert runtime.store.connect_job(job_id) is not None
     response = engine_api._response(api_request(config_path, "connect.queue.pump"))
     assert response["ok"], response

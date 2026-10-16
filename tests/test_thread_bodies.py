@@ -4,6 +4,7 @@ import sqlite3
 from datetime import timedelta
 
 import pytest
+from conftest import local_removal
 from test_thread_reconcile import KEY, NOW, seed, state_store
 
 from eom_email_watcher import mime
@@ -255,16 +256,16 @@ def test_bodyless_old_or_unfollowed_message_is_never_fetched(tmp_path, monkeypat
         assert not body_state.pending(db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW)
 
 
-@pytest.mark.parametrize("method", ["delete_message", "clear_messages"])
+@pytest.mark.parametrize("method", ["delete", "clear"])
 def test_all_message_deletions_schedule_checkpoint_without_marker_inheritance(tmp_path, method):
     from eom_email_watcher import body_state
 
     store, state, _ = followed(tmp_path)
     body_state.record(store, "m", ("body", 4), fetched_at=NOW)
-    if method == "delete_message":
-        store.delete_message("m")
+    if method == "delete":
+        local_removal(store, "delete_message", "m")
     else:
-        store.clear_messages()
+        local_removal(store, "request_removal", "clear", {})
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
         assert db.execute(
@@ -286,7 +287,7 @@ def test_busy_checkpoint_remains_pending_until_reader_finishes(tmp_path):
     try:
         reader.execute("BEGIN")
         assert reader.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
-        store.delete_message("m")
+        local_removal(store, "delete_message", "m")
         assert not body_state.checkpoint(store)
         with store.connection() as db:
             assert db.execute(
@@ -676,7 +677,7 @@ def test_checkpoint_never_clears_a_newer_deletion(tmp_path, monkeypatch):
     seed(store, "n")
     for message_id in ("m", "n"):
         body_state.record(store, message_id, ("body", 4), fetched_at=NOW)
-    store.delete_message("m")
+    local_removal(store, "delete_message", "m")
     original = store.connection
     injected = False
 
@@ -692,7 +693,7 @@ def test_checkpoint_never_clears_a_newer_deletion(tmp_path, monkeypatch):
             if sql == "PRAGMA wal_checkpoint(TRUNCATE)" and not injected:
                 result = self.db.execute(sql).fetchall()[0]
                 injected = True
-                store.delete_message("n")
+                local_removal(store, "delete_message", "n")
                 return SimpleNamespace(fetchone=lambda: result)
             return self.db.execute(sql, *args)
 
