@@ -173,7 +173,7 @@ def runner(tmp_path, monkeypatch, gateway, provider="gmail"):
         service, "connect_entitlement_decision", lambda: service.EntitlementDecision.ACTIVE
     )
     watcher = Watcher(
-        replace(config(tmp_path), senders=(), retention_days=30),
+        replace(config(tmp_path), database_file=store.path, senders=(), retention_days=30),
         store,
         MailboxSession(provider, "mailbox", gateway, KEY),
         FakeModel(),

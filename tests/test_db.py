@@ -629,9 +629,11 @@ def test_extraction_transport_failure_preserves_request_and_retry_schedule(
 
 def test_schema_14_payload_table_migrates_retry_and_organizer_fields(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     with store.connection() as db:
         for column in (
             "organizer_address",
@@ -1310,9 +1312,12 @@ def test_expired_confirmation_can_enter_review_when_refresh_is_invalid(
     assert (reviewed.state, reviewed.failure_code) == ("manual_review", "proposal_invalid")
 
 
-def test_schema_16_calendar_proposal_migration_preserves_payload(tmp_path: Path) -> None:
+def test_schema_16_calendar_proposal_migration_preserves_payload(
+    tmp_path: Path, pre36_schema,
+) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     proposing, extraction = proposing_scheduling_run(store)
     store.record_automation_proposal(
         proposing.run_id,
@@ -1349,9 +1354,11 @@ def test_schema_16_calendar_proposal_migration_preserves_payload(tmp_path: Path)
 
 def test_schema_17_migrates_every_durable_microsoft_principal_reference(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     account_id = f"microsoft365-{'a' * 32}"
     home_account_id = "home-account-id"
     tenant_id = "tenant-id"
@@ -1461,9 +1468,11 @@ def test_schema_17_migrates_every_durable_microsoft_principal_reference(
 def test_schema_17_principal_migration_does_not_rewrite_unrecognized_keys(
     tmp_path: Path,
     principal_key_kind: str,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / principal_key_kind / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     home_account_id = "home-account-id"
     object_id = "object-id"
     current_key = MicrosoftPrincipal(
@@ -1517,10 +1526,13 @@ def test_runtime_principal_migration_rejects_non_sha256_keys(
         )
 
 
-def test_failed_schema_17_proposal_rebuild_rolls_back_and_can_retry(tmp_path: Path) -> None:
+def test_failed_schema_17_proposal_rebuild_rolls_back_and_can_retry(
+    tmp_path: Path, pre36_schema,
+) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     proposing, extraction = proposing_scheduling_run(store)
     store.record_automation_proposal(
         proposing.run_id,
@@ -2276,8 +2288,10 @@ def test_gmail_validation_schema_bump_rejects_previous_binary(
 
 def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selectors(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
-    store, identity = _gmail_selector_store(tmp_path)
+    with pre36_schema():
+        store, identity = _gmail_selector_store(tmp_path)
     revision, selector = store.add_gmail_label_selector(
         "gmail-default", identity, "Label_1", "Invoices", 0
     )
@@ -2308,8 +2322,10 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
 
 def test_schema_26_migrates_current_validation_with_explicit_catalog_state(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
-    store, identity = _gmail_selector_store(tmp_path)
+    with pre36_schema():
+        store, identity = _gmail_selector_store(tmp_path)
     revision, _selector = store.add_gmail_label_selector(
         "gmail-default", identity, "Label_1", "Invoices", 0
     )
@@ -4655,10 +4671,12 @@ def downgrade_connect_jobs_to_v5(database: Path) -> None:
 
 def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     job_id = "33333333-3333-4333-8333-333333333333"
     create_connect_job(store, job_id)
@@ -4761,9 +4779,11 @@ def test_failed_v5_connect_migration_rolls_back_without_losing_legacy_rows(
 
 def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     assert store.add_message(
         message_id="already-analyzed",
         thread_id=None,
@@ -4871,10 +4891,12 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
 
 def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     store.put_automation_rule(
         {
@@ -4987,10 +5009,11 @@ def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
         assert "idx_automation_fires_message" in indexes
 
 
-def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path) -> None:
+def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path, pre36_schema) -> None:
     database = tmp_path / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     store.put_automation_rule(
         {
@@ -5050,10 +5073,12 @@ def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path) -> 
 
 def test_schema_22_marks_incomplete_legacy_dispatch_capability_authority_unknown(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     legacy_job_id = "33333333-3333-4333-8333-333333333333"
     create_v2_connect_job(store, legacy_job_id)
@@ -5658,10 +5683,13 @@ def test_authoritative_provider_progress_resets_reconciliation_backoff(
     assert dispatch.last_error_message is None
 
 
-def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(tmp_path: Path) -> None:
+def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(
+    tmp_path: Path, pre36_schema,
+) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     requested_id = "33333333-3333-4333-8333-333333333333"
     accepted_id = "44444444-4444-4444-8444-444444444444"
@@ -5694,10 +5722,12 @@ def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(tmp_path: Pa
 
 def test_initialize_preserves_legacy_active_v2_duplicates_until_reconciled(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     first_id = "33333333-3333-4333-8333-333333333333"
     second_id = "44444444-4444-4444-8444-444444444444"
@@ -5814,10 +5844,12 @@ def test_message_delete_preserves_provider_owned_job_as_content_free_tombstone(
 
 def test_initialize_replaces_v6_active_index_without_losing_jobs(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     create_v2_connect_job(
         store,
@@ -6267,8 +6299,9 @@ def test_deleting_a_message_removes_its_body_counts(tmp_path: Path) -> None:
         assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
 
 
-def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path) -> None:
-    store = _truncation_store(tmp_path, "m1")
+def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path, pre36_schema) -> None:
+    with pre36_schema():
+        store = _truncation_store(tmp_path, "m1")
     store.mark_analyzed("m1", _truncation_analysis())
     with store.connection() as db:
         db.execute("DROP TRIGGER messages_body_counts_consistent_insert")

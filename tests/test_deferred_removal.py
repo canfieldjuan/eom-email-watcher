@@ -1040,6 +1040,147 @@ def test_retention_does_not_bypass_pending_completion_owner(tmp_path, monkeypatc
         assert removal.outcome(db, reply["data"]["request_id"]).completed == 1
 
 
+def test_mixed_binding_clear_replay_and_whole_request_retirement(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime, snapshot
+    from test_thread_reconcile import KEY, seed
+
+    from eom_email_watcher import removal, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    second_key = "b" * 64
+    store.register_mail_account("imap", "second", display_name="Second mailbox")
+    store.reconcile_mailbox_identity("imap", "second", second_key)
+    second_binding = dict(provider="imap", account_id="second", mailbox_identity_key=second_key)
+    seed(store, "immediate", thread_id="immediate", rfc_message_id="immediate@vendor",
+         **second_binding)
+    body_state.record(store, "immediate", ("second body", 11), fetched_at=NOW)
+    key = removal.issue_key(store, "clear", {}, retention_days=1, now=NOW)
+    accepted = local_removal(
+        store, "request_removal", "clear", {}, request_id=key, retention_days=1, now=NOW,
+    )
+    assert (accepted.requested, accepted.completed, accepted.pending) == (2, 1, 1)
+    assert len(accepted.intent_ids) == 2
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert {
+            (row["provider"], row["account_id"], row["mailbox_identity_key"])
+            for row in db.execute(
+                "SELECT * FROM message_removal_intents WHERE request_id=?", (key,),
+            )
+        } == {("gmail", "mailbox", KEY), ("imap", "second", second_key)}
+        assert {
+            (row[0], row[1], row[2], row[3]) for row in db.execute(
+                "SELECT i.provider,i.account_id,t.state,COUNT(*) "
+                "FROM message_removal_targets t JOIN message_removal_intents i USING(intent_id) "
+                "WHERE i.request_id=? GROUP BY i.provider,i.account_id,t.state", (key,),
+            )
+        } == {("gmail", "mailbox", "pending", 33), ("imap", "second", "completed", 1)}
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+        assert db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0] == (
+            "private body"
+        )
+        assert not db.execute(
+            "SELECT 1 FROM message_bodies WHERE message_id='immediate'"
+        ).fetchone()
+
+    seed(store, "later-first", thread_id="later-first", rfc_message_id="later-first@vendor")
+    seed(store, "later-second", thread_id="later-second", rfc_message_id="later-second@vendor",
+         **second_binding)
+    for message_id in ("later-first", "later-second"):
+        body_state.record(store, message_id, (message_id, len(message_id)), fetched_at=NOW)
+    reopened = database.Store(store.path)
+    with monkeypatch.context() as before_lift:
+        def unavailable(*args, **kwargs):
+            raise source_locks.SourceProtocolUnavailable("public mixed-binding restart before lift")
+
+        before_lift.setattr(source_locks, "initialize_protocol", unavailable)
+        reopened.initialize()
+    before = snapshot(reopened)
+    retry = local_removal(
+        reopened, "request_removal", "clear", {}, request_id=key,
+        retention_days=100, now=NOW + timedelta(days=2),
+    )
+    assert retry.data() == accepted.data()
+    removal.retire(reopened, 1, now=NOW + timedelta(days=2))
+    assert snapshot(reopened) == before, "A pending sibling must preserve the entire receipt group"
+
+    settled_at = NOW + timedelta(days=3)
+    original_resume = removal.resume
+    with monkeypatch.context() as completion_clock:
+        completion_clock.setattr(
+            removal, "resume", lambda candidate: original_resume(candidate, now=settled_at)
+        )
+        source_locks.qualify_protocol(reopened, fresh=False)
+    with reopened.connection() as db:
+        settled = removal.outcome(db, key)
+        assert (settled.requested, settled.completed, settled.pending) == (2, 2, 0)
+        assert settled.intent_ids == accepted.intent_ids
+        assert {row[0] for row in db.execute("SELECT message_id FROM messages")} == {
+            "later-first", "later-second"
+        }
+        assert dict(db.execute("SELECT message_id,text FROM message_bodies")) == {
+            "later-first": "later-first", "later-second": "later-second"
+        }
+    before = snapshot(reopened)
+    removal.retire(reopened, 1, now=settled_at + timedelta(hours=12))
+    assert snapshot(reopened) == before, "The newest settled sibling has not passed retention"
+    retired_at = settled_at + timedelta(days=2)
+    removal.retire(reopened, 1, now=retired_at)
+    with reopened.connection() as db:
+        assert removal.outcome(db, key) is None
+        for table in (
+            "message_removal_requests", "message_removal_intents", "message_removal_targets",
+        ):
+            assert db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] == 0
+    before = snapshot(reopened)
+    with pytest.raises(removal.RemovalRequestInvalid, match="expired"):
+        local_removal(
+            reopened, "request_removal", "clear", {}, request_id=key,
+            retention_days=100, now=retired_at,
+        )
+    assert snapshot(reopened) == before
+    fresh_key = removal.issue_key(reopened, "clear", {}, retention_days=1, now=retired_at)
+    assert fresh_key != key
+    fresh = local_removal(
+        reopened, "request_removal", "clear", {}, request_id=fresh_key,
+        retention_days=1, now=retired_at,
+    )
+    assert (fresh.requested, fresh.completed, fresh.pending) == (2, 2, 0)
+    with reopened.connection() as db:
+        assert not db.execute("SELECT 1 FROM messages").fetchone()
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+
+
+def test_public_delete_key_parameter_reuse_never_selects_another_message(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime, snapshot
+    from test_thread_reconcile import seed
+
+    from eom_email_watcher import engine_api
+
+    store = held_runtime(tmp_path, monkeypatch)
+    prepared = engine_api._response({
+        "protocol": 1, "operation": "inbox.removal.prepare",
+        "payload": {"kind": "delete", "message_id": "m"},
+    })
+    assert prepared["ok"], prepared
+    key = prepared["data"]["request_id"]
+    original = {"protocol": 1, "operation": "inbox.delete",
+                "payload": {"request_id": key, "message_id": "m"}}
+    accepted = engine_api._response(original)
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    seed(store, "other-message", thread_id="other", rfc_message_id="other@vendor")
+    body_state.record(store, "other-message", ("other body", 10), fetched_at=NOW)
+    before = snapshot(store)
+    rejected = engine_api._response({
+        "protocol": 1, "operation": "inbox.delete",
+        "payload": {"request_id": key, "message_id": "other-message"},
+    })
+    assert not rejected["ok"] and rejected["error"]["code"] == "invalid_request", rejected
+    assert snapshot(store) == before
+    assert engine_api._response(original) == accepted
+    assert snapshot(store) == before
+
+
 @pytest.mark.parametrize("retire", [False, True])
 def test_zero_target_retry_and_retired_expiry_never_select_new_arrivals(
     tmp_path,

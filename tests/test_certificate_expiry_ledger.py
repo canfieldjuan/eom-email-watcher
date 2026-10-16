@@ -1554,9 +1554,10 @@ def test_certificate_ledger_rejects_invalid_calendar_dates(tmp_path: Path, today
         store.list_certificate_expiry_ledger(today=today)
 
 
-def test_schema_24_migrates_certificate_ledger_tables(tmp_path: Path) -> None:
+def test_schema_24_migrates_certificate_ledger_tables(tmp_path: Path, pre36_schema) -> None:
     store = Store(tmp_path / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     with store.connection() as db:
         db.execute("DROP TABLE certificate_policy_rows")
         db.execute("DROP TABLE certificate_records")

@@ -80,7 +80,7 @@ def test_deferred_cutover_does_not_prevent_scheduled_poll(tmp_path, monkeypatch)
     monkeypatch.setattr(
         service,
         "Watcher",
-        lambda *_: SimpleNamespace(
+        lambda *_, operation: SimpleNamespace(
             check=lambda **_: calls.append("polled") or {"active": True, "purged": 0}
         ),
     )

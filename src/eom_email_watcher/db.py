@@ -620,7 +620,7 @@ _AUTOMATION_SOURCE_BINDING_SQL = """
       );
 """
 
-_CONNECT_SOURCE_UNAVAILABLE_SQL = _AUTOMATION_SOURCE_BINDING_SQL + """
+_CONNECT_SOURCE_INVALIDATION_SQL = """
     DELETE FROM connect_attachment_jobs
     WHERE message_id = {message_id}
       AND (
@@ -665,9 +665,15 @@ _CONNECT_SOURCE_UNAVAILABLE_SQL = _AUTOMATION_SOURCE_BINDING_SQL + """
     );
 """
 
+# Physical deletion uses SQLite's BEFORE/AFTER phases; deferred acceptance
+# composes the same binding and invalidation rules in this order.
+_CONNECT_SOURCE_UNAVAILABLE_SQL = (
+    _AUTOMATION_SOURCE_BINDING_SQL + _CONNECT_SOURCE_INVALIDATION_SQL
+)
+
 _CONNECT_JOBS_DELETE_TRIGGER_V19_SQL = (
     "CREATE TRIGGER messages_delete_connect_attachment_jobs AFTER DELETE ON messages BEGIN\n"
-    + _CONNECT_SOURCE_UNAVAILABLE_SQL.format(message_id="OLD.message_id")
+    + _CONNECT_SOURCE_INVALIDATION_SQL.format(message_id="OLD.message_id")
     + "END"
 )
 
