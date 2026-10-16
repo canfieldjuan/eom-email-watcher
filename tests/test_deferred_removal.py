@@ -2644,3 +2644,313 @@ def test_removal_status_reads_one_snapshot_during_receipt_retirement(tmp_path, m
     assert response["data"]["requested"] == response["data"]["completed"] == 1
     assert response["data"]["pending"] == 0
     assert response["data"]["request_id"] == key
+
+
+def saved_unfollow_v35(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(database, "SCHEMA_VERSION", 35)
+        store = held_runtime(tmp_path, legacy)
+        with store.connection() as db:
+            vendor_id = db.execute("SELECT vendor_id FROM vendor_addresses").fetchone()[0]
+        store.remove_vendor_address(vendor_id, "vendor@example.com", now=NOW)
+        with store.connection() as db:
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 35
+            assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+            assert not db.execute("SELECT 1 FROM thread_follow WHERE followed=1").fetchone()
+            assert not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='message_removal_requests'"
+            ).fetchone()
+    return store
+
+
+def test_saved_unfollow_conversion_is_atomic_and_body_only(tmp_path, monkeypatch):
+    from eom_email_watcher import removal, source_locks
+
+    store = saved_unfollow_v35(tmp_path, monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        raise source_locks.SourceProtocolUnavailable("migration conversion before native lift")
+
+    with monkeypatch.context() as held:
+        held.setattr(source_locks, "qualify_protocol", unavailable)
+        store.initialize()
+        with store.connection() as db:
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+            requests = db.execute("SELECT * FROM message_removal_requests").fetchall()
+            assert len(requests) == 1, "Saved-unfollow upgrade must create its receipt atomically"
+            receipt = requests[0]
+            assert receipt["kind"] == "unfollow"
+            removal._parse_key(db, receipt["request_id"], "unfollow", receipt["parameters_sha256"])
+            result = removal.outcome(db, receipt["request_id"])
+            assert (result.requested, result.completed, result.pending) == (1, 0, 1)
+            assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
+            assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+            assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+            assert not removal.message_available(db, "m", include_unfollow=True)
+            assert removal.message_available(db, "m")
+        store.initialize()
+        with store.connection() as db:
+            assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+        assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
+        result = removal.outcome(db, receipt["request_id"])
+        assert (result.requested, result.completed, result.pending) == (1, 1, 0)
+
+
+def test_saved_unfollow_conversion_failure_rolls_back_original_store(tmp_path, monkeypatch):
+    from test_removal_refusal import snapshot
+
+    from eom_email_watcher import source_locks
+
+    store = saved_unfollow_v35(tmp_path, monkeypatch)
+    before = snapshot(store)
+
+    def fail_after_conversion(db):
+        assert db.in_transaction
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 35
+        raise RuntimeError("injected failure after migration conversion")
+
+    with monkeypatch.context() as failing:
+        failing.setattr(thread_migration, "check_database", fail_after_conversion)
+        with pytest.raises(RuntimeError, match="injected failure after migration conversion"):
+            store.initialize()
+    assert snapshot(store) == before
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 35
+        assert not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='message_removal_requests'"
+        ).fetchone()
+
+    def unavailable(*args, **kwargs):
+        raise source_locks.SourceProtocolUnavailable("rollback retry before native lift")
+
+    monkeypatch.setattr(source_locks, "qualify_protocol", unavailable)
+    store.initialize()
+    store.initialize()
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+
+
+def test_saved_unfollow_conversion_rejects_unowned_capabilities_before_writes(
+    tmp_path, monkeypatch
+):
+    import copy
+    from concurrent.futures import ThreadPoolExecutor
+
+    from eom_email_watcher import removal, source_locks
+
+    store = saved_unfollow_v35(tmp_path, monkeypatch)
+    original = removal.convert_saved_unfollow
+    captured = []
+
+    def check_authority(db, owner, *, now):
+        assert db.in_transaction
+        captured.append(owner)
+        parameters = {"message_ids": ["m"]}
+        key = removal._issue_key(db, "unfollow", parameters, retention_days=30, now=now)
+        for invalid in (None, False, True, object(), copy.copy(owner)):
+            with pytest.raises(RuntimeError, match="live migration owner"):
+                removal._accept_in_transaction(
+                    db, key, "unfollow", parameters, ["m"], now=now, authority=invalid,
+                )
+            assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        with (
+            store.connection() as other,
+            pytest.raises(RuntimeError, match="live migration owner"),
+        ):
+            thread_migration.require_migration_owner(owner, other)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            error = pool.submit(thread_migration.require_migration_owner, owner, db).exception(5)
+        assert isinstance(error, RuntimeError), repr(error)
+        assert "live migration owner" in str(error)
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        original(db, owner, now=now)
+
+    def unavailable(*args, **kwargs):
+        raise source_locks.SourceProtocolUnavailable("authority fixture before native lift")
+
+    monkeypatch.setattr(removal, "convert_saved_unfollow", check_authority)
+    monkeypatch.setattr(source_locks, "qualify_protocol", unavailable)
+    store.initialize()
+    with store.connection() as db:
+        with pytest.raises(RuntimeError, match="live migration owner"):
+            thread_migration.require_migration_owner(captured[0], db)
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+
+
+def test_migration_capability_expires_on_native_commit_before_scope_exit(tmp_path, monkeypatch):
+    store = saved_unfollow_v35(tmp_path, monkeypatch)
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        thread_migration.require_migration_owner(owner, db)
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        with pytest.raises(RuntimeError, match="live migration owner"):
+            thread_migration.require_migration_owner(owner, db)
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 35
+
+
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_migration_without_saved_unfollow_creates_no_receipt(tmp_path, monkeypatch, upgrade):
+    from test_removal_refusal import held_runtime
+
+    if upgrade:
+        with monkeypatch.context() as legacy:
+            legacy.setattr(database, "SCHEMA_VERSION", 35)
+            store = held_runtime(tmp_path, legacy)
+        store.initialize()
+    else:
+        store = database.Store(tmp_path / "empty.db")
+        store.initialize()
+    store.initialize()
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+        if upgrade:
+            assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+
+
+def test_converted_unfollow_refollow_cannot_adopt_a_late_body(tmp_path, monkeypatch):
+    from eom_email_watcher import removal, source_locks
+
+    store = saved_unfollow_v35(tmp_path, monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        raise source_locks.SourceProtocolUnavailable("refollow before native lift")
+
+    with monkeypatch.context() as held:
+        held.setattr(source_locks, "qualify_protocol", unavailable)
+        store.initialize()
+    with store.connection() as db:
+        key = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
+        vendor_id = db.execute("SELECT vendor_id FROM vendors").fetchone()[0]
+    store.add_vendor_address(vendor_id, "vendor@example.com", now=NOW)
+    body_state.record(store, "m", ("late refollow body", 18), fetched_at=NOW)
+    with store.connection() as db:
+        assert db.execute("SELECT 1 FROM thread_follow WHERE followed=1").fetchone()
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+        assert removal.outcome(db, key).pending == 1
+    source_locks.qualify_protocol(store, fresh=False)
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert removal.outcome(db, key).completed == 1
+        assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
+
+
+def test_saved_unfollow_upgrade_excludes_old_writer_and_second_runtime(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import replace
+
+    from connect_automate.locking import OperationLockBusy, connect_operation_lock
+    from test_service import config
+
+    from eom_email_watcher import removal, runtime, source_locks
+
+    store = saved_unfollow_v35(tmp_path, monkeypatch)
+    reached, release, second_started = (threading.Event() for _ in range(3))
+    original_conversion = removal.convert_saved_unfollow
+    original_initialize = database.Store.initialize
+    timeouts = []
+
+    def pause_after_conversion(db, owner, *, now):
+        original_conversion(db, owner, now=now)
+        assert db.in_transaction
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 35
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        reached.set()
+        if not release.wait(10):
+            timeouts.append(True)
+
+    def observed_initialize(self):
+        if self is not store:
+            second_started.set()
+        return original_initialize(self)
+
+    def unavailable(*args, **kwargs):
+        raise source_locks.SourceProtocolUnavailable("concurrent migration before native lift")
+
+    monkeypatch.setattr(removal, "convert_saved_unfollow", pause_after_conversion)
+    monkeypatch.setattr(database.Store, "initialize", observed_initialize)
+    monkeypatch.setattr(source_locks, "qualify_protocol", unavailable)
+    cfg = replace(config(tmp_path), database_file=store.path)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        migrating = pool.submit(store.initialize)
+        try:
+            assert reached.wait(5), "Migration did not reach uncommitted conversion"
+            with sqlite3.connect(store.path, timeout=0) as old:
+                assert old.execute("PRAGMA user_version").fetchone()[0] == 35
+                assert not old.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='message_removal_requests'"
+                ).fetchone()
+                with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                    old.execute("BEGIN IMMEDIATE")
+            with (
+                pytest.raises(OperationLockBusy),
+                connect_operation_lock(
+                    store.path.with_name(store.path.name + ".upgrade.lock"), "upgrade busy",
+                    timeout_seconds=0,
+                ),
+            ):
+                pytest.fail("Upgrade lock admitted another initializer")
+            waiting = pool.submit(runtime.runtime_from_config, cfg, config_path_already_safe=True)
+            assert second_started.wait(5), "Second runtime did not enter Store initialization"
+            assert not waiting.done(), "Runtime returned before conversion committed"
+        finally:
+            release.set()
+        migrating.result(timeout=10)
+        reopened = waiting.result(timeout=10)
+    assert not timeouts
+    with reopened.store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+
+
+@pytest.mark.parametrize("retained", ["copy_body", "unavailable"])
+def test_saved_unfollow_conversion_freezes_complete_unit_from_retained_alias_or_marker(
+    tmp_path, monkeypatch, retained
+):
+    from eom_email_watcher import removal, source_locks
+
+    store = saved_unfollow_v35(tmp_path, monkeypatch)
+    with store.connection() as db:
+        if retained == "copy_body":
+            db.execute("UPDATE message_bodies SET message_id='copy-00'")
+        else:
+            db.execute("DELETE FROM message_bodies")
+            db.execute("INSERT INTO message_body_unavailable VALUES('copy-00','source_gone')")
+
+    def unavailable(*args, **kwargs):
+        raise source_locks.SourceProtocolUnavailable("alias conversion before native lift")
+
+    with monkeypatch.context() as held:
+        held.setattr(source_locks, "qualify_protocol", unavailable)
+        store.initialize()
+    with store.connection() as db:
+        key = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
+        assert removal.outcome(db, key).requested == 1
+        assert not removal.message_available(db, "m", include_unfollow=True)
+        assert not removal.message_available(db, "copy-00", include_unfollow=True)
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        assert removal.outcome(db, key).completed == 1
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+        assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()

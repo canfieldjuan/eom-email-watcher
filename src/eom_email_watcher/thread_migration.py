@@ -3,9 +3,14 @@
 import os
 import re
 import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
+
+from connect_automate.locking import connect_operation_lock
 
 ADMISSION_KINDS = (
     "exact_sender",
@@ -15,6 +20,83 @@ ADMISSION_KINDS = (
     "thread_follow",
     "gmail_user_label",
 )
+
+
+_active_upgrade = ContextVar("email_watcher_upgrade", default=None)
+
+
+class _MigrationOwner:
+    """Authority of one native upgrade lock and its live write transaction."""
+
+    def __init__(self, path):
+        self.path = path.resolve()
+        self.execution = (os.getpid(), threading.get_ident())
+        self.connection = None
+        self.version = None
+        self.live = True
+
+    def _invalidate(self):
+        self.live = False
+
+    def require(self, db):
+        if (
+            _active_upgrade.get() is not self
+            or not self.live
+            or self.execution != (os.getpid(), threading.get_ident())
+            or self.connection is not db
+            or not db.in_transaction
+            or self.version is None
+            or self.version >= 36
+        ):
+            raise RuntimeError("Removal acceptance requires the live migration owner")
+        main = next(row[2] for row in db.execute("PRAGMA database_list") if row[1] == "main")
+        if Path(main).resolve() != self.path:
+            raise RuntimeError("Removal migration owner belongs to another database")
+
+    @contextmanager
+    def transaction(self, store):
+        if (
+            _active_upgrade.get() is not self
+            or not self.live
+            or self.connection is not None
+            or self.execution != (os.getpid(), threading.get_ident())
+            or store.path.resolve() != self.path
+        ):
+            raise RuntimeError("Database initialization requires its native upgrade owner")
+        try:
+            with store.connection() as db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("BEGIN IMMEDIATE")
+                self.connection = db
+                self.version = db.execute("PRAGMA user_version").fetchone()[0]
+                db._migration_owner = self
+                yield db
+        finally:
+            self._invalidate()
+            self.connection = None
+
+
+@contextmanager
+def upgrade_owner(path):
+    """Mint authority only inside the scope which acquires the native lock."""
+    with connect_operation_lock(
+        path.with_name(path.name + ".upgrade.lock"),
+        "The mailbox database is being upgraded",
+        timeout_seconds=-1,
+    ):
+        owner = _MigrationOwner(path)
+        token = _active_upgrade.set(owner)
+        try:
+            yield owner
+        finally:
+            owner._invalidate()
+            _active_upgrade.reset(token)
+
+
+def require_migration_owner(owner, db):
+    if type(owner) is not _MigrationOwner:
+        raise RuntimeError("Removal acceptance requires the live migration owner")
+    owner.require(db)
 
 
 def write_backup(path: Path, db: sqlite3.Connection, *, target_schema: int = 33) -> Path:

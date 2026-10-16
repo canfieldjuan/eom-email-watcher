@@ -74,6 +74,11 @@ def _signature(db, unsigned, kind, parameters_sha256):
 
 
 def issue_key(store, kind, parameters, *, retention_days, now=None):
+    with store.connection() as db:
+        return _issue_key(db, kind, parameters, retention_days=retention_days, now=now)
+
+
+def _issue_key(db, kind, parameters, *, retention_days, now=None):
     if type(retention_days) is not int or retention_days < 1:
         raise RemovalRequestInvalid("Invalid removal retention interval")
     stamp = (now or datetime.now(UTC)).astimezone(UTC)
@@ -83,8 +88,7 @@ def issue_key(store, kind, parameters, *, retention_days, now=None):
         raise RemovalRequestInvalid("Invalid removal retention interval") from exc
     unsigned = f"rm1.{expires}.{secrets.token_hex(16)}"
     fingerprint = request_hash(kind, parameters)
-    with store.connection() as db:
-        signature = _signature(db, unsigned, kind, fingerprint)
+    signature = _signature(db, unsigned, kind, fingerprint)
     return f"{unsigned}.{signature}"
 
 
@@ -408,12 +412,59 @@ def freeze(db, key, kind, message_ids, *, accepted_at):
                 )
 
 
+def _accept_in_transaction(db, key, kind, parameters, message_ids, *, now, authority):
+    """One receipt/freeze/invalidation owner; never opens a transaction or lock."""
+    from . import thread_migration
+    from .db import _mark_automation_sources_unavailable
+
+    if type(authority) is _RuntimeAcceptance:
+        authority.require(db)
+    else:
+        thread_migration.require_migration_owner(authority, db)
+    fingerprint = request_hash(kind, parameters)
+    previous = outcome(db, key, kind=kind, fingerprint=fingerprint)
+    if previous is not None:
+        return previous, False
+    validate_key(db, key, kind, fingerprint, now=now)
+    if kind == "delete":
+        message_ids = [parameters["message_id"]]
+        if not db.execute(
+            "SELECT 1 FROM logical_messages WHERE message_id=?", (message_ids[0],)
+        ).fetchone():
+            raise KeyError(message_ids[0])
+    elif kind == "clear":
+        message_ids = [r[0] for r in db.execute("SELECT message_id FROM logical_messages")]
+    elif kind != "unfollow" or message_ids is None:
+        raise RemovalRequestInvalid("Unfollow acceptance belongs to the derived owner")
+    stamp = now.astimezone(UTC).isoformat()
+    db.execute(
+        "INSERT INTO message_removal_requests VALUES(?,?,?,?)", (key, kind, fingerprint, stamp)
+    )
+    freeze(db, key, kind, message_ids, accepted_at=stamp)
+    selected = [
+        r[0] for r in db.execute(
+            "SELECT t.message_id FROM message_removal_targets t JOIN message_removal_intents i "
+            "ON i.intent_id=t.intent_id WHERE i.request_id=?", (key,),
+        )
+    ]
+    _mark_automation_sources_unavailable(db, selected, updated_at=stamp)
+    return outcome(db, key, kind=kind, fingerprint=fingerprint), True
+
+
+class _RuntimeAcceptance:
+    def __init__(self, db):
+        self.db = db
+        self.live = True
+
+    def require(self, db):
+        if not self.live or self.db is not db or not db.in_transaction:
+            raise RuntimeError("Removal acceptance requires its guarded write transaction")
+
+
 def accept(store, key, kind, parameters, *, now):
     """Accept a frozen selection under the caller's existing operation lock."""
     from . import source_locks
-    from .db import _mark_automation_sources_unavailable
 
-    stamp = now.astimezone(UTC).isoformat()
     fingerprint = request_hash(kind, parameters)
     with (
         source_locks.protocol_guard(
@@ -424,36 +475,52 @@ def accept(store, key, kind, parameters, *, now):
         store.connection() as db,
     ):
         db.execute("BEGIN IMMEDIATE")
-        previous = outcome(db, key, kind=kind, fingerprint=fingerprint)
-        if previous is not None:
-            return previous
-        validate_key(db, key, kind, fingerprint, now=now)
-        if kind == "delete":
-            message_ids = [parameters["message_id"]]
-            if not db.execute(
-                "SELECT 1 FROM logical_messages WHERE message_id=?", (message_ids[0],)
-            ).fetchone():
-                raise KeyError(message_ids[0])
-        elif kind == "clear":
-            message_ids = [r[0] for r in db.execute("SELECT message_id FROM logical_messages")]
-        else:
-            raise RemovalRequestInvalid("Unfollow acceptance belongs to the derived owner")
-        db.execute(
-            "INSERT INTO message_removal_requests VALUES(?,?,?,?)", (key, kind, fingerprint, stamp)
-        )
-        freeze(db, key, kind, message_ids, accepted_at=stamp)
-        selected = [
-            r[0]
-            for r in db.execute(
-                "SELECT t.message_id FROM message_removal_targets t JOIN message_removal_intents i "
-                "ON i.intent_id=t.intent_id WHERE i.request_id=?",
-                (key,),
+        authority = _RuntimeAcceptance(db)
+        try:
+            result, created = _accept_in_transaction(
+                db, key, kind, parameters, None, now=now, authority=authority,
             )
-        ]
-        _mark_automation_sources_unavailable(db, selected, updated_at=stamp)
+        finally:
+            authority.live = False
+        if not created:
+            return result
     resume(store, now=now)
     with store.connection() as db:
         return outcome(db, key, kind=kind, fingerprint=fingerprint)
+
+
+def convert_saved_unfollow(db, migration_owner, *, now):
+    """Represent retained pre-36 unfollowed bodies in the upgrade snapshot."""
+    from . import thread_migration
+    from .config import MAX_RETENTION_DAYS
+    from .db import _effective_message_identity_sql, _logical_unit
+
+    thread_migration.require_migration_owner(migration_owner, db)
+    candidates = [r[0] for r in db.execute(
+        f"""SELECT m.message_id FROM messages m
+        WHERE NOT EXISTS (SELECT 1 FROM thread_follow f
+            WHERE f.provider=m.provider AND f.account_id=m.account_id
+            AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
+            AND f.thread_key=m.thread_key AND f.followed=1) AND (
+            EXISTS(SELECT 1 FROM message_bodies b WHERE b.message_id=m.message_id)
+            OR EXISTS(SELECT 1 FROM message_body_unavailable b WHERE b.message_id=m.message_id))
+        ORDER BY m.message_id"""
+    )]
+    selected = {}
+    for message_id in candidates:
+        unit = _logical_unit(db, message_id)
+        if unit is None:
+            continue
+        if any(not message_available(db, row_id, include_unfollow=True) for row_id in unit.rows):
+            continue
+        selected[unit.rows] = message_id
+    if not selected:
+        return
+    parameters = {"message_ids": sorted(selected.values())}
+    key = _issue_key(db, "unfollow", parameters, retention_days=MAX_RETENTION_DAYS, now=now)
+    _accept_in_transaction(
+        db, key, "unfollow", parameters, selected.values(), now=now, authority=migration_owner,
+    )
 
 
 def resume(store, *, now=None):

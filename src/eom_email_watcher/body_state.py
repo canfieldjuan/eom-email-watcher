@@ -69,10 +69,14 @@ def sources(db, message_id, scope, folders):
 
 
 def record(store, message_id, body, *, fetched_at, reason=None):
+    from . import removal
     from .db import _effective_message_identity_sql
 
     with store.connection() as db:
         db.execute("BEGIN IMMEDIATE")
+        # A refollow cannot revive content already accepted for body-only removal.
+        if not removal.message_available(db, message_id, include_unfollow=True):
+            return
         # The derived input owner may have deleted or unfollowed this source.
         present = db.execute(
             f"""SELECT 1 FROM logical_messages m JOIN thread_follow f

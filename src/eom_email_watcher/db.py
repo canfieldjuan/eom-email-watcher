@@ -19,7 +19,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from connect_automate import connect
-from connect_automate.locking import connect_operation_lock
 
 from . import body_state, deployment, reconcile_state, removal, source_locks, thread_migration
 from .automation.rules import (
@@ -5973,6 +5972,10 @@ class Store:
                 changed: set[str] = set()
 
                 def track_inputs(action, table, column, database, trigger):
+                    if action == sqlite3.SQLITE_TRANSACTION and table in {"COMMIT", "ROLLBACK"}:
+                        owner = getattr(connection, "_migration_owner", None)
+                        if owner is not None:
+                            owner._invalidate()
                     if (
                         action
                         in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE)
@@ -6034,11 +6037,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Serialize backup plus migration across simultaneous desktop/scheduler
         # starts. Version is also read inside BEGIN IMMEDIATE below.
-        with connect_operation_lock(
-            self.path.with_name(self.path.name + ".upgrade.lock"),
-            "The mailbox database is being upgraded",
-            timeout_seconds=-1,
-        ):
+        with thread_migration.upgrade_owner(self.path) as migration_owner:
             fresh = not self.path.exists()
             backup_target = SCHEMA_VERSION if SCHEMA_VERSION >= 36 else 33
             if self.path.exists():
@@ -6053,7 +6052,7 @@ class Store:
                             self.path, source, target_schema=backup_target,
                         )
             try:
-                self._initialize_locked()
+                self._initialize_locked(migration_owner)
             except Exception:
                 thread_migration.cleanup_backups(
                     self.path, success=False, target_schema=backup_target,
@@ -6069,13 +6068,11 @@ class Store:
                     # The schema is available; source-protected work remains refused.
                     logging.getLogger(__name__).warning("Source-lock cutover deferred: %s", exc)
 
-    def _initialize_locked(self) -> None:
+    def _initialize_locked(self, migration_owner) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         migration_observed_at = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("BEGIN IMMEDIATE")
-            version = db.execute("PRAGMA user_version").fetchone()[0]
+        with migration_owner.transaction(self) as db:
+            version = migration_owner.version
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Database schema version {version} is newer than supported "
@@ -6454,6 +6451,8 @@ class Store:
             if version < 35:
                 db.execute("DELETE FROM reconcile_coverage")
             if SCHEMA_VERSION >= 36:
+                if version < 36:
+                    removal.convert_saved_unfollow(db, migration_owner, now=datetime.now(UTC))
                 thread_migration.check_database(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
