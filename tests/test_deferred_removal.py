@@ -150,6 +150,583 @@ def prior_store(tmp_path, monkeypatch, version):
     return store
 
 
+@pytest.mark.parametrize("owner", ["job_enqueue", "model_adopt", "source_return", "copy_join"])
+def test_late_source_adoption_cannot_repopulate_held_target(tmp_path, monkeypatch, owner):
+    import hashlib
+    import uuid
+
+    from test_removal_refusal import held_runtime
+    from test_service import FakeModel
+    from test_thread_reconcile import KEY, seed
+
+    from eom_email_watcher import engine_api
+    from eom_email_watcher.mime import AttachmentDescriptor
+
+    store = held_runtime(tmp_path, monkeypatch)
+    job_values = dict(
+        message_id="m",
+        part_id="2",
+        capability_id="document.summarize",
+        capability_version="1.0",
+        provider_app_id="document-summarizer",
+        provider_instance_id=str(uuid.uuid4()),
+        input_artifact_id=str(uuid.uuid4()),
+        input_media_type="application/pdf",
+        input_byte_size=1,
+        input_sha256=hashlib.sha256(b"x").hexdigest(),
+    )
+    if owner == "job_enqueue":
+        store.replace_attachments(
+            "m",
+            (
+                AttachmentDescriptor(
+                    "2",
+                    "public-attachment",
+                    "public.pdf",
+                    "application/pdf",
+                    1,
+                    0,
+                ),
+            ),
+        )
+        assert store.create_connect_job(job_id=str(uuid.uuid4()), **job_values)
+    elif owner == "model_adopt":
+        assert store.reserve_analysis_request("m", 100, now=NOW)
+    elif owner == "copy_join":
+        seed(store, "before-copy", rfc_message_id="same@vendor")
+        with store.connection() as db:
+            assert db.execute(
+                "SELECT 1 FROM message_locations WHERE provider_message_id='before-copy'"
+            ).fetchone()
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "m"},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["outcome"] == "deferred", accepted
+    if owner == "job_enqueue":
+        with pytest.raises(KeyError):
+            store.create_connect_job(job_id=str(uuid.uuid4()), **job_values)
+    elif owner == "model_adopt":
+        with pytest.raises(KeyError):
+            database.Store(store.path).mark_analyzed(
+                "m",
+                FakeModel().analyze().model_dump(),
+                mailbox_identity_key=KEY,
+                body_chars=12,
+                body_source_chars=12,
+                now=NOW,
+            )
+    elif owner == "source_return":
+        with store.connection() as db:
+            db.execute("DELETE FROM messages WHERE message_id='copy-00'")
+        seed(store, "copy-00")
+        with store.connection() as db:
+            assert not db.execute("SELECT 1 FROM messages WHERE message_id='copy-00'").fetchone()
+            assert not db.execute(
+                "SELECT 1 FROM message_locations WHERE provider_message_id='copy-00'"
+            ).fetchone()
+    else:
+        seed(store, "after-copy", rfc_message_id="same@vendor")
+        with store.connection() as db:
+            assert not db.execute(
+                "SELECT 1 FROM message_locations WHERE provider_message_id='after-copy'"
+            ).fetchone()
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+
+
+@pytest.mark.parametrize("owner", ["v1_fetch", "v1_enqueue", "v1_submit", "v2_enqueue"])
+def test_connect_api_acceptance_between_source_use_boundaries(tmp_path, monkeypatch, owner):
+    import uuid
+    from concurrent.futures import ThreadPoolExecutor
+
+    from connect_automate import connect
+    from test_connect_engine_api import provider
+    from test_connect_v2_engine_api import PDF, capability, seeded_runtime
+
+    from eom_email_watcher import engine_api, source_locks
+
+    _, runtime = seeded_runtime(tmp_path)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(connect, "require_connect_entitlement", lambda: None)
+    with runtime.store.connection() as db:
+        db.execute("UPDATE messages SET received_at=?", (NOW.isoformat(),))
+    accepted = []
+
+    def accept():
+        # Use the real other-thread operation lock and acceptance transaction.
+        # Any held source context stays in this thread through the late result.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            reply = pool.submit(
+                engine_api._response,
+                {
+                    "protocol": 1,
+                    "operation": "inbox.delete",
+                    "payload": {"message_id": "message-1"},
+                },
+            ).result(timeout=15)
+        assert reply["ok"], reply
+        accepted.append(reply)
+
+    def fetch(*args, **kwargs):
+        if owner == "v1_fetch":
+            pytest.fail("accepted target reached provider fetch")
+        accept()
+        return PDF
+
+    def discover(**kwargs):
+        if owner == "v1_fetch":
+            accept()
+        return connect.CapabilityDiscovery(provider())
+
+    monkeypatch.setattr(engine_api, "_verified_mailbox_attachment_bytes", fetch)
+    monkeypatch.setattr(connect, "discover_summary_capability", discover)
+    if owner == "v2_enqueue":
+        with pytest.raises(engine_api.ApiError) as refused:
+            engine_api._prepare_or_create_generic_connect_job(
+                runtime,
+                request_id=str(uuid.uuid4()),
+                message_id="message-1",
+                part_id="2",
+                capability=capability(),
+                parameters={},
+                confirmed=False,
+            )
+        assert refused.value.code == "connect_source_unavailable"
+        assert accepted[0]["data"]["outcome"] == "deferred"
+    elif owner == "v1_submit":
+        job = connect.prepare_summary_job(PDF, "invoice.pdf")
+        runtime.store.create_connect_job(
+            job_id=job.job_id,
+            message_id="message-1",
+            part_id="2",
+            capability_id=connect.CAPABILITY_ID,
+            capability_version=connect.CAPABILITY_VERSION,
+            provider_app_id=provider().app_id,
+            provider_instance_id=provider().instance_id,
+            input_artifact_id=job.artifact.artifact_id,
+            input_media_type=job.artifact.media_type,
+            input_byte_size=job.artifact.byte_size,
+            input_sha256=job.artifact.sha256,
+        )
+        accept()
+
+        class ForbiddenClient:
+            def __init__(self, selected):
+                pass
+
+            def submit(self, job, content):
+                pytest.fail("accepted target reached provider submit")
+
+        monkeypatch.setattr(connect, "ConnectClient", ForbiddenClient)
+        with pytest.raises(engine_api.ApiError) as refused:
+            engine_api._run_connect_job(runtime, provider(), job, PDF)
+        assert refused.value.code == "connect_source_unavailable"
+    else:
+        response = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "connect.attachment.summarize",
+                "payload": {"message_id": "message-1", "part_id": "2"},
+            }
+        )
+        assert not response["ok"], response
+        assert response["error"]["code"] == "connect_source_unavailable", response
+    assert len(accepted) == 1
+    with runtime.store.connection() as db:
+        assert not db.execute("SELECT 1 FROM connect_attachment_jobs").fetchone()
+
+
+def retain_legacy_aliases(store, message_id):
+    # Reproduce the existing pre-coalescing physical unit without another
+    # identity algorithm or a fake source-availability owner.
+    with store.connection() as db:
+        values = dict(
+            db.execute(
+                "SELECT * FROM messages WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+        )
+        columns = ",".join(values)
+        placeholders = ",".join("?" for _ in values)
+        for index in range(32):
+            alias = dict(
+                values,
+                message_id=f"legacy-{index}",
+                logical_of=message_id,
+                provider_message_id=f"legacy-{index}",
+            )
+            db.execute(
+                f"INSERT INTO messages({columns}) VALUES({placeholders})", tuple(alias.values())
+            )
+        db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+
+
+@pytest.mark.parametrize("owner", ["completion", "completion_missing", "ledger", "ledger_missing"])
+def test_pending_certificate_has_no_content_adoption_or_reader(tmp_path, monkeypatch, owner):
+    from test_certificate_expiry_ledger import (
+        INSTANCE_A,
+        _certificate_fire_job,
+        _record,
+        _result,
+    )
+    from test_connect_v2_engine_api import seeded_runtime
+
+    from eom_email_watcher import engine_api
+
+    _, runtime = seeded_runtime(tmp_path)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+    )
+    if owner.startswith("ledger"):
+        runtime.store.transition_connect_job(
+            job_id=job_id,
+            expected_state="accepted",
+            next_state="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_result(_record()),
+        )
+        assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20")
+    retain_legacy_aliases(runtime.store, "message-1")
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "message-1"},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    if owner.startswith("completion"):
+        if owner == "completion_missing":
+            with runtime.store.connection() as db:
+                db.execute("DELETE FROM messages")
+        terminal = runtime.store.transition_connect_job(
+            job_id=job_id,
+            expected_state="accepted",
+            next_state="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_result(_record()),
+        )
+        assert terminal.status == "completed"
+        settled = runtime.store.automation_fire(fire.fire_id)
+        assert settled.state == "completed" and settled.reason == "connect_completed"
+        assert runtime.store.connect_job(job_id) is None
+        with runtime.store.connection() as db:
+            assert not db.execute("SELECT 1 FROM certificate_records").fetchone()
+    if owner == "ledger_missing":
+        with runtime.store.connection() as db:
+            db.execute("DELETE FROM messages")
+    assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20") == []
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == (
+            0 if owner.endswith("_missing") else 33
+        )
+
+
+def connect_source_job(store):
+    import uuid
+
+    from connect_automate import connect
+    from test_connect_v2_engine_api import capability
+
+    from eom_email_watcher.mime import AttachmentDescriptor
+
+    selected = capability()
+    content = b"public attachment"
+    store.replace_attachments(
+        "m",
+        (
+            AttachmentDescriptor(
+                "2",
+                "public-attachment",
+                "public.pdf",
+                "application/pdf",
+                len(content),
+                0,
+            ),
+        ),
+    )
+    job = connect.prepare_capability_job(
+        selected,
+        content,
+        "application/pdf",
+        "public.pdf",
+        job_id=str(uuid.uuid4()),
+    )
+    created = store.create_connect_job(
+        job_id=job.job_id,
+        message_id="m",
+        part_id="2",
+        protocol_version=2,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        request_json=job.request_json,
+        selection=selected,
+        capability_produces=selected.produces,
+    )
+    return selected, created
+
+
+def test_accepted_target_refuses_connect_resubmission(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+
+    from eom_email_watcher import engine_api
+
+    store = held_runtime(tmp_path, monkeypatch)
+    selected, job = connect_source_job(store)
+    assert store.claim_connect_lane_head(
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    reply = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "m"},
+        }
+    )
+    assert reply["ok"] and reply["data"]["pending"] == 1, reply
+    before = store.connect_dispatch(job.job_id)
+    assert before is not None and not before.source_available
+    with pytest.raises(KeyError):
+        store.reset_connect_job_for_resubmission(
+            job_id=job.job_id,
+            expected_state="requested",
+            provider_app_id=selected.app_id,
+            provider_instance_id=selected.instance_id,
+        )
+    after = store.connect_dispatch(job.job_id)
+    assert after == before
+    # A possibly submitted source-less job still owns the same GET identity.
+    claimed = store.claim_connect_lane_head(
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    assert claimed is not None and claimed[0].job_id == job.job_id
+    assert claimed[1].state == "reconciling" and not claimed[1].source_available
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "source_start",
+        "message_source",
+        "add_message",
+        "create_connect_job",
+        "mark_analyzed",
+        "connect_dispatch",
+        "claim_connect_lane_head",
+        "reset_connect_job_for_resubmission",
+        "transition_connect_job",
+    ],
+)
+def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, owner):
+    import hashlib
+    import threading
+    import uuid
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+
+    from connect_automate.locking import operation_lock
+    from test_removal_refusal import held_runtime
+    from test_service import FakeModel
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import removal, source_locks
+    from eom_email_watcher.config import exact_sender_selector_id
+    from eom_email_watcher.mime import AttachmentDescriptor
+
+    seeded = held_runtime(tmp_path, monkeypatch)
+    main_thread = threading.get_ident()
+    reached, release = threading.Event(), threading.Event()
+    observation_timeouts = []
+
+    class ProbeStore(database.Store):
+        @contextmanager
+        def connection(self):
+            with super().connection() as db:
+                # Observe the actual SQLite write exclusion without waiting the
+                # production busy timeout; production timeout is unchanged.
+                db.execute("PRAGMA busy_timeout=0")
+
+                execute = db.execute
+
+                def observe(sql, parameters=()):
+                    cursor = execute(sql, parameters)
+                    if (
+                        threading.get_ident() != main_thread
+                        and not reached.is_set()
+                        and "FROM message_removal_targets" in sql
+                    ):
+
+                        class DecisionCursor:
+                            def fetchone(self):
+                                # Pause after SQLite made the real decision, not
+                                # before the SELECT could observe acceptance.
+                                row = cursor.fetchone()
+                                reached.set()
+                                if not release.wait(10):
+                                    observation_timeouts.append(sql)
+                                return row
+
+                        return DecisionCursor()
+                    return cursor
+
+                db.execute = observe
+                try:
+                    yield db
+                finally:
+                    db.execute = execute
+
+    store = ProbeStore(seeded.path)
+    if owner == "create_connect_job":
+        store.replace_attachments(
+            "m",
+            (
+                AttachmentDescriptor(
+                    "2",
+                    "public-attachment",
+                    "public.pdf",
+                    "application/pdf",
+                    1,
+                    0,
+                ),
+            ),
+        )
+    if owner == "mark_analyzed":
+        store.reserve_analysis_request("m", 100, now=NOW)
+    if owner in {
+        "connect_dispatch",
+        "claim_connect_lane_head",
+        "reset_connect_job_for_resubmission",
+        "transition_connect_job",
+    }:
+        selected, source_job = connect_source_job(store)
+        if owner == "reset_connect_job_for_resubmission":
+            assert store.claim_connect_lane_head(
+                provider_app_id=selected.app_id,
+                provider_instance_id=selected.instance_id,
+            )
+    key = removal.issue_key(store, "delete", {"message_id": "m"}, retention_days=30, now=NOW)
+
+    def start():
+        if owner == "transition_connect_job":
+            return store.transition_connect_job(
+                job_id=source_job.job_id,
+                expected_state="requested",
+                next_state="accepted",
+                provider_app_id=selected.app_id,
+                provider_instance_id=selected.instance_id,
+            )
+        if owner == "connect_dispatch":
+            return store.connect_dispatch(source_job.job_id)
+        if owner == "claim_connect_lane_head":
+            return store.claim_connect_lane_head(
+                provider_app_id=selected.app_id,
+                provider_instance_id=selected.instance_id,
+            )
+        if owner == "reset_connect_job_for_resubmission":
+            return store.reset_connect_job_for_resubmission(
+                job_id=source_job.job_id,
+                expected_state="requested",
+                provider_app_id=selected.app_id,
+                provider_instance_id=selected.instance_id,
+            )
+        if owner == "source_start":
+            return store.source_start("m")
+        if owner == "message_source":
+            return store.message_source("m")
+        if owner == "mark_analyzed":
+            return store.mark_analyzed(
+                "m",
+                FakeModel().analyze().model_dump(),
+                mailbox_identity_key=KEY,
+                body_chars=12,
+                body_source_chars=12,
+                now=NOW,
+            )
+        if owner == "create_connect_job":
+            return store.create_connect_job(
+                job_id=str(uuid.uuid4()),
+                message_id="m",
+                part_id="2",
+                capability_id="document.summarize",
+                capability_version="1.0",
+                provider_app_id="document-summarizer",
+                provider_instance_id=str(uuid.uuid4()),
+                input_artifact_id=str(uuid.uuid4()),
+                input_media_type="application/pdf",
+                input_byte_size=1,
+                input_sha256=hashlib.sha256(b"x").hexdigest(),
+            )
+        return store.add_message(
+            message_id="before-race-copy",
+            provider="gmail",
+            account_id="mailbox",
+            provider_message_id="before-race-copy",
+            mailbox_identity_key=KEY,
+            thread_id="native",
+            sender="vendor@example.com",
+            sender_name=None,
+            subject="Public copy",
+            received_at=NOW.isoformat(),
+            rfc_message_id="same@vendor",
+            admission=database.AdmissionProvenance(
+                "exact_sender",
+                exact_sender_selector_id("vendor@example.com"),
+                None,
+                KEY,
+                NOW.isoformat(),
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(start)
+        try:
+            assert reached.wait(5), "owner never consulted persisted target eligibility"
+            with (
+                operation_lock(source_locks.operation_lock_path(store.path), "public operation"),
+                pytest.raises(sqlite3.OperationalError, match="locked"),
+            ):
+                store.request_removal(
+                    "delete",
+                    {"message_id": "m"},
+                    request_id=key,
+                    now=NOW,
+                )
+        finally:
+            release.set()
+        future.result(timeout=10)
+    assert not observation_timeouts
+    with operation_lock(source_locks.operation_lock_path(store.path), "public operation"):
+        result = store.request_removal("delete", {"message_id": "m"}, request_id=key, now=NOW)
+    assert result.pending == 1 and result.completed == 0
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
+
+
 def test_restart_preserves_request_and_qualification_completes_once(tmp_path, monkeypatch):
     from test_removal_refusal import held_runtime
 
@@ -541,3 +1118,87 @@ def test_request_parameter_hash_rejects_invalid_input(kind, parameters):
 
     with pytest.raises(removal.RemovalRequestInvalid):
         removal.request_hash(kind, parameters)
+
+
+@pytest.mark.parametrize("context", ["selected", "raw"])
+def test_qualification_inside_source_context_defers_physical_completion(
+    tmp_path, monkeypatch, context
+):
+    from test_removal_refusal import held_runtime
+
+    from eom_email_watcher import engine_api, removal, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    reply = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "m"},
+        }
+    )
+    assert reply["ok"] and reply["data"]["pending"] == 1, reply
+    # Simulate the completed qualification marker while an existing handoff
+    # still owns a subset. Completion must enter later in operation→source order.
+    with store.connection() as db:
+        db.execute(
+            "INSERT INTO maintenance_state VALUES('source_lock_protocol',?,?)",
+            (source_locks.SOURCE_LOCK_PROTOCOL, NOW.isoformat()),
+        )
+    owned = (
+        store.source_locks(("m",))
+        if context == "selected"
+        else source_locks.source_locks(store.path, ("m",))
+    )
+    with owned:
+        source_locks.qualify_protocol(store, fresh=False)
+        with store.connection() as db:
+            assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+            assert removal.outcome(db, reply["data"]["request_id"]).pending == 1
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM messages").fetchone()
+        assert removal.outcome(db, reply["data"]["request_id"]).completed == 1
+
+
+@pytest.mark.parametrize("changed", [None, "provider", "account_id", "mailbox_identity_key"])
+def test_missing_source_eligibility_preserves_retained_binding(tmp_path, monkeypatch, changed):
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api, removal, source_locks
+
+    store = held_runtime(tmp_path, monkeypatch)
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "m"},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    binding = dict(provider="gmail", account_id="mailbox", mailbox_identity_key=KEY)
+    if changed:
+        binding[changed] = "e" * 64 if changed == "mailbox_identity_key" else "different"
+        assert binding != dict(provider="gmail", account_id="mailbox", mailbox_identity_key=KEY)
+    with store.connection() as db:
+        db.execute("DELETE FROM messages")
+        assert removal.message_available(
+            db,
+            "m",
+            require_source=False,
+            retained_bindings=(binding,),
+        ) is (changed is not None)
+        assert not removal.message_available(db, "m")
+        db.execute(
+            "INSERT INTO maintenance_state VALUES('source_lock_protocol',?,?)",
+            (source_locks.SOURCE_LOCK_PROTOCOL, NOW.isoformat()),
+        )
+    source_locks.qualify_protocol(store, fresh=False)
+    with store.connection() as db:
+        assert removal.outcome(db, accepted["data"]["request_id"]).completed == 1
+        assert removal.message_available(
+            db,
+            "m",
+            require_source=False,
+            retained_bindings=(binding,),
+        )

@@ -2878,7 +2878,7 @@ def _certificate_assert_projection(
 def _certificate_source_for_job(
     db: sqlite3.Connection,
     job: ConnectJob,
-) -> tuple[dict[str, str], tuple[str, ...]]:
+) -> tuple[dict[str, str] | None, tuple[str, ...]]:
     fire_rows = db.execute(
         "SELECT * FROM automation_fires WHERE job_id = ? ORDER BY fire_id", (job.job_id,)
     ).fetchall()
@@ -2952,6 +2952,11 @@ def _certificate_source_for_job(
     else:
         raise CertificateResultInvalid("certificate source identity is unavailable")
 
+    if not removal.message_available(
+        db, job.message_id, require_source=False, retained_bindings=(source,),
+    ):
+        return None, tuple(fire_ids)
+
     for fire, identity in identities:
         if identity is not None:
             continue
@@ -3024,8 +3029,10 @@ def _persist_certificate_projection(
     job: ConnectJob,
     result: _ValidatedCertificateResult,
     stamp: str,
-) -> tuple[str, tuple[str, ...]]:
+) -> tuple[str | None, tuple[str, ...]]:
     source, fire_ids = _certificate_source_for_job(db, job)
+    if source is None:
+        return None, fire_ids
     source_tuple = (
         source["provider"],
         source["account_id"],
@@ -6412,8 +6419,13 @@ class Store:
             raise ValueError("Certificate ledger limit must be between 1 and 500")
 
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            eligible = (
+                removal.retained_available_sql("certificate", message_id_field="source_message_id")
+                if removal.has_schema(db) else "1"
+            )
             rows = db.execute(
-                """SELECT certificate.certificate_id, policy.policy_id, policy.ordinal,
+                f"""SELECT certificate.certificate_id, policy.policy_id, policy.ordinal,
                     length(certificate.canonical_result_json) AS canonical_result_bytes,
                     CASE WHEN COALESCE(dispatch.source_available, 1) = 1 AND EXISTS (
                         SELECT 1 FROM messages AS message
@@ -6430,6 +6442,7 @@ class Store:
                   ON policy.certificate_id = certificate.certificate_id
                 LEFT JOIN connect_job_dispatch AS dispatch
                   ON dispatch.job_id = certificate.connect_job_id
+                WHERE ({eligible})
                 ORDER BY CASE WHEN policy.expiration_date_iso IS NULL THEN 1 ELSE 0 END,
                     policy.expiration_date_iso, certificate.certificate_id, policy.ordinal
                 LIMIT ?""",
@@ -9480,7 +9493,7 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if message_id is not None:
                 return removal.message_available(db, message_id, include_unfollow=include_unfollow)
-            return not removal.has_schema(db) or removal.source_available(
+            return removal.source_available(
                 db, provider=provider, account_id=account_id,
                 mailbox_identity_key=mailbox_identity_key,
                 provider_message_id=provider_message_id,
@@ -9601,6 +9614,11 @@ class Store:
         ).fetchone()
         if account is None or account["mailbox_identity_key"] != mailbox_identity_key:
             raise MailboxIdentityChanged("mailbox identity changed")
+        if not removal.source_available(
+            db, message_id=message_id, provider=provider, account_id=account_id,
+            mailbox_identity_key=mailbox_identity_key, provider_message_id=source_message_id,
+        ):
+            return False
         if admission.kind == "gmail_user_label" and (
             db.execute(
                 """SELECT 1 FROM gmail_label_selectors AS l
@@ -9632,6 +9650,18 @@ class Store:
         thread_ids: tuple[str, ...] = ()
         merged: tuple[str, ...] = ()
         rfc_message_id = normalize_message_id(rfc_message_id)
+        logical_id = None
+        if rfc_message_id is not None:
+            logical_id = _logical_message_id(
+                db,
+                provider,
+                account_id,
+                mailbox_identity_key,
+                rfc_message_id,
+                other_than=source_message_id,
+            )
+        if logical_id is not None and not removal.message_available(db, logical_id):
+            return False
         if provider == "imap":
             thread_ids = tuple(
                 dict.fromkeys(
@@ -9655,38 +9685,29 @@ class Store:
             return False
         # A second location of an already-captured logical identity is recorded,
         # not captured again (contract D-identity).
-        if rfc_message_id is not None:
-            logical_id = _logical_message_id(
+        if logical_id is not None:
+            _record_locations(
                 db,
-                provider,
-                account_id,
-                mailbox_identity_key,
-                rfc_message_id,
-                other_than=source_message_id,
+                message_id=logical_id,
+                provider=provider,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=source_message_id,
+                locations=locations,
+                observed_at=discovered_at,
+                scope_complete=scope_complete,
+                headers_observed=True,
+                received_at=received_at,
             )
-            if logical_id is not None:
-                _record_locations(
-                    db,
-                    message_id=logical_id,
-                    provider=provider,
-                    account_id=account_id,
-                    mailbox_identity_key=mailbox_identity_key,
-                    provider_message_id=source_message_id,
-                    locations=locations,
-                    observed_at=discovered_at,
-                    scope_complete=scope_complete,
-                    headers_observed=True,
-                    received_at=received_at,
+            _record_recipients(db, message_id=logical_id, to=to, cc=cc)
+            _requeue_if_skipped(db, logical_id)
+            if provider == "imap":
+                # The copy's reply headers may bridge components (contract
+                # D-identity): the one re-key owner applies them as for a new row.
+                _apply_imap_component(
+                    db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
                 )
-                _record_recipients(db, message_id=logical_id, to=to, cc=cc)
-                _requeue_if_skipped(db, logical_id)
-                if provider == "imap":
-                    # The copy's reply headers may bridge components (contract
-                    # D-identity): the one re-key owner applies them as for a new row.
-                    _apply_imap_component(
-                        db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
-                    )
-                return False
+            return False
         cursor = db.execute(
             """INSERT OR IGNORE INTO messages(
                 message_id, provider, account_id, mailbox_identity_key, provider_message_id,
@@ -10253,10 +10274,21 @@ class Store:
 
     def connect_dispatch(self, job_id: str) -> ConnectDispatch | None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT * FROM connect_job_dispatch WHERE job_id = ?", (job_id,)
             ).fetchone()
-        return self._connect_dispatch(row) if row else None
+            if row is None:
+                return None
+            job = db.execute(
+                "SELECT message_id FROM connect_attachment_jobs WHERE job_id = ?", (job_id,),
+            ).fetchone()
+            if job is None:
+                raise RuntimeError("Connect dispatch is missing its job")
+            eligible = removal.message_available(db, str(job["message_id"]))
+            values = dict(row)
+            values["source_available"] = bool(row["source_available"]) and eligible
+        return self._connect_dispatch(values)
 
     def connect_queue_ahead(self, job_id: str) -> int:
         with self.connection() as db:
@@ -10572,6 +10604,7 @@ class Store:
             self._expire_waiting_connect_jobs_transaction(db, stamp)
             row = db.execute(
                 """SELECT j.*, d.state AS claim_dispatch_state,
+                    d.submission_possible AS claim_submission_possible,
                     CASE WHEN d.next_attempt_at IS NULL
                               OR aware_iso_epoch(d.next_attempt_at) <= aware_iso_epoch(?)
                          THEN 1 ELSE 0 END AS claim_is_due
@@ -10600,6 +10633,10 @@ class Store:
                 return None
             if row["claim_dispatch_state"] != "dispatching" and not bool(row["claim_is_due"]):
                 return None
+            eligible = removal.message_available(db, str(row["message_id"]))
+            if (not eligible and row["claim_dispatch_state"] == "waiting"
+                    and not bool(row["claim_submission_possible"])):
+                return None
             db.execute(
                 """UPDATE connect_job_dispatch
                 SET state = CASE
@@ -10627,7 +10664,9 @@ class Store:
             ).fetchone()
         if dispatch_row is None or job_row is None:
             raise RuntimeError("Claimed Connect job is missing dispatch state")
-        return self._connect_job(job_row), self._connect_dispatch(dispatch_row)
+        dispatch_values = dict(dispatch_row)
+        dispatch_values["source_available"] = bool(dispatch_row["source_available"]) and eligible
+        return self._connect_job(job_row), self._connect_dispatch(dispatch_values)
 
     @staticmethod
     def completed_connect_warnings(job: ConnectJob) -> list[dict[str, str]]:
@@ -10898,6 +10937,8 @@ class Store:
         stamp = created_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError((message_id, part_id))
             if (
                 db.execute(
                     """SELECT 1 FROM message_attachments
@@ -11039,6 +11080,17 @@ class Store:
             if current is None or current["status"] != expected_state:
                 raise RuntimeError("Connect job transition lost its expected-state race")
             current_job = self._connect_job(current)
+            retained_bindings = db.execute(
+                """SELECT identity.provider,identity.account_id,identity.mailbox_identity_key
+                FROM automation_fire_source_identities identity
+                JOIN automation_fires fire ON fire.fire_id=identity.fire_id
+                WHERE fire.job_id=? AND identity.message_id=? AND identity.part_id=?""",
+                (job_id, current_job.message_id, current_job.part_id),
+            ).fetchall()
+            target_available = removal.message_available(
+                db, current_job.message_id, require_source=False,
+                retained_bindings=retained_bindings,
+            )
             if current_job.protocol_version == 2 and (
                 current_job.provider_app_id != provider_app_id
                 or current_job.provider_instance_id != provider_instance_id
@@ -11184,7 +11236,7 @@ class Store:
                 and not certificate_job
                 and dispatch_before is not None
                 and not bool(dispatch_before["source_available"])
-                and not deferred_interactive_fire
+                and (not deferred_interactive_fire or not target_available)
             )
             if discard_terminal:
                 fire_state = "completed" if next_state == "completed" else "failed"
@@ -11628,6 +11680,8 @@ class Store:
             ).fetchone()
             if current is None or current["status"] != expected_state:
                 raise RuntimeError("Connect job resubmission lost its expected-state race")
+            if not removal.message_available(db, str(current["message_id"])):
+                raise KeyError(str(current["message_id"]))
             is_v2 = int(current["protocol_version"]) == 2
             if is_v2:
                 dispatch = db.execute(
@@ -13322,6 +13376,8 @@ class Store:
         stamp = admitted_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             source = db.execute(
                 """SELECT status, provider, account_id, provider_message_id, discovered_at,
                     mailbox_identity_key, sender, sender_name, subject

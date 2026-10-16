@@ -276,6 +276,13 @@ def qualify_protocol(store: Store, *, fresh: bool) -> None:
         raise SourceProtocolUnavailable(
             "Source-lock upgrade deferred; a native source owner remains active"
         ) from exc
+    # Never invert operation→source ordering or expand a frozen source set.
+    # The ordinary operation entry point resumes after this owner releases it.
+    if any(
+        held is not None and held[0] == os.getpid()
+        for held in (getattr(_selection, "held", None), getattr(_context, "held", None))
+    ):
+        return
     with store.connection() as db:
         has_requests = removal.has_schema(db)
     if has_requests:

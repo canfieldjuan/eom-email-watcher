@@ -257,6 +257,30 @@ def available_sql(alias, *, include_unfollow=False):
         ))"""
 
 
+def retained_available_sql(alias, *, message_id_field="message_id", include_unfollow=False):
+    """Apply target eligibility to a live or frozen, retained source binding."""
+    bound_id = f"{alias}.{message_id_field}"
+    live = f"""live.message_id={bound_id} AND live.provider={alias}.provider
+        AND live.account_id={alias}.account_id
+        AND live.mailbox_identity_key IS {alias}.mailbox_identity_key"""
+    return f"""NOT EXISTS (
+        SELECT 1 FROM (
+            SELECT live.message_id,live.provider,live.account_id,
+                live.mailbox_identity_key,live.provider_message_id
+            FROM messages live WHERE {live}
+            UNION ALL
+            SELECT frozen.message_id,frozen.provider,frozen.account_id,
+                frozen.stored_identity_key AS mailbox_identity_key,frozen.provider_message_id
+            FROM message_removal_targets frozen
+            JOIN message_removal_intents intent ON intent.intent_id=frozen.intent_id
+            WHERE frozen.message_id={bound_id} AND frozen.provider={alias}.provider
+                AND frozen.account_id={alias}.account_id
+                AND intent.mailbox_identity_key IS {alias}.mailbox_identity_key
+                AND NOT EXISTS (SELECT 1 FROM messages live WHERE {live})
+        ) candidate WHERE NOT ({available_sql("candidate", include_unfollow=include_unfollow)})
+    )"""
+
+
 def source_available(
     db,
     *,
@@ -267,6 +291,8 @@ def source_available(
     message_id=None,
     include_unfollow=False,
 ):
+    if not has_schema(db):
+        return True
     return bool(
         db.execute(
             f"""SELECT {available_sql("source", include_unfollow=include_unfollow)} FROM (
@@ -277,14 +303,43 @@ def source_available(
     )
 
 
-def message_available(db, message_id, *, include_unfollow=False):
-    eligible = available_sql("m", include_unfollow=include_unfollow) if has_schema(db) else "1"
-    return (
-        db.execute(
-            f"SELECT 1 FROM messages m WHERE m.message_id=? AND ({eligible})", (message_id,)
-        ).fetchone()
-        is not None
-    )
+def message_available(
+    db,
+    message_id,
+    *,
+    include_unfollow=False,
+    require_source=True,
+    retained_bindings=(),
+):
+    schema = has_schema(db)
+    eligible = available_sql("m", include_unfollow=include_unfollow) if schema else "1"
+    row = db.execute(
+        f"SELECT ({eligible}) FROM messages m WHERE m.message_id=?",
+        (message_id,),
+    ).fetchone()
+    if row is not None:
+        return bool(row[0])
+    if require_source:
+        return False
+    # Existing source-less terminal receipts remain valid. If the live row has
+    # disappeared during an accepted request, its immutable retained binding
+    # selects the frozen source candidates for the SAME eligibility predicate.
+    if schema:
+        for binding in retained_bindings:
+            candidates = db.execute(
+                f"""SELECT ({retained_available_sql("retained", include_unfollow=include_unfollow)})
+                    FROM (SELECT ? AS message_id,? AS provider,? AS account_id,
+                        ? AS mailbox_identity_key) retained""",
+                (
+                    message_id,
+                    binding["provider"],
+                    binding["account_id"],
+                    binding["mailbox_identity_key"],
+                ),
+            ).fetchall()
+            if any(not candidate[0] for candidate in candidates):
+                return False
+    return True
 
 
 def freeze(db, key, kind, message_ids, *, accepted_at):

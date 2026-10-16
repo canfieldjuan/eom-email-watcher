@@ -3454,6 +3454,13 @@ def _run_connect_job(
     job: connect.PreparedSummaryJob,
     content: bytes | None,
 ) -> dict[str, object]:
+    if content is not None:
+        current = runtime.store.connect_job(job.job_id)
+        if current is None or not runtime.store.source_start(current.message_id):
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment is no longer available for handoff.",
+            )
     client = connect.ConnectClient(provider)
     try:
         initial = client.submit(job, content) if content is not None else client.get(job)
@@ -4105,6 +4112,11 @@ def _run_claimed_generic_connect_job(
         )
         if reclaimed is None or reclaimed[1].state != "dispatching":
             raise RuntimeError("Connect job could not reclaim its provider lane")
+    except KeyError as exc:
+        raise ApiError(
+            "connect_source_unavailable",
+            "The source attachment is no longer available for handoff.",
+        ) from exc
     except RuntimeError as exc:
         concurrent = runtime.store.connect_job(tracked.job_id)
         if concurrent is not None and concurrent.status == "completed":
@@ -4759,6 +4771,11 @@ def _prepare_or_create_generic_connect_job(
                 capability_external_effects=capability.external_effects,
                 capability_confirmation_required=capability.confirmation_required,
             )
+        except KeyError as exc:
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment is no longer available for handoff.",
+            ) from exc
         except ConnectQueueFull as exc:
             raise ApiError(
                 "connect_queue_full",
@@ -5538,65 +5555,81 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
     else:
         job = None
 
-    if source.provider != IMAP_PROVIDER and attachment.byte_size > provider.max_input_bytes:
-        raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-    content = _verified_mailbox_attachment_bytes(
-        runtime,
-        source,
-        part_id,
-        attachment.attachment_id,
-        source_provider_message_id=attachment.source_provider_message_id,
-    )
-    if not _attachment_download_matches(source.provider, attachment.byte_size, content):
-        raise MailboxError("Mailbox attachment size did not match stored metadata")
-    if len(content) > provider.max_input_bytes:
-        raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-    if job is None:
-        job = connect.prepare_summary_job(content, attachment.filename)
-        try:
-            runtime.store.create_connect_job(
-                job_id=job.job_id,
-                message_id=message_id,
-                part_id=part_id,
-                capability_id=connect.CAPABILITY_ID,
-                capability_version=connect.CAPABILITY_VERSION,
-                provider_app_id=provider.app_id,
-                provider_instance_id=provider.instance_id,
-                input_artifact_id=job.artifact.artifact_id,
-                input_media_type=job.artifact.media_type,
-                input_byte_size=job.artifact.byte_size,
-                input_sha256=job.artifact.sha256,
+    with runtime.store.source_locks((message_id,)):
+        if not runtime.store.source_start(message_id):
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment is no longer available for handoff.",
             )
-        except sqlite3.IntegrityError as exc:
-            concurrent = runtime.store.active_connect_job(
-                message_id=message_id,
-                part_id=part_id,
-                capability_id=connect.CAPABILITY_ID,
-                capability_version=connect.CAPABILITY_VERSION,
-            )
-            if concurrent is not None:
+        if source.provider != IMAP_PROVIDER and attachment.byte_size > provider.max_input_bytes:
+            raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
+        content = _verified_mailbox_attachment_bytes(
+            runtime,
+            source,
+            part_id,
+            attachment.attachment_id,
+            source_provider_message_id=attachment.source_provider_message_id,
+        )
+        if not _attachment_download_matches(source.provider, attachment.byte_size, content):
+            raise MailboxError("Mailbox attachment size did not match stored metadata")
+        if len(content) > provider.max_input_bytes:
+            raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
+        if job is None:
+            job = connect.prepare_summary_job(content, attachment.filename)
+            try:
+                runtime.store.create_connect_job(
+                    job_id=job.job_id,
+                    message_id=message_id,
+                    part_id=part_id,
+                    capability_id=connect.CAPABILITY_ID,
+                    capability_version=connect.CAPABILITY_VERSION,
+                    provider_app_id=provider.app_id,
+                    provider_instance_id=provider.instance_id,
+                    input_artifact_id=job.artifact.artifact_id,
+                    input_media_type=job.artifact.media_type,
+                    input_byte_size=job.artifact.byte_size,
+                    input_sha256=job.artifact.sha256,
+                )
+            except KeyError as exc:
+                raise ApiError(
+                    "connect_source_unavailable",
+                    "The source attachment is no longer available for handoff.",
+                ) from exc
+            except sqlite3.IntegrityError as exc:
+                concurrent = runtime.store.active_connect_job(
+                    message_id=message_id,
+                    part_id=part_id,
+                    capability_id=connect.CAPABILITY_ID,
+                    capability_version=connect.CAPABILITY_VERSION,
+                )
+                if concurrent is not None:
+                    raise ApiError(
+                        "connect_job_in_progress",
+                        "A summary job is already in progress for this attachment.",
+                    ) from exc
+                raise
+        elif resubmit_expected_state is not None:
+            try:
+                runtime.store.reset_connect_job_for_resubmission(
+                    job_id=job.job_id,
+                    expected_state=resubmit_expected_state,
+                    provider_app_id=provider.app_id,
+                    provider_instance_id=provider.instance_id,
+                )
+            except KeyError as exc:
+                raise ApiError(
+                    "connect_source_unavailable",
+                    "The source attachment is no longer available for handoff.",
+                ) from exc
+            except RuntimeError as exc:
+                concurrent = runtime.store.connect_job(job.job_id)
+                if concurrent is not None and concurrent.status == "completed":
+                    return _connect_result(concurrent)
                 raise ApiError(
                     "connect_job_in_progress",
-                    "A summary job is already in progress for this attachment.",
+                    "The local capability job changed while it was being reconciled.",
                 ) from exc
-            raise
-    elif resubmit_expected_state is not None:
-        try:
-            runtime.store.reset_connect_job_for_resubmission(
-                job_id=job.job_id,
-                expected_state=resubmit_expected_state,
-                provider_app_id=provider.app_id,
-                provider_instance_id=provider.instance_id,
-            )
-        except RuntimeError as exc:
-            concurrent = runtime.store.connect_job(job.job_id)
-            if concurrent is not None and concurrent.status == "completed":
-                return _connect_result(concurrent)
-            raise ApiError(
-                "connect_job_in_progress",
-                "The local capability job changed while it was being reconciled.",
-            ) from exc
-    return _run_connect_job(runtime, provider, job, content)
+        return _run_connect_job(runtime, provider, job, content)
 
 
 def _watchlist(request: dict[str, object]) -> dict[str, object]:
