@@ -151,6 +151,7 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
                         "model": self.model_id,
                         "message": {"content": ""},
                         "done": True,
+                        "done_reason": "stop",
                         "prompt_eval_count": 1,
                         "eval_count": 1,
                     },
