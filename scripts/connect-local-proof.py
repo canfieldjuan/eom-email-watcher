@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from contextlib import ExitStack, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
@@ -30,14 +30,23 @@ from connect_reference_provider import (
 from fixture_toml import toml_path_literal
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.config import config_admission_snapshot
 from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount
-from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
+from eom_email_watcher.mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    MailboxChanges,
+    MessageContent,
+    MessageMetadata,
+    validate_operation_timeout,
+)
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
 
 FIXTURE_PART_ID = "fixture-mime-part"
 FIXTURE_MODEL_DIGEST = "b8693e6b4f5f228844ef5a842c7e7a332d9b2fa9e1241a423ef1de7928065b79"
 FIXTURE_MAILBOX_IDENTITY_KEY = hashlib.sha256(b"connect-local-proof-mailbox-v1").hexdigest()
+FIXTURE_MAILBOX_ADDRESS = "fixture@example.invalid"
 
 
 class FixtureModelHandler(BaseHTTPRequestHandler):
@@ -319,11 +328,47 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
 
 
 class FixtureGmail:
+    """The proof's mailbox double; it implements every mailbox.MailboxGateway member.
+
+    Members the PDF proof never reaches fail loudly instead of returning invented
+    mailbox data (issue #275).
+    """
+
     def __init__(self, content: bytes):
-        self.content = content
+        # Not `content`: that name is the MailboxGateway message-content member.
+        self.attachment_content = content
+        self.operation_timeouts: list[float] = []
+
+    def set_operation_timeout(self, timeout_seconds: float) -> None:
+        # The engine bounds each mailbox phase by its remaining deadline; accept
+        # exactly what production gateways accept and keep the bound for review.
+        self.operation_timeouts.append(validate_operation_timeout(timeout_seconds))
+
+    def mailbox_address(self) -> str:
+        return FIXTURE_MAILBOX_ADDRESS
 
     def mailbox_identity_key(self) -> str:
         return FIXTURE_MAILBOX_IDENTITY_KEY
+
+    def initial_cursor(self) -> str:
+        raise AssertionError("The PDF proof does not poll the fixture mailbox")
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        raise AssertionError("The PDF proof does not poll the fixture mailbox")
+
+    def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
+        raise AssertionError("The PDF proof does not recover fixture mailbox history")
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        raise AssertionError("The PDF proof does not read fixture message metadata")
+
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
+        raise AssertionError("The PDF proof does not read fixture message content")
+
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
+        raise AssertionError("The PDF proof does not read fixture stored bodies")
 
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if (message_id, part_id, attachment_id) != (
@@ -332,7 +377,20 @@ class FixtureGmail:
             "fixture-attachment",
         ):
             raise AssertionError("Unexpected fixture attachment identity")
-        return self.content
+        return self.attachment_content
+
+
+def fixture_message_times(now: datetime | None = None) -> tuple[str, str]:
+    """Received and admitted times for the fixture message, inside retention.
+
+    Fixed calendar dates age out of the retention window, after which the
+    retained-source check refuses the fixture before any provider is reached.
+    """
+    current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+    return (
+        (current - timedelta(days=2)).isoformat(),
+        (current - timedelta(days=1)).isoformat(),
+    )
 
 
 def write_config(path: Path) -> None:
@@ -386,7 +444,7 @@ def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
             DEFAULT_MAIL_PROVIDER,
             DEFAULT_MAIL_ACCOUNT_ID,
             display_name="Fixture mailbox",
-            address="fixture@example.invalid",
+            address=FIXTURE_MAILBOX_ADDRESS,
             active=True,
         )
     token_file = mail_account_token_file(runtime.config, account)
@@ -402,12 +460,17 @@ def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
 
 
 def request(config_path: Path, operation: str, payload: dict[str, object] | None = None):
-    return {
+    value: dict[str, object] = {
         "protocol": 1,
         "operation": operation,
         "config_path": str(config_path),
         "payload": payload or {},
     }
+    # Admission-required operations carry the token from the engine's own
+    # configuration admission issuer, as the host does (issue #270).
+    if operation in engine_api.ADMISSION_REQUIRED_OPERATIONS:
+        value["admission_token"] = config_admission_snapshot(config_path).token
+    return value
 
 
 def wait_for_capability(available: bool, timeout_seconds: float = 15) -> dict[str, object]:
@@ -656,13 +719,14 @@ def main() -> None:
             write_config(config_path)
             runtime = load_runtime(config_path)
             fixture_account = install_fixture_mailbox(runtime)
+            received_at, admitted_at = fixture_message_times()
             runtime.store.add_message(
                 message_id="fixture-message",
                 thread_id=None,
                 sender="fixture@example.invalid",
                 sender_name="Fixture Sender",
                 subject="Fixture document",
-                received_at="2026-08-29T12:00:00+00:00",
+                received_at=received_at,
                 provider=fixture_account.provider,
                 account_id=fixture_account.account_id,
                 mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
@@ -671,7 +735,7 @@ def main() -> None:
                     selector_id="sender:fixture@example.invalid",
                     display_name="Fixture Sender",
                     mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
-                    admitted_at="2026-09-19T12:00:00+00:00",
+                    admitted_at=admitted_at,
                 ),
             )
             runtime.store.replace_attachments(

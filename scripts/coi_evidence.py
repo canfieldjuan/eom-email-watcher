@@ -13,8 +13,13 @@ from pathlib import Path
 
 def evidence_directory(path: Path) -> Path:
     resolved = path.resolve()
-    if any((ancestor / ".git").exists() for ancestor in (resolved, *resolved.parents)):
-        raise RuntimeError("Private evidence must be outside every Git worktree")
+    for ancestor in (resolved, *resolved.parents):
+        marker = ancestor / ".git"
+        if marker.exists():
+            raise RuntimeError(
+                "Private evidence must be outside every Git worktree; "
+                f"Git marker: {marker}"
+            )
     return resolved
 
 

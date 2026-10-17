@@ -463,8 +463,12 @@ def test_git_evidence_destination_is_rejected(tmp_path, marker, symlink):
         link = tmp_path / "alias"
         link.symlink_to(repo, target_is_directory=True)
         output = link / "nested" / "evidence"
-    with pytest.raises(RuntimeError, match="Git"):
+    with pytest.raises(RuntimeError, match="Git") as error:
         coi_evidence.evidence_directory(output)
+    assert str(error.value) == (
+        "Private evidence must be outside every Git worktree; "
+        f"Git marker: {repo / '.git'}"
+    )
     assert not output.exists()
 
 
