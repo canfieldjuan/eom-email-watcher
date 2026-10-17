@@ -15,7 +15,7 @@ from connect_automate import connect, entitlement
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import DEFAULT_RETENTION_DAYS, config_admission_snapshot
-from eom_email_watcher.db import AdmissionProvenance
+from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, Store
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -31,6 +31,7 @@ FIXTURE_MODEL_DIGEST = PROOF_SCRIPT["FIXTURE_MODEL_DIGEST"]
 FIXTURE_MAILBOX_IDENTITY_KEY = PROOF_SCRIPT["FIXTURE_MAILBOX_IDENTITY_KEY"]
 FixtureGmail = PROOF_SCRIPT["FixtureGmail"]
 FixtureModelHandler = PROOF_SCRIPT["FixtureModelHandler"]
+email_database_evidence = PROOF_SCRIPT["email_database_evidence"]
 fixture_message_times = PROOF_SCRIPT["fixture_message_times"]
 gmail_from_token = PROOF_SCRIPT["gmail_from_token"]
 instrumented_client_factory = PROOF_SCRIPT["instrumented_client_factory"]
@@ -456,6 +457,24 @@ def test_proof_entitlement_doubles_match_sdk_signatures() -> None:
     assert [(parameter.name, parameter.kind) for parameter in features] == [
         ("feature_ids", inspect.Parameter.VAR_POSITIONAL)
     ]
+
+
+def test_email_database_evidence_checks_schema_functions_through_store_owner(
+    tmp_path: Path,
+) -> None:
+    # The current schema's CHECK constraints call application SQL functions that only
+    # Store.connection registers; quick_check must run with them, not on a bare connection.
+    store = Store(tmp_path / "watcher.sqlite3")
+    store.initialize()
+
+    quick_check, schema_version, job_row, interrupted_rows = email_database_evidence(
+        store, "proof-job", "interrupted-proof-job"
+    )
+
+    assert quick_check == "ok"
+    assert schema_version == SCHEMA_VERSION
+    assert job_row is None
+    assert interrupted_rows == []
 
 
 def test_proof_check_gate_accepts_only_complete_success() -> None:

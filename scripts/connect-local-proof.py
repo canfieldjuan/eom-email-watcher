@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, closing, suppress
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,7 +32,7 @@ from fixture_toml import toml_path_literal
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import config_admission_snapshot
-from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount
+from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount, Store
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -567,6 +567,29 @@ def positive_seconds(value: str) -> int:
     return seconds
 
 
+def email_database_evidence(
+    store: Store, request_id: str, interrupted_request_id: str
+) -> tuple[str, int, sqlite3.Row | None, list[sqlite3.Row]]:
+    with store.connection() as database:
+        quick_check = database.execute("PRAGMA quick_check").fetchone()[0]
+        schema_version = database.execute("PRAGMA user_version").fetchone()[0]
+        job_row = database.execute(
+            """SELECT job_id, protocol_version, capability_id, capability_version,
+            provider_app_id, provider_app_version, provider_instance_id,
+            input_media_type, input_byte_size, input_sha256, source_app_id,
+            status, request_json, result_json
+            FROM connect_attachment_jobs WHERE job_id = ?""",
+            (request_id,),
+        ).fetchone()
+        interrupted_rows = database.execute(
+            """SELECT job_id, provider_instance_id, status, error_code,
+            error_retryable
+            FROM connect_attachment_jobs WHERE job_id = ?""",
+            (interrupted_request_id,),
+        ).fetchall()
+    return quick_check, schema_version, job_row, interrupted_rows
+
+
 def require_proof_checks(checks: dict[str, bool]) -> None:
     failed_checks = sorted(name for name, passed in checks.items() if not passed)
     if failed_checks:
@@ -972,7 +995,7 @@ def main() -> None:
                 raise RuntimeError(
                     f"Expected one Document Summarizer database: {provider_databases}"
                 )
-            with sqlite3.connect(provider_databases[0]) as provider_database:
+            with closing(sqlite3.connect(provider_databases[0])) as provider_database:
                 provider_profile_rows = provider_database.execute(
                     """SELECT p.summary_profile
                     FROM connect_jobs AS c
@@ -1329,23 +1352,9 @@ def main() -> None:
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
 
-            with sqlite3.connect(runtime.config.database_file) as database:
-                quick_check = database.execute("PRAGMA quick_check").fetchone()[0]
-                schema_version = database.execute("PRAGMA user_version").fetchone()[0]
-                job_row = database.execute(
-                    """SELECT job_id, protocol_version, capability_id, capability_version,
-                    provider_app_id, provider_app_version, provider_instance_id,
-                    input_media_type, input_byte_size, input_sha256, source_app_id,
-                    status, request_json, result_json
-                    FROM connect_attachment_jobs WHERE job_id = ?""",
-                    (request_id,),
-                ).fetchone()
-                interrupted_rows = database.execute(
-                    """SELECT job_id, provider_instance_id, status, error_code,
-                    error_retryable
-                    FROM connect_attachment_jobs WHERE job_id = ?""",
-                    (interrupted_invocation["request_id"],),
-                ).fetchall()
+            quick_check, schema_version, job_row, interrupted_rows = email_database_evidence(
+                runtime.store, request_id, interrupted_invocation["request_id"]
+            )
             if job_row is None:
                 raise RuntimeError("Connect proof result was not durable")
             durable_request = json.loads(job_row[12])
