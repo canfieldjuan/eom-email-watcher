@@ -57,7 +57,7 @@ from eom_email_watcher.model import (
     GatewayOutputRejected,
     ModelError,
 )
-from eom_email_watcher.notifications import NotificationError
+from eom_email_watcher.notifications import ChannelResult, DeliveryResult, NotificationError
 from eom_email_watcher.scheduling import (
     SchedulingSource,
     scheduling_source_sha256,
@@ -73,6 +73,8 @@ from eom_email_watcher.service import (
     reconcile_mailbox_session_identity,
     run_watcher_check,
 )
+
+DELIVERED_NOTIFICATION = DeliveryResult(ChannelResult(True, True), ChannelResult(False, False))
 
 TEST_MAILBOX_IDENTITY_KEY = "f" * 64
 
@@ -2075,7 +2077,7 @@ def test_open_recovery_retains_dedupe_until_page_token_restart_drains(
     monkeypatch.setattr(
         service_module,
         "send_analysis",
-        lambda *_args, **_kwargs: notifications.append("analysis"),
+        lambda *_args, **_kwargs: notifications.append("analysis") or DELIVERED_NOTIFICATION,
     )
     gateway = RestartedRecoveryGmail()
     model = FakeModel()
@@ -3977,7 +3979,7 @@ def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
         "send_review",
         lambda *args, **kwargs: delivered.append(
             (args[1], kwargs["ntfy_content_disclosure_acknowledged"])
-        ),
+        ) or DELIVERED_NOTIFICATION,
     )
 
     run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=True)
@@ -4430,11 +4432,12 @@ def test_failed_fallback_for_permanent_content_error_retries_without_analysis(
     model = FakeModel()
     attempts = 0
 
-    def flaky_fallback(*_args, **_kwargs) -> None:
+    def flaky_fallback(*_args, **_kwargs) -> DeliveryResult:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise NotificationError("all channels unavailable")
+        return DELIVERED_NOTIFICATION
 
     monkeypatch.setattr(service_module, "send_fallback", flaky_fallback)
     watcher = Watcher(cfg, store, InvalidContentGmail(), model)
@@ -4795,12 +4798,13 @@ def test_notification_retry_uses_persisted_analysis(tmp_path: Path, monkeypatch)
     analysis_attempts = 0
     acknowledged: list[bool] = []
 
-    def flaky_analysis_notification(*args, **kwargs) -> None:
+    def flaky_analysis_notification(*args, **kwargs) -> DeliveryResult:
         nonlocal analysis_attempts
         analysis_attempts += 1
         acknowledged.append(kwargs["ntfy_content_disclosure_acknowledged"])
         if analysis_attempts == 1:
             raise NotificationError("all channels unavailable")
+        return DELIVERED_NOTIFICATION
 
     def unavailable_fallback(*args, **kwargs) -> None:
         acknowledged.append(kwargs["ntfy_content_disclosure_acknowledged"])
@@ -5058,12 +5062,12 @@ def test_fallback_does_not_suppress_recovered_analysis(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         service_module,
         "send_fallback",
-        lambda *args, **kwargs: delivered.append("fallback"),
+        lambda *args, **kwargs: delivered.append("fallback") or DELIVERED_NOTIFICATION,
     )
     monkeypatch.setattr(
         service_module,
         "send_analysis",
-        lambda *args, **kwargs: delivered.append("analysis"),
+        lambda *args, **kwargs: delivered.append("analysis") or DELIVERED_NOTIFICATION,
     )
     watcher = Watcher(cfg, store, FakeGmail(), model)
 
@@ -5546,10 +5550,11 @@ def test_analysis_stores_body_counts_and_marks_partial_notifications(
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     partial: list[bool] = []
 
-    def flaky_analysis_notification(*args, **kwargs) -> None:
+    def flaky_analysis_notification(*args, **kwargs) -> DeliveryResult:
         partial.append(kwargs["partial_summary"])
         if len(partial) == 1:
             raise NotificationError("all channels unavailable")
+        return DELIVERED_NOTIFICATION
 
     def unavailable_fallback(*args, **kwargs) -> None:
         raise NotificationError("all channels unavailable")

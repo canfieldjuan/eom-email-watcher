@@ -13,7 +13,7 @@ from pathlib import Path
 
 from connect_automate.locking import operation_lock
 
-from . import __version__, private_storage
+from . import __version__, private_storage, removal
 from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .db import Store
 from .mailbox import MailboxError
@@ -72,9 +72,10 @@ def _runtime(config_path: Path) -> tuple[object, Store, ModelRuntime]:
 
 @contextmanager
 def _production_check_lock(database_file: Path):
-    lock_path = database_file.with_name(f"{database_file.name}.check.lock")
-    with operation_lock(lock_path, "Another production check is already running"):
-        yield
+    with removal.operation_scope(
+        database_file, busy_message="Another production check is already running",
+    ) as operation:
+        yield operation
 
 
 @contextmanager
@@ -182,22 +183,25 @@ def _setup(config_path: Path) -> int:
 def _check(config_path: Path, dry_run: bool) -> int:
     config = load_config(config_path)
 
-    def run(active_config, active_store, active_model):
+    def run(active_config, active_store, active_model, operation):
         result = run_watcher_check(
             active_config,
             active_store,
             active_model,
             dry_run=dry_run,
+            operation=operation,
         )
         if not dry_run:
             from .engine_api import pump_connect_runtime
             from .runtime import Runtime
 
-            pump_connect_runtime(Runtime(active_config, active_store, active_model), 25)
+            pump_connect_runtime(
+                Runtime(active_config, active_store, active_model, operation=operation), 25,
+            )
         return result
 
-    with _production_check_lock(config.database_file):
-        result = run(*_runtime(config_path))
+    with _production_check_lock(config.database_file) as operation:
+        result = run(*_runtime(config_path), operation)
     print(json.dumps(result, indent=2))
     return 0
 

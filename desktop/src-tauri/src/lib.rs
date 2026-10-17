@@ -1,5 +1,6 @@
 mod delivery;
 mod engine;
+mod inbox_removal;
 mod scheduler;
 
 use delivery::NotificationDelivery;
@@ -1719,17 +1720,96 @@ async fn certificate_expiry_ledger_list(
 }
 
 #[tauri::command]
-async fn inbox_delete(
+async fn inbox_removal_prepare(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
-    message_id: String,
+    kind: String,
+    message_id: Option<String>,
+) -> Result<engine::InboxRemovalPrepared, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        delivery.run_engine_exclusive(&engine, |engine| {
+            engine.prepare_saved_inbox_removal(kind, message_id)
+        })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn inbox_removal_saved(
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<Vec<inbox_removal::SavedRemoval>, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        delivery.run_engine_exclusive(&engine, |engine| engine.saved_inbox_removals())
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn inbox_removal_status(
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    request_id: String,
+    kind: Option<String>,
+    message_id: Option<String>,
+) -> Result<engine::InboxRemovalResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        delivery.run_engine_exclusive(&engine, |engine| {
+            engine.recover_inbox_removal_status(request_id, kind, message_id)
+        })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn inbox_removal_acknowledge(
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    request_id: String,
 ) -> Result<(), EngineError> {
     let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        delivery.run_engine_exclusive(&engine, |engine| engine.delete_inbox_item(message_id))
+        delivery.run_engine_exclusive(&engine, |engine| {
+            engine.acknowledge_rendered_inbox_removal(request_id)
+        })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn inbox_delete(
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    message_id: String,
+    request_id: String,
+) -> Result<engine::InboxDeletion, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        delivery.run_engine_exclusive(&engine, |engine| {
+            engine.delete_saved_inbox_item(message_id, request_id)
+        })
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -1740,12 +1820,13 @@ async fn inbox_clear(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
+    request_id: String,
 ) -> Result<engine::InboxClear, EngineError> {
     let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        delivery.run_engine_exclusive(&engine, Engine::clear_inbox)
+        delivery.run_engine_exclusive(&engine, |engine| engine.clear_saved_inbox(request_id))
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -2590,6 +2671,10 @@ pub fn run() {
             inbox_clear,
             inbox_delete,
             inbox_query,
+            inbox_removal_prepare,
+            inbox_removal_saved,
+            inbox_removal_status,
+            inbox_removal_acknowledge,
             mail_account_activate,
             mail_account_connect,
             mail_account_disconnect,

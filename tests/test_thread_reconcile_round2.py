@@ -84,6 +84,19 @@ def test_merge_preserves_max_target_and_other_scope(
     tmp_path, monkeypatch, reconcile_clock, survivor_later
 ):
     watcher, state = runner(tmp_path, monkeypatch, object(), "imap")
+    # Foreign-key enforcement requires the independent scope's real parent;
+    # retain the original same-key/different-account isolation control.
+    watcher.store.register_mail_account("imap", "other", display_name="Other mailbox")
+    watcher.store.reconcile_mailbox_identity("imap", "other", KEY)
+    seed(
+        watcher.store, "other-message", provider="imap", account_id="other",
+        rfc_message_id="other@root",
+    )
+    with watcher.store.connection() as db:
+        other_thread = db.execute(
+            "SELECT thread_key FROM thread_follow WHERE provider='imap' AND account_id='other' "
+            "AND mailbox_identity_key=?", (KEY,),
+        ).fetchone()[0]
     seed(watcher.store, "a", provider="imap", rfc_message_id="survivor@root")
     survivor = state.threads()[0]
     progress = state.load_or_start(NOW, 30, {"units": []})
@@ -97,7 +110,7 @@ def test_merge_preserves_max_target_and_other_scope(
         )
         db.execute(
             "INSERT INTO reconcile_catchup VALUES (?,?,?,?,?,?)",
-            ("imap", "other", KEY, progress["generation"], "separate", later.isoformat()),
+            ("imap", "other", KEY, progress["generation"], other_thread, later.isoformat()),
         )
     seed(
         watcher.store,

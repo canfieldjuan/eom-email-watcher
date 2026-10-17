@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
@@ -39,6 +40,10 @@ class ChannelResult:
 class DeliveryResult:
     desktop: ChannelResult
     ntfy: ChannelResult
+
+    @property
+    def delivered(self) -> bool:
+        return any(channel.attempted and channel.delivered for channel in (self.desktop, self.ntfy))
 
     @property
     def failures(self) -> tuple[str, ...]:
@@ -100,7 +105,10 @@ def _deliver(
     ntfy_priority: int,
     ntfy_content_disclosure_acknowledged: bool,
     dry_run: bool,
+    source_start: Callable[[], bool] | None = None,
 ) -> DeliveryResult:
+    if source_start is not None and not source_start():
+        return DeliveryResult(ChannelResult(False, False), ChannelResult(False, False))
     if ntfy_topic and ntfy_content_disclosure_acknowledged is not True:
         raise NotificationError("ntfy content disclosure must be acknowledged before delivery")
     # Each configured channel is independent: a down phone-push endpoint should
@@ -114,7 +122,10 @@ def _deliver(
         desktop = ChannelResult(attempted=True, delivered=False, error=str(exc))
 
     ntfy = ChannelResult(attempted=False, delivered=False)
-    if ntfy_topic:
+    suppressed = False
+    if ntfy_topic and source_start is not None and not source_start():
+        suppressed = True
+    if ntfy_topic and not suppressed:
         ntfy = ChannelResult(attempted=True, delivered=True)
         try:
             _send_ntfy(ntfy_topic, ntfy_url, title, body, ntfy_priority, dry_run)
@@ -123,7 +134,7 @@ def _deliver(
 
     result = DeliveryResult(desktop=desktop, ntfy=ntfy)
     attempted = (channel for channel in (desktop, ntfy) if channel.attempted)
-    if not any(channel.delivered for channel in attempted):
+    if not any(channel.delivered for channel in attempted) and not suppressed:
         raise NotificationError("; ".join(result.failures))
     return result
 
@@ -138,6 +149,7 @@ def send_analysis(
     ntfy_content_disclosure_acknowledged: bool = False,
     partial_summary: bool = False,
     dry_run: bool = False,
+    source_start: Callable[[], bool] | None = None,
 ) -> DeliveryResult:
     urgency = "critical" if analysis.priority == "urgent" else "normal"
     lines = [analysis.summary]
@@ -156,6 +168,7 @@ def send_analysis(
         ntfy_priority=_NTFY_PRIORITY.get(analysis.priority, 3),
         ntfy_content_disclosure_acknowledged=ntfy_content_disclosure_acknowledged,
         dry_run=dry_run,
+        source_start=source_start,
     )
 
 
@@ -167,6 +180,7 @@ def send_fallback(
     ntfy_url: str = "https://ntfy.sh",
     ntfy_content_disclosure_acknowledged: bool = False,
     dry_run: bool = False,
+    source_start: Callable[[], bool] | None = None,
 ) -> DeliveryResult:
     return _deliver(
         f"{sender_label}: {subject}",
@@ -177,6 +191,7 @@ def send_fallback(
         ntfy_priority=3,
         ntfy_content_disclosure_acknowledged=ntfy_content_disclosure_acknowledged,
         dry_run=dry_run,
+        source_start=source_start,
     )
 
 
@@ -189,6 +204,7 @@ def send_review(
     ntfy_url: str = "https://ntfy.sh",
     ntfy_content_disclosure_acknowledged: bool = False,
     dry_run: bool = False,
+    source_start: Callable[[], bool] | None = None,
 ) -> DeliveryResult:
     return _deliver(
         f"{sender_label}: {subject}",
@@ -199,4 +215,5 @@ def send_review(
         ntfy_priority=3,
         ntfy_content_disclosure_acknowledged=ntfy_content_disclosure_acknowledged,
         dry_run=dry_run,
+        source_start=source_start,
     )

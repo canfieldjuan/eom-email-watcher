@@ -78,7 +78,9 @@ impl DeliveryDeadline {
     }
 
     fn bounded_engine(&self, engine: &Engine) -> Result<Engine, EngineError> {
-        let engine = engine.with_request_timeout(self.remaining()?);
+        let engine = engine
+            .with_request_timeout(self.remaining()?)
+            .with_operation_deadline(self.deadline);
         Ok(match self.shutdown.as_ref() {
             Some(shutdown) => engine.with_cancellation(shutdown.clone()),
             None => engine,
@@ -428,7 +430,7 @@ impl NotificationProcess {
         })
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn with_command(program: impl Into<OsString>, args: Vec<OsString>) -> Self {
         Self {
             program: program.into(),
@@ -715,7 +717,7 @@ pub struct NotificationDelivery {
 }
 
 impl NotificationDelivery {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn with_notification_command(
         program: impl Into<OsString>,
         args: Vec<OsString>,
@@ -1548,5 +1550,47 @@ mod tests {
             OsStr::new("watcher"),
             OsStr::new("--notification-helper-extra"),
         ]));
+    }
+
+    #[test]
+    fn journal_prepare_cannot_finish_a_later_rpc_after_the_operation_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("watcher.check.lock");
+        let marker = directory.path().join("late-prepare-finished");
+        let script = r#"
+import json,sys,time
+request=json.load(sys.stdin)
+if request['operation']=='host.operation_lock':
+ time.sleep(.6)
+ data={'path':sys.argv[1]}
+elif request['operation']=='inbox.removal.prepare':
+ time.sleep(1.6)
+ with open(sys.argv[2],'w') as marker: marker.write('finished')
+ data={'request_id':'opaque-key'}
+else: raise AssertionError(request)
+print(json.dumps({'protocol':1,'ok':True,'operation':request['operation'],'data':data}))
+"#;
+        let engine = Engine::with_command(
+            if cfg!(windows) { "python" } else { "python3" },
+            vec![
+                "-c".into(),
+                script.into(),
+                lock.clone().into_os_string(),
+                marker.clone().into_os_string(),
+            ],
+            directory.path().join("config.toml"),
+        );
+        let delivery = NotificationDelivery::default();
+        let outcome = delivery.run_exclusive_with_timeout(Duration::from_secs(2), |deadline| {
+            deadline
+                .bounded_engine(&engine)?
+                .prepare_saved_inbox_removal("clear".into(), None)
+        });
+        assert_eq!(outcome.unwrap_err().code, "engine_timeout");
+        assert!(
+            !marker.exists(),
+            "Later RPC completed after the operation deadline"
+        );
+        assert!(!crate::inbox_removal::journal_path(&lock).exists());
     }
 }

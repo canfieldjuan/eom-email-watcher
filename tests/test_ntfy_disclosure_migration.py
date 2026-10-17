@@ -880,9 +880,12 @@ def test_systemd_cli_check_recovers_mismatch_before_consuming_topic(
     captured_requests: list[tuple[object, ...]] = []
     real_check = cli.run_watcher_check
 
-    def observe_check(config, store, model, *, dry_run: bool):
+    def observe_check(config, store, model, *, dry_run: bool, operation):
+        from eom_email_watcher.removal import require_operation_owner
+
+        require_operation_owner(operation, store.path)
         observed_topics.append(config.ntfy_topic)
-        return real_check(config, store, model, dry_run=dry_run)
+        return real_check(config, store, model, dry_run=dry_run, operation=operation)
 
     monkeypatch.setattr(cli, "run_watcher_check", observe_check)
     monkeypatch.setattr(

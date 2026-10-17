@@ -741,6 +741,7 @@ pub struct Engine {
     mailbox_operation_gate: Arc<Mutex<MailboxOperationState>>,
     admission_binding: Arc<Mutex<Option<AdmissionBinding>>>,
     request_timeout: Option<Duration>,
+    operation_deadline: Option<Instant>,
     cancellations: Vec<CancellationToken>,
     #[cfg(test)]
     test_environment: Vec<(OsString, OsString)>,
@@ -1244,26 +1245,53 @@ pub struct CertificateExpiryLedger {
     pub items: Vec<Value>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-struct InboxDeletion {
-    deleted: bool,
-    message_id: String,
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxRemovalOutcome {
+    Completed,
+    Deferred,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxRemovalResult {
+    pub request_id: String,
+    pub intent_ids: Vec<String>,
+    pub outcome: InboxRemovalOutcome,
+    pub requested: u64,
+    pub completed: u64,
+    pub pending: u64,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxRemovalPrepared {
+    pub request_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxDeletion {
+    pub deleted: bool,
+    pub message_id: String,
+    #[serde(flatten)]
+    pub removal: InboxRemovalResult,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct InboxClear {
     pub deleted: u64,
-    #[serde(default)]
-    pub refused: u64,
-    #[serde(default)]
-    pub held_message_ids: Vec<String>,
-    #[serde(default = "completed_removal_outcome")]
-    pub outcome: String,
-    pub message: Option<String>,
+    #[serde(flatten)]
+    pub removal: InboxRemovalResult,
 }
 
-fn completed_removal_outcome() -> String {
-    "completed".to_owned()
+fn inbox_removal_payload(kind: Option<String>, message_id: Option<String>) -> Value {
+    let mut payload = json!({});
+    if let Some(kind) = kind {
+        payload["kind"] = json!(kind);
+    }
+    if let Some(message_id) = message_id {
+        payload["message_id"] = json!(message_id);
+    }
+    payload
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1746,6 +1774,7 @@ impl Engine {
                 mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
                 admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
+                operation_deadline: None,
                 cancellations: Vec::new(),
                 #[cfg(test)]
                 test_environment: Vec::new(),
@@ -1762,6 +1791,7 @@ impl Engine {
                 mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
                 admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
+                operation_deadline: None,
                 cancellations: Vec::new(),
                 #[cfg(test)]
                 test_environment: Vec::new(),
@@ -1784,6 +1814,7 @@ impl Engine {
             mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
             admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
+            operation_deadline: None,
             cancellations: Vec::new(),
             #[cfg(test)]
             test_environment: Vec::new(),
@@ -1803,6 +1834,7 @@ impl Engine {
             mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
             admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
+            operation_deadline: None,
             cancellations: Vec::new(),
             test_environment: Vec::new(),
         }
@@ -1918,11 +1950,116 @@ impl Engine {
         )
     }
 
-    pub fn delete_inbox_item(&self, message_id: String) -> Result<(), EngineError> {
-        let response = self
-            .request::<InboxDeletion>("inbox.delete", json!({"message_id": message_id.clone()}))?;
-        if response.deleted && response.message_id == message_id {
-            return Ok(());
+    pub fn prepare_inbox_removal(
+        &self,
+        kind: String,
+        message_id: Option<String>,
+    ) -> Result<InboxRemovalPrepared, EngineError> {
+        self.request(
+            "inbox.removal.prepare",
+            inbox_removal_payload(Some(kind), message_id),
+        )
+    }
+
+    pub(crate) fn prepare_saved_inbox_removal(
+        &self,
+        kind: String,
+        message_id: Option<String>,
+    ) -> Result<InboxRemovalPrepared, EngineError> {
+        let location = self.request::<OperationLockLocation>("host.operation_lock", json!({}))?;
+        let prepared = self.prepare_inbox_removal(kind.clone(), message_id.clone())?;
+        crate::inbox_removal::remember(
+            &location.path,
+            crate::inbox_removal::SavedRemoval {
+                request_id: prepared.request_id.clone(),
+                kind,
+                message_id,
+            },
+        )
+        .map_err(|_| EngineError::host("host_error", "Local removal recovery is unavailable"))?;
+        Ok(prepared)
+    }
+
+    pub fn inbox_removal_status(
+        &self,
+        request_id: String,
+        kind: Option<String>,
+        message_id: Option<String>,
+    ) -> Result<InboxRemovalResult, EngineError> {
+        let mut payload = inbox_removal_payload(kind, message_id);
+        payload["request_id"] = json!(request_id);
+        self.request("inbox.removal.status", payload)
+    }
+
+    pub(crate) fn saved_inbox_removals(
+        &self,
+    ) -> Result<Vec<crate::inbox_removal::SavedRemoval>, EngineError> {
+        let location = self.request::<OperationLockLocation>("host.operation_lock", json!({}))?;
+        crate::inbox_removal::read(&location.path)
+            .map_err(|_| EngineError::host("host_error", "Local removal recovery is unavailable"))
+    }
+
+    pub(crate) fn acknowledge_rendered_inbox_removal(
+        &self,
+        request_id: String,
+    ) -> Result<(), EngineError> {
+        self.reconcile_inbox_removal_status(request_id, None, None, true)
+            .map(|_| ())
+    }
+
+    pub(crate) fn recover_inbox_removal_status(
+        &self,
+        request_id: String,
+        kind: Option<String>,
+        message_id: Option<String>,
+    ) -> Result<InboxRemovalResult, EngineError> {
+        self.reconcile_inbox_removal_status(request_id, kind, message_id, false)
+    }
+
+    fn reconcile_inbox_removal_status(
+        &self,
+        request_id: String,
+        kind: Option<String>,
+        message_id: Option<String>,
+        rendered: bool,
+    ) -> Result<InboxRemovalResult, EngineError> {
+        self.with_operation_lock_location(|path| {
+            let saved = crate::inbox_removal::read(path).map_err(|_| {
+                EngineError::host("host_error", "Local removal recovery is unavailable")
+            })?;
+            let entry = saved
+                .into_iter()
+                .find(|saved| saved.request_id == request_id);
+            let (kind, message_id) = entry.map_or((kind, message_id), |saved| {
+                (Some(saved.kind), saved.message_id)
+            });
+            let result = self.inbox_removal_status(request_id.clone(), kind, message_id);
+            let discard = match &result {
+                Ok(receipt) => rendered && receipt.outcome == InboxRemovalOutcome::Completed,
+                // request() records the diagnostic. Invalid is never evidence
+                // that the request did not commit; preserve its original error.
+                Err(error) => matches!(error.code.as_str(), "not_found" | "invalid_request"),
+            };
+            if discard {
+                crate::inbox_removal::forget(path, &request_id).map_err(|_| {
+                    EngineError::host("host_error", "Local removal recovery is unavailable")
+                })?;
+            }
+            result
+        })
+    }
+
+    pub fn delete_inbox_item(
+        &self,
+        message_id: String,
+        request_id: String,
+    ) -> Result<InboxDeletion, EngineError> {
+        let response = self.request::<InboxDeletion>(
+            "inbox.delete",
+            json!({"message_id": message_id.clone(), "request_id": request_id}),
+        )?;
+        if response.message_id == message_id {
+            return Ok(response);
         }
         Err(EngineError::host(
             "engine_protocol_error",
@@ -1930,8 +2067,40 @@ impl Engine {
         ))
     }
 
-    pub fn clear_inbox(&self) -> Result<InboxClear, EngineError> {
-        self.request::<InboxClear>("inbox.clear", json!({}))
+    pub fn clear_inbox(&self, request_id: String) -> Result<InboxClear, EngineError> {
+        self.request::<InboxClear>("inbox.clear", json!({"request_id": request_id}))
+    }
+
+    fn require_saved_inbox_removal(&self, request_id: &str) -> Result<(), EngineError> {
+        let location = self.request::<OperationLockLocation>("host.operation_lock", json!({}))?;
+        let requests = crate::inbox_removal::read(&location.path).map_err(|_| {
+            EngineError::host("host_error", "Local removal recovery is unavailable")
+        })?;
+        if requests
+            .iter()
+            .any(|request| request.request_id == request_id)
+        {
+            Ok(())
+        } else {
+            Err(EngineError::host(
+                "invalid_request",
+                "Local removal request is no longer saved",
+            ))
+        }
+    }
+
+    pub(crate) fn delete_saved_inbox_item(
+        &self,
+        message_id: String,
+        request_id: String,
+    ) -> Result<InboxDeletion, EngineError> {
+        self.require_saved_inbox_removal(&request_id)?;
+        self.delete_inbox_item(message_id, request_id)
+    }
+
+    pub(crate) fn clear_saved_inbox(&self, request_id: String) -> Result<InboxClear, EngineError> {
+        self.require_saved_inbox_removal(&request_id)?;
+        self.clear_inbox(request_id)
     }
 
     pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
@@ -2562,6 +2731,15 @@ impl Engine {
         engine
     }
 
+    pub(crate) fn with_operation_deadline(&self, deadline: Instant) -> Self {
+        let mut engine = self.clone();
+        engine.operation_deadline = Some(
+            self.operation_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+        engine
+    }
+
     pub(crate) fn with_cancellation(&self, cancellation: CancellationToken) -> Self {
         let mut engine = self.clone();
         engine.cancellations.push(cancellation);
@@ -2576,37 +2754,48 @@ impl Engine {
         }
     }
 
+    fn request_deadline(&self, timeout: Option<Duration>, started: Instant) -> Option<Instant> {
+        let request = timeout.and_then(|timeout| started.checked_add(timeout));
+        match (request, self.operation_deadline) {
+            (Some(request), Some(operation)) => Some(request.min(operation)),
+            (request, operation) => request.or(operation),
+        }
+    }
+
+    fn remaining_request_time(deadline: Option<Instant>) -> Result<Option<Duration>, EngineError> {
+        deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| {
+                        EngineError::host(
+                            "engine_timeout",
+                            "Watcher engine did not respond before its timeout",
+                        )
+                    })
+            })
+            .transpose()
+    }
+
     fn mailbox_operation_lock(
         &self,
     ) -> Result<(MutexGuard<'_, MailboxOperationState>, Option<Duration>), EngineError> {
-        if self.request_timeout.is_none() && self.cancellations.is_empty() {
+        let deadline = self.request_deadline(self.request_timeout, Instant::now());
+        if deadline.is_none() && self.cancellations.is_empty() {
             return self
                 .mailbox_operation_gate
                 .lock()
                 .map(|guard| (guard, None))
                 .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"));
         }
-        let started = Instant::now();
         loop {
             self.check_cancellation()?;
+            Self::remaining_request_time(deadline)?;
             match self.mailbox_operation_gate.try_lock() {
                 Ok(guard) => {
                     self.check_cancellation()?;
-                    let remaining = self
-                        .request_timeout
-                        .map(|timeout| {
-                            timeout
-                                .checked_sub(started.elapsed())
-                                .filter(|remaining| !remaining.is_zero())
-                                .ok_or_else(|| {
-                                    EngineError::host(
-                                        "engine_timeout",
-                                        "Watcher engine did not respond before its timeout",
-                                    )
-                                })
-                        })
-                        .transpose()?;
-                    return Ok((guard, remaining));
+                    return Ok((guard, Self::remaining_request_time(deadline)?));
                 }
                 Err(MutexTryLockError::Poisoned(_)) => {
                     return Err(EngineError::host(
@@ -2615,23 +2804,11 @@ impl Engine {
                     ));
                 }
                 Err(MutexTryLockError::WouldBlock) => {
-                    let sleep_for = self
-                        .request_timeout
-                        .map(|timeout| {
-                            timeout
-                                .checked_sub(started.elapsed())
-                                .filter(|remaining| !remaining.is_zero())
-                                .ok_or_else(|| {
-                                    EngineError::host(
-                                        "engine_timeout",
-                                        "Watcher engine did not respond before its timeout",
-                                    )
-                                })
-                        })
-                        .transpose()?
-                        .unwrap_or(ENGINE_LOCK_RETRY)
-                        .min(ENGINE_LOCK_RETRY);
-                    std::thread::sleep(sleep_for);
+                    std::thread::sleep(
+                        Self::remaining_request_time(deadline)?
+                            .unwrap_or(ENGINE_LOCK_RETRY)
+                            .min(ENGINE_LOCK_RETRY),
+                    );
                 }
             }
         }
@@ -2666,9 +2843,17 @@ impl Engine {
         &self,
         operation: impl FnOnce() -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
+        self.with_operation_lock_location(|_| operation())
+    }
+
+    fn with_operation_lock_location<T>(
+        &self,
+        operation: impl FnOnce(&Path) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
         let location = self.request::<OperationLockLocation>("host.operation_lock", json!({}))?;
         let _lock = HostOperationLock::acquire(&location.path)?;
-        operation()
+        Self::remaining_request_time(self.operation_deadline)?;
+        operation(&location.path)
     }
 
     #[cfg(test)]
@@ -2869,6 +3054,7 @@ impl Engine {
         commit_risk: EngineRequestCommitRisk,
     ) -> Result<T, EngineError> {
         self.check_cancellation()?;
+        Self::remaining_request_time(self.operation_deadline)?;
         let admission_binding = if operation_requires_admission_token(operation) {
             self.admission_binding
                 .lock()
@@ -2930,7 +3116,7 @@ impl Engine {
         }
 
         let started = Instant::now();
-        let deadline = timeout.and_then(|timeout| started.checked_add(timeout));
+        let deadline = self.request_deadline(timeout, started);
         let status = loop {
             if cancellation_requested(&self.cancellations) {
                 child.terminate();
@@ -3635,6 +3821,642 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
     }
 
     #[test]
+    fn native_removal_counts_survive_the_boundary_without_recounting() {
+        for completed in [0_u64, 1] {
+            let data = json!({
+                "deleted": completed,
+                "request_id": "opaque-backend-key",
+                "intent_ids": ["opaque-intent"],
+                "outcome": "deferred",
+                "requested": 2,
+                "completed": completed,
+                "pending": 2 - completed,
+                "message": "Deletion pending until the local upgrade completes"
+            });
+            let response: InboxClear =
+                serde_json::from_value(data.clone()).expect("deserialize accepted deferred clear");
+            assert_eq!(
+                serde_json::to_value(response).expect("serialize clear for webview"),
+                data,
+                "Native transport dropped or replaced the backend's frozen counts"
+            );
+        }
+    }
+
+    #[test]
+    fn native_removal_boundary_rejects_retired_refusal_outcomes() {
+        for outcome in ["partial", "refused"] {
+            let data = json!({
+                "deleted": 0,
+                "request_id": "opaque-backend-key",
+                "intent_ids": ["opaque-intent"],
+                "outcome": outcome,
+                "requested": 1,
+                "completed": 0,
+                "pending": 1,
+                "message": "Deletion pending until the local upgrade completes"
+            });
+            assert!(
+                serde_json::from_value::<InboxClear>(data).is_err(),
+                "Retired refusal outcome was accepted as a current removal result"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn native_removal_engine(directory: &Path, data: Value) -> Engine {
+        Engine::with_command(
+            "python3",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"import json,sys
+request=json.load(sys.stdin)
+with open(sys.argv[1], 'a', encoding='utf-8') as capture:
+    capture.write(json.dumps(request)+'\n')
+print(json.dumps({'protocol':1,'ok':True,'operation':request['operation'],'data':json.loads(sys.argv[2])}))"#,
+                ),
+                directory.join("requests.jsonl").into_os_string(),
+                OsString::from(data.to_string()),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn native_removal_requests(directory: &Path) -> Vec<Value> {
+        fs::read_to_string(directory.join("requests.jsonl"))
+            .expect("read captured requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("decode captured request"))
+            .collect()
+    }
+
+    fn native_journal_engine(directory: &Path) -> Engine {
+        let script = r#"
+import json,sys
+request=json.load(sys.stdin)
+with open(sys.argv[2],'a',encoding='utf-8') as log: log.write(json.dumps(request)+'\n')
+if request['operation']=='host.operation_lock': data={'path':sys.argv[1]}
+elif request['operation']=='inbox.removal.prepare':
+ import uuid
+ data={'request_id':'opaque-'+uuid.uuid4().hex}
+elif request['operation']=='inbox.removal.status':
+ from pathlib import Path
+ status=Path(sys.argv[1]).parent/'status.json'
+ error=Path(sys.argv[1]).parent/'status-error.json'
+ if error.exists() or not status.exists():
+  failure=json.loads(error.read_text()) if error.exists() else {'code':'not_found','message':'Local removal request was not found'}
+  print(json.dumps({'protocol':1,'ok':False,'operation':request['operation'],'error':failure}))
+  sys.exit(0)
+ data=json.loads(status.read_text());data['request_id']=request['payload']['request_id']
+elif request['operation']=='inbox.clear':
+ data={'request_id':request['payload']['request_id'],'intent_ids':[],'outcome':'completed',
+       'requested':0,'completed':0,'pending':0,'message':None,'deleted':0}
+elif request['operation']=='inbox.delete':
+ data={'request_id':request['payload']['request_id'],'intent_ids':[],'outcome':'completed',
+       'requested':0,'completed':0,'pending':0,'message':None,'deleted':True,
+       'message_id':request['payload']['message_id']}
+else: raise AssertionError(request)
+print(json.dumps({'protocol':1,'ok':True,'operation':request['operation'],'data':data}))
+"#;
+        Engine::with_command(
+            if cfg!(windows) { "python" } else { "python3" },
+            vec![
+                "-c".into(),
+                script.into(),
+                directory
+                    .join("watcher.sqlite3.check.lock")
+                    .into_os_string(),
+                directory.join("journal-rpc.jsonl").into_os_string(),
+            ],
+            directory.join("config.toml"),
+        )
+    }
+
+    #[test]
+    fn native_journal_saved_mutations_preserve_keys_and_literal_parameters() {
+        for kind in ["clear", "delete"] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = native_journal_engine(directory.path());
+            let id = (kind == "delete").then(|| " literal id ".to_string());
+            let prepared = engine
+                .prepare_saved_inbox_removal(kind.into(), id.clone())
+                .unwrap();
+            if kind == "clear" {
+                let result = engine
+                    .clear_saved_inbox(prepared.request_id.clone())
+                    .unwrap();
+                assert_eq!(result.removal.request_id, prepared.request_id);
+            } else {
+                let result = engine
+                    .delete_saved_inbox_item(id.clone().unwrap(), prepared.request_id.clone())
+                    .unwrap();
+                assert_eq!(result.message_id, id.unwrap());
+                assert_eq!(result.removal.request_id, prepared.request_id);
+            }
+            let requests =
+                crate::inbox_removal::read(&directory.path().join("watcher.sqlite3.check.lock"))
+                    .unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "Mutation must retain recovery identity until acknowledged"
+            );
+            assert_eq!(requests[0].request_id, prepared.request_id);
+            let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+            let operations: Vec<Value> = calls
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                operations.last().unwrap()["payload"]["request_id"],
+                prepared.request_id
+            );
+        }
+    }
+
+    #[test]
+    fn native_journal_prepare_or_mutation_failure_preserves_corrupt_file_and_never_mutates() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = native_journal_engine(directory.path());
+        let path = directory
+            .path()
+            .join("watcher.sqlite3.check.removal-requests.json");
+        fs::write(&path, b"unreadable recovery data").unwrap();
+        assert_eq!(
+            engine
+                .prepare_saved_inbox_removal("clear".into(), None)
+                .unwrap_err()
+                .code,
+            "host_error"
+        );
+        assert_eq!(
+            engine.clear_saved_inbox("old key".into()).unwrap_err().code,
+            "host_error"
+        );
+        assert_eq!(fs::read(path).unwrap(), b"unreadable recovery data");
+        let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+        for line in calls.lines() {
+            let request: Value = serde_json::from_str(line).unwrap();
+            assert!(matches!(
+                request["operation"].as_str(),
+                Some("host.operation_lock" | "inbox.removal.prepare")
+            ));
+        }
+    }
+
+    #[test]
+    fn native_journal_mailbox_gate_uses_the_same_operation_deadline() {
+        for expired in [false, true] {
+            let deadline = if expired {
+                Instant::now() - Duration::from_secs(1)
+            } else {
+                Instant::now() + Duration::from_secs(30)
+            };
+            let engine = Engine::with_command("unused", vec![], PathBuf::from("unused.toml"))
+                .with_operation_deadline(deadline);
+            let outcome = engine.mailbox_operation_lock();
+            if expired {
+                assert!(
+                    outcome.is_err(),
+                    "Mailbox gate ignored expired operation deadline"
+                );
+            } else {
+                assert!(
+                    outcome.unwrap().1.is_some(),
+                    "Mailbox gate lost operation deadline"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_journal_expired_operation_deadline_cannot_spawn_or_be_extended() {
+        let engine = Engine::with_command("must-not-execute", vec![], PathBuf::from("unused.toml"))
+            .with_operation_deadline(Instant::now() - Duration::from_secs(1))
+            .with_operation_deadline(Instant::now() + Duration::from_secs(30));
+        assert_eq!(
+            engine
+                .prepare_inbox_removal("clear".into(), None)
+                .unwrap_err()
+                .code,
+            "engine_timeout"
+        );
+    }
+
+    #[test]
+    fn native_journal_recovery_reads_only_status_and_preserves_separate_pending_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = native_journal_engine(directory.path());
+        let first = engine
+            .prepare_saved_inbox_removal("delete".into(), Some(" literal id ".into()))
+            .unwrap();
+        let second = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .unwrap();
+        assert_ne!(first.request_id, second.request_id);
+        fs::write(directory.path().join("status.json"),serde_json::to_vec(&json!({
+            "intent_ids":["first-intent"],"outcome":"deferred",
+            "requested":1,"completed":0,"pending":1,"message":"Deletion pending until the local upgrade completes"
+        })).unwrap()).unwrap();
+        let recovered = engine
+            .recover_inbox_removal_status(
+                first.request_id.clone(),
+                Some("clear".into()),
+                Some("wrong".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            (recovered.requested, recovered.completed, recovered.pending),
+            (1, 0, 1)
+        );
+        assert_eq!(recovered.request_id, first.request_id);
+        assert_eq!(engine.saved_inbox_removals().unwrap().len(), 2);
+        let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+        let calls: Vec<Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            !calls
+                .iter()
+                .any(|r| r["operation"] == "inbox.clear" || r["operation"] == "inbox.delete")
+        );
+        let status = calls
+            .iter()
+            .find(|r| r["operation"] == "inbox.removal.status")
+            .unwrap();
+        assert_eq!(
+            status["payload"],
+            json!({"request_id":first.request_id,"kind":"delete","message_id":" literal id "})
+        );
+    }
+
+    #[test]
+    fn native_journal_bookkeeping_render_ack_retires_only_settled_identity() {
+        for (outcome, requested, completed, pending, kept) in [
+            ("deferred", 2, 1, 1, 1),
+            ("completed", 1, 1, 0, 0),
+            ("completed", 0, 0, 0, 0),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = native_journal_engine(directory.path());
+            let prepared = engine
+                .prepare_saved_inbox_removal("clear".into(), None)
+                .unwrap();
+            fs::write(directory.path().join("status.json"), serde_json::to_vec(&json!({
+                "request_id": prepared.request_id, "intent_ids": [], "outcome": outcome,
+                "requested": requested, "completed": completed, "pending": pending, "message": null
+            })).unwrap()).unwrap();
+            let found = engine
+                .recover_inbox_removal_status(prepared.request_id.clone(), None, None)
+                .unwrap();
+            assert_eq!(
+                (found.requested, found.completed, found.pending),
+                (requested, completed, pending)
+            );
+            assert_eq!(
+                engine.saved_inbox_removals().unwrap().len(),
+                1,
+                "A status read is not a render acknowledgement"
+            );
+            let restarted = native_journal_engine(directory.path());
+            assert_eq!(restarted.saved_inbox_removals().unwrap().len(), 1);
+            restarted
+                .acknowledge_rendered_inbox_removal(prepared.request_id)
+                .unwrap();
+            assert_eq!(restarted.saved_inbox_removals().unwrap().len(), kept);
+            let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+            assert!(
+                !calls
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .any(|call| call["operation"] == "inbox.clear"
+                        || call["operation"] == "inbox.delete")
+            );
+        }
+    }
+
+    #[test]
+    fn native_journal_bookkeeping_ack_refuses_busy_before_status_or_discard() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = native_journal_engine(directory.path());
+        let prepared = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .unwrap();
+        fs::write(
+            directory.path().join("status.json"),
+            serde_json::to_vec(&json!({
+                "request_id": prepared.request_id, "intent_ids": [], "outcome": "completed",
+                "requested": 1, "completed": 1, "pending": 0, "message": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lock = directory.path().join("watcher.sqlite3.check.lock");
+        let busy = HostOperationLock::acquire(&lock).unwrap();
+        assert_eq!(
+            engine
+                .acknowledge_rendered_inbox_removal(prepared.request_id.clone())
+                .unwrap_err()
+                .code,
+            "operation_busy"
+        );
+        assert_eq!(engine.saved_inbox_removals().unwrap().len(), 1);
+        let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+        assert!(
+            !calls
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .any(|call| call["operation"] == "inbox.removal.status")
+        );
+        drop(busy);
+        engine
+            .acknowledge_rendered_inbox_removal(prepared.request_id)
+            .unwrap();
+        assert!(engine.saved_inbox_removals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_journal_bookkeeping_invalid_key_discards_only_client_identity() {
+        for message in [
+            "Local removal request key has expired; start a new request",
+            "Malformed removal key",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = native_journal_engine(directory.path());
+            let prepared = engine
+                .prepare_saved_inbox_removal("clear".into(), None)
+                .unwrap();
+            fs::write(
+                directory.path().join("status-error.json"),
+                serde_json::to_vec(&json!({
+                    "code": "invalid_request", "message": message
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let result = engine.recover_inbox_removal_status(prepared.request_id, None, None);
+            assert_eq!(result.unwrap_err().code, "invalid_request");
+            assert!(engine.saved_inbox_removals().unwrap().is_empty());
+            assert!(
+                native_journal_engine(directory.path())
+                    .saved_inbox_removals()
+                    .unwrap()
+                    .is_empty()
+            );
+            let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+            assert!(
+                !calls
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .any(|call| call["operation"] == "inbox.clear"
+                        || call["operation"] == "inbox.delete")
+            );
+        }
+    }
+
+    #[test]
+    fn native_journal_transient_or_unclassified_lookup_keeps_recovery_identity() {
+        for code in ["runtime_error", "operation_busy", "not_found_extra"] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = native_journal_engine(directory.path());
+            let prepared = engine
+                .prepare_saved_inbox_removal("clear".into(), None)
+                .unwrap();
+            fs::write(
+                directory.path().join("status-error.json"),
+                serde_json::to_vec(&json!({
+                    "code":code,"message":"existing backend error"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                engine
+                    .recover_inbox_removal_status(prepared.request_id, None, None)
+                    .unwrap_err()
+                    .code,
+                code
+            );
+            assert_eq!(engine.saved_inbox_removals().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn native_journal_recovery_never_classifies_an_accepting_request_as_not_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = native_journal_engine(directory.path());
+        let prepared = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .unwrap();
+        let lock = directory.path().join("watcher.sqlite3.check.lock");
+        let _accepting = HostOperationLock::acquire(&lock).unwrap();
+        let result =
+            engine.recover_inbox_removal_status(prepared.request_id, Some("clear".into()), None);
+        let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+        assert!(
+            !calls.lines().any(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                request["operation"] == "inbox.removal.status"
+            }),
+            "Status RPC ran before acceptance fence"
+        );
+        assert_eq!(result.unwrap_err().code, "operation_busy");
+        assert_eq!(crate::inbox_removal::read(&lock).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_journal_not_found_removes_dispatch_authority_before_a_queued_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = native_journal_engine(directory.path());
+        let prepared = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .unwrap();
+        let result = engine.recover_inbox_removal_status(
+            prepared.request_id.clone(),
+            Some("clear".into()),
+            None,
+        );
+        assert_eq!(result.unwrap_err().code, "not_found");
+        let refused = engine.clear_saved_inbox(prepared.request_id).is_err();
+        let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+        assert!(
+            !calls.lines().any(|line| {
+                let request: Value = serde_json::from_str(line).unwrap();
+                request["operation"] == "inbox.clear"
+            }),
+            "Discarded request key reached mutation RPC"
+        );
+        assert!(refused);
+    }
+
+    #[test]
+    fn native_journal_unsaved_keys_never_reach_mutation_rpc() {
+        for kind in ["clear", "delete"] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = native_journal_engine(directory.path());
+            let failed = if kind == "clear" {
+                engine.clear_saved_inbox("discarded-key".into()).is_err()
+            } else {
+                engine
+                    .delete_saved_inbox_item(" literal id ".into(), "discarded-key".into())
+                    .is_err()
+            };
+            let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+            assert!(
+                !calls.lines().any(|line| {
+                    let request: Value = serde_json::from_str(line).unwrap();
+                    request["operation"] == "inbox.clear" || request["operation"] == "inbox.delete"
+                }),
+                "Unsaved request key reached mutation RPC"
+            );
+            assert!(failed);
+        }
+    }
+
+    #[test]
+    fn native_removal_prepare_is_durable_before_returning_the_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("watcher.sqlite3.check.lock");
+        let journal_path = lock_path.with_extension("removal-requests.json");
+        let script = r#"
+import json,sys
+request=json.load(sys.stdin)
+if request['operation']=='host.operation_lock':
+ data={'path':sys.argv[1]}
+else:
+ assert request['operation']=='inbox.removal.prepare',request
+ data={'request_id':'opaque-backend-key'}
+print(json.dumps({'protocol':1,'ok':True,'operation':request['operation'],'data':data}))
+"#;
+        let engine = Engine::with_command(
+            if cfg!(windows) { "python" } else { "python3" },
+            vec!["-c".into(), script.into(), lock_path.into_os_string()],
+            directory.path().join("config.toml"),
+        );
+        let prepared = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .unwrap();
+        assert!(
+            journal_path.is_file(),
+            "Returned request key is not durable"
+        );
+        let saved: Value = serde_json::from_slice(&fs::read(journal_path).unwrap()).unwrap();
+        assert_eq!(
+            saved["requests"],
+            json!([{
+                "request_id": prepared.request_id, "kind": "clear", "message_id": null,
+            }])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_removal_prepare_and_status_forward_opaque_identity_and_parameters() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let prepared = native_removal_engine(directory.path(), json!({"request_id":"opaque-key"}))
+            .prepare_inbox_removal("delete".into(), Some(" literal-id ".into()))
+            .expect("prepare deletion key");
+        assert_eq!(prepared.request_id, "opaque-key");
+        let data = json!({
+            "request_id": "opaque-key", "intent_ids": ["frozen-intent"],
+            "outcome": "deferred", "requested": 1, "completed": 0, "pending": 1,
+            "message": "Deletion pending until the local upgrade completes"
+        });
+        for parameters in [true, false] {
+            let status = native_removal_engine(directory.path(), data.clone())
+                .inbox_removal_status(
+                    prepared.request_id.clone(),
+                    parameters.then(|| "delete".into()),
+                    parameters.then(|| " literal-id ".into()),
+                )
+                .expect("read persisted removal status");
+            assert_eq!(serde_json::to_value(status).unwrap(), data);
+        }
+        let requests = native_removal_requests(directory.path());
+        assert_eq!(
+            requests.len(),
+            3,
+            "status must not issue a new prepare or mutation"
+        );
+        assert_eq!(requests[0]["operation"], "inbox.removal.prepare");
+        assert_eq!(
+            requests[0]["payload"],
+            json!({"kind":"delete","message_id":" literal-id "})
+        );
+        assert_eq!(requests[1]["operation"], "inbox.removal.status");
+        assert_eq!(
+            requests[1]["payload"],
+            json!({
+                "request_id":"opaque-key", "kind":"delete", "message_id":" literal-id "
+            })
+        );
+        assert_eq!(requests[2]["operation"], "inbox.removal.status");
+        assert_eq!(requests[2]["payload"], json!({"request_id":"opaque-key"}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_removal_mutations_forward_the_saved_key_and_return_deferred_receipts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let data = json!({
+            "request_id": "saved-key", "intent_ids": ["frozen-intent"],
+            "outcome": "deferred", "requested": 1, "completed": 0, "pending": 1,
+            "message": "Deletion pending until the local upgrade completes"
+        });
+        let mut clear_data = data.clone();
+        clear_data["deleted"] = json!(0);
+        let clear = native_removal_engine(directory.path(), clear_data.clone())
+            .clear_inbox("saved-key".into())
+            .expect("deferred clear is an accepted result");
+        assert_eq!(serde_json::to_value(clear).unwrap(), clear_data);
+        let mut delete_data = data.clone();
+        delete_data["deleted"] = json!(false);
+        delete_data["message_id"] = json!("message-1");
+        let deleted = native_removal_engine(directory.path(), delete_data.clone())
+            .delete_inbox_item("message-1".into(), "saved-key".into())
+            .expect("deferred delete is an accepted result");
+        assert_eq!(serde_json::to_value(deleted).unwrap(), delete_data);
+        let requests = native_removal_requests(directory.path());
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["operation"], "inbox.clear");
+        assert_eq!(requests[0]["payload"], json!({"request_id":"saved-key"}));
+        assert_eq!(requests[1]["operation"], "inbox.delete");
+        assert_eq!(
+            requests[1]["payload"],
+            json!({
+                "request_id":"saved-key", "message_id":"message-1"
+            })
+        );
+        delete_data["message_id"] = json!("different-message");
+        let error = native_removal_engine(directory.path(), delete_data)
+            .delete_inbox_item("message-1".into(), "saved-key".into())
+            .expect_err("mismatched deletion identity must still be refused");
+        assert_eq!(error.code, "engine_protocol_error");
+    }
+
+    #[test]
+    fn native_removal_boundary_rejects_missing_keys_and_non_numeric_counts() {
+        let data = json!({
+            "deleted":0, "request_id":"opaque-key", "intent_ids":["intent"],
+            "outcome":"deferred", "requested":1, "completed":0, "pending":1,
+            "message":"Deletion pending until the local upgrade completes"
+        });
+        let mut missing = data.clone();
+        missing.as_object_mut().unwrap().remove("request_id");
+        assert!(serde_json::from_value::<InboxClear>(missing).is_err());
+        for field in ["requested", "completed", "pending"] {
+            for invalid in [json!(false), json!("0"), json!(-1), Value::Null] {
+                let mut malformed = data.clone();
+                malformed[field] = invalid;
+                assert!(serde_json::from_value::<InboxClear>(malformed).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn inbox_query_and_page_contract_are_typed() {
         let query: InboxQuery = serde_json::from_value(json!({
             "limit": 25, "cursor": "opaque-cursor", "provider": "gmail",
@@ -3669,28 +4491,39 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
 
         let deletion: InboxDeletion = serde_json::from_value(json!({
             "deleted": true,
-            "message_id": "message-1"
+            "message_id": "message-1",
+            "request_id": "opaque-delete-key",
+            "intent_ids": ["delete-intent"],
+            "outcome": "completed",
+            "requested": 1, "completed": 1, "pending": 0, "message": null
         }))
         .expect("deserialize inbox deletion");
         assert!(deletion.deleted);
         assert_eq!(deletion.message_id, "message-1");
+        assert_eq!(deletion.removal.completed, 1);
 
-        let cleared: InboxClear =
-            serde_json::from_value(json!({"deleted": 3})).expect("deserialize inbox clear result");
-        assert_eq!(cleared.deleted, 3);
-        assert_eq!(cleared.outcome, "completed");
-        let partial: InboxClear = serde_json::from_value(json!({
-            "deleted": 1,
-            "refused": 1,
-            "held_message_ids": ["held"],
-            "outcome": "partial",
-            "message": "Can't delete this yet, the local upgrade is still finishing; try again later"
+        let cleared: InboxClear = serde_json::from_value(json!({
+            "deleted": 3,
+            "request_id": "opaque-clear-key",
+            "intent_ids": ["clear-intent"],
+            "outcome": "completed",
+            "requested": 3, "completed": 3, "pending": 0, "message": null
         }))
-        .expect("deserialize held clear");
-        let webview = serde_json::to_value(partial).expect("serialize clear for webview");
-        assert_eq!(webview["outcome"], "partial");
-        assert_eq!(webview["refused"], 1);
-        assert_eq!(webview["held_message_ids"], json!(["held"]));
+        .expect("deserialize inbox clear result");
+        assert_eq!(cleared.deleted, 3);
+        assert_eq!(cleared.removal.outcome, InboxRemovalOutcome::Completed);
+        let deferred_data = json!({
+            "deleted": 1,
+            "request_id": "opaque-clear-key",
+            "intent_ids": ["clear-intent"],
+            "outcome": "deferred",
+            "requested": 2, "completed": 1, "pending": 1,
+            "message": "Deletion pending until the local upgrade completes"
+        });
+        let deferred: InboxClear =
+            serde_json::from_value(deferred_data.clone()).expect("deserialize deferred clear");
+        let webview = serde_json::to_value(deferred).expect("serialize clear for webview");
+        assert_eq!(webview, deferred_data);
     }
 
     #[cfg(unix)]
@@ -5528,6 +6361,206 @@ fi"#,
         .with_test_environment("LOCALAPPDATA", process_root.join("local-app-data"))
     }
 
+    #[test]
+    fn native_removal_notification_queue_keeps_the_send_acceptance_boundary() {
+        use crate::delivery::NotificationDelivery;
+        use std::thread;
+
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        for ordering in ["eligible", "accepted", "sending"] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("config.toml");
+            let database = directory.path().join("watcher.sqlite3");
+            fs::write(
+                &config,
+                format!(
+                    "database_file = {}\nmodel_base_url = \"http://127.0.0.1:9/v1\"\n\
+                     model_name = \"fixture\"\nmodel_require_auth = false\n\
+                     notifications_enabled = true\nretention_days = 100\ntimezone = \"UTC\"\n",
+                    toml_path_literal(&database),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            // Reuse the public native DB fixture adapters. The transport below
+            // still runs the production source engine, without patched gateways.
+            let fixture = Command::new("uv")
+                .args(["run", "--project"])
+                .arg(project_root)
+                .args(["python", "-c"])
+                .arg(
+                    r#"
+import json,sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1])/'tests'))
+from test_db import Store
+from test_thread_reconcile import seed,KEY,NOW
+from test_service import FakeModel
+from eom_email_watcher.source_locks import source_lock_path
+store=Store(Path(sys.argv[2]));store.initialize()
+store.register_mail_account('gmail','mailbox',display_name='Fixture')
+store.reconcile_mailbox_identity('gmail','mailbox',KEY)
+vendor=store.create_vendor('Fixture vendor');store.add_vendor_address(vendor,'vendor@example.com')
+seed(store,'m',rfc_message_id='root@fixture',subject='Private root subject')
+for i in range(32): seed(store,f'copy-{i}',rfc_message_id=f'copy-{i}@fixture')
+seed(store,'other',rfc_message_id='other@fixture',thread_id='other-thread',subject='Other subject')
+with store.connection() as db:
+ db.execute("UPDATE messages SET logical_of='m' WHERE message_id LIKE 'copy-%'")
+for message_id in ['m','other']:
+ store.mark_analyzed(message_id,FakeModel().analyze().model_dump(),now=NOW)
+assert {item.message_id for item in store.notification_intents()}=={'m','other'}
+source_lock=source_lock_path(store.path,'m')
+source_lock.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+print(json.dumps(str(source_lock)))
+"#,
+                )
+                .arg(project_root)
+                .arg(&database)
+                .output()
+                .unwrap();
+            assert!(
+                fixture.status.success(),
+                "Native notification fixture: {}",
+                String::from_utf8_lossy(&fixture.stderr)
+            );
+            let source_lock: PathBuf = serde_json::from_slice(&fixture.stdout).unwrap();
+            let _source_holder = HostOperationLock::acquire(&source_lock).unwrap();
+            let engine = real_engine(config);
+            let snapshot = engine.admission_snapshot().unwrap();
+            engine.install_admission_binding(
+                AdmissionLease::new(),
+                snapshot.token,
+                Arc::new(|_, _| {}),
+            );
+            let prepare = || {
+                engine
+                    .prepare_inbox_removal("delete".into(), Some("m".into()))
+                    .unwrap()
+                    .request_id
+            };
+            let prepared_key = prepare();
+            if ordering == "accepted" {
+                let accepted = engine
+                    .delete_inbox_item("m".into(), prepared_key.clone())
+                    .unwrap();
+                assert_eq!(accepted.removal.outcome, InboxRemovalOutcome::Deferred);
+                assert_eq!(accepted.removal.pending, 1);
+            }
+            let shown = directory.path().join("shown.jsonl");
+            let started = directory.path().join("platform-started");
+            let release = directory.path().join("platform-release");
+            if ordering != "sending" {
+                fs::write(&release, b"release").unwrap();
+            }
+            let delivery = NotificationDelivery::with_notification_command(
+                if cfg!(windows) { "python" } else { "python3" },
+                vec![
+                    "-c".into(),
+                    r#"import json,sys,time
+from pathlib import Path
+payload=json.load(sys.stdin)
+Path(sys.argv[2]).write_text('started')
+while not Path(sys.argv[3]).exists(): time.sleep(.005)
+with open(sys.argv[1],'a') as output: output.write(json.dumps(payload)+'\n')
+"#
+                    .into(),
+                    shown.clone().into_os_string(),
+                    started.clone().into_os_string(),
+                    release.clone().into_os_string(),
+                ],
+            );
+            let worker_engine = engine.clone();
+            let worker = thread::spawn(move || {
+                delivery.deliver_with_cancellation(
+                    &worker_engine,
+                    crate::STARTUP_DELIVERY_TIMEOUT,
+                    CancellationToken::new(),
+                )
+            });
+            if ordering == "sending" {
+                let wait = Instant::now();
+                while !started.exists() && !worker.is_finished() {
+                    assert!(
+                        wait.elapsed() < Duration::from_secs(10),
+                        "Platform send did not start"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let result = engine.delete_inbox_item("m".into(), prepared_key);
+                // Release before assertions, so an unexpected acceptance cannot
+                // strand the controlled helper or its delivery worker.
+                fs::write(&release, b"release").unwrap();
+                let delivered = worker.join().unwrap();
+                assert!(started.exists());
+                assert_eq!(
+                    result
+                        .expect_err(
+                            "Acceptance must not enter between queue selection and send/ack"
+                        )
+                        .code,
+                    "runtime_error",
+                );
+                let delivered = delivered.unwrap();
+                assert_eq!(delivered.delivered, 2);
+                assert_eq!(delivered.failed, 0);
+                assert_eq!(delivered.remaining, 0);
+                let accepted = engine.delete_inbox_item("m".into(), prepare()).unwrap();
+                assert_eq!(accepted.removal.outcome, InboxRemovalOutcome::Deferred);
+            } else {
+                let delivered = worker.join().unwrap().unwrap();
+                assert_eq!(
+                    delivered.delivered,
+                    if ordering == "accepted" { 1 } else { 2 }
+                );
+                assert_eq!(delivered.failed, 0);
+                assert_eq!(delivered.remaining, 0);
+            }
+            let payloads: Vec<Value> = fs::read_to_string(&shown)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(payloads.len(), if ordering == "accepted" { 1 } else { 2 });
+            assert_eq!(
+                payloads
+                    .iter()
+                    .filter(|item| item["title"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Private root subject"))
+                    .count(),
+                usize::from(ordering != "accepted")
+            );
+            assert_eq!(
+                payloads
+                    .iter()
+                    .filter(|item| item["title"].as_str().unwrap().contains("Other subject"))
+                    .count(),
+                1
+            );
+            let retained = Command::new("uv")
+                .args(["run", "--project"])
+                .arg(project_root)
+                .args(["python", "-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute(\"SELECT COUNT(*) FROM messages WHERE message_id='m' OR logical_of='m'\").fetchone()[0])"])
+                .arg(&database)
+                .output()
+                .unwrap();
+            assert!(retained.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&retained.stdout).trim(),
+                "33",
+                "The queue must exclude accepted retained content, not rely on physical deletion"
+            );
+        }
+    }
+
     fn toml_path_literal(path: &Path) -> String {
         serde_json::to_string(&path.to_string_lossy()).expect("serialize test config path")
     }
@@ -5621,7 +6654,7 @@ timezone = "UTC"
             fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
                 .expect("secure config file");
         }
-        let engine = real_engine(config_path);
+        let engine = real_engine(config_path.clone());
         let snapshot = engine
             .admission_snapshot()
             .expect("obtain atomic admission snapshot");
@@ -5682,20 +6715,157 @@ timezone = "UTC"
                 .expect("host lock must permit lock-aware notification reads"),
             (vec![], 0)
         );
+        let clear_key = engine
+            .prepare_inbox_removal("clear".into(), None)
+            .expect("prepare clear before mutation")
+            .request_id;
         assert_eq!(
             engine
-                .run_with_operation_lock(|| engine.clear_inbox())
+                .inbox_removal_status(clear_key.clone(), Some("clear".into()), None)
+                .expect_err("unaccepted prepared key must have no receipt")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .run_with_operation_lock(|| engine.clear_inbox(clear_key.clone()))
                 .expect_err("Python mutation must contend with the Rust host lock")
                 .code,
             "runtime_error"
         );
+        let cleared = engine
+            .clear_inbox(clear_key.clone())
+            .expect("released host lock is reusable");
+        assert_eq!(cleared.deleted, 0);
+        let recovered = real_engine(config_path.clone())
+            .inbox_removal_status(clear_key.clone(), None, None)
+            .expect("reopened native transport reads the persisted receipt");
+        assert_eq!(recovered, cleared.removal);
         assert_eq!(
             engine
-                .clear_inbox()
-                .expect("released host lock is reusable")
-                .deleted,
-            0
+                .clear_inbox(clear_key)
+                .expect("retry the retained request"),
+            cleared
         );
+        let unaccepted = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .expect("durably prepare without accepting")
+            .request_id;
+        // Exercise the native journal's real atomic writer below the database
+        // root already validated by host.operation_lock. The shared SDK owns
+        // Windows ACL inspection; native code adds no second ACL policy.
+        let assert_journal_private = || {
+            let operation_lock = database_path.with_file_name("watcher.sqlite3.check.lock");
+            let journal = crate::inbox_removal::journal_path(&operation_lock);
+            assert!(journal.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            #[cfg(windows)]
+            {
+                let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap();
+                let proof = Command::new("uv")
+                    .args(["run", "--project"])
+                    .arg(project_root)
+                    .args(["python", "-c"])
+                    .arg(
+                        "import sys; from pathlib import Path; \
+                         from connect_automate.connect_windows import \
+                         validate_private_directory, validate_private_regular_file; \
+                         root=Path(sys.argv[1]); \
+                         validate_private_directory(root, root=root); \
+                         validate_private_regular_file(Path(sys.argv[2]), root=root)",
+                    )
+                    .arg(directory.path())
+                    .arg(&journal)
+                    .output()
+                    .expect("run shared SDK journal privacy proof");
+                assert!(
+                    proof.status.success(),
+                    "native recovery journal must inherit private DB root: {}",
+                    String::from_utf8_lossy(&proof.stderr)
+                );
+            }
+        };
+        assert_journal_private();
+        let reopened = real_engine(config_path.clone());
+        let reopened_snapshot = reopened.admission_snapshot().unwrap();
+        reopened.install_admission_binding(
+            AdmissionLease::new(),
+            reopened_snapshot.token,
+            Arc::new(|_, _| {}),
+        );
+        assert!(
+            reopened
+                .saved_inbox_removals()
+                .unwrap()
+                .iter()
+                .any(|saved| saved.request_id == unaccepted)
+        );
+        assert_eq!(
+            reopened
+                .recover_inbox_removal_status(unaccepted.clone(), None, None)
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .clear_saved_inbox(unaccepted.clone())
+                .unwrap_err()
+                .code,
+            "invalid_request"
+        );
+        assert_eq!(
+            engine
+                .inbox_removal_status(unaccepted.clone(), Some("clear".into()), None)
+                .unwrap_err()
+                .code,
+            "not_found",
+            "Recovery must not accept the old request"
+        );
+        let saved_key = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .unwrap()
+            .request_id;
+        assert_ne!(unaccepted, saved_key);
+        assert_journal_private();
+        // Discard the mutation response, then recover from a fresh transport.
+        engine.clear_saved_inbox(saved_key.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .run_with_operation_lock(|| {
+                    reopened.recover_inbox_removal_status(saved_key.clone(), None, None)
+                })
+                .unwrap_err()
+                .code,
+            "operation_busy"
+        );
+        let recovered = reopened
+            .recover_inbox_removal_status(saved_key.clone(), None, None)
+            .unwrap();
+        assert_eq!(recovered.request_id, saved_key);
+        assert_eq!(
+            (recovered.requested, recovered.completed, recovered.pending),
+            (0, 0, 0)
+        );
+        assert_eq!(recovered.outcome, InboxRemovalOutcome::Completed);
+        assert!(
+            reopened
+                .saved_inbox_removals()
+                .unwrap()
+                .iter()
+                .any(|saved| saved.request_id == saved_key)
+        );
+
         assert_eq!(
             engine
                 .settings_with_timeout(Duration::from_secs(5))
@@ -5808,10 +6978,24 @@ timezone = "UTC"
                 .items,
             vec![]
         );
-        assert_eq!(engine.clear_inbox().expect("clear empty inbox").deleted, 0);
+        let clear_key = engine
+            .prepare_inbox_removal("clear".into(), None)
+            .expect("prepare empty clear")
+            .request_id;
         assert_eq!(
             engine
-                .delete_inbox_item("missing-message".into())
+                .clear_inbox(clear_key)
+                .expect("clear empty inbox")
+                .deleted,
+            0
+        );
+        let delete_key = engine
+            .prepare_inbox_removal("delete".into(), Some("missing-message".into()))
+            .expect("prepare missing delete")
+            .request_id;
+        assert_eq!(
+            engine
+                .delete_inbox_item("missing-message".into(), delete_key)
                 .expect_err("missing inbox item must not be deleted")
                 .code,
             "not_found"

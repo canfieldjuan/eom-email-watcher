@@ -19,13 +19,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from connect_automate import connect
-from connect_automate.locking import connect_operation_lock
 
 from . import (
     body_state,
     deployment,
     private_storage,
     reconcile_state,
+    removal,
     source_locks,
     thread_migration,
 )
@@ -62,7 +62,7 @@ from .mime import AttachmentDescriptor, body_was_truncated
 from .text import within_utf8_bytes
 from .thread_state import VendorIndex, vendor_index
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 
 class LocalRemovalHeld(RuntimeError):
@@ -581,12 +581,56 @@ _CONNECT_TABLE_TRIGGER_NAMES = (
     "connect_jobs_delete_linked_automation_fires",
 )
 
-_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL = """
-CREATE TRIGGER messages_delete_connect_attachment_jobs
-AFTER DELETE ON messages
-BEGIN
+# Bind provider-admitted attempts before either logical or physical source removal.
+# The physical-delete trigger and deferred invalidation consume this same rule.
+_AUTOMATION_SOURCE_BINDING_SQL = """
+    UPDATE automation_fire_attempts
+    SET job_id = dispatch_request_id
+    WHERE job_id IS NULL
+      AND fire_id IN (
+        SELECT fire_id FROM automation_fires
+        WHERE message_id = {message_id}
+          AND state IN ('pending_dispatch', 'entitlement_paused')
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM connect_attachment_jobs AS job
+        JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
+        WHERE job.job_id = automation_fire_attempts.dispatch_request_id
+          AND job.protocol_version = 2
+          AND job.status IN ('requested', 'accepted', 'processing', 'completed', 'failed')
+          AND dispatch.capability_authority_known = 1
+          AND NOT (
+            dispatch.state = 'waiting' AND dispatch.submission_possible = 0
+          )
+      );
+    UPDATE automation_fires
+    SET state = 'submitted',
+        state_version = state_version + 1,
+        reason = 'source_removed_after_provider_admission',
+        job_id = (
+            SELECT attempt.job_id
+            FROM automation_fire_attempts AS attempt
+            WHERE attempt.fire_id = automation_fires.fire_id
+              AND attempt.attempt_no = automation_fires.current_attempt_no
+        ),
+        pending_since = NULL,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    WHERE message_id = {message_id}
+      AND state IN ('pending_dispatch', 'entitlement_paused')
+      AND job_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM automation_fire_attempts AS attempt
+        WHERE attempt.fire_id = automation_fires.fire_id
+          AND attempt.attempt_no = automation_fires.current_attempt_no
+          AND attempt.job_id IS NOT NULL
+      );
+"""
+
+_CONNECT_SOURCE_INVALIDATION_SQL = """
     DELETE FROM connect_attachment_jobs
-    WHERE message_id = OLD.message_id
+    WHERE message_id = {message_id}
       AND (
         protocol_version = 1
         OR (
@@ -625,10 +669,21 @@ BEGIN
     SET source_available = 0,
         updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
     WHERE job_id IN (
-        SELECT job_id FROM connect_attachment_jobs WHERE message_id = OLD.message_id
+        SELECT job_id FROM connect_attachment_jobs WHERE message_id = {message_id}
     );
-END
 """
+
+# Physical deletion uses SQLite's BEFORE/AFTER phases; deferred acceptance
+# composes the same binding and invalidation rules in this order.
+_CONNECT_SOURCE_UNAVAILABLE_SQL = (
+    _AUTOMATION_SOURCE_BINDING_SQL + _CONNECT_SOURCE_INVALIDATION_SQL
+)
+
+_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL = (
+    "CREATE TRIGGER messages_delete_connect_attachment_jobs AFTER DELETE ON messages BEGIN\n"
+    + _CONNECT_SOURCE_INVALIDATION_SQL.format(message_id="OLD.message_id")
+    + "END"
+)
 
 _AUTOMATE_CORE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS automation_rule_set (
@@ -781,48 +836,7 @@ CREATE TABLE IF NOT EXISTS automation_run_source_identities (
 CREATE TRIGGER IF NOT EXISTS messages_delete_pending_automation_fires
 BEFORE DELETE ON messages
 BEGIN
-    UPDATE automation_fire_attempts
-    SET job_id = dispatch_request_id
-    WHERE job_id IS NULL
-      AND fire_id IN (
-        SELECT fire_id FROM automation_fires
-        WHERE message_id = OLD.message_id
-          AND state IN ('pending_dispatch', 'entitlement_paused')
-      )
-      AND EXISTS (
-        SELECT 1
-        FROM connect_attachment_jobs AS job
-        JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
-        WHERE job.job_id = automation_fire_attempts.dispatch_request_id
-          AND job.protocol_version = 2
-          AND job.status IN ('requested', 'accepted', 'processing', 'completed', 'failed')
-          AND dispatch.capability_authority_known = 1
-          AND NOT (
-            dispatch.state = 'waiting' AND dispatch.submission_possible = 0
-          )
-      );
-    UPDATE automation_fires
-    SET state = 'submitted',
-        state_version = state_version + 1,
-        reason = 'source_removed_after_provider_admission',
-        job_id = (
-            SELECT attempt.job_id
-            FROM automation_fire_attempts AS attempt
-            WHERE attempt.fire_id = automation_fires.fire_id
-              AND attempt.attempt_no = automation_fires.current_attempt_no
-        ),
-        pending_since = NULL,
-        updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
-    WHERE message_id = OLD.message_id
-      AND state IN ('pending_dispatch', 'entitlement_paused')
-      AND job_id IS NULL
-      AND EXISTS (
-        SELECT 1
-        FROM automation_fire_attempts AS attempt
-        WHERE attempt.fire_id = automation_fires.fire_id
-          AND attempt.attempt_no = automation_fires.current_attempt_no
-          AND attempt.job_id IS NOT NULL
-      );
+""" + _AUTOMATION_SOURCE_BINDING_SQL.format(message_id="OLD.message_id") + """
     DELETE FROM automation_fire_confirmations
     WHERE fire_id IN (
         SELECT fire_id FROM automation_fires
@@ -1832,6 +1846,10 @@ def _mark_automation_sources_unavailable(
 ) -> int:
     if not message_ids:
         return 0
+    for message_id in message_ids:
+        _execute_transactional_script(
+            db, _CONNECT_SOURCE_UNAVAILABLE_SQL.format(message_id="?"), (message_id,)
+        )
     transitioned = 0
     for offset in range(0, len(message_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
         chunk = message_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
@@ -2876,10 +2894,67 @@ def _certificate_assert_projection(
             raise RuntimeError("Stored certificate policy projection is inconsistent")
 
 
+def _automation_source_available_sql(alias: str) -> str:
+    """Resolve the existing run source key through live and frozen bindings."""
+    return f"""NOT EXISTS (
+        SELECT 1 FROM (
+            SELECT message_id,provider,account_id,mailbox_identity_key,provider_message_id,
+                mailbox_identity_key AS binding_key FROM messages
+            UNION ALL
+            SELECT t.message_id,t.provider,t.account_id,t.stored_identity_key,
+                t.provider_message_id,i.mailbox_identity_key
+            FROM message_removal_targets t
+            JOIN message_removal_intents i ON i.intent_id=t.intent_id
+            UNION ALL
+            SELECT t.message_id,json_extract(s.value,'$.provider'),
+                json_extract(s.value,'$.account_id'),
+                json_extract(s.value,'$.mailbox_identity_key'),
+                json_extract(s.value,'$.provider_message_id'),
+                json_extract(s.value,'$.mailbox_identity_key')
+            FROM message_removal_targets t JOIN json_each(t.source_identities_json) s
+        ) source
+        LEFT JOIN automation_run_source_identities identity ON identity.run_id={alias}.run_id
+        WHERE source.provider={alias}.provider AND source.account_id={alias}.account_id
+          AND (
+            (identity.mailbox_identity_key IS NOT NULL
+             AND source.binding_key IS identity.mailbox_identity_key
+             AND message_source_key(source.provider,source.account_id,
+                    source.provider_message_id,identity.mailbox_identity_key)
+                    ={alias}.source_message_key)
+            OR (identity.mailbox_identity_key IS NULL
+                AND source.mailbox_identity_key IS NULL
+                AND message_source_key(source.provider,source.account_id,
+                        source.provider_message_id)={alias}.source_message_key)
+          ) AND NOT ({removal.available_sql("source")})
+    )"""
+
+
+def _automation_source_available(db: sqlite3.Connection, run_id: str) -> bool:
+    eligible = _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+    row = db.execute(
+        f"SELECT ({eligible}) FROM automation_runs r WHERE r.run_id=?", (run_id,),
+    ).fetchone()
+    return row is not None and bool(row[0])
+
+
+def _connect_source_available(db: sqlite3.Connection, job: ConnectJob) -> bool:
+    """The retained Connect binding feeds the shared eligibility owner."""
+    bindings = db.execute(
+        """SELECT identity.provider,identity.account_id,identity.mailbox_identity_key
+        FROM automation_fire_source_identities identity
+        JOIN automation_fires fire ON fire.fire_id=identity.fire_id
+        WHERE fire.job_id=? AND identity.message_id=? AND identity.part_id=?""",
+        (job.job_id, job.message_id, job.part_id),
+    ).fetchall()
+    return removal.message_available(
+        db, job.message_id, require_source=False, retained_bindings=bindings,
+    )
+
+
 def _certificate_source_for_job(
     db: sqlite3.Connection,
     job: ConnectJob,
-) -> tuple[dict[str, str], tuple[str, ...]]:
+) -> tuple[dict[str, str] | None, tuple[str, ...]]:
     fire_rows = db.execute(
         "SELECT * FROM automation_fires WHERE job_id = ? ORDER BY fire_id", (job.job_id,)
     ).fetchall()
@@ -2953,6 +3028,11 @@ def _certificate_source_for_job(
     else:
         raise CertificateResultInvalid("certificate source identity is unavailable")
 
+    if not removal.message_available(
+        db, job.message_id, require_source=False, retained_bindings=(source,),
+    ):
+        return None, tuple(fire_ids)
+
     for fire, identity in identities:
         if identity is not None:
             continue
@@ -3025,8 +3105,10 @@ def _persist_certificate_projection(
     job: ConnectJob,
     result: _ValidatedCertificateResult,
     stamp: str,
-) -> tuple[str, tuple[str, ...]]:
+) -> tuple[str | None, tuple[str, ...]]:
     source, fire_ids = _certificate_source_for_job(db, job)
+    if source is None:
+        return None, fire_ids
     source_tuple = (
         source["provider"],
         source["account_id"],
@@ -3299,14 +3381,14 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
     db.execute(_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL)
 
 
-def _execute_transactional_script(db: sqlite3.Connection, script: str) -> None:
+def _execute_transactional_script(db: sqlite3.Connection, script: str, parameters=()) -> None:
     """Execute complete SQL statements without executescript's implicit commit."""
     pending: list[str] = []
     for line in script.splitlines():
         pending.append(line)
         statement = "\n".join(pending).strip()
         if statement and sqlite3.complete_statement(statement):
-            db.execute(statement)
+            db.execute(statement, parameters)
             pending.clear()
     if "\n".join(pending).strip():
         raise RuntimeError("automation schema script ended with an incomplete statement")
@@ -3520,6 +3602,13 @@ def _effective_message_identity_sql(alias: str) -> str:
         WHERE account.provider = {alias}.provider AND account.account_id = {alias}.account_id
           AND account.legacy_identity_status = 'continuity_proven'
     ))"""
+
+
+def _followed_message_sql(alias: str, follow: str = "f") -> str:
+    """D-derived's followed membership, shared by body and transition owners."""
+    return f"""{follow}.provider={alias}.provider AND {follow}.account_id={alias}.account_id
+        AND {follow}.mailbox_identity_key={_effective_message_identity_sql(alias)}
+        AND {follow}.thread_key={alias}.thread_key AND {follow}.followed=1"""
 
 
 def _logical_message_rank_sql(alias: str) -> str:
@@ -3935,6 +4024,10 @@ def _unit_rows(db: sqlite3.Connection, canonicals: Sequence[str]) -> list[str]:
     return sorted(rows)
 
 
+def _logical_unit_members_sql(alias: str, canonical: str) -> str:
+    return f"({alias}.message_id={canonical} OR {alias}.logical_of={canonical})"
+
+
 def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | None:
     """The rows and source identities that are one logical message (D-identity)."""
     row = db.execute(
@@ -3945,9 +4038,10 @@ def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | Non
         return None
     canonical = str(row["canonical"])
     members = db.execute(
-        """SELECT message_id, provider, account_id, mailbox_identity_key,
+        f"""SELECT message_id, provider, account_id, mailbox_identity_key,
             provider_message_id, received_at
-        FROM messages WHERE message_id = ? OR logical_of = ? ORDER BY message_id""",
+        FROM messages member WHERE {_logical_unit_members_sql("member", "?")}
+        ORDER BY message_id""",
         (canonical, canonical),
     ).fetchall()
     sources = {
@@ -3991,8 +4085,9 @@ def _refresh_logical_messages_view(db: sqlite3.Connection) -> None:
     always the current ones.
     """
     db.execute("DROP VIEW IF EXISTS logical_messages")
+    eligible = " AND " + removal.available_sql("messages") if removal.has_schema(db) else ""
     db.execute(
-        "CREATE VIEW logical_messages AS SELECT * FROM messages WHERE logical_of IS NULL"
+        "CREATE VIEW logical_messages AS SELECT * FROM messages WHERE logical_of IS NULL" + eligible
     )
 
 
@@ -5565,6 +5660,8 @@ DERIVED_INPUT_TABLES = frozenset(
         "vendors",
         "vendor_addresses",
         "vendor_domains",
+        "message_removal_intents",
+        "message_removal_targets",
     }
 )
 
@@ -5607,15 +5704,57 @@ THREAD_DERIVED_SCHEMA = (
 )
 
 
+def _derived_record_scopes_sql(table: str, record: str) -> str:
+    """The one OLD/NEW scope selection for both sides of a local input write."""
+    def columns(row):
+        return (
+            f"{row}.provider AS provider,{row}.account_id AS account_id,"
+            f"{_effective_message_identity_sql(row)} AS identity,{row}.thread_key AS thread_key"
+        )
+    if table == "messages":
+        return (f"SELECT {columns(record)} UNION "
+                f"SELECT {columns('canonical')} FROM messages canonical "
+                f"WHERE canonical.message_id={record}.logical_of")
+    return f"""SELECT {columns('a')} FROM messages a
+        WHERE a.message_id={record}.message_id OR a.message_id=(
+            SELECT logical_of FROM messages WHERE message_id={record}.message_id)"""
+
+
+def _derived_scope_match_sql(message: str, scope: str) -> str:
+    return f"""{message}.provider={scope}.provider AND {message}.account_id={scope}.account_id
+        AND {_effective_message_identity_sql(message)} IS {scope}.identity
+        AND {message}.thread_key={scope}.thread_key"""
+
+
+def _capture_followed_content_sql(scopes: str | None) -> str:
+    """Before evidence: complete units bearing retained content, never body text."""
+    condition = "1" if scopes is None else (
+        f"EXISTS (SELECT 1 FROM ({scopes}) scope "
+        f"WHERE {_derived_scope_match_sql('m', 'scope')})"
+    )
+    return f"""INSERT OR IGNORE INTO derived_previous_followed
+        SELECT member.message_id FROM (
+            SELECT DISTINCT COALESCE(content.logical_of,content.message_id) AS canonical
+            FROM (SELECT message_id FROM message_bodies UNION
+                  SELECT message_id FROM message_body_unavailable) retained
+            JOIN messages content ON content.message_id=retained.message_id
+        ) unit JOIN messages m ON m.message_id=unit.canonical
+        JOIN thread_follow f ON {_followed_message_sql('m')}
+        JOIN messages member ON {_logical_unit_members_sql('member', 'm.message_id')}
+        WHERE {condition};"""
+
+
 def _track_derived_rows(db: sqlite3.Connection) -> None:
     """Connection-local row evidence; no extra persistent state or writer lists."""
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_derived'").fetchone():
         return
     db.execute("CREATE TEMP TABLE derived_changed_messages(message_id TEXT PRIMARY KEY)")
+    db.execute("CREATE TEMP TABLE derived_previous_followed(message_id TEXT PRIMARY KEY)")
     db.execute("""CREATE TEMP TABLE derived_changed_threads (
         provider TEXT, account_id TEXT, identity TEXT, thread_key TEXT,
         UNIQUE(provider, account_id, identity, thread_key))""")
     db.execute("CREATE TEMP TABLE derived_changed_config(table_name TEXT PRIMARY KEY)")
+    capture = removal.has_schema(db)
     coverage = reconcile_state.track_coverage_inputs(db)
     global_inputs = DERIVED_INPUT_TABLES - {"messages", "message_locations", "message_recipients"}
     for table in sorted(global_inputs):
@@ -5624,6 +5763,14 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
         ).fetchone():
             continue
         for event in ("INSERT", "DELETE", "UPDATE"):
+            if capture:
+                # Config changes already cause FULL recomputation. Mirror it once,
+                # starting from content-bearing units, without per-config rules.
+                db.execute(f"""CREATE TEMP TRIGGER derived_before_{table}_{event}
+                    BEFORE {event} ON main.{table}
+                    WHEN NOT EXISTS (SELECT 1 FROM derived_changed_config)
+                    BEGIN {_capture_followed_content_sql(None)}
+                    INSERT OR IGNORE INTO derived_changed_config VALUES ('{table}'); END""")
             evidence = reconcile_state.coverage_input_sql(table, event) if coverage else ""
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
                 AFTER {event} ON main.{table} BEGIN
@@ -5634,20 +5781,30 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
             ("DELETE", ("OLD",)),
             ("UPDATE", ("OLD", "NEW")),
         ):
-            statements = []
-            for record in records:
-                statements.append(
-                    f"INSERT OR IGNORE INTO derived_changed_messages VALUES ({record}.message_id);"
-                )
-                if table == "messages":
-                    statements.append(f"""INSERT OR IGNORE INTO derived_changed_threads VALUES (
-                        {record}.provider, {record}.account_id,
-                        {_effective_message_identity_sql(record)}, {record}.thread_key);""")
+            scopes = " UNION ".join(_derived_record_scopes_sql(table, r) for r in records)
+            statements = [
+                f"INSERT OR IGNORE INTO derived_changed_messages VALUES ({r}.message_id);"
+                for r in records
+            ]
+            statements.append("INSERT OR IGNORE INTO derived_changed_threads " + scopes + ";")
             update = (
                 " OF " + ",".join(sorted(DERIVED_MESSAGE_COLUMNS))
                 if event == "UPDATE" and table == "messages"
                 else ""
             )
+            if capture:
+                fresh_scopes = f"""SELECT * FROM ({scopes}) scope WHERE NOT EXISTS (
+                    SELECT 1 FROM derived_changed_threads seen WHERE seen.provider=scope.provider
+                    AND seen.account_id=scope.account_id AND seen.identity IS scope.identity
+                    AND seen.thread_key IS scope.thread_key)"""
+                # Existing changed-thread evidence is also the once-per-scope
+                # boundary. A prior FULL capture covers every local scope.
+                db.execute(f"""CREATE TEMP TRIGGER derived_before_{table}_{event}
+                    BEFORE {event}{update} ON main.{table}
+                    WHEN NOT EXISTS (SELECT 1 FROM derived_changed_config)
+                      AND EXISTS ({fresh_scopes})
+                    BEGIN {_capture_followed_content_sql(fresh_scopes)}
+                    INSERT OR IGNORE INTO derived_changed_threads {scopes}; END""")
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
                 AFTER {event}{update} ON main.{table} BEGIN {"".join(statements)} END""")
 
@@ -5702,23 +5859,14 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
     index = vendor_index(db)
     scopes: set[tuple[str, str, str, str]] = set()
     if tracked and not full:
-        # Locations and recipients name storage rows; resolve their canonical and
-        # include the complete affected thread so deletions can change its owner.
-        db.execute(f"""INSERT OR IGNORE INTO derived_changed_threads
-            SELECT m.provider, m.account_id, {_effective_message_identity_sql("m")}, m.thread_key
-            FROM messages m WHERE m.message_id IN (SELECT message_id FROM derived_changed_messages)
-               OR m.message_id IN (SELECT COALESCE(logical_of, message_id) FROM messages
-                   WHERE message_id IN (SELECT message_id FROM derived_changed_messages))""")
         scopes = {
             tuple(row)
             for row in db.execute("SELECT * FROM derived_changed_threads")
             if row[2] is not None
         }
         condition = f"""WHERE m.message_id IN (SELECT message_id FROM derived_changed_messages)
-            OR EXISTS (SELECT 1 FROM derived_changed_threads t WHERE t.provider=m.provider
-                AND t.account_id=m.account_id
-                AND t.identity IS {_effective_message_identity_sql("m")}
-                AND t.thread_key=m.thread_key)"""
+            OR EXISTS (SELECT 1 FROM derived_changed_threads t
+                WHERE {_derived_scope_match_sql("m", "t")})"""
     else:
         condition = ""
     rows = db.execute(f"""SELECT m.*, {_effective_message_identity_sql("m")} AS identity
@@ -5825,6 +5973,14 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
         AND f.mailbox_identity_key=thread_watermarks.mailbox_identity_key
         AND f.thread_key=thread_watermarks.thread_key AND f.followed=1)""")
 
+    if tracked and removal.has_schema(db):
+        # Only units followed before one of this transaction's input writes
+        # can become fresh unfollows. The shared helper tests current membership,
+        # retained content and pending targets, then uses the one issuer/freeze.
+        db._accepted_unfollow = removal.accept_unfollow_units(
+            db, [r[0] for r in db.execute("SELECT message_id FROM derived_previous_followed")],
+            now=datetime.now(UTC), authority=getattr(db, "_removal_transaction", None),
+        )
     body_state.recompute(db)
 
 class _DerivedCursor(sqlite3.Cursor):
@@ -5843,10 +5999,53 @@ class _DerivedCursor(sqlite3.Cursor):
 
 
 class _DerivedConnection(sqlite3.Connection):
+    # Main-schema dependencies of the TEMP trigger SQL generated by
+    # _track_derived_rows, including followed-content and coverage capture.
+    _derived_referenced_tables = DERIVED_INPUT_TABLES | {
+        "thread_follow",
+        "message_bodies",
+        "message_body_unavailable",
+    }
     _derived_enabled = False
     _derived_ready = False
     _derived_input_seen = False
     _held_body_cleanup: tuple[str, ...] = ()
+    _accepted_unfollow: str | None = None
+
+    @contextmanager
+    def _derived_schema_step(self):
+        """Suspend runtime triggers only across a migration's schema replacement.
+
+        Keep the connection-local evidence tables and their accumulated rows;
+        restoring the same SQL keeps pre- and post-DDL writes at one owner.
+        """
+        enabled = self._derived_enabled
+        self._derived_enabled = False
+        try:
+            triggers = self.execute(
+                "SELECT name, sql FROM sqlite_temp_master "
+                "WHERE type='trigger' AND name GLOB 'derived_*' ORDER BY name"
+            ).fetchall()
+            for trigger in triggers:
+                name = str(trigger["name"]).replace('"', '""')
+                self.execute(f'DROP TRIGGER temp."{name}"')
+            yield
+            for trigger in triggers:
+                # sqlite_temp_master normalizes away TEMP in the saved SQL.
+                self.execute(
+                    str(trigger["sql"]).replace(
+                        "CREATE TRIGGER ",
+                        "CREATE TEMP TRIGGER ",
+                        1,
+                    )
+                )
+            self._derived_ready = bool(
+                self.execute(
+                    "SELECT 1 FROM sqlite_temp_master WHERE name='derived_changed_messages'"
+                ).fetchone()
+            )
+        finally:
+            self._derived_enabled = enabled
 
     def _prepare_derived_write(self, sql, parameters):
         if not self._derived_enabled or self._derived_ready:
@@ -5877,6 +6076,29 @@ class Store:
         self.path = path
 
     @contextmanager
+    def derived_connection(self, operation=None):
+        """The derived writer's explicit segment opens before its transaction."""
+        if operation is None:
+            with self.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                yield db
+            return
+        removal.require_operation_owner(operation, self.path)
+        with operation.acceptance() as acceptance, acceptance.transaction(self) as db:
+            yield db
+        if db._accepted_unfollow:
+            # The segment's transaction and guard have fully exited. Keep the
+            # existing native operation owner while physical work takes sources.
+            removal.resume(self)
+            with self.connection() as settled:
+                db._held_body_cleanup = tuple(r[0] for r in settled.execute(
+                    "SELECT t.message_id FROM message_removal_targets t "
+                    "JOIN message_removal_intents i ON i.intent_id=t.intent_id "
+                    "WHERE i.request_id=? AND t.state='pending' ORDER BY t.message_id",
+                    (db._accepted_unfollow,),
+                ))
+
+    @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         with database_admission():
             private_storage.validate_database(self.path)
@@ -5886,6 +6108,7 @@ class Store:
                 private_storage.validate_file(self.path)
                 connection.execute("PRAGMA recursive_triggers = ON")
                 connection.execute("PRAGMA secure_delete = ON")
+                connection.execute("PRAGMA foreign_keys = ON")
                 connection.row_factory = sqlite3.Row
                 connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
                 connection.create_function(
@@ -5909,6 +6132,11 @@ class Store:
                 changed: set[str] = set()
 
                 def track_inputs(action, table, column, database, trigger):
+                    if action == sqlite3.SQLITE_TRANSACTION and table in {"COMMIT", "ROLLBACK"}:
+                        for name in ("_migration_owner", "_removal_transaction"):
+                            owner = getattr(connection, name, None)
+                            if owner is not None:
+                                owner._invalidate()
                     if (
                         action
                         in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE, sqlite3.SQLITE_UPDATE)
@@ -5971,12 +6199,9 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Serialize backup plus migration across simultaneous desktop/scheduler
         # starts. Version is also read inside BEGIN IMMEDIATE below.
-        with connect_operation_lock(
-            self.path.with_name(self.path.name + ".upgrade.lock"),
-            "The mailbox database is being upgraded",
-            timeout_seconds=-1,
-        ):
+        with thread_migration.upgrade_owner(self.path) as migration_owner:
             fresh = not self.path.exists()
+            backup_target = SCHEMA_VERSION if SCHEMA_VERSION >= 36 else 33
             if self.path.exists():
                 with self.connection() as source:
                     version = source.execute("PRAGMA user_version").fetchone()[0]
@@ -5984,29 +6209,33 @@ class Store:
                         "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
                     ).fetchone()
                     fresh = retained is None
-                    if retained is not None and version < 33:
-                        thread_migration.write_backup(self.path, source)
+                    if retained is not None and version < backup_target:
+                        thread_migration.write_backup(
+                            self.path, source, target_schema=backup_target,
+                        )
             try:
-                self._initialize_locked()
+                self._initialize_locked(migration_owner)
             except Exception:
-                thread_migration.cleanup_backups(self.path, success=False)
+                thread_migration.cleanup_backups(
+                    self.path, success=False, target_schema=backup_target,
+                )
                 raise
-            thread_migration.cleanup_backups(self.path, success=True)
+            thread_migration.cleanup_backups(
+                self.path, success=True, target_schema=backup_target,
+            )
             if SCHEMA_VERSION >= 35:
                 try:
-                    source_locks.qualify_protocol(self, fresh=fresh)
+                    source_locks.initialize_protocol(self, fresh=fresh)
                 except (source_locks.SourceProtocolUnavailable, deployment.DeploymentError) as exc:
                     # The schema is available; source-protected work remains refused.
                     logging.getLogger(__name__).warning("Source-lock cutover deferred: %s", exc)
 
-    def _initialize_locked(self) -> None:
+    def _initialize_locked(self, migration_owner) -> None:
         private_storage.validate_database(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         migration_observed_at = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("BEGIN IMMEDIATE")
-            version = db.execute("PRAGMA user_version").fetchone()[0]
+        with migration_owner.transaction(self) as db:
+            version = migration_owner.version
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Database schema version {version} is newer than supported "
@@ -6370,6 +6599,8 @@ class Store:
             _migrate_sent_capture(db, migration_observed_at)
             if version < 31:
                 _migrate_source_observations(db, migration_observed_at)
+            if SCHEMA_VERSION >= 36:
+                removal.ensure_schema(db)
             _refresh_logical_messages_view(db)
             if version < 33:
                 thread_migration.rebuild_messages(db)
@@ -6382,6 +6613,10 @@ class Store:
             reconcile_state.ensure_schema(db)
             if version < 35:
                 db.execute("DELETE FROM reconcile_coverage")
+            if SCHEMA_VERSION >= 36:
+                if version < 36:
+                    removal.convert_saved_unfollow(db, migration_owner, now=datetime.now(UTC))
+                thread_migration.check_database(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -6403,8 +6638,13 @@ class Store:
             raise ValueError("Certificate ledger limit must be between 1 and 500")
 
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            eligible = (
+                removal.retained_available_sql("certificate", message_id_field="source_message_id")
+                if removal.has_schema(db) else "1"
+            )
             rows = db.execute(
-                """SELECT certificate.certificate_id, policy.policy_id, policy.ordinal,
+                f"""SELECT certificate.certificate_id, policy.policy_id, policy.ordinal,
                     length(certificate.canonical_result_json) AS canonical_result_bytes,
                     CASE WHEN COALESCE(dispatch.source_available, 1) = 1 AND EXISTS (
                         SELECT 1 FROM messages AS message
@@ -6421,6 +6661,7 @@ class Store:
                   ON policy.certificate_id = certificate.certificate_id
                 LEFT JOIN connect_job_dispatch AS dispatch
                   ON dispatch.job_id = certificate.connect_job_id
+                WHERE ({eligible})
                 ORDER BY CASE WHEN policy.expiration_date_iso IS NULL THEN 1 ELSE 0 END,
                     policy.expiration_date_iso, certificate.certificate_id, policy.ordinal
                 LIMIT ?""",
@@ -6727,12 +6968,12 @@ class Store:
         display_name: str,
         address: str | None = None,
         active: bool = False,
+        operation=None,
     ) -> MailAccount:
         if not provider or not account_id or not display_name:
             raise ValueError("Mail account identity and display name must be non-empty")
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             if active:
                 db.execute(
                     "UPDATE mail_accounts SET active = 0, updated_at = ? WHERE active = 1",
@@ -6756,9 +6997,10 @@ class Store:
         *,
         display_name: str,
         address: str,
+        operation=None,
     ) -> MailAccount:
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
+        with self.derived_connection(operation) as db:
             cursor = db.execute(
                 """UPDATE mail_accounts
                 SET display_name = ?, address = ?, updated_at = ?
@@ -6779,13 +7021,13 @@ class Store:
         *,
         legacy_status: str | None = None,
         preserve_cursor: bool = False,
+        operation=None,
     ) -> MailAccount:
         _require_mailbox_identity_key(mailbox_identity_key)
         if legacy_status not in {None, "continuity_proven", "replacement", "unresolved"}:
             raise ValueError("legacy mailbox identity status is invalid")
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             row = db.execute(
                 """SELECT mailbox_identity_key, legacy_identity_status,
                     legacy_identity_key FROM mail_accounts
@@ -7796,6 +8038,7 @@ class Store:
         admission: AdmissionProvenance | None = None,
         metadata_label_ids: frozenset[str] | None = None,
         now: datetime | None = None,
+        operation=None,
     ) -> bool:
         """Advance one terminal candidate, atomically inserting an admitted message."""
         _require_mailbox_identity_key(mailbox_identity_key)
@@ -7817,8 +8060,7 @@ class Store:
             # was admitted from; _record_locations refuses any other folder.
             raise ValueError("admitted recovery metadata must name an admitted folder")
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _row, state = self._require_current_gmail_recovery(
                 db,
                 account_id=account_id,
@@ -7933,10 +8175,10 @@ class Store:
         mailbox_identity_key: str,
         *,
         now: datetime | None = None,
+        operation=None,
     ) -> str:
         _require_mailbox_identity_key(mailbox_identity_key)
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _row, state = self._require_current_gmail_recovery(
                 db,
                 account_id=account_id,
@@ -8898,10 +9140,11 @@ class Store:
             raise RuntimeError("Automation fire disappeared after retry")
         return _automation_fire(updated)
 
-    def activate_mail_account(self, provider: str, account_id: str) -> MailAccount:
+    def activate_mail_account(
+        self, provider: str, account_id: str, *, operation=None,
+    ) -> MailAccount:
         stamp = datetime.now(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             if (
                 db.execute(
                     "SELECT 1 FROM mail_accounts WHERE provider = ? AND account_id = ?",
@@ -9319,7 +9562,12 @@ class Store:
 
     def reconcile_source(self, provider, account_id, mailbox_identity_key, source_id):
         with self.connection() as db:
-            db.execute("BEGIN")
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.source_available(
+                db, provider=provider, account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key, provider_message_id=source_id,
+            ):
+                return None
             row = db.execute(
                 _stored_source_membership_sql() + " LIMIT 1",
                 (provider, account_id, mailbox_identity_key, source_id),
@@ -9350,14 +9598,14 @@ class Store:
         locations,
         observed_at,
         scope_complete,
+        operation=None,
     ):
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             row = db.execute(
                 _stored_source_membership_sql() + " LIMIT 1",
                 (provider, account_id, mailbox_identity_key, metadata.message_id),
             ).fetchone()
-            if row is None:
+            if row is None or not removal.message_available(db, row["logical_id"]):
                 return
             logical_id = row["logical_id"]
             _record_locations(
@@ -9404,9 +9652,12 @@ class Store:
         mailbox_identity_key: str,
         *,
         now: datetime | None = None,
+        operation=None,
     ) -> None:
         """Record an account's polling gap through the source-observation owner."""
-        reconcile_state.ReconcileState(self, (provider, account_id, mailbox_identity_key)).gap(
+        reconcile_state.ReconcileState(
+            self, (provider, account_id, mailbox_identity_key), operation=operation,
+        ).gap(
             now=now
         )
 
@@ -9462,8 +9713,30 @@ class Store:
         )
         return (canonical, *others)
 
+    def source_start(
+        self, message_id=None, *, provider=None, account_id=None,
+        mailbox_identity_key=None, provider_message_id=None, include_unfollow=False,
+        automation_run_id=None,
+    ) -> bool:
+        """Serialize source admission with acceptance; release before external work."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if automation_run_id is not None:
+                return _automation_source_available(db, automation_run_id)
+            if message_id is not None:
+                return removal.message_available(db, message_id, include_unfollow=include_unfollow)
+            return removal.source_available(
+                db, provider=provider, account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=provider_message_id,
+                include_unfollow=include_unfollow,
+            )
+
     def message_source(self, message_id: str) -> MessageSource:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             row = db.execute(
                 """SELECT message_id, provider, account_id, provider_message_id,
                     received_at, discovered_at, mailbox_identity_key
@@ -9573,6 +9846,11 @@ class Store:
         ).fetchone()
         if account is None or account["mailbox_identity_key"] != mailbox_identity_key:
             raise MailboxIdentityChanged("mailbox identity changed")
+        if not removal.source_available(
+            db, message_id=message_id, provider=provider, account_id=account_id,
+            mailbox_identity_key=mailbox_identity_key, provider_message_id=source_message_id,
+        ):
+            return False
         if admission.kind == "gmail_user_label" and (
             db.execute(
                 """SELECT 1 FROM gmail_label_selectors AS l
@@ -9604,6 +9882,18 @@ class Store:
         thread_ids: tuple[str, ...] = ()
         merged: tuple[str, ...] = ()
         rfc_message_id = normalize_message_id(rfc_message_id)
+        logical_id = None
+        if rfc_message_id is not None:
+            logical_id = _logical_message_id(
+                db,
+                provider,
+                account_id,
+                mailbox_identity_key,
+                rfc_message_id,
+                other_than=source_message_id,
+            )
+        if logical_id is not None and not removal.message_available(db, logical_id):
+            return False
         if provider == "imap":
             thread_ids = tuple(
                 dict.fromkeys(
@@ -9627,38 +9917,29 @@ class Store:
             return False
         # A second location of an already-captured logical identity is recorded,
         # not captured again (contract D-identity).
-        if rfc_message_id is not None:
-            logical_id = _logical_message_id(
+        if logical_id is not None:
+            _record_locations(
                 db,
-                provider,
-                account_id,
-                mailbox_identity_key,
-                rfc_message_id,
-                other_than=source_message_id,
+                message_id=logical_id,
+                provider=provider,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=source_message_id,
+                locations=locations,
+                observed_at=discovered_at,
+                scope_complete=scope_complete,
+                headers_observed=True,
+                received_at=received_at,
             )
-            if logical_id is not None:
-                _record_locations(
-                    db,
-                    message_id=logical_id,
-                    provider=provider,
-                    account_id=account_id,
-                    mailbox_identity_key=mailbox_identity_key,
-                    provider_message_id=source_message_id,
-                    locations=locations,
-                    observed_at=discovered_at,
-                    scope_complete=scope_complete,
-                    headers_observed=True,
-                    received_at=received_at,
+            _record_recipients(db, message_id=logical_id, to=to, cc=cc)
+            _requeue_if_skipped(db, logical_id)
+            if provider == "imap":
+                # The copy's reply headers may bridge components (contract
+                # D-identity): the one re-key owner applies them as for a new row.
+                _apply_imap_component(
+                    db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
                 )
-                _record_recipients(db, message_id=logical_id, to=to, cc=cc)
-                _requeue_if_skipped(db, logical_id)
-                if provider == "imap":
-                    # The copy's reply headers may bridge components (contract
-                    # D-identity): the one re-key owner applies them as for a new row.
-                    _apply_imap_component(
-                        db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
-                    )
-                return False
+            return False
         cursor = db.execute(
             """INSERT OR IGNORE INTO messages(
                 message_id, provider, account_id, mailbox_identity_key, provider_message_id,
@@ -9732,10 +10013,10 @@ class Store:
         scope_complete: bool = True,
         capture_timezone: str | None = None,
         observed_at: datetime | None = None,
+        operation=None,
     ) -> bool:
         stamp = (observed_at or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             return self._insert_message_in_transaction(
                 db,
                 message_id=message_id,
@@ -9908,6 +10189,7 @@ class Store:
         scope_complete: bool = True,
         headers_observed: bool,
         now: datetime | None = None,
+        operation=None,
     ) -> int:
         """Record an observation of a stored source identity's folders; new rows.
 
@@ -9917,15 +10199,14 @@ class Store:
         Only accepted header observations may fill missing recipients.
         """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             # A source identity is known through its row or a recorded location, the
             # same two places has_seen_message reads (contract D-identity).
             row = db.execute(
                 f"{_stored_source_membership_sql()} LIMIT 1",
                 (provider, account_id, mailbox_identity_key, provider_message_id),
             ).fetchone()
-            if row is None:
+            if row is None or not removal.message_available(db, row["logical_id"]):
                 return 0
             recorded = _record_locations(
                 db,
@@ -10025,10 +10306,12 @@ class Store:
             name = next(row["display_name"] for row in rows if row["vendor_id"] == winner[2])
             return (key, str(name))
 
-    def create_vendor(self, display_name: str, *, now: datetime | None = None) -> str:
+    def create_vendor(
+        self, display_name: str, *, now: datetime | None = None, operation=None,
+    ) -> str:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         vendor_id = str(uuid.uuid4())
-        with self.connection() as db:
+        with self.derived_connection(operation) as db:
             db.execute(
                 """INSERT INTO vendors(vendor_id, display_name, created_at, updated_at)
                 VALUES (?, ?, ?, ?)""",
@@ -10037,10 +10320,11 @@ class Store:
         return vendor_id
 
     def rename_vendor(
-        self, vendor_id: str, display_name: str, *, now: datetime | None = None
+        self, vendor_id: str, display_name: str, *, now: datetime | None = None,
+        operation=None,
     ) -> None:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
+        with self.derived_connection(operation) as db:
             updated = db.execute(
                 "UPDATE vendors SET display_name = ?, updated_at = ? WHERE vendor_id = ?",
                 (display_name, stamp, vendor_id),
@@ -10049,12 +10333,12 @@ class Store:
             raise KeyError(vendor_id)
 
     def add_vendor_address(
-        self, vendor_id: str, address: str, *, now: datetime | None = None
+        self, vendor_id: str, address: str, *, now: datetime | None = None,
+        operation=None,
     ) -> bool:
         """Link an address; False if this vendor already has it."""
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _require_vendor(db, vendor_id)
             owner = db.execute(
                 """SELECT a.vendor_id, v.display_name FROM vendor_addresses AS a
@@ -10072,12 +10356,12 @@ class Store:
         return True
 
     def remove_vendor_address(
-        self, vendor_id: str, address: str, *, now: datetime | None = None
+        self, vendor_id: str, address: str, *, now: datetime | None = None,
+        operation=None,
     ) -> VendorRemoval:
         """Unlink an address and report the committed change and any held body cleanup."""
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             _require_vendor(db, vendor_id)
             removed = db.execute(
                 "DELETE FROM vendor_addresses WHERE vendor_id = ? AND address = ?",
@@ -10092,10 +10376,9 @@ class Store:
             )
         return VendorRemoval(True, held_message_ids=db._held_body_cleanup)
 
-    def delete_vendor(self, vendor_id: str) -> VendorRemoval:
+    def delete_vendor(self, vendor_id: str, *, operation=None) -> VendorRemoval:
         """Delete a vendor and report its addresses and any held body cleanup."""
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.derived_connection(operation) as db:
             addresses = [
                 str(row["address"])
                 for row in db.execute(
@@ -10108,145 +10391,27 @@ class Store:
                 raise KeyError(vendor_id)
         return VendorRemoval(True, tuple(addresses), db._held_body_cleanup)
 
-    def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
-        """Delete a logical message as one unit (contract D-identity).
-
-        The canonical row, every row pointing to it through logical_of, and a
-        suppression for each recorded source identity go together, so no copy is
-        recaptured after a cursor recovery.
-        """
+    def request_removal(
+        self, kind, parameters, *, acceptance=None, request_id=None, retention_days=30, now=None,
+    ):
+        removal.require_runtime_acceptance(acceptance, self.path)
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
-        with self.connection() as db:
-            unit = _logical_unit(db, message_id)
-        if unit is None:
+        if request_id is None:
+            request_id = removal.issue_key(
+                self, kind, parameters, retention_days=retention_days, now=stamp
+            )
+        return removal.accept(self, request_id, kind, parameters, now=stamp, acceptance=acceptance)
+
+    def delete_message(
+        self, message_id: str, *, acceptance=None, now: datetime | None = None,
+    ) -> bool:
+        try:
+            result = self.request_removal(
+                "delete", {"message_id": message_id}, now=now, acceptance=acceptance,
+            )
+            return bool(result.requested)
+        except KeyError:
             return False
-        with self._source_cleanup_locks(unit.rows) as acquired, self.connection() as db:
-            if not acquired:
-                raise LocalRemovalHeld((message_id,))
-            db.execute("BEGIN IMMEDIATE")
-            unit = _logical_unit(db, message_id)
-            if unit is None:
-                return False
-            db.executemany(
-                """INSERT INTO suppressed_messages(
-                        provider, account_id, message_key, expires_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(provider, account_id, message_key)
-                    DO UPDATE SET expires_at = excluded.expires_at""",
-                [
-                    (
-                        source.provider,
-                        source.account_id,
-                        _message_suppression_key(
-                            source.provider,
-                            source.account_id,
-                            source.provider_message_id,
-                            source.mailbox_identity_key,
-                        ),
-                        _suppression_expiry(source.received_at, stamp),
-                    )
-                    for source in unit.sources
-                ],
-            )
-            _mark_automation_sources_unavailable(db, unit.rows, updated_at=stamp.isoformat())
-            placeholders = ", ".join("?" for _ in unit.rows)
-            cursor = db.execute(
-                f"DELETE FROM messages WHERE message_id IN ({placeholders})", tuple(unit.rows)
-            )
-            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
-        return cursor.rowcount >= 1
-
-    def clear_messages(self, *, now: datetime | None = None) -> int:
-        """Delete every message, each logical message as one unit (contract D-identity).
-
-        A unit's rows are locked, suppressed, marked, and counted together; the
-        delete trigger removes the rows pointing at each canonical.
-        """
-        stamp = (now or datetime.now(UTC)).astimezone(UTC)
-        with self.connection() as db:
-            canonicals = [
-                str(row["message_id"])
-                for row in db.execute(
-                    "SELECT message_id FROM logical_messages ORDER BY message_id"
-                ).fetchall()
-            ]
-        deleted = 0
-        held: list[str] = []
-        for offset in range(0, len(canonicals), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
-            initial = canonicals[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
-            with self.connection() as db:
-                units = {key: _unit_rows(db, (key,)) for key in initial}
-            for chunk, unit_rows in self._source_cleanup_groups(units):
-                if not unit_rows:
-                    continue
-                with self._source_cleanup_locks(unit_rows) as acquired, self.connection() as db:
-                    if not acquired:
-                        held.extend(chunk)
-                        continue
-                    db.execute("BEGIN IMMEDIATE")
-                    current_rows = _unit_rows(db, chunk)
-                    if not current_rows:
-                        continue
-                    row_placeholders = ", ".join("?" for _ in current_rows)
-                    rows = db.execute(
-                        f"""SELECT message_id, provider, account_id, mailbox_identity_key,
-                            provider_message_id, received_at FROM messages
-                            WHERE message_id IN ({row_placeholders})""",
-                        tuple(current_rows),
-                    ).fetchall()
-                    # Recorded locations are source identities too (contract D-identity).
-                    located = db.execute(
-                        f"""SELECT m.provider, m.account_id, l.mailbox_identity_key,
-                            l.provider_message_id,
-                            COALESCE(l.received_at, m.received_at) AS received_at
-                        FROM message_locations AS l
-                        JOIN messages AS m ON m.message_id = l.message_id
-                        WHERE l.message_id IN ({row_placeholders})""",
-                        tuple(current_rows),
-                    ).fetchall()
-                    db.executemany(
-                        """INSERT INTO suppressed_messages(
-                                provider, account_id, message_key, expires_at
-                            ) VALUES (?, ?, ?, ?)
-                            ON CONFLICT(provider, account_id, message_key)
-                            DO UPDATE SET expires_at = excluded.expires_at""",
-                        [
-                            (
-                                str(row["provider"]),
-                                str(row["account_id"]),
-                                _message_suppression_key(
-                                    str(row["provider"]),
-                                    str(row["account_id"]),
-                                    str(row["provider_message_id"]),
-                                    (
-                                        str(row["mailbox_identity_key"])
-                                        if row["mailbox_identity_key"] is not None
-                                        else None
-                                    ),
-                                ),
-                                _suppression_expiry(str(row["received_at"]), stamp),
-                            )
-                            for row in (*rows, *located)
-                        ],
-                    )
-                    _mark_automation_sources_unavailable(
-                        db,
-                        current_rows,
-                        updated_at=stamp.isoformat(),
-                    )
-                    current_canonicals = [m for m in chunk if m in set(current_rows)]
-                    canonical_placeholders = ", ".join("?" for _ in current_canonicals)
-                    db.execute(
-                        f"DELETE FROM messages WHERE message_id IN ({canonical_placeholders})",
-                        tuple(current_canonicals),
-                    )
-                    deleted += len(current_rows)
-        if held:
-            raise LocalRemovalHeld(held, deleted=deleted)
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
-        return deleted
 
     def replace_attachments(
         self,
@@ -10314,12 +10479,19 @@ class Store:
     def _connect_job(row: sqlite3.Row) -> ConnectJob:
         return ConnectJob(**dict(row))
 
-    def connect_job(self, job_id: str) -> ConnectJob | None:
+    def connect_job(self, job_id: str, *, source_start: bool = False) -> ConnectJob | None:
         with self.connection() as db:
+            if source_start:
+                db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
-        return self._connect_job(row) if row else None
+            if row is None:
+                return None
+            job = self._connect_job(row)
+            if source_start and not _connect_source_available(db, job):
+                return None
+        return job
 
     @staticmethod
     def _connect_dispatch(row: sqlite3.Row) -> ConnectDispatch:
@@ -10347,10 +10519,21 @@ class Store:
 
     def connect_dispatch(self, job_id: str) -> ConnectDispatch | None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT * FROM connect_job_dispatch WHERE job_id = ?", (job_id,)
             ).fetchone()
-        return self._connect_dispatch(row) if row else None
+            if row is None:
+                return None
+            job = db.execute(
+                "SELECT message_id FROM connect_attachment_jobs WHERE job_id = ?", (job_id,),
+            ).fetchone()
+            if job is None:
+                raise RuntimeError("Connect dispatch is missing its job")
+            eligible = removal.message_available(db, str(job["message_id"]))
+            values = dict(row)
+            values["source_available"] = bool(row["source_available"]) and eligible
+        return self._connect_dispatch(values)
 
     def connect_queue_ahead(self, job_id: str) -> int:
         with self.connection() as db:
@@ -10666,6 +10849,7 @@ class Store:
             self._expire_waiting_connect_jobs_transaction(db, stamp)
             row = db.execute(
                 """SELECT j.*, d.state AS claim_dispatch_state,
+                    d.submission_possible AS claim_submission_possible,
                     CASE WHEN d.next_attempt_at IS NULL
                               OR aware_iso_epoch(d.next_attempt_at) <= aware_iso_epoch(?)
                          THEN 1 ELSE 0 END AS claim_is_due
@@ -10694,6 +10878,10 @@ class Store:
                 return None
             if row["claim_dispatch_state"] != "dispatching" and not bool(row["claim_is_due"]):
                 return None
+            eligible = removal.message_available(db, str(row["message_id"]))
+            if (not eligible and row["claim_dispatch_state"] == "waiting"
+                    and not bool(row["claim_submission_possible"])):
+                return None
             db.execute(
                 """UPDATE connect_job_dispatch
                 SET state = CASE
@@ -10721,7 +10909,9 @@ class Store:
             ).fetchone()
         if dispatch_row is None or job_row is None:
             raise RuntimeError("Claimed Connect job is missing dispatch state")
-        return self._connect_job(job_row), self._connect_dispatch(dispatch_row)
+        dispatch_values = dict(dispatch_row)
+        dispatch_values["source_available"] = bool(dispatch_row["source_available"]) and eligible
+        return self._connect_job(job_row), self._connect_dispatch(dispatch_values)
 
     @staticmethod
     def completed_connect_warnings(job: ConnectJob) -> list[dict[str, str]]:
@@ -10992,6 +11182,8 @@ class Store:
         stamp = created_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError((message_id, part_id))
             if (
                 db.execute(
                     """SELECT 1 FROM message_attachments
@@ -11133,6 +11325,7 @@ class Store:
             if current is None or current["status"] != expected_state:
                 raise RuntimeError("Connect job transition lost its expected-state race")
             current_job = self._connect_job(current)
+            target_available = _connect_source_available(db, current_job)
             if current_job.protocol_version == 2 and (
                 current_job.provider_app_id != provider_app_id
                 or current_job.provider_instance_id != provider_instance_id
@@ -11278,7 +11471,7 @@ class Store:
                 and not certificate_job
                 and dispatch_before is not None
                 and not bool(dispatch_before["source_available"])
-                and not deferred_interactive_fire
+                and (not deferred_interactive_fire or not target_available)
             )
             if discard_terminal:
                 fire_state = "completed" if next_state == "completed" else "failed"
@@ -11722,6 +11915,8 @@ class Store:
             ).fetchone()
             if current is None or current["status"] != expected_state:
                 raise RuntimeError("Connect job resubmission lost its expected-state race")
+            if not removal.message_available(db, str(current["message_id"])):
+                raise KeyError(str(current["message_id"]))
             is_v2 = int(current["protocol_version"]) == 2
             if is_v2:
                 dispatch = db.execute(
@@ -11914,6 +12109,9 @@ class Store:
 
     def automation_extraction_payloads(self, run_id: str) -> list[AutomationExtractionPayload]:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                return []
             rows = db.execute(
                 """SELECT * FROM automation_extraction_payloads
                 WHERE run_id = ? ORDER BY attempt_no""",
@@ -12027,6 +12225,9 @@ class Store:
 
     def automation_proposal(self, run_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                return None
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
                 JOIN automation_runs AS r
@@ -12038,6 +12239,9 @@ class Store:
 
     def automation_proposal_for_message(self, message_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                return None
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
                 JOIN automation_runs AS r
@@ -12177,6 +12381,8 @@ class Store:
         created_at = stamp.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             extraction = db.execute(
                 """SELECT status FROM automation_extraction_payloads
@@ -12756,6 +12962,8 @@ class Store:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute(
                 "SELECT * FROM automation_runs WHERE run_id = ?",
                 (run_id,),
@@ -12906,6 +13114,8 @@ class Store:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute(
                 "SELECT * FROM automation_runs WHERE run_id = ?",
                 (run_id,),
@@ -13030,6 +13240,8 @@ class Store:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not _automation_source_available(db, run_id):
+                raise KeyError(run_id)
             row = db.execute(
                 "SELECT * FROM automation_runs WHERE run_id = ?",
                 (run_id,),
@@ -13258,6 +13470,8 @@ class Store:
         context_at = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             row = db.execute(
                 """SELECT status, analysis_request_id, analysis_context_at,
                 analysis_body_char_limit FROM messages WHERE message_id = ?""",
@@ -13374,6 +13588,9 @@ class Store:
 
     def mark_fallback_notified(self, message_id: str) -> None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                return
             db.execute(
                 "UPDATE messages SET fallback_notified_at = ? WHERE message_id = ?",
                 (datetime.now(UTC).isoformat(), message_id),
@@ -13414,6 +13631,8 @@ class Store:
         stamp = admitted_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             source = db.execute(
                 """SELECT status, provider, account_id, provider_message_id, discovered_at,
                     mailbox_identity_key, sender, sender_name, subject
@@ -13588,6 +13807,9 @@ class Store:
 
     def mark_delivery_complete(self, message_id: str, notified: bool) -> None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                return
             db.execute(
                 """UPDATE messages SET status='summarized', next_retry_at=NULL,
                 last_error=NULL, notified_at=? WHERE message_id=?""",
@@ -13601,6 +13823,10 @@ class Store:
         kind: str | None = None,
     ) -> list[NotificationIntent]:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            source_eligible = (
+                _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+            )
             rows = db.execute(
                 f"""SELECT subject_type, subject_id, revision, message_id, kind,
                     sender, sender_name, subject, analysis_at, priority, summary,
@@ -13664,6 +13890,7 @@ class Store:
                 WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
                   AND r.review_notified_at IS NULL
                   AND NOT {_RUN_OF_A_CHILD_ROW}
+                  AND ({source_eligible})
                 ) AS intents
                 WHERE (? IS NULL OR kind = ?)
                 ORDER BY sort_at LIMIT ?""",
@@ -13673,6 +13900,10 @@ class Store:
 
     def notification_intent_count(self) -> int:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            source_eligible = (
+                _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+            )
             row = db.execute(
                 f"""SELECT
                     (SELECT COUNT(*) FROM logical_messages
@@ -13683,7 +13914,8 @@ class Store:
                     (SELECT COUNT(*) FROM automation_runs AS r
                      WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
                        AND r.review_notified_at IS NULL
-                       AND NOT {_RUN_OF_A_CHILD_ROW}) AS count"""
+                       AND NOT {_RUN_OF_A_CHILD_ROW}
+                       AND ({source_eligible})) AS count"""
             ).fetchone()
         return int(row["count"])
 
@@ -13716,6 +13948,8 @@ class Store:
             stamp = datetime.now(UTC).isoformat()
             with self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
+                if not _automation_source_available(db, run_id):
+                    raise KeyError(run_id)
                 row = db.execute(
                     """SELECT state, state_version, review_notified_at
                     FROM automation_runs WHERE run_id = ?""",
@@ -13745,6 +13979,8 @@ class Store:
         stamp = datetime.now(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not removal.message_available(db, message_id):
+                raise KeyError(message_id)
             row = db.execute(
                 """SELECT status, analysis_at, fallback_notified_at, notified_at, last_error
                 FROM messages WHERE message_id = ?""",
@@ -14267,6 +14503,7 @@ class Store:
         polled_scope: tuple[str, str, str] | None = None,
     ) -> PurgeOutcome:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
+        removal.retire(self, retention_days, now=stamp)
         cutoff = stamp - timedelta(days=retention_days)
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         stamp_epoch = (stamp - epoch).total_seconds()
@@ -14276,6 +14513,11 @@ class Store:
         expired_units, expiry_parameters = _logical_messages_past_cutoff_sql(
             cutoff_epoch, stamp_epoch
         )
+        # Age alone is not cleanup authority for a pending logical removal.
+        # Both retention paths select through the shared eligibility projection;
+        # the completion owner settles its frozen targets and bytes together.
+        expired_units = f"""SELECT expired.canonical FROM ({expired_units}) expired
+            JOIN logical_messages visible ON visible.message_id=expired.canonical"""
         followed_expired_units = expired_units
         expired_units = f"""SELECT canonical FROM ({expired_units}) WHERE NOT EXISTS (
             SELECT 1 FROM messages m JOIN thread_follow f

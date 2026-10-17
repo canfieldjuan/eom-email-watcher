@@ -2037,9 +2037,28 @@ def test_inbox_delete_and_clear_are_local_only_and_explicit(
     missing = engine_api._response(request(config_path, "inbox.delete", {"message_id": "missing"}))
     cleared = engine_api._response(request(config_path, "inbox.clear"))
 
-    assert deleted["data"] == {"deleted": True, "message_id": "message-1"}
+    with runtime.store.connection() as db:
+        keys = {row["kind"]: row["request_id"] for row in db.execute(
+            "SELECT kind,request_id FROM message_removal_requests"
+        )}
+        intents = {kind: [row[0] for row in db.execute(
+            "SELECT intent_id FROM message_removal_intents WHERE request_id=? ORDER BY intent_id",
+            (key,),
+        )] for kind, key in keys.items()}
+    assert set(keys) == {"delete", "clear"}
+    assert all(len(ids) == 1 for ids in intents.values())
+    assert deleted["data"] == {
+        "deleted": True, "message_id": "message-1", "request_id": keys["delete"],
+        "intent_ids": intents["delete"], "outcome": "completed", "requested": 1,
+        "completed": 1, "pending": 0, "message": None,
+    }
+    assert type(deleted["data"]["deleted"]) is bool
     assert missing["error"]["code"] == "not_found"
-    assert cleared["data"] == {"deleted": 1}
+    assert cleared["data"] == {
+        "deleted": 1, "request_id": keys["clear"], "intent_ids": intents["clear"],
+        "outcome": "completed", "requested": 1, "completed": 1, "pending": 0, "message": None,
+    }
+    assert type(cleared["data"]["deleted"]) is int
     assert runtime.store.recent(10) == []
     assert runtime.store.state()[0] == "100"
 
@@ -2789,7 +2808,7 @@ def test_gmail_authorize_holds_operation_lock_through_baseline_initialization(
         original_set_state(history_id, provider=provider, account_id=account_id)
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
-    monkeypatch.setattr(engine_api, "operation_lock", account_operation_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", account_operation_lock)
     monkeypatch.setattr(engine_api, "_runtime", lambda request: runtime)
     monkeypatch.setattr(runtime.store, "state", state)
     monkeypatch.setattr(runtime.store, "set_state", set_state)
@@ -5661,7 +5680,9 @@ def test_production_check_rejects_config_change_while_acquiring_operation_lock(
         yield
 
     monkeypatch.setattr(engine_api, "load_runtime", load_runtime_after_lock)
-    monkeypatch.setattr(engine_api, "operation_lock", shorten_retention_before_lock_entry)
+    monkeypatch.setattr(
+        engine_api.removal, "connect_operation_lock", shorten_retention_before_lock_entry,
+    )
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: ExpiredGmail())
 
     response = engine_api._response(request(config_path, "watcher.check"))
@@ -6002,7 +6023,7 @@ def test_watchlist_mutations_hold_production_operation_lock(
         return original_remove_sender(path, email)
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
-    monkeypatch.setattr(engine_api, "operation_lock", mailbox_operation_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", mailbox_operation_lock)
     monkeypatch.setattr(engine_api, "add_sender", add_sender_while_locked)
     monkeypatch.setattr(engine_api, "remove_sender", remove_sender_while_locked)
 
@@ -6035,7 +6056,7 @@ def test_watchlist_mutations_fail_closed_when_production_lock_is_busy(
         yield
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
-    monkeypatch.setattr(engine_api, "operation_lock", busy_operation_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", busy_operation_lock)
     response = engine_api._response(
         request(config_path, operation, {"email": "new@example.com"})
     )
@@ -6546,7 +6567,7 @@ def test_zero_sender_check_is_inactive_without_gmail_and_uses_operation_lock(
         yield
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
-    monkeypatch.setattr(engine_api, "operation_lock", acquired_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", acquired_lock)
 
     response = engine_api._response(request(config_path, "watcher.check"))
 
@@ -6653,8 +6674,23 @@ def test_check_defers_delivery_until_state_checked_ack(
     patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
+    derived = loaded.store.derived_connection
+    owners = []
+
+    @contextmanager
+    def owned_connection(operation=None):
+        engine_api.removal.require_operation_owner(operation, loaded.store.path)
+        with derived(operation) as db:
+            db._removal_transaction.require(db)
+            owners.append(operation)
+            yield db
+
+    monkeypatch.setattr(loaded.store, "derived_connection", owned_connection)
     checked = engine_api._response(request(config_path, "watcher.check"))
     assert checked["ok"] is True
+    assert owners and all(owner is owners[0] for owner in owners)
+    with pytest.raises(RuntimeError, match="runtime operation owner"):
+        owners[0].require(loaded.store.path)
     assert checked["data"]["summarized"] == 1
     assert checked["data"]["pending_notifications"] == 1
     assert loaded.store.recent(1)[0]["status"] == "analyzed"
@@ -6886,7 +6922,7 @@ def test_catalog_failure_remains_primary_while_processing_persisted_pending_work
     def available_lock(_path: Path, _busy_message: str):
         yield
 
-    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", available_lock)
 
     response = engine_api._response(request(config_path, "watcher.check"))
 
@@ -6980,7 +7016,7 @@ def test_gmail_catalog_403_incomplete_body_fails_closed_through_engine_response(
     def available_lock(_path: Path, _busy_message: str):
         yield
 
-    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", available_lock)
 
     with caplog.at_level(logging.WARNING, logger=engine_api.__name__):
         response = engine_api._response(
@@ -7883,7 +7919,7 @@ def test_automation_rule_operations_expose_one_cas_lifecycle(
     def available_lock(path: Path, busy_message: str):
         yield
 
-    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", available_lock)
     created = engine_api._response(
         request(
             config_path,
@@ -7983,7 +8019,7 @@ def test_automation_rule_lock_contention_is_retryable_mailbox_busy(
         raise engine_api.OperationLockBusy(busy_message)
         yield
 
-    monkeypatch.setattr(engine_api, "operation_lock", busy_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", busy_lock)
     response = engine_api._response(
         request(
             config_path,
@@ -8071,7 +8107,7 @@ def test_account_scoped_rule_create_rejects_limit_before_mailbox_reconciliation(
         yield
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
-    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", available_lock)
     patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
@@ -8167,7 +8203,7 @@ def test_account_scoped_rule_edit_rejects_before_mailbox_reconciliation(
         yield
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
-    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", available_lock)
     patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
@@ -8229,7 +8265,7 @@ def test_account_scoped_rule_verification_and_commit_share_operation_lock(
         return original_put(*args, **kwargs)
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
-    monkeypatch.setattr(engine_api, "operation_lock", operation_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", operation_lock)
     patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
@@ -8377,7 +8413,7 @@ def test_watched_save_membership_and_commit_share_watchlist_mutation_lock(
     write_config(config_path)
     held = False
     observations = []
-    original_lock = engine_api.operation_lock
+    original_lock = engine_api.removal.connect_operation_lock
     original_allowlist = config_module.Config.allowlist.fget
     original_put = Store.put_automation_rule
 
@@ -8407,7 +8443,7 @@ def test_watched_save_membership_and_commit_share_watchlist_mutation_lock(
         observations.append("commit")
         return original_put(store, *args, **kwargs)
 
-    monkeypatch.setattr(engine_api, "operation_lock", tracked_lock)
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", tracked_lock)
     monkeypatch.setattr(config_module.Config, "allowlist", property(allowlist))
     monkeypatch.setattr(Store, "put_automation_rule", put)
     definition = _automation_definition()

@@ -134,9 +134,12 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
     def persist(*args):
         raise refusal
 
+    source_checks = []
     runtime = SimpleNamespace(
         store=SimpleNamespace(
             source_locks=lambda *args, **kwargs: nullcontext(),
+            connect_job=lambda _: SimpleNamespace(message_id="public-message"),
+            source_start=lambda message_id: source_checks.append(message_id) or True,
             connect_dispatch=lambda _: SimpleNamespace(
                 source_available=True, required_manifest_features=()
             ),
@@ -175,6 +178,7 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
                 inactive_dispatch_state="waiting",
             )
     assert observed.value is refusal
+    assert source_checks == (["public-message"] if path == "legacy" else [])
 
 
 def test_database_connection_checks_each_later_open(tmp_path, paired_deployment):

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import local_removal
 from connect_automate import locking
 
 from eom_email_watcher import db as db_module
@@ -126,7 +127,11 @@ from pathlib import Path
 from eom_email_watcher.db import Store
 
 print("waiting", flush=True)
-deleted = Store(Path(sys.argv[1])).delete_message(sys.argv[2])
+from eom_email_watcher.removal import acceptance_scope
+
+store = Store(Path(sys.argv[1]))
+with acceptance_scope(store) as acceptance:
+    deleted = store.delete_message(sys.argv[2], acceptance=acceptance)
 print("deleted" if deleted else "missing", flush=True)
 """
 
@@ -624,9 +629,11 @@ def test_extraction_transport_failure_preserves_request_and_retry_schedule(
 
 def test_schema_14_payload_table_migrates_retry_and_organizer_fields(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     with store.connection() as db:
         for column in (
             "organizer_address",
@@ -806,7 +813,7 @@ def test_source_cleanup_deletes_extraction_payload_and_transitions_active_run(
         organizer_address="owner@example.com",
     )
 
-    assert store.delete_message("local-scheduling") is True
+    assert local_removal(store, "delete_message", "local-scheduling") is True
 
     tombstone = store.automation_run(detected.run_id)
     assert tombstone is not None
@@ -1094,7 +1101,7 @@ def test_source_cleanup_deletes_calendar_proposal_and_tombstones_review(
         observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
     )
 
-    assert store.delete_message("local-scheduling") is True
+    assert local_removal(store, "delete_message", "local-scheduling") is True
 
     tombstone = store.automation_run(proposing.run_id)
     assert tombstone is not None
@@ -1305,9 +1312,12 @@ def test_expired_confirmation_can_enter_review_when_refresh_is_invalid(
     assert (reviewed.state, reviewed.failure_code) == ("manual_review", "proposal_invalid")
 
 
-def test_schema_16_calendar_proposal_migration_preserves_payload(tmp_path: Path) -> None:
+def test_schema_16_calendar_proposal_migration_preserves_payload(
+    tmp_path: Path, pre36_schema,
+) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     proposing, extraction = proposing_scheduling_run(store)
     store.record_automation_proposal(
         proposing.run_id,
@@ -1344,9 +1354,11 @@ def test_schema_16_calendar_proposal_migration_preserves_payload(tmp_path: Path)
 
 def test_schema_17_migrates_every_durable_microsoft_principal_reference(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     account_id = f"microsoft365-{'a' * 32}"
     home_account_id = "home-account-id"
     tenant_id = "tenant-id"
@@ -1456,9 +1468,11 @@ def test_schema_17_migrates_every_durable_microsoft_principal_reference(
 def test_schema_17_principal_migration_does_not_rewrite_unrecognized_keys(
     tmp_path: Path,
     principal_key_kind: str,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / principal_key_kind / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     home_account_id = "home-account-id"
     object_id = "object-id"
     current_key = MicrosoftPrincipal(
@@ -1512,10 +1526,13 @@ def test_runtime_principal_migration_rejects_non_sha256_keys(
         )
 
 
-def test_failed_schema_17_proposal_rebuild_rolls_back_and_can_retry(tmp_path: Path) -> None:
+def test_failed_schema_17_proposal_rebuild_rolls_back_and_can_retry(
+    tmp_path: Path, pre36_schema,
+) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     proposing, extraction = proposing_scheduling_run(store)
     store.record_automation_proposal(
         proposing.run_id,
@@ -1808,7 +1825,7 @@ def test_source_cleanup_cancels_authorized_write_before_submission(tmp_path: Pat
         now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
     )
 
-    assert store.delete_message("local-scheduling") is True
+    assert local_removal(store, "delete_message", "local-scheduling") is True
 
     run = store.automation_run(proposing.run_id)
     write = store.automation_calendar_write(proposing.run_id)
@@ -1868,7 +1885,7 @@ def test_source_unavailable_notification_survives_source_deletion(tmp_path: Path
     store.initialize()
     detected = admitted_scheduling_run(store)
 
-    assert store.delete_message("local-scheduling") is True
+    assert local_removal(store, "delete_message", "local-scheduling") is True
 
     intent = next(item for item in store.notification_intents() if item.kind == "automation_review")
     assert intent.subject_id == detected.run_id
@@ -1931,7 +1948,7 @@ def test_automation_events_are_immutable_and_source_delete_is_atomic(
             )
 
     removed_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
-    assert store.delete_message(raw_gmail_id, now=removed_at)
+    assert local_removal(store, "delete_message", raw_gmail_id, now=removed_at)
     tombstone = store.automation_run(detected.run_id)
     assert tombstone is not None
     assert (tombstone.state, tombstone.state_version) == ("source_unavailable", 2)
@@ -2051,7 +2068,7 @@ def test_bulk_cleanup_makes_detected_automation_source_unavailable(
 
     cleanup_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
     if cleanup == "clear":
-        assert store.clear_messages(now=cleanup_at) == 3
+        assert local_removal(store, "request_removal", "clear", {}, now=cleanup_at).completed == 3
     else:
         assert store.purge(30, now=cleanup_at) == 3
 
@@ -2098,9 +2115,9 @@ def test_manual_cleanup_purges_automation_after_source_expiry(
 
     cleanup_at = datetime(2026, 3, 1, 12, tzinfo=UTC)
     if cleanup == "delete":
-        assert store.delete_message("m1", now=cleanup_at)
+        assert local_removal(store, "delete_message", "m1", now=cleanup_at)
     else:
-        assert store.clear_messages(now=cleanup_at) == 1
+        assert local_removal(store, "request_removal", "clear", {}, now=cleanup_at).completed == 1
 
     assert store.automation_run(run.run_id) is None
     assert store.automation_events(run.run_id) == []
@@ -2129,7 +2146,7 @@ def test_mailbox_state_identity_and_suppression_are_account_scoped(
         subject="Gmail",
         received_at="2026-08-31T12:00:00+00:00",
     )
-    assert store.delete_message(source_id)
+    assert local_removal(store, "delete_message", source_id)
     assert store.has_seen_message(source_id, provider="gmail", account_id="gmail-default")
     assert not store.has_seen_message(source_id, provider="microsoft365", account_id="account-2")
 
@@ -2271,8 +2288,10 @@ def test_gmail_validation_schema_bump_rejects_previous_binary(
 
 def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selectors(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
-    store, identity = _gmail_selector_store(tmp_path)
+    with pre36_schema():
+        store, identity = _gmail_selector_store(tmp_path)
     revision, selector = store.add_gmail_label_selector(
         "gmail-default", identity, "Label_1", "Invoices", 0
     )
@@ -2303,8 +2322,10 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
 
 def test_schema_26_migrates_current_validation_with_explicit_catalog_state(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
-    store, identity = _gmail_selector_store(tmp_path)
+    with pre36_schema():
+        store, identity = _gmail_selector_store(tmp_path)
     revision, _selector = store.add_gmail_label_selector(
         "gmail-default", identity, "Label_1", "Invoices", 0
     )
@@ -3986,8 +4007,8 @@ def test_delete_message_cascades_local_state_and_prevents_rediscovery(
     create_connect_job(store, "33333333-3333-4333-8333-333333333333")
     store.record_failure("m1", "model unavailable", 0)
 
-    assert store.delete_message("m1", now=datetime(2026, 9, 1, 12, tzinfo=UTC))
-    assert not store.delete_message("m1")
+    assert local_removal(store, "delete_message", "m1", now=datetime(2026, 9, 1, 12, tzinfo=UTC))
+    assert not local_removal(store, "delete_message", "m1")
     assert store.recent(10) == []
     assert store.notification_intents() == []
     assert store.state() == ("100", "2026-09-01T00:00:00+00:00")
@@ -4056,7 +4077,7 @@ def test_delete_message_bounds_suppression_when_source_time_conversion_overflows
     )
     now = datetime(2026, 9, 1, 12, tzinfo=UTC)
 
-    assert store.delete_message("overflowing-source-time", now=now)
+    assert local_removal(store, "delete_message", "overflowing-source-time", now=now)
 
     with store.connection() as db:
         expires_at = db.execute("SELECT expires_at FROM suppressed_messages").fetchone()[0]
@@ -4084,7 +4105,9 @@ def test_clear_messages_preserves_mailbox_and_outbound_state(tmp_path: Path) -> 
             (datetime(2026, 9, 1, tzinfo=UTC).isoformat(),),
         )
 
-    assert store.clear_messages(now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 2
+    assert local_removal(
+        store, "request_removal", "clear", {}, now=datetime(2026, 9, 1, 12, tzinfo=UTC),
+    ).completed == 2
     assert store.recent(10) == []
     assert store.state() == ("200", "2026-09-01T00:00:00+00:00")
     assert store.outbound_status("monthly-hours:2026-08") == "sent"
@@ -4134,7 +4157,7 @@ def test_clear_messages_bounds_simultaneously_held_source_locks(
         lambda *args, **kwargs: TrackingLock(),
     )
 
-    assert store.clear_messages() == 5
+    assert local_removal(store, "request_removal", "clear", {}).completed == 5
     assert maximum == 2
     assert active == 0
 
@@ -4155,7 +4178,7 @@ def test_manual_delete_suppression_overlaps_maximum_retention_boundary(
         received_at=received_at.isoformat(),
     )
 
-    assert store.delete_message("boundary-message", now=received_at)
+    assert local_removal(store, "delete_message", "boundary-message", now=received_at)
     assert store.purge(MAX_RETENTION_DAYS, now=expires_at) == 0
     assert not store.add_message(
         message_id="boundary-message",
@@ -4648,10 +4671,12 @@ def downgrade_connect_jobs_to_v5(database: Path) -> None:
 
 def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     job_id = "33333333-3333-4333-8333-333333333333"
     create_connect_job(store, job_id)
@@ -4754,9 +4779,11 @@ def test_failed_v5_connect_migration_rolls_back_without_losing_legacy_rows(
 
 def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     store = Store(tmp_path / "watcher.sqlite3")
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     assert store.add_message(
         message_id="already-analyzed",
         thread_id=None,
@@ -4864,10 +4891,12 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
 
 def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     store.put_automation_rule(
         {
@@ -4980,10 +5009,11 @@ def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
         assert "idx_automation_fires_message" in indexes
 
 
-def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path) -> None:
+def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path, pre36_schema) -> None:
     database = tmp_path / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     store.put_automation_rule(
         {
@@ -5043,10 +5073,12 @@ def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path) -> 
 
 def test_schema_22_marks_incomplete_legacy_dispatch_capability_authority_unknown(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     legacy_job_id = "33333333-3333-4333-8333-333333333333"
     create_v2_connect_job(store, legacy_job_id)
@@ -5651,10 +5683,13 @@ def test_authoritative_provider_progress_resets_reconciliation_backoff(
     assert dispatch.last_error_message is None
 
 
-def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(tmp_path: Path) -> None:
+def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(
+    tmp_path: Path, pre36_schema,
+) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     requested_id = "33333333-3333-4333-8333-333333333333"
     accepted_id = "44444444-4444-4444-8444-444444444444"
@@ -5687,10 +5722,12 @@ def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(tmp_path: Pa
 
 def test_initialize_preserves_legacy_active_v2_duplicates_until_reconciled(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     first_id = "33333333-3333-4333-8333-333333333333"
     second_id = "44444444-4444-4444-8444-444444444444"
@@ -5769,7 +5806,7 @@ def test_message_delete_preserves_provider_owned_job_as_content_free_tombstone(
         provider_instance_id="11111111-1111-4111-8111-111111111111",
     )
 
-    assert store.delete_message("m1") is True
+    assert local_removal(store, "delete_message", "m1") is True
 
     assert store.connect_job(job_id) is not None
     dispatch = store.connect_dispatch(job_id)
@@ -5807,10 +5844,12 @@ def test_message_delete_preserves_provider_owned_job_as_content_free_tombstone(
 
 def test_initialize_replaces_v6_active_index_without_losing_jobs(
     tmp_path: Path,
+    pre36_schema,
 ) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
-    store.initialize()
+    with pre36_schema():
+        store.initialize()
     seed_pdf_attachment(store)
     create_v2_connect_job(
         store,
@@ -6254,14 +6293,15 @@ def test_deleting_a_message_removes_its_body_counts(tmp_path: Path) -> None:
     store = _truncation_store(tmp_path, "m1")
     store.mark_analyzed("m1", _truncation_analysis(), body_chars=5, body_source_chars=9)
 
-    assert store.delete_message("m1") is True
+    assert local_removal(store, "delete_message", "m1") is True
 
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
 
 
-def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path) -> None:
-    store = _truncation_store(tmp_path, "m1")
+def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path, pre36_schema) -> None:
+    with pre36_schema():
+        store = _truncation_store(tmp_path, "m1")
     store.mark_analyzed("m1", _truncation_analysis())
     with store.connection() as db:
         db.execute("DROP TRIGGER messages_body_counts_consistent_insert")
@@ -6457,7 +6497,7 @@ def test_deleting_a_components_last_message_releases_its_ids(tmp_path: Path) -> 
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     only = _imap_message(store, "1", "solo@x")
-    assert store.delete_message(only) is True
+    assert local_removal(store, "delete_message", only) is True
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0] == 0
     fresh = _imap_message(store, "2", "reply@x", ("solo@x",))
@@ -6575,7 +6615,7 @@ def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
     # The retained row stored the raw header <old-root@x>; a reply names it bare.
     reply = _imap_message(migrated, "2", "reply@x", ("old-root@x",))
     assert _thread_keys(migrated)[reply] == keys[old]
-    assert migrated.delete_message(old) is True
+    assert local_removal(migrated, "delete_message", old) is True
     with migrated.connection() as db:
         assert db.execute(
             "SELECT 1 FROM imap_reply_header_gaps WHERE message_id = ?", (old,)
@@ -6716,7 +6756,7 @@ def test_a_suppressed_bridging_message_changes_no_component(tmp_path: Path) -> N
     one = _imap_message(store, "1", "root-one@x")
     two = _imap_message(store, "2", "root-two@x")
     bridge = _imap_message(store, "3", "bridge@x", ("root-one@x", "root-two@x"))
-    assert store.delete_message(bridge) is True
+    assert local_removal(store, "delete_message", bridge) is True
     before = _thread_keys(store)
     with store.connection() as db:
         registered = db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0]
@@ -6743,7 +6783,7 @@ def test_a_suppressed_message_cannot_bridge_separate_components(tmp_path: Path) 
     one = _imap_message(store, "1", "root-one@x")
     two = _imap_message(store, "2", "root-two@x")
     lone = _imap_message(store, "3", "lone@x")
-    assert store.delete_message(lone) is True
+    assert local_removal(store, "delete_message", lone) is True
     before = _thread_keys(store)
     assert before[one] != before[two]
 
@@ -7046,7 +7086,7 @@ def test_deleting_a_message_removes_its_recipients_and_locations(tmp_path: Path)
         subject="S", received_at="2026-08-29T12:00:00+00:00",
         to=("a@vendor.com",), locations=frozenset({"inbox", "sent"}),
     )
-    assert store.delete_message("gmail-gone") is True
+    assert local_removal(store, "delete_message", "gmail-gone") is True
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM message_recipients").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM message_locations").fetchone()[0] == 0
@@ -7086,7 +7126,7 @@ def test_deleting_any_row_of_a_logical_message_removes_the_unit_and_suppresses_e
     ) is False
 
     # Deleting through the duplicate's id resolves the unit.
-    assert migrated.delete_message(duplicate) is True
+    assert local_removal(migrated, "delete_message", duplicate) is True
 
     with migrated.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
@@ -7095,7 +7135,7 @@ def test_deleting_any_row_of_a_logical_message_removes_the_unit_and_suppresses_e
         assert migrated.has_seen_message(
             source, provider="imap", account_id="imap-account", mailbox_identity_key=identity
         ), source
-    assert migrated.delete_message(root) is False
+    assert local_removal(migrated, "delete_message", root) is False
 
 
 def test_clearing_messages_suppresses_recorded_locations_too(tmp_path: Path) -> None:
@@ -7121,7 +7161,7 @@ def test_clearing_messages_suppresses_recorded_locations_too(tmp_path: Path) -> 
         locations=frozenset({"sent"}),
     ) is False
 
-    assert store.clear_messages() == 1
+    assert local_removal(store, "request_removal", "clear", {}).completed == 1
 
     for source in ("imap:mailbox:44:1", "imap:sent:77:4"):
         assert store.has_seen_message(
@@ -7388,24 +7428,71 @@ def test_upgrade_assumes_inbox_and_the_first_observation_stamps_it(tmp_path: Pat
     assert recorded() == [observed_at.isoformat()]
 
 
-def test_clear_messages_removes_logical_units_whole(tmp_path: Path) -> None:
+@pytest.mark.parametrize("transport", ["store", "api"])
+def test_clear_messages_removes_logical_units_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport,
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from test_service import config
+
+    from eom_email_watcher import engine_api, removal
+
     store, root, duplicate = _coalesced_pair(tmp_path)
     lone = _imap_message(store, "3", None)
     root_scope = _source_scope(store, root)
     duplicate_scope = _source_scope(store, duplicate)
+    lone_scope = _source_scope(store, lone)
+    with store.connection() as db:
+        before_ids = {r[0] for r in db.execute("SELECT message_id FROM messages")}
+        assert len(before_ids) == 3
+        assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 2
+    later = []
+    original_resume = removal.resume
 
-    assert store.clear_messages() == 3
+    def arrive_after_acceptance(active_store, *, now=None):
+        if not later:
+            later.append(_imap_message(active_store, "4", "later@x"))
+        return original_resume(active_store, now=now)
+
+    monkeypatch.setattr(removal, "resume", arrive_after_acceptance)
+    if transport == "api":
+        cfg = replace(config(tmp_path), database_file=store.path)
+        monkeypatch.setattr(
+            engine_api, "_runtime", lambda _: SimpleNamespace(store=store, config=cfg),
+        )
+        response = engine_api._response({
+            "protocol": 1, "operation": "inbox.clear", "payload": {},
+        })
+        assert response["ok"], response
+        data = response["data"]
+        assert data["deleted"] == 2 and type(data["deleted"]) is int
+    else:
+        data = local_removal(store, "request_removal", "clear", {}).data()
+    assert data["requested"] == data["completed"] == 2
+    assert data["pending"] == 0 and data["outcome"] == "completed"
     assert not store.has_message(root)
     assert not store.has_message(duplicate)
     assert not store.has_message(lone)
     # Every source identity of the unit is suppressed, the child's included.
-    for scope in (root_scope, duplicate_scope):
+    for scope in (root_scope, duplicate_scope, lone_scope):
         assert store.has_seen_message(
             scope["provider_message_id"],
             provider=scope["provider"],
             account_id=scope["account_id"],
             mailbox_identity_key=scope["mailbox_identity_key"],
         )
+    with store.connection() as db:
+        remaining_ids = {r[0] for r in db.execute("SELECT message_id FROM messages")}
+        assert len(before_ids - remaining_ids) == 3
+        assert remaining_ids == set(later)
+        assert {r[0] for r in db.execute(
+            "SELECT t.message_id FROM message_removal_targets t "
+            "JOIN message_removal_intents i USING(intent_id) WHERE i.request_id=?",
+            (data["request_id"],),
+        )} == before_ids
+    assert store.has_message(later[0])
 
 
 def test_inbox_lists_a_coalesced_message_once(tmp_path: Path) -> None:
@@ -8398,7 +8485,7 @@ def test_a_deleted_location_copy_is_suppressed_for_its_own_retention(tmp_path: P
         locations=frozenset({"sent"}),
     )
 
-    assert store.delete_message(root, now=datetime(2026, 9, 10, tzinfo=UTC))
+    assert local_removal(store, "delete_message", root, now=datetime(2026, 9, 10, tzinfo=UTC))
     with store.connection() as db:
         rows = db.execute(
             "SELECT message_key, expires_at FROM suppressed_messages ORDER BY expires_at"

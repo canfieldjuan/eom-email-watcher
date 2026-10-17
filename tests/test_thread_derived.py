@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import local_removal
 from test_db import Store, _upgraded_completed_legacy_message
 
 from eom_email_watcher import db as db_module
@@ -98,7 +99,7 @@ def test_deleted_last_message_drops_follow_and_derived(tmp_path: Path):
     store = Store(tmp_path / "mail.db")
     store.initialize()
     seed(store)
-    store.delete_message("m")
+    local_removal(store, "delete_message", "m")
     assert derived(store) is None
     assert follow(store) == []
 
@@ -203,7 +204,7 @@ def test_follow_owner_uses_received_time_not_arrival(tmp_path, order):
             received_at="2026-10-10T12:00:00+00:00" if name == "early" else STAMP,
         )
     assert follow(store)[0]["owner_vendor_id"] == early
-    store.delete_message("early")
+    local_removal(store, "delete_message", "early")
     assert follow(store)[0]["owner_vendor_id"] == late
 
 

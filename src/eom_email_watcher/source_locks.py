@@ -24,7 +24,7 @@ from connect_automate.locking import (
 )
 from connect_automate.locking import connect_operation_lock as protocol_guard
 
-from . import body_state, deployment
+from . import body_state, deployment, removal
 
 if TYPE_CHECKING:
     from .db import Store
@@ -49,6 +49,19 @@ def source_lock_stripe(message_id: str) -> int:
     return (
         int.from_bytes(hashlib.sha256(("source\0" + message_id).encode()).digest(), "big")
         % SOURCE_LOCK_STRIPE_COUNT
+    )
+
+
+def operation_lock_path(database_path: Path) -> Path:
+    """The existing watcher operation exclusion, shared by all entry points."""
+    return database_path.with_name(f"{database_path.name}.check.lock")
+
+
+def source_context_active() -> bool:
+    """Read the existing source owners; never mint or reuse their authority."""
+    return any(
+        held is not None and held[0] == os.getpid()
+        for held in (getattr(_selection, "held", None), getattr(_context, "held", None))
     )
 
 
@@ -264,13 +277,35 @@ def _cutover_admission() -> Iterator[None]:
         yield
 
 
-def qualify_protocol(store: Store, *, fresh: bool) -> None:
+def initialize_protocol(store: Store, *, fresh: bool) -> None:
+    """Establish source exclusion on open, without running physical removal."""
     try:
         _qualify_protocol(store, fresh=fresh)
     except OperationLockBusy as exc:
         raise SourceProtocolUnavailable(
             "Source-lock upgrade deferred; a native source owner remains active"
         ) from exc
+
+
+def qualify_protocol(store: Store, *, fresh: bool) -> None:
+    """Explicit qualification entry: establish exclusion, then resume removals."""
+    initialize_protocol(store, fresh=fresh)
+    # Never invert operation→source ordering or expand a frozen source set.
+    # The ordinary operation entry point resumes after this owner releases it.
+    if source_context_active():
+        return
+    with store.connection() as db:
+        has_requests = removal.has_schema(db)
+    if has_requests:
+        try:
+            with connect_operation_lock(
+                operation_lock_path(store.path), "Another watcher operation is already running"
+            ):
+                removal.resume(store)
+        except OperationLockBusy:
+            # An existing operation keeps its exclusion. Its ordinary-check
+            # entry point resumes through the same completion owner.
+            pass
 
 
 def _qualify_protocol(store: Store, *, fresh: bool) -> None:

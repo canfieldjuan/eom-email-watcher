@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxActionState.ts";
-import { inboxClearView } from "../src/inboxRemoval.ts";
+import { inboxClearView, inboxRemovalStatus } from "../src/inboxRemoval.ts";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
@@ -104,26 +104,25 @@ test("inbox first-page and clear-history success record loaded before rendering"
   const success = inboxLoad.slice(inboxLoad.indexOf("if (!append) {\n    attachmentCapabilities"));
   assert.match(success, /if \(!append\) \{[^}]*inboxPageState = "loaded";[^}]*\} else \{[^}]*\}[\s\S]*renderInbox\(inboxItems\)/, "first-page success must record loaded before rendering");
   const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
-  assert.match(clear, /const result = await invoke<InboxClearResult>\("inbox_clear"\);\s+const view = inboxClearView\(inboxItems, result\);/);
+  assert.match(clear, /const result = await inboxRemovalClient.clear\(\);\s+if \(!result\) return;\s+const view = inboxClearView\(inboxItems, result\);/);
   assert.match(clear, /inboxItems = view.retained;\s+if \(result.outcome === "completed"\) \{\s+expandedInboxMessages.clear\(\);\s+inboxPageState = "loaded";[^}]*\}\s+renderInbox\(inboxItems\);/, "only completed history clear must clear expansion and record loaded before rendering retained rows");
 });
 
-test("clear handler renders retained state for partial and refused results, and resets completed state", async () => {
+test("clear handler hides accepted targets, preserves unaccepted state, and resets only completed state", async () => {
   const handler = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0]
-    .replace("(): Promise<void>", "()")
-    .replace("invoke<InboxClearResult>", "invoke");
-  const refusal = "Can't delete this yet, the local upgrade is still finishing; try again later";
-  for (const outcome of ["partial", "refused", "completed"] as const) {
-    const held = outcome === "refused" ? ["held", "deleted"] : ["held"];
-    const result = { outcome, deleted: outcome === "refused" ? 0 : 1,
-      refused: outcome === "completed" ? 0 : held.length,
-      held_message_ids: outcome === "completed" ? [] : held,
-      message: outcome === "completed" ? null : refusal };
+    .replace("(): Promise<void>", "()");
+  const pending = "Deletion pending until the local upgrade completes";
+  for (const outcome of ["deferred", "completed", "unaccepted", "error"] as const) {
+    const accepted = outcome === "deferred" || outcome === "completed";
+    const result = accepted ? { outcome, request_id: "saved-key", intent_ids: ["one", "two"],
+      requested: 2, completed: outcome === "completed" ? 2 : 1,
+      pending: outcome === "completed" ? 0 : 1,
+      message: outcome === "completed" ? null : pending } : undefined;
     const observed = JSON.parse(await runInNewContext(`(async () => {
       let inboxItems = [{ message_id: "held" }, { message_id: "deleted" }];
       const expandedInboxMessages = new Set(["held", "deleted"]);
       let inboxPageState = "failed", inboxNextCursor = "next", inboxCapabilityUnavailableCount = 3;
-      let inboxClearInFlight = false, inboxRequestGeneration = 0;
+      let inboxClearInFlight = false, inboxRequestGeneration = 0, inboxReloadAfterMutation = false;
       const inboxLoadMore = { hidden: false }, inboxStatus = { textContent: "", dataset: {} };
       const renders = [], cleared = [];
       const window = { confirm: () => true }, inboxMutationInFlight = () => false;
@@ -131,30 +130,79 @@ test("clear handler renders retained state for partial and refused results, and 
       const clearMessageOwnedUiState = id => cleared.push(id ?? "all");
       const renderInbox = items => renders.push({ ids: items.map(item => item.message_id),
         state: inboxPageState, expanded: [...expandedInboxMessages] });
-      const invoke = async () => result;
+      const inboxRemovalClient = { clear: async () => {
+        if (outcome === "error") throw { message: "Existing failure" };
+        return result;
+      } };
       ${handler}
       await clearInboxHistory();
       return JSON.stringify({ renders, cleared, inboxNextCursor, inboxCapabilityUnavailableCount,
-        inboxLoadMore, inboxStatus, inboxClearInFlight });
-    })()`, { result, inboxClearView }));
+        inboxLoadMore, inboxStatus, inboxClearInFlight, inboxReloadAfterMutation });
+    })()`, { result, outcome, inboxClearView, errorMessage: (error: { message: string }) => error.message }));
     const completed = outcome === "completed";
     for (const render of observed.renders.slice(1)) {
-      assert.deepEqual(render.ids, completed ? [] : held);
-      assert.deepEqual(render.expanded, completed ? [] : held);
+      assert.deepEqual(render.ids, accepted ? [] : ["held", "deleted"]);
+      assert.deepEqual(render.expanded, accepted ? [] : ["held", "deleted"]);
       assert.equal(render.state, completed ? "loaded" : "failed");
     }
-    assert.equal(observed.renders.length, 3);
-    assert.deepEqual(observed.cleared, completed ? ["held", "deleted", "all"] : outcome === "partial" ? ["deleted"] : []);
+    assert.equal(observed.renders.length, accepted ? 3 : 2);
+    assert.deepEqual(observed.cleared, completed ? ["held", "deleted", "all"] : accepted ? ["held", "deleted"] : []);
     assert.equal(observed.inboxNextCursor, completed ? null : "next");
     assert.equal(observed.inboxCapabilityUnavailableCount, completed ? 0 : 3);
     assert.equal(observed.inboxLoadMore.hidden, completed);
-    assert.equal(observed.inboxStatus.dataset.kind, completed ? "success" : "error");
+    assert.equal(observed.inboxStatus.dataset.kind,
+      completed ? "success" : outcome === "deferred" ? "pending" : outcome === "error" ? "error" : undefined);
     assert.equal(observed.inboxClearInFlight, false);
-    if (completed) assert.match(observed.inboxStatus.textContent, /^Cleared 1 local message\./);
-    else {
-      assert.ok(observed.inboxStatus.textContent.includes(refusal));
+    assert.equal(observed.inboxReloadAfterMutation, true);
+    if (completed) assert.match(observed.inboxStatus.textContent, /^Cleared 2 local messages\./);
+    else if (outcome === "deferred") {
+      assert.ok(observed.inboxStatus.textContent.includes(pending));
+      assert.match(observed.inboxStatus.textContent, /^1 completed; 1 pending\./);
       assert.doesNotMatch(observed.inboxStatus.textContent, /Cleared/);
-    }
+    } else assert.equal(observed.inboxStatus.textContent, outcome === "error" ? "Existing failure" : "");
+  }
+});
+
+test("Delete handler clears only its accepted cached item and always reloads the shared projection", async () => {
+  const handler = source.match(/async function deleteInboxItem\([\s\S]*?\n\}/)![0]
+    .replace("(item: InboxItem): Promise<void>", "(item)");
+  for (const outcome of ["completed", "deferred", "unaccepted", "error"] as const) {
+    const accepted = outcome === "completed" || outcome === "deferred";
+    const result = accepted ? { request_id: "saved-key", intent_ids: ["one"], outcome,
+      requested: 1, completed: outcome === "completed" ? 1 : 0,
+      pending: outcome === "deferred" ? 1 : 0,
+      message: outcome === "deferred" ? "Deletion pending until the local upgrade completes" : null } : undefined;
+    const observed = JSON.parse(await runInNewContext(`(async () => {
+      const item = { message_id: "selected", subject: "Selected message" };
+      let inboxItems = [item, { message_id: "other", subject: "Other message" }];
+      const expandedInboxMessages = new Set(["selected", "other"]), inboxDeletionsInFlight = new Set();
+      let inboxRequestGeneration = 0, inboxReloadAfterMutation = false, calls = 0;
+      const inboxStatus = { textContent: "", dataset: {} }, cleared = [];
+      const window = { confirm: () => true }, inboxMutationInFlight = () => false;
+      const setInboxControlsBusy = () => {}, renderInbox = () => {}, resumeInboxReloadAfterMutation = () => {};
+      const clearMessageOwnedUiState = id => cleared.push(id);
+      const inboxRemovalClient = { delete: async id => {
+        calls++; if (id !== "selected") throw Error("Wrong item");
+        if (outcome === "error") throw { message: "Existing failure" };
+        return result;
+      } };
+      ${handler}
+      await deleteInboxItem(item);
+      return JSON.stringify({ ids: inboxItems.map(item => item.message_id), expanded: [...expandedInboxMessages],
+        inflight: [...inboxDeletionsInFlight], inboxReloadAfterMutation, inboxStatus, cleared, calls });
+    })()`, { result, outcome, inboxRemovalStatus, errorMessage: (error: { message: string }) => error.message }));
+    assert.deepEqual(observed.ids, accepted ? ["other"] : ["selected", "other"]);
+    assert.deepEqual(observed.expanded, observed.ids);
+    assert.deepEqual(observed.cleared, accepted ? ["selected"] : []);
+    assert.deepEqual(observed.inflight, []);
+    assert.equal(observed.calls, 1);
+    assert.equal(observed.inboxReloadAfterMutation, true);
+    assert.equal(observed.inboxStatus.dataset.kind,
+      outcome === "completed" ? "success" : outcome === "deferred" ? "pending" : outcome === "error" ? "error" : undefined);
+    if (outcome === "completed") assert.equal(observed.inboxStatus.textContent,
+      'Deleted "Selected message" from local history. The source email was not changed.');
+    if (outcome === "deferred") assert.match(observed.inboxStatus.textContent, /^0 completed; 1 pending\./);
+    if (outcome === "error") assert.equal(observed.inboxStatus.textContent, "Existing failure");
   }
 });
 
@@ -177,8 +225,8 @@ test("sender selection defers reload until the final inbox mutation finishes", (
   assert.match(resume, /inboxReloadAfterMutation = false;\s+void loadInbox\(\);/);
   const deletion = source.match(/async function deleteInboxItem\([\s\S]*?\n\}/)![0];
   const clearing = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
-  assert.match(deletion, /finally \{\s+inboxDeletionsInFlight.delete\(item.message_id\);\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
-  assert.match(clearing, /finally \{\s+inboxClearInFlight = false;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
+  assert.match(deletion, /finally \{\s+inboxDeletionsInFlight.delete\(item.message_id\);\s+inboxReloadAfterMutation = true;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
+  assert.match(clearing, /finally \{\s+inboxClearInFlight = false;\s+inboxReloadAfterMutation = true;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
 });
 
 test("Apply and Reset carry the sender and clear query expansion", () => {
@@ -221,7 +269,7 @@ test("expansion survives renders and first-page reloads until query, delete, or 
   assert.doesNotMatch(render, /expandedInboxMessages.clear|expandedInboxMessages.*filter/);
   const load = source.match(/async function loadInbox\([\s\S]*?\n\}/)![0];
   assert.doesNotMatch(load, /expandedInboxMessages/);
-  assert.match(source, /await invoke<void>\("inbox_delete"[^\n]+\n\s+expandedInboxMessages.delete\(item.message_id\)/);
+  assert.match(source, /const result = await inboxRemovalClient.delete\(item.message_id\);\s+if \(!result\) return;\s+expandedInboxMessages.delete\(item.message_id\)/);
   const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
   assert.match(clear, /if \(!retained.has\(item.message_id\)\) \{\s+expandedInboxMessages.delete\(item.message_id\)/);
   assert.match(clear, /if \(result.outcome === "completed"\) \{\s+expandedInboxMessages.clear\(\)/);

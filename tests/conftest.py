@@ -115,3 +115,31 @@ def tmp_path(tmp_path, request):
     from prove_windows_cutover import probe_output
 
     return probe_output(request.node.name, tmp_path)
+
+
+def local_removal(store, method, *args, **kwargs):
+    """Exercise the real Store method under its required native entry owner."""
+    from eom_email_watcher.removal import acceptance_scope
+
+    with acceptance_scope(store) as acceptance:
+        return getattr(store, method)(*args, acceptance=acceptance, **kwargs)
+
+
+@pytest.fixture
+def pre36_schema(monkeypatch):
+    """Seed only the pre-removal catalog; run the tested upgrade as v36.
+
+    Plan 31–33/76–77: older fixtures must not carry schema-36 receipt tables.
+    The authentic main-source v35 upgrade is also qualified independently.
+    """
+    from contextlib import contextmanager
+
+    from eom_email_watcher import db as database
+
+    @contextmanager
+    def seed():
+        with monkeypatch.context() as legacy:
+            legacy.setattr(database, "SCHEMA_VERSION", 35)
+            yield
+
+    return seed
