@@ -30,6 +30,7 @@ from connect_reference_provider import (
 from fixture_toml import toml_path_literal
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.config import config_admission_snapshot
 from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
@@ -402,12 +403,17 @@ def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
 
 
 def request(config_path: Path, operation: str, payload: dict[str, object] | None = None):
-    return {
+    value: dict[str, object] = {
         "protocol": 1,
         "operation": operation,
         "config_path": str(config_path),
         "payload": payload or {},
     }
+    # Admission-required operations carry the token from the engine's own
+    # configuration admission issuer, as the host does (issue #270).
+    if operation in engine_api.ADMISSION_REQUIRED_OPERATIONS:
+        value["admission_token"] = config_admission_snapshot(config_path).token
+    return value
 
 
 def wait_for_capability(available: bool, timeout_seconds: float = 15) -> dict[str, object]:

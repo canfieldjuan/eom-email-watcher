@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.config import config_admission_snapshot
 from eom_email_watcher.db import AdmissionProvenance
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
@@ -183,6 +184,43 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
         "ok": True,
         "operation": "connect.attachment.capabilities",
         "protocol": 1,
+    }
+
+
+def test_proof_requests_carry_admission_for_admission_required_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    load_runtime(config_path)
+
+    pump = request(config_path, "connect.queue.pump")
+
+    # The Contract Watch pump is admission-required; the proof must bind it to
+    # the engine's own configuration admission snapshot (issue #270).
+    assert "connect.queue.pump" in engine_api.ADMISSION_REQUIRED_OPERATIONS
+    assert pump["admission_token"] == config_admission_snapshot(config_path).token
+    pumped = engine_api._response(pump)
+    assert pumped["ok"] is True, pumped
+    assert pumped["operation"] == "connect.queue.pump"
+    for operation in (
+        "inbox.recent",
+        "connect.attachment.capabilities",
+        "connect.attachment.invoke",
+        "connect.output.present",
+        "connect.output.export",
+    ):
+        assert operation not in engine_api.ADMISSION_REQUIRED_OPERATIONS
+        assert "admission_token" not in request(config_path, operation)
+
+    # The engine guard is unchanged: the same request without its token is refused.
+    bare = {key: value for key, value in pump.items() if key != "admission_token"}
+    assert engine_api._response(bare)["error"] == {
+        "code": "invalid_request",
+        "message": "admission_token is invalid",
     }
 
 
