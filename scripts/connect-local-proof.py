@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from contextlib import ExitStack, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
@@ -335,7 +335,8 @@ class FixtureGmail:
     """
 
     def __init__(self, content: bytes):
-        self.content = content
+        # Not `content`: that name is the MailboxGateway message-content member.
+        self.attachment_content = content
         self.operation_timeouts: list[float] = []
 
     def set_operation_timeout(self, timeout_seconds: float) -> None:
@@ -376,7 +377,20 @@ class FixtureGmail:
             "fixture-attachment",
         ):
             raise AssertionError("Unexpected fixture attachment identity")
-        return self.content
+        return self.attachment_content
+
+
+def fixture_message_times(now: datetime | None = None) -> tuple[str, str]:
+    """Received and admitted times for the fixture message, inside retention.
+
+    Fixed calendar dates age out of the retention window, after which the
+    retained-source check refuses the fixture before any provider is reached.
+    """
+    current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+    return (
+        (current - timedelta(days=2)).isoformat(),
+        (current - timedelta(days=1)).isoformat(),
+    )
 
 
 def write_config(path: Path) -> None:
@@ -705,13 +719,14 @@ def main() -> None:
             write_config(config_path)
             runtime = load_runtime(config_path)
             fixture_account = install_fixture_mailbox(runtime)
+            received_at, admitted_at = fixture_message_times()
             runtime.store.add_message(
                 message_id="fixture-message",
                 thread_id=None,
                 sender="fixture@example.invalid",
                 sender_name="Fixture Sender",
                 subject="Fixture document",
-                received_at="2026-08-29T12:00:00+00:00",
+                received_at=received_at,
                 provider=fixture_account.provider,
                 account_id=fixture_account.account_id,
                 mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
@@ -720,7 +735,7 @@ def main() -> None:
                     selector_id="sender:fixture@example.invalid",
                     display_name="Fixture Sender",
                     mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
-                    admitted_at="2026-09-19T12:00:00+00:00",
+                    admitted_at=admitted_at,
                 ),
             )
             runtime.store.replace_attachments(

@@ -5,6 +5,7 @@ import json
 import runpy
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import httpx
 import pytest
 
 from eom_email_watcher import engine_api
-from eom_email_watcher.config import config_admission_snapshot
+from eom_email_watcher.config import DEFAULT_RETENTION_DAYS, config_admission_snapshot
 from eom_email_watcher.db import AdmissionProvenance
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
@@ -29,6 +30,7 @@ FIXTURE_MODEL_DIGEST = PROOF_SCRIPT["FIXTURE_MODEL_DIGEST"]
 FIXTURE_MAILBOX_IDENTITY_KEY = PROOF_SCRIPT["FIXTURE_MAILBOX_IDENTITY_KEY"]
 FixtureGmail = PROOF_SCRIPT["FixtureGmail"]
 FixtureModelHandler = PROOF_SCRIPT["FixtureModelHandler"]
+fixture_message_times = PROOF_SCRIPT["fixture_message_times"]
 install_fixture_mailbox = PROOF_SCRIPT["install_fixture_mailbox"]
 require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
 privacy_projection = PROOF_SCRIPT["privacy_projection"]
@@ -125,13 +127,14 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
         FIXTURE_MAILBOX_IDENTITY_KEY,
         legacy_status="replacement",
     )
+    received_at, admitted_at = fixture_message_times()
     runtime.store.add_message(
         message_id="fixture-message",
         thread_id=None,
         sender="fixture@example.invalid",
         sender_name="Fixture Sender",
         subject="Fixture document",
-        received_at="2026-08-29T12:00:00+00:00",
+        received_at=received_at,
         provider=DEFAULT_MAIL_PROVIDER,
         account_id=DEFAULT_MAIL_ACCOUNT_ID,
         mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
@@ -140,7 +143,7 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
             selector_id="sender:fixture@example.invalid",
             display_name="Fixture Sender",
             mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
-            admitted_at="2026-09-19T12:00:00+00:00",
+            admitted_at=admitted_at,
         ),
     )
     runtime.store.replace_attachments(
@@ -244,12 +247,33 @@ def test_fixture_gmail_implements_every_mailbox_gateway_member() -> None:
     # the nightly full proof (issue #275).
     members = _gateway_members()
     assert "set_operation_timeout" in members
+    gateway = FixtureGmail(b"%PDF")
     for name in members:
+        # The bound member of a real instance: an instance attribute with the same
+        # name would shadow the method and fail here.
+        member = getattr(gateway, name)
+        assert inspect.ismethod(member), name
         expected = inspect.signature(getattr(MailboxGateway, name)).parameters
-        actual = inspect.signature(getattr(FixtureGmail, name)).parameters
+        actual = inspect.signature(member.__func__).parameters
         assert [(p.name, p.kind, p.default) for p in actual.values()] == [
             (p.name, p.kind, p.default) for p in expected.values()
         ], name
+    with pytest.raises(AssertionError, match="does not read fixture message content"):
+        gateway.content("fixture-message", 1, scope=frozenset())
+
+
+def test_fixture_message_times_stay_inside_retention_at_any_clock() -> None:
+    # Fixed calendar dates aged out of the retention window and would have made
+    # the retained-source check refuse the fixture once time passed.
+    for now in (
+        datetime(2026, 10, 17, 2, 0, tzinfo=UTC),
+        datetime(2027, 3, 1, tzinfo=UTC),
+        datetime(2035, 1, 1, tzinfo=UTC),
+    ):
+        received_at, admitted_at = fixture_message_times(now)
+        received = datetime.fromisoformat(received_at)
+        admitted = datetime.fromisoformat(admitted_at)
+        assert now - timedelta(days=DEFAULT_RETENTION_DAYS) < received < admitted < now
 
 
 def test_fixture_gmail_operation_timeout_uses_production_validation() -> None:
@@ -278,13 +302,14 @@ def _fixture_attachment_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         FIXTURE_MAILBOX_IDENTITY_KEY,
         legacy_status="replacement",
     )
+    received_at, admitted_at = fixture_message_times()
     runtime.store.add_message(
         message_id="fixture-message",
         thread_id=None,
         sender="fixture@example.invalid",
         sender_name="Fixture Sender",
         subject="Fixture document",
-        received_at="2026-08-29T12:00:00+00:00",
+        received_at=received_at,
         provider=DEFAULT_MAIL_PROVIDER,
         account_id=DEFAULT_MAIL_ACCOUNT_ID,
         mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
@@ -293,7 +318,7 @@ def _fixture_attachment_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
             selector_id="sender:fixture@example.invalid",
             display_name="Fixture Sender",
             mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
-            admitted_at="2026-09-19T12:00:00+00:00",
+            admitted_at=admitted_at,
         ),
     )
     runtime.store.replace_attachments(
