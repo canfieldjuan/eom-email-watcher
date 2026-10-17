@@ -3878,8 +3878,7 @@ def _atomic_create(path: Path, content: str) -> None:
     try:
         private_storage.prepare_file(path)
         with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
+            "wb",
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
@@ -3887,11 +3886,12 @@ def _atomic_create(path: Path, content: str) -> None:
         ) as stream:
             temporary = Path(stream.name)
             private_storage.validate_file(temporary)
-            stream.write(content)
+            stream.write(content.encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
         if not private_storage.is_windows():
             temporary.chmod(0o600)
+        _initialization_probe("before_publish")
         try:
             os.link(temporary, path)
             published = True

@@ -5,6 +5,7 @@ import os
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -84,7 +85,7 @@ def legacy_store(tmp_path: Path) -> Store:
     seed(store, to=("recipient@example.com",))
     # Only this disposable fixture rewrites its schema catalog. This reconstructs
     # the prior closed CHECK without running the migration under test to do it.
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db, db:
         sql = db.execute("SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0]
         widened = (
             "admission_kind IN ("
@@ -105,7 +106,7 @@ def legacy_store(tmp_path: Path) -> Store:
 
 
 def snapshot(path):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db:
         return (
             db.execute("PRAGMA user_version").fetchone()[0],
             db.execute("SELECT * FROM messages").fetchall(),
@@ -116,6 +117,24 @@ def snapshot(path):
                 "'view') AND sql IS NOT NULL ORDER BY name"
             ).fetchall(),
         )
+
+
+def test_fixture_sqlite_connections_are_closed(tmp_path, monkeypatch):
+    connect = sqlite3.connect
+    opened = []
+
+    def capture(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        opened.append(db)
+        return db
+
+    monkeypatch.setattr(sqlite3, "connect", capture)
+    store = legacy_store(tmp_path)
+    assert snapshot(store.path)[0] == 32
+    assert opened
+    for db in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            db.execute("SELECT 1")
 
 
 def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatch):

@@ -86,11 +86,11 @@ name = "Trusted Person"
     path.write_text(
         f'''model_base_url = "{base_url}"
 model_name = "local-model"
-model_api_token_file = "{(path.parent / "lm-token").as_posix()}"
-database_file = "{(path.parent / "db.sqlite3").as_posix()}"
-gmail_credentials_file = "{(path.parent / "credentials.json").as_posix()}"
-microsoft_credentials_file = "{(path.parent / "microsoft-oauth-client.json").as_posix()}"
-gmail_token_file = "{(path.parent / "token.json").as_posix()}"
+model_api_token_file = {toml_path_literal(path.parent / "lm-token")}
+database_file = {toml_path_literal(path.parent / "db.sqlite3")}
+gmail_credentials_file = {toml_path_literal(path.parent / "credentials.json")}
+microsoft_credentials_file = {toml_path_literal(path.parent / "microsoft-oauth-client.json")}
+gmail_token_file = {toml_path_literal(path.parent / "token.json")}
 {extra}
 {sender}
 ''',
@@ -330,13 +330,16 @@ def test_local_model_url_rejects_invalid_port_boundaries(tmp_path: Path, port: i
         load_config(path)
 
 
-def test_gateway_config_requires_https_trust_and_auth(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "ca_name", ["gateway-ca.pem", r"gateway\certificate.pem"], ids=["plain", "backslash"]
+)
+def test_gateway_config_requires_https_trust_and_auth(tmp_path: Path, ca_name: str) -> None:
     path = tmp_path / "config.toml"
-    ca_file = tmp_path / "gateway-ca.pem"
+    ca_file = tmp_path / ca_name
     write_config(
         path,
         base_url="https://inference.office.internal:8443",
-        extra=f'model_backend = "gateway"\nmodel_ca_file = "{ca_file}"',
+        extra=f'model_backend = "gateway"\nmodel_ca_file = {toml_path_literal(ca_file)}',
     )
 
     config = load_config(path)
@@ -462,7 +465,12 @@ def test_first_run_initialization_creates_private_zero_sender_config(
     assert config.model_require_auth is False
     assert config.notifications_enabled is True
     assert config.senders == ()
-    assert path.stat().st_mode & 0o777 == 0o600
+    if os.name == "nt":
+        from connect_automate.connect_windows import validate_private_regular_file
+
+        validate_private_regular_file(path, root=path.parent)
+    else:
+        assert path.stat().st_mode & 0o777 == 0o600
     assert path.stat().st_nlink == 1
     text = path.read_text(encoding="utf-8")
     assert "gmail_send" not in text
@@ -484,6 +492,28 @@ def test_first_run_initialization_never_replaces_existing_config(tmp_path: Path)
         )
 
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "content", ['timezone = "UTC"\n', '# mixed\r\ntimezone = "UTC"\n', '# café\n'],
+    ids=["lf", "mixed", "utf8"],
+)
+def test_non_posix_publication_preserves_exact_utf8_bytes(tmp_path, monkeypatch, content):
+    path = tmp_path / "config.toml"
+    named_temporary_file = config_module.tempfile.NamedTemporaryFile
+
+    def windows_newlines(*args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "w+b")
+        if "b" not in mode and kwargs.get("newline") is None:
+            # Reproduce Windows text-mode newline translation on every platform.
+            kwargs["newline"] = "\r\n"
+        return named_temporary_file(*args, **kwargs)
+
+    monkeypatch.setattr(config_module.tempfile, "NamedTemporaryFile", windows_newlines)
+    config_module._atomic_create(path, content)
+    assert path.read_bytes() == content.encode("utf-8")
+    assert path.stat().st_nlink == 1
+    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
 
 
 def test_non_posix_initialization_load_failure_reports_uncertain_publication(
@@ -575,10 +605,13 @@ def test_first_run_atomic_publication_failure_leaves_no_config(
 ) -> None:
     path = tmp_path / "config.toml"
 
-    def fail_link(_source_fd: int, _parent_fd: int, _destination: str) -> None:
+    def fail_link(*_args: object) -> None:
         raise OSError("link failed")
 
-    monkeypatch.setattr(config_module, "_link_unnamed_candidate_at", fail_link)
+    if os.name == "nt":
+        monkeypatch.setattr(config_module.os, "link", fail_link)
+    else:
+        monkeypatch.setattr(config_module, "_link_unnamed_candidate_at", fail_link)
 
     with pytest.raises(OSError, match="link failed"):
         initialize_config(
@@ -694,10 +727,12 @@ def test_first_run_crash_after_publication_leaves_one_recoverable_name(
 
 
 @pytest.mark.parametrize("entry_kind", ["collision", "symlink", "hardlink"])
+@pytest.mark.parametrize("publication_backend", ["native", "non_posix"])
 def test_first_run_publication_preserves_existing_entry_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     entry_kind: str,
+    publication_backend: str,
 ) -> None:
     path = tmp_path / "config.toml"
     target = tmp_path / "operator.toml"
@@ -719,12 +754,15 @@ def test_first_run_publication_preserves_existing_entry_boundaries(
     monkeypatch.setattr(config_module, "_initialization_probe", install_entry)
 
     with pytest.raises(ConfigAlreadyExistsError, match="already exists"):
-        initialize_config(
-            path,
-            timezone="UTC",
-            model_base_url="http://127.0.0.1:8080/v1",
-            model_name="local-model",
-        )
+        if publication_backend == "non_posix":
+            config_module._atomic_create(path, 'timezone = "UTC"\n')
+        else:
+            initialize_config(
+                path,
+                timezone="UTC",
+                model_base_url="http://127.0.0.1:8080/v1",
+                model_name="local-model",
+            )
 
     if entry_kind == "symlink":
         assert path.is_symlink()
@@ -1214,10 +1252,14 @@ def test_watchlist_atomic_replace_failure_preserves_original(
     write_config(path)
     original = path.read_bytes()
 
-    def fail_replace(_parent_fd: int, _source: str, _destination: str) -> None:
+    def fail_replace(*_args: object) -> None:
         raise OSError("replace failed")
 
-    monkeypatch.setattr("eom_email_watcher.config._rename_exchange_at", fail_replace)
+    monkeypatch.setattr(
+        config_module,
+        "_windows_replace_file" if os.name == "nt" else "_rename_exchange_at",
+        fail_replace,
+    )
 
     with pytest.raises(OSError, match="replace failed"):
         add_sender(path, "new@example.com", "New")
@@ -1322,15 +1364,18 @@ def test_settings_update_rejects_invalid_values_without_changing_config(
 
 
 @pytest.mark.parametrize("model_update", ["model_base_url", "model_name"])
+@pytest.mark.parametrize(
+    "ca_name", ["gateway-ca.pem", r"gateway\certificate.pem"], ids=["plain", "backslash"]
+)
 def test_settings_update_keeps_gateway_model_configuration_read_only(
-    tmp_path: Path, model_update: str
+    tmp_path: Path, model_update: str, ca_name: str
 ) -> None:
     path = tmp_path / "config.toml"
-    ca_file = tmp_path / "gateway-ca.pem"
+    ca_file = tmp_path / ca_name
     write_config(
         path,
         base_url="https://inference.office.internal:8443",
-        extra=f'model_backend = "gateway"\nmodel_ca_file = "{ca_file}"',
+        extra=f'model_backend = "gateway"\nmodel_ca_file = {toml_path_literal(ca_file)}',
     )
     original = path.read_bytes()
     value = "http://127.0.0.1:8080/v1" if model_update == "model_base_url" else "replacement-model"
@@ -1351,10 +1396,14 @@ def test_settings_update_atomic_replace_failure_preserves_original(
     write_config(path)
     original = path.read_bytes()
 
-    def fail_replace(_parent_fd: int, _source: str, _destination: str) -> None:
+    def fail_replace(*_args: object) -> None:
         raise OSError("replace failed")
 
-    monkeypatch.setattr("eom_email_watcher.config._rename_exchange_at", fail_replace)
+    monkeypatch.setattr(
+        config_module,
+        "_windows_replace_file" if os.name == "nt" else "_rename_exchange_at",
+        fail_replace,
+    )
 
     with pytest.raises(OSError, match="replace failed"):
         update_settings(path, {"poll_interval_minutes": 60})
