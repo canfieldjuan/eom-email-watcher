@@ -115,3 +115,24 @@ def tmp_path(tmp_path, request):
     from prove_windows_cutover import probe_output
 
     return probe_output(request.node.name, tmp_path)
+
+
+@pytest.fixture
+def native_private_storage():
+    """Isolated public data outside Local AppData, with the actual SDK DACL."""
+    if os.name != "nt":
+        pytest.skip("native Windows DACL and reparse controls")
+    import shutil
+    import uuid
+    from pathlib import Path
+
+    from connect_automate import connect_windows
+
+    anchor = Path.home()
+    connect_windows.validate_private_directory(anchor, root=anchor)
+    root = anchor / f"ew-privacy-qualification-{uuid.uuid4().hex}"
+    connect_windows.ensure_private_directory(root, root=anchor)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root)
