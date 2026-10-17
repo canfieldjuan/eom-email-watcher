@@ -83,7 +83,7 @@ def test_startup_refusal_uses_api_envelope(monkeypatch, operation):
     (b"", "invalid_json"),
     (b"{" + b" " * engine_api.MAX_REQUEST_BYTES, "request_too_large"),
     (b'{"protocol":99,"operation":"health.get"}', "unsupported_protocol"),
-])
+], ids=["empty", "oversized", "unsupported-protocol"])
 def test_api_parses_and_bounds_before_admission(monkeypatch, raw, code):
     import io
     import json

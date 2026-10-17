@@ -4394,6 +4394,7 @@ def test_late_terminal_after_source_cleanup_is_returned_without_persistence(
 
 
 def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
+    assert_private_file,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
@@ -4517,7 +4518,7 @@ def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
     assert exported_path.name.startswith("email-watcher-output-")
     assert exported_path.suffix == ".bin"
     assert exported_path.read_bytes() == opaque_payload
-    assert exported_path.stat().st_mode & 0o777 == 0o600
+    assert_private_file(exported_path)
     assert "run-me.exe" not in exported_path.name
     assert "dangerous-content-must-not-reach-the-dom" not in str(exported)
 

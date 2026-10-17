@@ -124,6 +124,7 @@ jobs:
           tests/test_deferred_removal.py
           tests/test_engine_api.py
           tests/test_ntfy_disclosure_migration.py
+          tests/test_platform_contract.py
           tests/test_positive_deployment.py
           tests/test_removal_refusal.py
           tests/test_service.py

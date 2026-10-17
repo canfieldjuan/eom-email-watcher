@@ -1,5 +1,8 @@
+import json
 import os
+import re
 import sys
+import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -7,6 +10,112 @@ import pytest
 
 # Match direct script execution before any spec/runpy test module is collected.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+_PRODUCT_ROOT = Path(__file__).resolve().parents[1]
+_FIXTURE_CONTRACTS = {}
+_EXCLUSIONS = pytest.StashKey[list[dict]]()
+
+
+def platform_fixture(*, platforms, owner, reason):
+    """Declare applicability once where a shared fixture owns the mechanism."""
+    def declare(function):
+        _FIXTURE_CONTRACTS[function.__name__] = pytest.mark.platform_contract(
+            platforms=platforms, owner=owner, reason=reason
+        ).mark
+        return function
+    return declare
+
+
+def _platform_tags():
+    return {os.name, sys.platform}
+
+
+def _checked_contract(marker):
+    data = marker.kwargs
+    error = "invalid platform contract: expected platforms, product owner file:line, and reason"
+    if marker.args or set(data) != {"platforms", "owner", "reason"}:
+        raise pytest.UsageError(error)
+    platforms, owner, reason = (data[key] for key in ("platforms", "owner", "reason"))
+    if (not isinstance(platforms, (list, tuple)) or not platforms
+            or any(not isinstance(p, str)
+                   or p not in {"posix", "nt", "linux", "win32", "darwin"} for p in platforms)
+            or not isinstance(owner, str) or not isinstance(reason, str) or not reason.strip()):
+        raise pytest.UsageError(error)
+    match = re.fullmatch(r"(src/eom_email_watcher/[A-Za-z0-9_/]+\.py):([1-9][0-9]*)", owner)
+    if match is None:
+        raise pytest.UsageError(error)
+    source = _PRODUCT_ROOT / match[1]
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+        if not lines[int(match[2]) - 1].strip():
+            raise ValueError("empty source line")
+    except (OSError, IndexError, ValueError) as exc:
+        raise pytest.UsageError(error + f": {owner}") from exc
+    return {"platforms": list(platforms), "owner": owner, "reason": reason}
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "platform_contract(platforms, owner, reason): cited product applicability"
+    )
+    config.stash[_EXCLUSIONS] = []
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    fixtures = {name: _checked_contract(mark) for name, mark in _FIXTURE_CONTRACTS.items()}
+    applicable, excluded = [], []
+    inventory = []
+    tags = _platform_tags()
+    for item in items:
+        contracts = [_checked_contract(mark) for mark in item.iter_markers("platform_contract")]
+        contracts += [fixtures[name] for name in item.fixturenames if name in fixtures]
+        outside = [
+            contract for contract in contracts if not tags.intersection(contract["platforms"])
+        ]
+        if outside:
+            excluded.append(item)
+            inventory.append({"nodeid": item.nodeid, "contracts": outside})
+        else:
+            applicable.append(item)
+    config.stash[_EXCLUSIONS] = inventory
+    if excluded:
+        config.hook.pytest_deselected(items=excluded)
+        items[:] = applicable
+
+
+def pytest_terminal_summary(terminalreporter, config):
+    inventory = config.stash[_EXCLUSIONS]
+    terminalreporter.write_line(f"platform-contract excluded count: {len(inventory)}")
+    terminalreporter.write_line(
+        "platform-contract excluded: " + json.dumps(inventory, sort_keys=True)
+    )
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_sessionfinish(session, exitstatus):
+    # The outer hook resumes after pytest's JUnit writer. Preserve all testcase
+    # results/counts and add only the same explicit inventory printed above.
+    result = yield
+    xml_path = session.config.getoption("--junitxml", default=None)
+    if xml_path is None:
+        return result
+    document = ET.parse(xml_path)
+    suite = document.getroot().find("testsuite")
+    if suite is None:
+        raise pytest.UsageError("platform contract inventory requires a JUnit testsuite")
+    properties = suite.find("properties")
+    if properties is None:
+        properties = ET.Element("properties")
+        suite.insert(0, properties)
+    inventory = session.config.stash[_EXCLUSIONS]
+    for name, value in {
+        "platform_contract.excluded_count": str(len(inventory)),
+        "platform_contract.excluded": json.dumps(inventory, sort_keys=True),
+    }.items():
+        ET.SubElement(properties, "property", name=name, value=value)
+    document.write(xml_path, encoding="utf-8", xml_declaration=True)
+    return result
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +144,10 @@ def _no_machine_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+@platform_fixture(
+    platforms=("linux",), owner="src/eom_email_watcher/deployment.py:223",
+    reason="Linux deployment_lease uses fcntl and the paired systemd graph",
+)
 def paired_deployment(tmp_path, monkeypatch):
     """One public deployed graph fixture for origin and sibling regressions."""
     import shutil
@@ -143,3 +256,16 @@ def pre36_schema(monkeypatch):
             yield
 
     return seed
+
+
+@pytest.fixture
+def assert_private_file():
+    """Use the actual platform privacy oracle on the same persisted output."""
+    def check(path):
+        if os.name == "nt":
+            from connect_automate import connect_windows
+
+            connect_windows.validate_private_regular_file(path, root=path.parent)
+        else:
+            assert path.stat().st_mode & 0o777 == 0o600
+    return check

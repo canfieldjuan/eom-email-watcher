@@ -375,7 +375,17 @@ def test_config_admission_snapshot_rejects_unsafe_path_generically(
 ) -> None:
     config_path = tmp_path / "sensitive-name.toml"
     write_config(config_path)
-    config_path.chmod(0o640)
+    original = config_path.read_bytes()
+    if os.name == "nt":
+        import subprocess
+
+        subprocess.run(
+            ["icacls", str(config_path), "/grant", "*S-1-1-0:(R)"],
+            check=True, capture_output=True, text=True,
+        )
+        original_acl = subprocess.check_output(["icacls", str(config_path)])
+    else:
+        config_path.chmod(0o640)
 
     response = engine_api._response(
         request(config_path, "config.admission.snapshot")
@@ -386,6 +396,9 @@ def test_config_admission_snapshot_rejects_unsafe_path_generically(
         "message": "Configuration admission snapshot is unavailable",
     }
     assert str(config_path) not in json.dumps(response)
+    assert config_path.read_bytes() == original
+    if os.name == "nt":
+        assert subprocess.check_output(["icacls", str(config_path)]) == original_acl
 
 
 def test_gmail_label_engine_operations_enforce_payload_shape_before_runtime(
@@ -2889,6 +2902,7 @@ def test_mail_account_list_adopts_existing_gmail_token_without_exposing_paths(
 
 
 def test_mail_account_connect_installs_private_token_and_initializes_identity(
+    assert_private_file,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2936,7 +2950,7 @@ def test_mail_account_connect_installs_private_token_and_initializes_identity(
     }
     runtime = load_runtime(config_path)
     assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "private readonly token"
-    assert runtime.config.gmail_token_file.stat().st_mode & 0o777 == 0o600
+    assert_private_file(runtime.config.gmail_token_file)
     account = runtime.store.active_mail_account()
     assert account is not None
     assert account.address == "owner@example.com"
@@ -2980,6 +2994,7 @@ def test_mail_account_list_advertises_valid_microsoft_public_client_without_expo
 
 
 def test_mail_account_connect_authorizes_microsoft_and_initializes_delta_baseline(
+    assert_private_file,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3027,7 +3042,7 @@ def test_mail_account_connect_authorizes_microsoft_and_initializes_delta_baselin
     assert account.account_id.startswith("microsoft365-")
     token_file = mail_account_token_file(runtime.config, account)
     assert token_file.read_text(encoding="utf-8") == "private Microsoft cache"
-    assert token_file.stat().st_mode & 0o777 == 0o600
+    assert_private_file(token_file)
     assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
         "https://graph.microsoft.com/private-delta-cursor"
     )
@@ -3037,6 +3052,7 @@ def test_mail_account_connect_authorizes_microsoft_and_initializes_delta_baselin
 
 
 def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
+    assert_private_file,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3107,7 +3123,7 @@ def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
     }
     calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
     assert calendar_token.read_text(encoding="utf-8") == "calendar-read-cache"
-    assert calendar_token.stat().st_mode & 0o777 == 0o600
+    assert_private_file(calendar_token)
     assert mail_token.read_text(encoding="utf-8") == "mail-read-cache"
     grant = runtime.store.calendar_grant(account.account_id)
     assert grant is not None
@@ -4344,6 +4360,7 @@ def test_calendar_events_response_limit_accepts_exact_utf8_size_and_rejects_one_
 
 
 def test_mail_account_connect_installs_private_imap_credentials_and_baseline(
+    assert_private_file,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4391,7 +4408,7 @@ def test_mail_account_connect_installs_private_imap_credentials_and_baseline(
     assert account.account_id.startswith("imap-")
     credentials_file = mail_account_token_file(runtime.config, account)
     assert credentials_file.is_file()
-    assert credentials_file.stat().st_mode & 0o777 == 0o600
+    assert_private_file(credentials_file)
     assert runtime.store.state(provider="imap", account_id=account.account_id)[0] == (IMAP_CURSOR)
     encoded = json.dumps(response)
     assert "private-password" not in encoded
@@ -6070,6 +6087,7 @@ def test_watchlist_mutations_fail_closed_when_production_lock_is_busy(
 
 
 def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
+    assert_private_file,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
@@ -6154,7 +6172,7 @@ def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     assert exported.name != "private.PDF"
     assert exported.suffix == ".pdf"
     assert exported.read_bytes() == b"%PDF"
-    assert exported.stat().st_mode & 0o777 == 0o600
+    assert_private_file(exported)
     assert response["data"] == {
         "byte_size": 4,
         "filename": "../../private.PDF",
@@ -7881,14 +7899,14 @@ def test_rule_entitlement_preserves_validation(monkeypatch: pytest.MonkeyPatch) 
 @pytest.mark.parametrize("active", [False, True])
 @pytest.mark.parametrize("operation", ["status", "install"])
 def test_rule_entitlement_status_and_install(
-    monkeypatch: pytest.MonkeyPatch, active: bool, operation: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: bool, operation: str,
 ) -> None:
     public = {"state": "active", "active": True}
     status = SimpleNamespace(public_dict=lambda: public.copy())
     monkeypatch.setattr(engine_api.entitlement, "connect_entitlement_status", lambda: status)
     monkeypatch.setattr(engine_api.entitlement, "install_connect_entitlement", lambda _: status)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: active)
-    payload = {"source_path": "/license.json"} if operation == "install" else {}
+    payload = {"source_path": str(tmp_path / "license.json")} if operation == "install" else {}
     result = engine_api._response(request(
         Path("missing"), f"connect.entitlement.{operation}", payload,
     ))

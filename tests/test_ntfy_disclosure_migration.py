@@ -17,6 +17,14 @@ from eom_email_watcher import cli, engine_api
 from eom_email_watcher.config import ConfigError, load_config, ntfy_disclosure_status
 
 TOPIC = "YOUR_NTFY_TOPIC_0123456789"
+POSIX_NTFY = pytest.mark.platform_contract(
+    platforms=("posix",), owner="src/eom_email_watcher/config.py:3145",
+    reason="POSIX disclosure transaction; non-POSIX acknowledgement refuses",
+)
+POSIX_STATUS = pytest.mark.platform_contract(
+    platforms=("posix",), owner="src/eom_email_watcher/config.py:1432",
+    reason="POSIX descriptor safety; Windows status uses manual-repair mapping",
+)
 
 
 def _config_bytes(
@@ -122,6 +130,7 @@ def _crash_immediately_after_exchange(path: Path, revision: str) -> None:
     assert os.WEXITSTATUS(status) == 86
 
 
+@POSIX_NTFY
 def test_legacy_valid_topic_without_ack_requires_explicit_migration(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     original = _write_legacy_config(path)
@@ -145,10 +154,10 @@ def test_legacy_valid_topic_without_ack_requires_explicit_migration(tmp_path: Pa
 @pytest.mark.parametrize(
     ("content", "state"),
     [
-        (_config_bytes(), "acknowledgement_required"),
-        (
+        pytest.param(_config_bytes(), "acknowledgement_required", marks=POSIX_STATUS),
+        pytest.param(
             _config_bytes(acknowledgement="ntfy_content_disclosure_acknowledged = false"),
-            "acknowledgement_required",
+            "acknowledgement_required", marks=POSIX_STATUS,
         ),
         (
             _config_bytes(acknowledgement="ntfy_content_disclosure_acknowledged = true"),
@@ -299,6 +308,7 @@ def test_non_posix_runtime_load_rejects_atomic_swap_generically(
     assert TOPIC not in str(raised.value)
 
 
+@POSIX_STATUS
 @pytest.mark.parametrize("unsafe", ["file_mode", "parent_mode", "hardlink", "fifo"])
 def test_status_rejects_unsafe_filesystem_boundaries(tmp_path: Path, unsafe: str) -> None:
     parent = tmp_path / unsafe
@@ -318,6 +328,7 @@ def test_status_rejects_unsafe_filesystem_boundaries(tmp_path: Path, unsafe: str
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
 
 
+@POSIX_STATUS
 def test_status_rejects_file_and_parent_symlinks_without_readthrough(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -343,6 +354,7 @@ def test_status_rejects_file_and_parent_symlinks_without_readthrough(
     assert reads == 0
 
 
+@POSIX_STATUS
 def test_status_rejects_wrong_effective_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -354,6 +366,7 @@ def test_status_rejects_wrong_effective_owner(
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
 
 
+@POSIX_STATUS
 def test_status_rejects_inode_swap_between_inspect_and_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -381,6 +394,7 @@ def test_status_rejects_inode_swap_between_inspect_and_open(
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
 
 
+@POSIX_STATUS
 @pytest.mark.parametrize("mutation", ["mode", "hardlink"])
 def test_status_rechecks_complete_safety_predicate_after_no_follow_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
@@ -411,6 +425,7 @@ def test_status_rechecks_complete_safety_predicate_after_no_follow_open(
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
 
 
+@POSIX_NTFY
 def test_false_ack_replaces_only_the_boolean_token(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     marker = b"ntfy_content_disclosure_acknowledged = false"
@@ -449,6 +464,7 @@ def test_false_ack_replaces_only_the_boolean_token(tmp_path: Path) -> None:
     assert load_config(path).ntfy_content_disclosure_acknowledged is True
 
 
+@POSIX_NTFY
 def test_candidate_is_same_directory_regular_owner_private_before_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -492,6 +508,7 @@ def test_candidate_is_same_directory_regular_owner_private_before_replace(
     }
 
 
+@POSIX_NTFY
 def test_absent_ack_inserts_one_root_assignment_and_preserves_crlf(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     original = _write_bytes(
@@ -520,6 +537,7 @@ def test_absent_ack_inserts_one_root_assignment_and_preserves_crlf(tmp_path: Pat
     assert path.read_bytes() == (b"ntfy_content_disclosure_acknowledged = true\r\n" + original)
 
 
+@POSIX_NTFY
 def test_quoted_root_key_and_no_final_newline_preserve_exact_suffix(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     original = _write_bytes(
@@ -541,6 +559,7 @@ def test_quoted_root_key_and_no_final_newline_preserve_exact_suffix(tmp_path: Pa
     assert path.read_bytes() == original[:-5] + b"true"
 
 
+@POSIX_NTFY
 def test_stale_and_repeated_acknowledgements_do_not_mutate(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     original = _write_legacy_config(path)
@@ -584,6 +603,7 @@ def test_stale_and_repeated_acknowledgements_do_not_mutate(tmp_path: Path) -> No
     assert ntfy_disclosure_status(path).state == "normal_admission"
 
 
+@POSIX_NTFY
 def test_two_concurrent_acknowledgements_replace_at_most_once(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     _write_legacy_config(path)
@@ -621,6 +641,7 @@ def test_two_concurrent_acknowledgements_replace_at_most_once(tmp_path: Path) ->
     assert ntfy_disclosure_status(path).state == "normal_admission"
 
 
+@POSIX_NTFY
 def test_manual_edit_during_precommit_wins_without_lost_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -668,6 +689,7 @@ def test_manual_edit_during_precommit_wins_without_lost_update(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+@POSIX_NTFY
 def test_manual_edit_after_precommit_check_is_atomically_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -719,6 +741,7 @@ def test_manual_edit_after_precommit_check_is_atomically_preserved(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+@POSIX_NTFY
 def test_atomic_replacement_after_final_precheck_is_restored_without_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -773,6 +796,7 @@ def test_atomic_replacement_after_final_precheck_is_restored_without_consent(
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 @pytest.mark.parametrize("crash_point", ["after_exchange", "after_rollback"])
 def test_restart_restores_atomic_replacement_across_mismatch_rollback(
     tmp_path: Path, crash_point: str
@@ -827,6 +851,7 @@ def test_restart_restores_atomic_replacement_across_mismatch_rollback(
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 def test_systemd_cli_check_recovers_mismatch_before_consuming_topic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -905,6 +930,7 @@ def test_systemd_cli_check_recovers_mismatch_before_consuming_topic(
     assert not _disposition_path(path).exists()
 
 
+@POSIX_NTFY
 def test_post_exchange_displaced_replacement_is_restored_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -943,6 +969,7 @@ def test_post_exchange_displaced_replacement_is_restored_live(
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 def test_restart_restores_manual_replacement_after_disposition_is_durable(
     tmp_path: Path,
 ) -> None:
@@ -992,6 +1019,7 @@ def test_restart_restores_manual_replacement_after_disposition_is_durable(
     assert not _disposition_path(path).exists()
 
 
+@POSIX_NTFY
 def test_mismatch_rollback_response_loss_restores_manual_without_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1039,6 +1067,7 @@ def test_mismatch_rollback_response_loss_restores_manual_without_consent(
     assert not _disposition_path(path).exists()
 
 
+@POSIX_NTFY
 def test_tampered_mismatch_disposition_fails_closed_without_deleting_manual(
     tmp_path: Path,
 ) -> None:
@@ -1092,6 +1121,7 @@ def test_tampered_mismatch_disposition_fails_closed_without_deleting_manual(
     assert disposition.read_bytes() == b'{"tampered":true}\n'
 
 
+@POSIX_NTFY
 def test_metadata_change_after_precommit_check_is_atomically_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1143,6 +1173,7 @@ def test_metadata_change_after_precommit_check_is_atomically_preserved(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+@POSIX_NTFY
 def test_displaced_validation_failure_rolls_back_without_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1184,6 +1215,7 @@ def test_displaced_validation_failure_rolls_back_without_consent(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+@POSIX_NTFY
 def test_exchange_rollback_response_failure_retries_and_restores_manual_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1250,6 +1282,7 @@ def test_exchange_rollback_response_failure_retries_and_restores_manual_config(
     assert candidate.name not in rendered
 
 
+@POSIX_NTFY
 def test_restart_recovers_crash_immediately_after_exchange(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     _write_legacy_config(path)
@@ -1266,6 +1299,7 @@ def test_restart_recovers_crash_immediately_after_exchange(tmp_path: Path) -> No
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+@POSIX_NTFY
 def test_recovery_fails_closed_on_tampered_displaced_file(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     _write_legacy_config(path)
@@ -1285,6 +1319,7 @@ def test_recovery_fails_closed_on_tampered_displaced_file(tmp_path: Path) -> Non
     assert path.read_bytes() == tampered
 
 
+@POSIX_NTFY
 def test_recovery_fails_closed_on_tampered_transaction_marker(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     _write_legacy_config(path)
@@ -1308,6 +1343,7 @@ def test_recovery_fails_closed_on_tampered_transaction_marker(tmp_path: Path) ->
     assert TOPIC not in str(raised.value)
 
 
+@POSIX_NTFY
 def test_recovery_preserves_manual_concurrent_replacement(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     _write_legacy_config(path)
@@ -1330,6 +1366,7 @@ def test_recovery_preserves_manual_concurrent_replacement(tmp_path: Path) -> Non
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 def test_recovery_cleans_displaced_original_behind_unsafe_manual_target(
     tmp_path: Path,
 ) -> None:
@@ -1355,6 +1392,7 @@ def test_recovery_cleans_displaced_original_behind_unsafe_manual_target(
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 def test_no_marker_equal_byte_candidate_is_preserved_as_manual_state(
     tmp_path: Path,
 ) -> None:
@@ -1372,6 +1410,7 @@ def test_no_marker_equal_byte_candidate_is_preserved_as_manual_state(
     assert path.read_bytes() == original
 
 
+@POSIX_NTFY
 def test_marker_only_recovery_preserves_equal_byte_manual_candidate(
     tmp_path: Path,
 ) -> None:
@@ -1394,6 +1433,7 @@ def test_marker_only_recovery_preserves_equal_byte_manual_candidate(
     assert path.read_bytes() == original
 
 
+@POSIX_NTFY
 @pytest.mark.parametrize("crash_after_write", [1, 2, 3])
 def test_crash_during_unnamed_candidate_short_write_leaves_no_named_secret(
     tmp_path: Path, crash_after_write: int
@@ -1442,6 +1482,7 @@ def test_crash_during_unnamed_candidate_short_write_leaves_no_named_secret(
     assert not marker.exists()
 
 
+@POSIX_NTFY
 def test_crash_after_candidate_inode_is_marked_but_before_link_recovers(
     tmp_path: Path,
 ) -> None:
@@ -1464,6 +1505,7 @@ def test_crash_after_candidate_inode_is_marked_but_before_link_recovers(
     assert not marker.exists()
 
 
+@POSIX_NTFY
 def test_fixed_candidate_collision_at_link_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1493,6 +1535,7 @@ def test_fixed_candidate_collision_at_link_is_preserved(
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
 
 
+@POSIX_NTFY
 @pytest.mark.parametrize(
     ("primitive", "error_number"),
     [
@@ -1532,6 +1575,7 @@ def test_unnamed_candidate_primitive_unsupported_is_stable_manual_state(
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
 
 
+@POSIX_NTFY
 @pytest.mark.parametrize(
     "stage",
     [
@@ -1578,6 +1622,7 @@ def test_parent_path_replacement_stops_each_transaction_mutation(
     assert not any(displaced.glob(".config.toml.ntfy-disclosure-*"))
 
 
+@POSIX_NTFY
 @pytest.mark.parametrize(
     "stage",
     [
@@ -1638,6 +1683,7 @@ def test_parent_mode_is_revalidated_before_each_transaction_mutation(
     assert ntfy_disclosure_status(path).state == "acknowledgement_required"
 
 
+@POSIX_NTFY
 def test_missing_exchange_symbol_never_offers_acknowledgement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1651,6 +1697,7 @@ def test_missing_exchange_symbol_never_offers_acknowledgement(
     assert path.read_bytes() == original
 
 
+@POSIX_NTFY
 def test_unsupported_filesystem_persists_stable_manual_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1680,6 +1727,7 @@ def test_unsupported_filesystem_persists_stable_manual_status(
     assert _unsupported_path(path).exists()
 
 
+@POSIX_NTFY
 def test_restart_recovers_crash_after_unsupported_marker_is_durable(
     tmp_path: Path
 ) -> None:
@@ -1719,6 +1767,7 @@ def test_restart_recovers_crash_after_unsupported_marker_is_durable(
     assert _unsupported_path(path).exists()
 
 
+@POSIX_NTFY
 def test_unsupported_recovery_preserves_manual_target_and_cleans_exact_candidate(
     tmp_path: Path,
 ) -> None:
@@ -1766,6 +1815,7 @@ def test_unsupported_recovery_preserves_manual_target_and_cleans_exact_candidate
     assert _unsupported_path(path).exists()
 
 
+@POSIX_NTFY
 def test_marker_is_private_durable_and_precedes_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1810,6 +1860,7 @@ def test_marker_is_private_durable_and_precedes_candidate(
     assert observed["marker_contains_topic"] is False
 
 
+@POSIX_NTFY
 @pytest.mark.parametrize(
     ("stage", "expected_state"),
     [
@@ -1840,6 +1891,7 @@ def test_restart_recovers_crash_at_each_reordered_transaction_step(
         assert load_config(path).ntfy_content_disclosure_acknowledged is True
 
 
+@POSIX_NTFY
 def test_transaction_create_collision_preserves_preexisting_private_file(
     tmp_path: Path,
 ) -> None:
@@ -1858,6 +1910,7 @@ def test_transaction_create_collision_preserves_preexisting_private_file(
     assert stat.S_IMODE(collision.stat().st_mode) == 0o600
 
 
+@POSIX_NTFY
 def test_recovery_resumes_after_interruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1887,6 +1940,7 @@ def test_recovery_resumes_after_interruption(
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 def test_exchange_response_loss_reconciles_exact_committed_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1918,6 +1972,7 @@ def test_exchange_response_loss_reconciles_exact_committed_state(
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 @pytest.mark.parametrize("failure", ["write", "file_fsync", "exchange"])
 def test_pre_replace_failures_preserve_exact_old_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
@@ -1963,6 +2018,7 @@ def test_pre_replace_failures_preserve_exact_old_bytes(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+@POSIX_NTFY
 def test_candidate_creation_failure_preserves_exact_old_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1992,6 +2048,7 @@ def test_candidate_creation_failure_preserves_exact_old_bytes(
     assert path.read_bytes() == original
 
 
+@POSIX_NTFY
 def test_transaction_marker_directory_fsync_failure_prevents_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2024,6 +2081,7 @@ def test_transaction_marker_directory_fsync_failure_prevents_replacement(
     assert not candidate.exists()
 
 
+@POSIX_NTFY
 def test_final_validation_failure_reports_unknown_without_rollback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2103,6 +2161,7 @@ def test_status_and_errors_never_disclose_canary_values(
     assert conflict["error"]["code"] == "conflict"
 
 
+@POSIX_NTFY
 def test_lock_failure_uses_fixed_secret_free_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2139,7 +2198,7 @@ def test_lock_failure_uses_fixed_secret_free_error(
     assert TOPIC not in rendered
 
 
-@pytest.mark.skipif(os.name != "posix", reason="systemd writable-state contract is POSIX-only")
+@POSIX_NTFY
 def test_config_serialization_lock_uses_private_state_not_config_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2175,7 +2234,7 @@ def test_config_serialization_lock_uses_private_state_not_config_parent(
 
 
 
-@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+@POSIX_NTFY
 @pytest.mark.parametrize("unsafe_mode", [0o755, 0o500])
 def test_config_serialization_lock_rejects_unsafe_state_before_effects(
     tmp_path: Path,
@@ -2198,7 +2257,7 @@ def test_config_serialization_lock_rejects_unsafe_state_before_effects(
 
 
 
-@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+@POSIX_NTFY
 def test_config_serialization_lock_blocks_on_one_inode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2243,7 +2302,7 @@ def test_config_serialization_lock_blocks_on_one_inode(
 
 
 
-@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+@POSIX_NTFY
 @pytest.mark.parametrize("attack", ["parent_symlink", "lock_symlink", "lock_hardlink"])
 def test_config_serialization_lock_rejects_unsafe_lock_paths(
     tmp_path: Path,
@@ -2279,7 +2338,7 @@ def test_config_serialization_lock_rejects_unsafe_lock_paths(
 
 
 
-@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+@POSIX_NTFY
 def test_config_serialization_lock_rejects_replacement_after_acquire(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2311,7 +2370,7 @@ def test_config_serialization_lock_rejects_replacement_after_acquire(
 
 
 
-@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+@POSIX_NTFY
 def test_custom_config_paths_share_the_state_lock_inode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2432,3 +2491,22 @@ def test_non_posix_lock_release_failure_after_success_is_fixed_and_secret_free(
         pass
 
     assert "PRIVATE_RELEASE_DETAIL" not in str(failure.value)
+
+
+@pytest.mark.platform_contract(
+    platforms=("nt",), owner="src/eom_email_watcher/config.py:3145",
+    reason="Native Windows manual repair and acknowledgement refusal",
+)
+@pytest.mark.parametrize("acknowledgement", ["", "ntfy_content_disclosure_acknowledged = false"],
+                         ids=["missing-ack", "false-ack"])
+def test_native_windows_ntfy_manual_repair_refuses_acknowledgement(tmp_path, acknowledgement):
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path, acknowledgement=acknowledgement)
+    status = engine_api._response(_request(path, "config.ntfy_disclosure.status"))
+    assert status["data"] == {"state": "manual_repair_required"}
+    response = engine_api._response(_request(path, "config.ntfy_disclosure.acknowledge", {
+        "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+    }))
+    assert response["error"]["code"] == "conflict"
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]
