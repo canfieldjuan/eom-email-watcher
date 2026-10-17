@@ -1,9 +1,11 @@
 """Schema-32 upgrade fixtures and transactional schema-33 failure probes."""
 
 import errno
+import os
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,68 @@ from test_db import Store
 from test_thread_derived import derived, follow, seed
 
 from eom_email_watcher import thread_migration
+
+
+def test_windows_unsafe_retained_backup_refuses_before_sqlite_open(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backup = thread_migration.write_backup(store.path, db)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(
+        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
+    )
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda path: path != backup)
+    connect = sqlite3.connect
+    opened = []
+
+    def observe(*args, **kwargs):
+        opened.append(args[0])
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", observe)
+    with pytest.raises(OSError, match="unsafe"):
+        store.initialize()
+    assert opened == [], "An unsafe retained backup was checked only after SQLite opened"
+    assert store.path.read_bytes() == before
+    assert backup.exists()
+
+
+def test_windows_retiring_backup_does_not_block_private_database_reads(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backup = thread_migration.write_backup(store.path, db)
+    monkeypatch.setattr(
+        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
+    )
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: True)
+    validate = connect_windows.validate_private_regular_file
+
+    def retire_between_enumeration_and_validation(path, **kwargs):
+        if path == backup:
+            backup.unlink()
+        return validate(path, **kwargs)
+
+    monkeypatch.setattr(
+        connect_windows, "validate_private_regular_file", retire_between_enumeration_and_validation
+    )
+    with store.connection() as db:
+        assert db.execute("SELECT 1").fetchone()[0] == 1
+    assert not backup.exists()
 
 
 def legacy_store(tmp_path: Path) -> Store:
@@ -21,7 +85,7 @@ def legacy_store(tmp_path: Path) -> Store:
     seed(store, to=("recipient@example.com",))
     # Only this disposable fixture rewrites its schema catalog. This reconstructs
     # the prior closed CHECK without running the migration under test to do it.
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db, db:
         sql = db.execute("SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0]
         widened = (
             "admission_kind IN ("
@@ -42,7 +106,7 @@ def legacy_store(tmp_path: Path) -> Store:
 
 
 def snapshot(path):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db:
         return (
             db.execute("PRAGMA user_version").fetchone()[0],
             db.execute("SELECT * FROM messages").fetchall(),
@@ -55,6 +119,24 @@ def snapshot(path):
         )
 
 
+def test_fixture_sqlite_connections_are_closed(tmp_path, monkeypatch):
+    connect = sqlite3.connect
+    opened = []
+
+    def capture(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        opened.append(db)
+        return db
+
+    monkeypatch.setattr(sqlite3, "connect", capture)
+    store = legacy_store(tmp_path)
+    assert snapshot(store.path)[0] == 32
+    assert opened
+    for db in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            db.execute("SELECT 1")
+
+
 def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatch):
     store = legacy_store(tmp_path)
     before = snapshot(store.path)
@@ -64,7 +146,12 @@ def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatc
     def inspect_backup(db):
         backups = list(tmp_path.glob("mail.db.pre-v33.*.bak"))
         assert len(backups) == 1
-        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+        if os.name == "nt":
+            from connect_automate.connect_windows import validate_private_regular_file
+
+            validate_private_regular_file(backups[0], root=tmp_path)
+        else:
+            assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
         assert snapshot(backups[0]) == before
         observed.append(True)
         rebuild(db)
@@ -103,7 +190,12 @@ def test_failed_rebuild_rolls_back_and_keeps_newest_backup(tmp_path, monkeypatch
     backups = list(tmp_path.glob("mail.db.pre-v33.*.bak"))
     assert len(backups) == 1 and backups[0] != old
     assert snapshot(backups[0]) == before
-    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    if os.name == "nt":
+        from connect_automate.connect_windows import validate_private_regular_file
+
+        validate_private_regular_file(backups[0], root=tmp_path)
+    else:
+        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
 
 
 def test_backup_full_disk_does_not_start_migration(tmp_path, monkeypatch):

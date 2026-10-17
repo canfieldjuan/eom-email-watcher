@@ -13,7 +13,7 @@ from pathlib import Path
 
 from connect_automate.locking import operation_lock
 
-from . import __version__
+from . import __version__, private_storage
 from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .db import Store
 from .mailbox import MailboxError
@@ -127,7 +127,7 @@ def _doctor(config_path: Path) -> int:
             "url": config.model_base_url,
         }
         checks["notify_send"] = {"ok": shutil.which("notify-send") is not None}
-    except ConfigError as exc:
+    except (ConfigError, private_storage.PrivateStorageError) as exc:
         checks["config"] = {"ok": False, "error": str(exc)}
     print(json.dumps(checks, indent=2))
     return 0 if checks and all(bool(item.get("ok")) for item in checks.values()) else 1
@@ -360,7 +360,9 @@ def main(argv: list[str] | None = None) -> None:
                 code = _requeue_analysis(args.config, args.message_id)
             else:
                 code = _recent(args.config, args.limit)
-        except (ConfigError, MailboxError, SendError, RuntimeError) as exc:
+        except (
+            ConfigError, MailboxError, SendError, RuntimeError, private_storage.PrivateStorageError
+        ) as exc:
             print(f"error: {exc}", file=sys.stderr)
             code = 2
     finally:

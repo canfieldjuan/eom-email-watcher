@@ -1540,3 +1540,295 @@ def test_native_scheduled_actor_terminates_actual_held_process(tmp_path):
         if child.poll() is None:
             child.kill()
             child.wait(timeout=10)
+
+
+@pytest.fixture
+def full_proof_timing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import prove_windows_cutover_full as proof
+    from connect_automate.locking import OperationLockBusy, connect_operation_lock
+
+    clock = SimpleNamespace(value=0.0, per_call=0.25, empty=False, item_count=2,
+                            malformed=False, changed_path=False,
+                            contender_busy=True, ack_status="acknowledged")
+    monkeypatch.setattr(proof, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    location = tmp_path / "host.lock"
+    items = [{
+        "message_id": f"public-message-{index}", "kind": "analysis",
+        "analysis_at": "public-revision", "subject_type": "message",
+        "subject_id": f"public-message-{index}", "revision": "public-revision",
+        "title": "Public fixture", "body": "Public fixture",
+    } for index in range(26)]
+    events = []
+
+    class Process:
+        def __init__(self, request):
+            self.operation, self.payload = request["operation"], request["payload"]
+            if self.operation in proof.ADMISSION_REQUIRED_OPERATIONS:
+                assert request["admission_token"] == {"public": "startup-binding"}
+            self.returncode = 0
+
+        def communicate(self, timeout):
+            assert timeout == 150
+            clock.value += clock.per_call
+            operation, payload = self.operation, self.payload
+            events.append((operation, payload))
+            if operation == "config.admission.snapshot":
+                data = {"token": {"public": "startup-binding"}}
+            elif operation == "host.operation_lock":
+                changed = clock.changed_path and sum(
+                    event[0] == "host.operation_lock" for event in events
+                ) > 1
+                data = {"path": str(location.with_name("changed.lock") if changed else location)}
+            elif operation == "watcher.check":
+                data = {"active": True}
+            else:
+                with (
+                    pytest.raises(OperationLockBusy),
+                    connect_operation_lock(location, "unit contender"),
+                ):
+                    pass
+                if operation == "notifications.pending":
+                    if clock.contender_busy:
+                        self.returncode = 2
+                        return json.dumps({"ok": False, "error": {
+                            "code": "runtime_error",
+                            "message": "Another watcher operation is already running",
+                        }}), ""
+                    data = {"items": items}
+                elif operation == "notifications.pending_under_host_lock":
+                    assert payload == {"limit": 25}
+                    selected = [dict(item) for item in items[:clock.item_count]]
+                    if clock.malformed:
+                        selected[-1].pop("revision")
+                    data = {"items": [] if clock.empty else selected}
+                elif operation == "notifications.ack":
+                    expected = [{key: item[key] for key in (
+                        "message_id", "kind", "analysis_at",
+                        "subject_type", "subject_id", "revision"
+                    )} for item in items]
+                    assert payload in expected
+                    data = {"status": clock.ack_status}
+                else:
+                    assert operation == "notifications.count_under_host_lock"
+                    data = {"count": 0}
+            return json.dumps({"ok": True, "data": data}), ""
+
+    engine = proof.Engine(tmp_path / "unused-engine", tmp_path / "config.toml", tmp_path, {})
+    monkeypatch.setattr(
+        engine, "start", lambda operation, payload=None: Process(
+            json.loads(engine.request(operation, payload))
+        )
+    )
+    return proof, engine, clock, events, location
+
+
+def test_full_proof_startup_acquires_one_admission_binding(full_proof_timing):
+    proof, engine, _, events, location = full_proof_timing
+    proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+    assert sum(operation == "config.admission.snapshot" for operation, _ in events) == 1
+    # The scope must release its binding; later operations reacquire admission.
+    engine.call("host.operation_lock")
+    assert sum(operation == "config.admission.snapshot" for operation, _ in events) == 2
+
+
+def test_full_proof_deadline_failure_preserves_receipt(full_proof_timing):
+    proof, engine, clock, events, location = full_proof_timing
+    clock.per_call = 6
+    with pytest.raises(AssertionError, match="30 s deadline"):
+        proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+    receipt = engine.folder / "startup-delivery.json"
+    assert receipt.exists(), "red startup measurement must preserve its receipt"
+    report = json.loads(receipt.read_text())
+    assert report["total_seconds"] == 30
+    assert report["deadline_seconds"] == 30
+    assert report["pending_intents"] == 2
+    assert report["remaining_intents"] == 0
+    assert report["backup_count"] == 0
+    assert len(report["ipc_calls"]) == 5
+    assert len(report["store_open"]["samples_seconds"]) == 5
+    assert report["no_store_round_trip"]["operation"] == "config.admission.snapshot"
+    assert report["no_store_round_trip"]["elapsed_seconds"] == 6
+    engine.call("host.operation_lock")
+    assert sum(operation == "config.admission.snapshot" for operation, _ in events) == 2
+
+
+def test_full_proof_store_open_span_preserves_populated_database(tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    import prove_windows_cutover_full as proof
+
+    database = tmp_path / "public.db"
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("CREATE TABLE public_fixture(value TEXT)")
+        db.execute("INSERT INTO public_fixture VALUES ('retained')")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
+    report = proof.measure_store_connections(database)
+    assert len(report["samples_seconds"]) == 5
+    assert all(sample >= 0 for sample in report["samples_seconds"])
+    assert report["max_seconds"] == max(report["samples_seconds"])
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("SELECT value FROM public_fixture").fetchall() == [("retained",)]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
+
+
+def test_full_proof_store_span_reports_each_cycle_and_median(monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import prove_windows_cutover_full as proof
+
+    from eom_email_watcher import db
+
+    samples = [0.25, 0.75, 0.5, 1.0, 0.125]
+    clock = SimpleNamespace(value=0.0)
+    opened = []
+
+    class Store:
+        def __init__(self, path):
+            assert path == Path("public.db")
+
+        @contextmanager
+        def connection(self):
+            clock.value += samples[len(opened)]
+            opened.append("open")
+            yield
+            opened[-1] = "closed"
+
+    monkeypatch.setattr(db, "Store", Store)
+    monkeypatch.setattr(proof, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    report = proof.measure_store_connections(Path("public.db"))
+    assert report["samples_seconds"] == samples
+    assert report["median_seconds"] == 0.5
+    assert report["max_seconds"] == 1.0
+    assert opened == ["closed"] * 5
+
+
+def test_full_proof_records_each_ipc_duration(full_proof_timing):
+    _, engine, _, _, location = full_proof_timing
+    assert engine.call("host.operation_lock") == {"path": str(location)}
+    rows = [json.loads(line) for line in (
+        engine.folder / "operations.jsonl"
+    ).read_text().splitlines()]
+    assert rows[0]["operation"] == "config.admission.snapshot"
+    assert rows[0]["elapsed_seconds"] == 0.25
+    assert rows[-1]["elapsed_seconds"] == 0.5
+    assert engine.operation_timings[-1] == {
+        "operation": "host.operation_lock", "elapsed_seconds": 0.5
+    }
+
+
+def test_full_proof_startup_sequence_holds_native_lock_and_records_receipt(full_proof_timing):
+    proof, engine, _, events, location = full_proof_timing
+    from connect_automate.locking import connect_operation_lock
+
+    database = location.with_name("mail.db")
+    for name in ("mail.db.pre-v33.first.bak", "mail.db.pre-v33.second.bak", "unrelated.bak"):
+        location.with_name(name).write_bytes(b"public backup inventory fixture")
+    report = proof.measure_startup_delivery(engine, database)
+    assert [entry["operation"] for entry in report["ipc_calls"]] == [
+        "host.operation_lock", "notifications.pending_under_host_lock",
+        "notifications.ack", "notifications.ack", "notifications.count_under_host_lock",
+    ]
+    assert [event[0] for event in events[:3]] == [
+        "config.admission.snapshot", "host.operation_lock", "notifications.pending"
+    ]
+    assert all(entry["elapsed_seconds"] == 0.25 for entry in report["ipc_calls"])
+    assert report["total_seconds"] == 1.25
+    assert report["deadline_seconds"] == 30
+    assert report["pending_intents"] == 2
+    assert report["remaining_intents"] == 0
+    assert report["backup_count"] == 2
+    assert report["host_lock_contention_proved"] is True
+    assert json.loads((engine.folder / "startup-delivery.json").read_text()) == report
+    with connect_operation_lock(location, "unit release control"):
+        pass
+
+
+@pytest.mark.parametrize("seconds, passes", [(5.999, True), (6, False), (6.001, False)])
+def test_full_proof_startup_deadline_boundary(full_proof_timing, seconds, passes):
+    proof, engine, clock, _, location = full_proof_timing
+    clock.per_call = seconds
+    if passes:
+        report = proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+        assert report["total_seconds"] < 30
+    else:
+        with pytest.raises(AssertionError, match="30 s deadline"):
+            proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+
+
+@pytest.mark.parametrize("defeat", ["empty", "unlocked", "ack_failed"])
+def test_full_proof_startup_refuses_empty_unlocked_or_failed_ack(full_proof_timing, defeat):
+    proof, engine, clock, events, location = full_proof_timing
+    if defeat == "empty":
+        clock.empty = True
+    elif defeat == "unlocked":
+        clock.contender_busy = False
+    else:
+        clock.ack_status = "rejected"
+    with pytest.raises(AssertionError):
+        proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+    assert not any(operation == "notifications.count_under_host_lock" for operation, _ in events)
+
+
+
+def test_full_proof_public_check_records_time_without_startup_deadline(full_proof_timing):
+    _, engine, clock, _, _ = full_proof_timing
+    clock.per_call = 40
+    assert engine.call("watcher.check") == {"active": True}
+    assert engine.operation_timings[-1] == {
+        "operation": "watcher.check", "elapsed_seconds": 80
+    }
+
+
+def test_full_proof_missing_host_lock_stops_before_queue_calls(full_proof_timing, monkeypatch):
+    from connect_automate import locking
+
+    proof, engine, _, events, location = full_proof_timing
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("public native-lock refusal")
+
+    monkeypatch.setattr(locking, "connect_operation_lock", refuse)
+    with pytest.raises(OSError, match="native-lock refusal"):
+        proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+    assert [operation for operation, _ in events] == [
+        "config.admission.snapshot", "host.operation_lock"
+    ]
+
+
+
+@pytest.mark.parametrize("item_count, accepted", [(0, False), (1, True), (25, True), (26, False)])
+def test_full_proof_startup_batch_boundaries(full_proof_timing, item_count, accepted):
+    proof, engine, clock, _, location = full_proof_timing
+    clock.item_count = item_count
+    if accepted:
+        report = proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+        assert report["pending_intents"] == item_count
+        assert sum(call["operation"] == "notifications.ack" for call in report["ipc_calls"]) == (
+            item_count
+        )
+    else:
+        with pytest.raises(AssertionError, match="real pending fixture intents"):
+            proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+
+
+def test_full_proof_mixed_intents_do_not_fill_missing_ack_identity(full_proof_timing):
+    proof, engine, clock, events, location = full_proof_timing
+    clock.malformed = True
+    with pytest.raises(KeyError, match="revision"):
+        proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+    assert sum(operation == "notifications.ack" for operation, _ in events) == 1
+    assert not any(operation == "notifications.count_under_host_lock" for operation, _ in events)
+
+
+def test_full_proof_changed_host_lock_path_stops_before_queue(full_proof_timing):
+    proof, engine, clock, events, location = full_proof_timing
+    clock.changed_path = True
+    with pytest.raises(AssertionError, match="Host lock path changed"):
+        proof.measure_startup_delivery(engine, location.with_name("mail.db"))
+    assert not any(operation == "notifications.pending_under_host_lock" for operation, _ in events)

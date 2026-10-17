@@ -110,6 +110,8 @@ jobs:
         run: >-
           uv run pytest -v
           tests/test_windows_cutover.py
+          tests/test_config.py
+          tests/test_thread_migration.py
           tests/test_windows_cutover_round9.py
           tests/test_windows_context_probe.py
           tests/test_gmail_recovery_retention.py
