@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from connect_automate import connect, entitlement
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import DEFAULT_RETENTION_DAYS, config_admission_snapshot
@@ -31,6 +32,9 @@ FIXTURE_MAILBOX_IDENTITY_KEY = PROOF_SCRIPT["FIXTURE_MAILBOX_IDENTITY_KEY"]
 FixtureGmail = PROOF_SCRIPT["FixtureGmail"]
 FixtureModelHandler = PROOF_SCRIPT["FixtureModelHandler"]
 fixture_message_times = PROOF_SCRIPT["fixture_message_times"]
+gmail_from_token = PROOF_SCRIPT["gmail_from_token"]
+instrumented_client_factory = PROOF_SCRIPT["instrumented_client_factory"]
+refuse_gmail = PROOF_SCRIPT["refuse_gmail"]
 install_fixture_mailbox = PROOF_SCRIPT["install_fixture_mailbox"]
 require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
 privacy_projection = PROOF_SCRIPT["privacy_projection"]
@@ -382,6 +386,76 @@ def test_fixture_gmail_expired_deadline_reads_no_attachment(
 
     assert reads == []
     assert gateway.operation_timeouts == []
+
+
+def _signature_call_shapes(callable_) -> list[tuple[tuple[object, ...], dict[str, object]]]:
+    """Every-parameter positional and keyword calls admitted by a real signature."""
+    parameters = [
+        parameter
+        for parameter in inspect.signature(callable_).parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ]
+    values = {parameter.name: object() for parameter in parameters}
+    positional = tuple(
+        values[parameter.name]
+        for parameter in parameters
+        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    keyword_only = {
+        parameter.name: values[parameter.name]
+        for parameter in parameters
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    return [((), {}), (positional, keyword_only), ((), values)]
+
+
+def test_instrumented_client_factory_forwards_every_sdk_call_shape() -> None:
+    # The proof replaces connect._client; the SDK calls it with a timeout, so a
+    # zero-argument wrapper broke the interrupted-job phase (issue #281).
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    submissions: list[str] = []
+
+    def original(*args: object, **kwargs: object) -> httpx.Client:
+        calls.append((args, kwargs))
+        return httpx.Client(
+            base_url="http://provider.invalid",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(202)),
+        )
+
+    def record(request: httpx.Request) -> None:
+        if request.method == "POST" and request.url.path == "/v2/jobs":
+            submissions.append(request.url.path)
+
+    factory = instrumented_client_factory(original, record)
+    shapes = _signature_call_shapes(connect._client)
+    assert ((), {"timeout_seconds": shapes[2][1]["timeout_seconds"]}) == shapes[2]
+    for args, kwargs in shapes:
+        with factory(*args, **kwargs) as client:
+            client.post("/v2/jobs")
+            client.get("/v2/manifest")
+    assert calls == shapes
+    assert submissions == ["/v2/jobs"] * len(shapes)
+
+
+def test_gmail_from_token_double_accepts_every_real_factory_call_shape() -> None:
+    gateway = FixtureGmail(b"%PDF")
+    opened = gmail_from_token(lambda: gateway).__func__
+    refused = gmail_from_token(refuse_gmail("must not open Gmail")).__func__
+    for args, kwargs in _signature_call_shapes(engine_api.GmailGateway.from_token):
+        assert opened(*args, **kwargs) is gateway
+        with pytest.raises(AssertionError, match="must not open Gmail"):
+            refused(*args, **kwargs)
+
+
+def test_proof_entitlement_doubles_match_sdk_signatures() -> None:
+    # The proof replaces these SDK callables with a bound zero-argument method and
+    # a *feature_ids lambda; a changed SDK signature must fail here first.
+    assert list(inspect.signature(entitlement.connect_entitlement_decision).parameters) == []
+    features = list(inspect.signature(entitlement.feature_entitlements_active).parameters.values())
+    assert [(parameter.name, parameter.kind) for parameter in features] == [
+        ("feature_ids", inspect.Parameter.VAR_POSITIONAL)
+    ]
 
 
 def test_proof_check_gate_accepts_only_complete_success() -> None:

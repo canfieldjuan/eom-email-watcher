@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack, suppress
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -378,6 +379,36 @@ class FixtureGmail:
         ):
             raise AssertionError("Unexpected fixture attachment identity")
         return self.attachment_content
+
+
+def gmail_from_token(opened: Callable[[], FixtureGmail]) -> staticmethod:
+    """A GmailGateway.from_token double accepting every call the real factory accepts.
+
+    The proof replaces this engine factory; positional-only lambdas broke as soon
+    as a caller passed a keyword (issue #281).
+    """
+    return staticmethod(lambda *_args, **_kwargs: opened())
+
+
+def refuse_gmail(message: str) -> Callable[[], FixtureGmail]:
+    def opened() -> FixtureGmail:
+        raise AssertionError(message)
+
+    return opened
+
+
+def instrumented_client_factory(
+    original: Callable[..., httpx.Client],
+    hook: Callable[[httpx.Request], None],
+) -> Callable[..., httpx.Client]:
+    """Wrap connect._client, forwarding the SDK's own arguments unchanged (issue #281)."""
+
+    def factory(*args: object, **kwargs: object) -> httpx.Client:
+        client = original(*args, **kwargs)
+        client.event_hooks["request"].append(hook)
+        return client
+
+    return factory
 
 
 def fixture_message_times(now: datetime | None = None) -> tuple[str, str]:
@@ -789,7 +820,7 @@ def main() -> None:
                 "confirmed": False,
             }
             original_from_token = engine_api.GmailGateway.__dict__["from_token"]
-            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             try:
                 response = engine_api._response(
                     request(
@@ -880,9 +911,7 @@ def main() -> None:
                 )
             automation_fire = automation_fires[0]
             automation_deadline = time.monotonic() + model_timeout_seconds + 30
-            engine_api.GmailGateway.from_token = staticmethod(
-                lambda *_args: FixtureGmail(pdf)
-            )
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             try:
                 while automation_fire.state not in {
                     "completed",
@@ -970,10 +999,8 @@ def main() -> None:
                     },
                 )
             denied_manifest_body = denied_manifest.json()
-            engine_api.GmailGateway.from_token = staticmethod(
-                lambda *_args: (_ for _ in ()).throw(
-                    AssertionError("completed result replay reopened Gmail while unentitled")
-                )
+            engine_api.GmailGateway.from_token = gmail_from_token(
+                refuse_gmail("completed result replay reopened Gmail while unentitled")
             )
             try:
                 cached_while_expired = engine_api._response(
@@ -1072,10 +1099,8 @@ def main() -> None:
                 "confirmed": False,
             }
             stale_post_attempts_before = reference_provider.post_attempt_count()
-            engine_api.GmailGateway.from_token = staticmethod(
-                lambda *_args: (_ for _ in ()).throw(
-                    AssertionError("stale capability selection reached Gmail")
-                )
+            engine_api.GmailGateway.from_token = gmail_from_token(
+                refuse_gmail("stale capability selection reached Gmail")
             )
             try:
                 stale_response = engine_api._response(
@@ -1088,7 +1113,7 @@ def main() -> None:
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
             stale_post_attempts_after = reference_provider.post_attempt_count()
-            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             try:
                 translation_response = engine_api._response(
                     request(
@@ -1215,18 +1240,14 @@ def main() -> None:
             interrupted_result: dict[str, object] = {}
             interrupted_provider_submissions = 0
 
-            def instrumented_connect_client() -> httpx.Client:
-                client = original_connect_client_factory()
+            def record_request(request: httpx.Request) -> None:
+                nonlocal interrupted_provider_submissions
+                if request.method == "POST" and request.url.path == "/v2/jobs":
+                    interrupted_provider_submissions += 1
 
-                def record_request(request: httpx.Request) -> None:
-                    nonlocal interrupted_provider_submissions
-                    if request.method == "POST" and request.url.path == "/v2/jobs":
-                        interrupted_provider_submissions += 1
-
-                client.event_hooks["request"].append(record_request)
-                return client
-
-            connect._client = instrumented_connect_client
+            connect._client = instrumented_client_factory(
+                original_connect_client_factory, record_request
+            )
 
             def invoke_interrupted_job() -> None:
                 try:
@@ -1241,7 +1262,7 @@ def main() -> None:
                     interrupted_result["error_type"] = type(error).__name__
 
             FixtureModelHandler.pause_one_generation()
-            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             interrupted_thread = threading.Thread(
                 target=invoke_interrupted_job,
                 name="connect-interrupted-invocation",
@@ -1273,12 +1294,12 @@ def main() -> None:
             after_job_restart = wait_for_capability(True)
             gmail_reconciliation_reads = 0
 
-            def reject_gmail_reopen(*_args: object) -> FixtureGmail:
+            def reject_gmail_reopen() -> FixtureGmail:
                 nonlocal gmail_reconciliation_reads
                 gmail_reconciliation_reads += 1
                 raise AssertionError("Provider reconciliation must not reopen Gmail")
 
-            engine_api.GmailGateway.from_token = staticmethod(reject_gmail_reopen)
+            engine_api.GmailGateway.from_token = gmail_from_token(reject_gmail_reopen)
             try:
                 reconciliation_deadline = time.monotonic() + 15
                 while True:
