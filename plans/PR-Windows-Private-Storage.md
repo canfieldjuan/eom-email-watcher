@@ -1,0 +1,91 @@
+# Windows private storage — separate #269 contract
+
+Status: **PROPOSED, CONTRACT ONLY.** Juan authorized this session to own #269 separately, contract first. Implementation requires his explicit acceptance of this contract. No production code, path transition, installed-app change or native privacy claim is included here.
+
+## Root cause and baseline
+
+Inventory baseline: main `167e3a97abee478859fbd51a36b4945cbd170d03`. The pinned SDK is `connect-automate` revision `a6bbb347ae6a4cb30aeb531153ef2c33ee828fed` (`pyproject.toml:8`, `uv.lock:181`). The accepted Windows protection model is in `docs/CONNECT_V1.md:138-147`: private DACLs through the shared SDK, allowed current user/SYSTEM/Administrators, and rejection of reparse indirection.
+
+`config.py:4181` (`secure_runtime_paths`, introduced by `153e0d4b`) establishes directory modes and config-file mode through mkdir/chmod. `thread_migration.py:20` creates a backup with `os.open(..., 0o600)` before VACUUM. On Windows those modes do not establish the required DACL. Credential publication/read owners have the same platform gap. Runtime invokes secure_runtime_paths before Store initialization (`runtime.py:171` `runtime_from_config`), but config parsing and direct credential/Store entries also exist, so a runtime-only check is insufficient.
+
+Correction to the earlier #261 privacy inventory: that artifact labelled itself main while showing #261's target-schema backup signature. On this main baseline, write_backup is at `thread_migration.py:20`, has no target_schema argument, and uses the existing pre-v33 naming owner. The old artifact is retained; the inventory here is authoritative. #261's additive-schema extension must be preserved when the separately accepted fix is forward-merged there.
+
+## Required behavior and trusted-root rule
+
+1. **Keep the current paths.** No automatic move to Local AppData, no new path setting and no reinterpretation of account/profile identity. Config remains at its existing default or explicit path. State remains selected by `_runtime_state_root` (`config.py:226`), including STATE_DIRECTORY, XDG_STATE_HOME and the current home-based default. Explicit `_path` values (`config.py:218`) retain their existing lexical path/cwd semantics. Use the existing absolute lexical adapter where needed; do not resolve away an indirection to make a check pass.
+2. **The storage root comes from the actual selected location.** For a configured file, its selected storage directory is the root; generated mail-account/calendar files are descendants of the selected database storage directory. A private custom root outside Local AppData remains supported. Do not replace these roots with LOCALAPPDATA as the sole permitted anchor.
+3. **Validate an existing root through the SDK itself.** Consume `connect_automate.connect_windows.validate_private_directory(root, root=root)` and the SDK directory/file owners. The explicit root is not exempt from ACL/owner/reparse validation. Its current-user/SYSTEM/Administrators rule is the SDK's rule, not a copied ACE/SID implementation in Email Watcher.
+4. **Create missing directories below a verified existing anchor.** Walk the selected lexical path to its nearest existing containing directory, validate it as the SDK root, then use `ensure_private_directory` to create the missing descendants. Newly created directories receive the SDK's private inheritable DACL. Do not first create a directory with mkdir and later pretend it was a pre-existing trusted root. An unsafe existing component is a refusal; do not walk past it to find a more permissive anchor. Existing reparse roots/descendants are rejected.
+5. **Refuse unsafe existing storage.** A root, descendant or private file with extra content/mutation rights, an untrusted owner, reparse indirection, or a non-regular file is rejected with a plain existing error shape. No silent re-ACL of an existing directory or file, including outside the app's own area. No chmod fallback after SDK rejection. Caller-supplied allow_missing applies only to legitimate not-yet-created files, not an invalid existing object.
+6. **Privacy precedes use.** Validate existing files before credential/config/content reads, refreshes, replacement or SQLite opening. Establish and validate the private parent before any new secret/content file is created. Validate a newly created empty regular file before the publication owner writes sensitive bytes; retain its current identity/atomicity guards. Use `validate_private_regular_file` for the database, backups, config and credential/cache files. Privacy refusal must not authorize a network effect, truncate an existing file or stamp an upgrade.
+7. **SQLite files belong to the same boundary.** Existing database, WAL/SHM and any journal/backup files must not bypass the file owner. Parent privacy is established before SQLite can create files; new SQLite auxiliary files must inherit private storage. Native qualification must demonstrate that property for both app-created and pre-existing private roots. If the SDK/SQLite boundary cannot satisfy it without a new ACL algorithm or a path transition, stop and revise this contract rather than claim post-write validation repaired exposure.
+8. **POSIX behavior stays unchanged.** Preserve existing directory/file mode, ownership, nofollow, identity, atomic publication, rollback and recovery rules and assertions. The platform adapter adds the Windows equivalent; it does not replace existing checks with a weaker cross-platform predicate.
+
+A standard Windows profile's actual ACL and inherited file behavior are native proof obligations, not assumptions that make the default root pass. If a supported default cannot validate, report that source/native contradiction before proposing a path transition.
+
+## One owner and required change surface
+
+Introduce one small private-storage platform adapter in Email Watcher that selects the above configured root and delegates Windows directory/file operations to the existing SDK. It owns root selection and platform dispatch only. It must not contain a second DACL parser, principal allowlist, credential format, message identity rule or alternate SQLite migration. Every applicable reader/publication owner consumes that same adapter at its first read/write boundary.
+
+| Object / path selection | Existing first-use or publication owner | Required integration |
+| --- | --- | --- |
+| Config, containing directory, first-run config, publication markers/candidates/backups | `config.py:1051` `_read_admission_config`; `:3334` `_read_safe_windows_file`; `:3506` `_write_private_windows_file`; `:3846` `_atomic_create`; `:3880` `_initialize_config_non_posix` | Validate before reading config or writing any candidate bytes. Preserve serialization, held-parent/file identity, compare-and-swap, journals, outcome-unknown classification and rollback. ACL validation is additional to the existing regular/nlink/reparse rules, never their replacement. |
+| Fixed Gmail read/send tokens and their parents | `config.py:4181`; `gmail.py:691` `from_token`, `:778` `authorize_with_status`; `outbound.py:55` `GmailSender.authorize`, `:68` `from_token` | Establish parent privacy, validate reads and destinations before OAuth refresh/write, and publish privately before token use. Direct setup-send must not bypass the owner. Keep consent/scopes/refresh and error semantics. |
+| Generated Gmail/Microsoft/IMAP account paths | `runtime.py:43` `mail_account_token_file` | Preserve these existing path/name constructors; no path copied from account state. Apply the shared boundary at credential owners, not just this path-returning function. |
+| IMAP saved and staged credentials | `imap.py:281` `write_credentials`, `:286` `load_credentials`; `engine_api.py:822` `_connect_imap_account` (parent at `:852`) | Establish the private staging/publication parent before password bytes are written. Preserve existing authorization staging, account activation and identity checks; validate saved files before reading. |
+| OAuth staging and common token installation | `engine_api.py:519` `_authorize_gmail_account`, `:718` `_authorize_microsoft_account`, `:485` `_install_private_token`; `:2771` `_write_private_file` credential call | Protect staged directories before provider authorization. Validate the staged source, destination and empty publication candidate before reading/writing credentials; preserve the destination lock and atomic replacement. The generic file helper also serves user-selected exports: integrate the private-storage requirement at its credential publication entry without imposing a new private-directory policy on exports. |
+| Microsoft mail and calendar caches | `microsoft365.py:218` `_load_cache`, `:230` `_write_private_cache`; calendar readers/writers call those same owners (`microsoft_calendar.py:341-488`) | One cache privacy/publication rule shared by mail and calendar. No duplicated calendar ACL rule. Preserve atomic replacement, locks, serialization and refresh behavior. |
+| Calendar read/proposal/write path selection | `runtime.py:70` `microsoft_calendar_token_file`, `:85` read helper | Keep literal profile isolation and existing account validation. File handling stays at the common cache owner. |
+| Database, SQLite-created auxiliaries | `db.py:5873` `Store.connection`; `:5959` `initialize`; `:5991` `_initialize_locked` | Protect direct Store callers too; establish parent and validate existing database/auxiliary files before opening. Preserve operation/upgrade locking, SQLite transactions, journal mode, derived-state ownership and integrity checks. |
+| Pre-upgrade backups and cleanup | `thread_migration.py:20` `write_backup`; `:35` `cleanup_backups` | Private exclusive empty-file creation/validation before VACUUM writes content; preserve literal naming, no overwrite, cleanup ownership and failure rollback. No schema or retention change. |
+| Model/gateway bearer-token input | `model.py:324` `LocalModel._headers`; `:456` gateway `_open_readonly` / `:467` `_headers`; selected by runtime/config | Validate the private token before reading through the same Windows owner. Keep existing size/ASCII/file checks and POSIX restrictions. No inference, prompt, model, endpoint or capacity change. |
+
+The SDK additionally exposes `atomic_replace_bytes`: it validates the replacement temporary ACL before writing bytes and owns flush/replace cleanup. Reuse it for ordinary Windows credential/cache publication where it preserves the existing owner contract. Config publication's stronger existing transaction/recovery protocol must remain its owner; consume the shared privacy boundary inside that protocol rather than substituting a second publication mechanism. Do not invent a new credential-size cap to satisfy a helper signature.
+
+Bundled/public OAuth client identities and CA certificates are distinct inputs, not writable user-token stores. Do not impose private-token ACLs on shipped readable package resources. Runtime Connect registrations/entitlement storage already have their SDK owners and are outside this slice.
+
+## Explicit non-scope
+
+- No storage moves, new user-facing path option, account/profile removal, permission broadening, automatic repair of unsafe existing ACLs or additional trust principals.
+- No schema/version/table change, removal predicate, request-key behavior, completion logic, source-lock protocol, retention, scheduler or installer policy change.
+- No dependency revision, second Windows ACL implementation, PyInstaller workaround, broad refactor or changes in another repository.
+- No live credentials/config/mailbox access, host installation or promotion. Native proof uses isolated public fixtures and existing qualification lanes.
+- #261 remains frozen at its published B5 head with its separately prepared qualification commit unpublished. Only forward merges integrate the accepted #269 implementation later.
+
+## Assumptions and blockers
+
+This proposal is source-grounded; no native reproduction is claimed yet. Before editing each production owner, identify its introducing commit and exact first divergence and record the expected fail-first failure class. Map every new or changed assertion to a required behavior above; preserve existing POSIX assertions. A new native failure is classified before another edit, and a contradiction of the root/SDK/SQLite contract stops implementation for a contract revision.
+
+The installed SDK revision must expose these supported public helpers with their current contracts. No private SDK ACL routine may be called. Existing-path validation and the caller's held-identity/locking protocol must jointly protect the actual object used, including a directory/file replacement interleaving; a pathname-only preflight cannot replace those guards. A default profile, missing-directory anchor or SQLite-created file that cannot satisfy the shared owner is a blocker, not permission to relocate data, change existing ACLs or add a local ACL algorithm.
+
+## Verification contract
+
+### Fail-first and native boundary twins
+
+Exercise the actual production boundary, not a test-only validator or assertions that a helper was called:
+
+- POSIX twins retain their current assertions and results.
+- On native Windows, both existing private defaults and a private custom root outside Local AppData pass; newly created nested app directories and created files validate through the SDK.
+- Extra Everyone and Users content/mutation ACEs on an existing root, descendant or file refuse before read/write/network/SQLite mutation. The existing ACL and bytes remain unchanged after refusal.
+- Reparse roots, descendants and private files refuse; directory/non-regular destinations refuse. Missing file is allowed only for the explicit creation flow; an unsafe existing file never becomes a missing file.
+- Validate generated Gmail/Microsoft/IMAP/calendar paths and the fixed send/read/model tokens through their real read/publication owners. No OAuth/network effect after privacy refusal.
+- Before-data-write probe at existing publication seams proves empty-file validation precedes token/config/cache/backup bytes. Failed validation leaves previous content and config publication state unchanged; created empty candidates are cleaned only by their current owner.
+- A real SQLite round trip verifies main/WAL/SHM privacy in existing and app-created private roots, including direct Store use. Actual backup/migration success and rollback preserve private files and original database content.
+- Remove the Windows branch in a test mutation: the native permissive-ACL/reparse controls must fail. The corresponding POSIX twins still exercise their unchanged mode/ownership rules.
+- Existing configuration publication/recovery, token refresh, credential staging, migration/FK/integrity, and path-identity/race controls remain green. No skip, blanket exception, weaker expected value or second policy is an acceptable port.
+
+### Gates and integration
+
+Put regressions with the existing config, provider, model, engine API, migration and Windows cutover tests; select them in the existing Windows CI/qualification lanes. No new standalone harness. Run focused regressions/adjacent owners first, then applicable Ruff/build checks and the repository-required local full suite under umask 022 on the final implementation candidate. Native Windows must exercise the actual SDK and filesystem ACLs; Linux mocks/collection are not native proof. Existing Windows qualification selects the new privacy controls explicitly. Reuse existing native installed/public fixture machinery; no new standalone harness.
+
+Only after this separate slice is implemented, reviewed and qualified may it land and be forward-merged into #261. Refresh #261's backup/privacy controls through this production owner while retaining the original POSIX assertions, then assemble the final candidate and run its full local/native/installed qualification and exact-head review gates. A prior #261 build green does not prove that final tree.
+
+## Acceptance, implementation summary and gap audit
+
+Acceptance required: Juan accepts this root/path/refusal/publication contract before production code. Oversight technical review does not supply operator authority. Record his exact acceptance before implementation.
+
+Implementation summary: contract only. No runtime code or tests changed and no native result claimed.
+
+Cold diff audit: the proposed change is this plan only; its source inventory is pinned to the baseline above. A durable copy and source hashes accompany the proposal. Corrected older mixed-tree evidence is not reused as current proof.
+
+Gap audit: **NOT DONE**. Contract acceptance, fail-first reproduction, implementation, native Windows privacy/auxiliary-file proof, full gates, separate merge, and forward integration/final #261 qualification remain outstanding.
