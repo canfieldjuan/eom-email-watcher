@@ -72,7 +72,7 @@ export function inboxRemovalRecordStatus(
 
 export class InboxRemovalClient {
   private invoke: RemovalInvoke;
-  private onChange: (records: readonly InboxRemovalRecord[]) => void;
+  private onChange: (records: readonly InboxRemovalRecord[]) => void | Promise<void>;
   private errorCode: (error: unknown) => string | null;
   private records = new Map<string, InboxRemovalRecord>();
   private tail: Promise<unknown> = Promise.resolve();
@@ -81,7 +81,7 @@ export class InboxRemovalClient {
 
   constructor(
     invoke: RemovalInvoke,
-    onChange: (records: readonly InboxRemovalRecord[]) => void = () => {},
+    onChange: (records: readonly InboxRemovalRecord[]) => void | Promise<void> = () => {},
     errorCode: (error: unknown) => string | null = () => null,
   ) {
     this.invoke = invoke;
@@ -97,9 +97,18 @@ export class InboxRemovalClient {
     return next;
   }
 
-  private publish(record: InboxRemovalRecord): void {
+  private async publish(record: InboxRemovalRecord): Promise<void> {
     this.records.set(record.request.request_id, record);
-    this.onChange(this.statuses());
+    await this.onChange(this.statuses());
+    if (record.state === "found" && record.receipt.outcome === "completed") {
+      try {
+        await this.invoke<void>("inbox_removal_acknowledge", { requestId: record.request.request_id });
+      } catch (error) {
+        // Keep the rendered outcome and recovery identity; never retry a
+        // mutation or classify acknowledgement failure as a lost reply.
+        console.warn("Local removal acknowledgement unavailable", this.errorCode(error));
+      }
+    }
   }
 
   private async readStatus(request: SavedRemoval): Promise<InboxRemovalResult | undefined> {
@@ -112,13 +121,13 @@ export class InboxRemovalClient {
       const missing = this.errorCode(error) === "not_found";
       if (missing && request.kind === "clear" && request.request_id !== this.latestClear) {
         this.records.delete(request.request_id);
-        this.onChange(this.statuses());
+        await this.onChange(this.statuses());
       } else {
-        this.publish({ request, state: missing ? "missing" : "error", error });
+        await this.publish({ request, state: missing ? "missing" : "error", error });
       }
       return undefined;
     }
-    this.publish({ request, state: "found", receipt });
+    await this.publish({ request, state: "found", receipt });
     return receipt;
   }
 
@@ -130,7 +139,7 @@ export class InboxRemovalClient {
         for (const [key, record] of this.records) {
           if (record.request.kind === "clear" && record.state === "missing") this.records.delete(key);
         }
-        this.onChange(this.statuses());
+        await this.onChange(this.statuses());
       }
       const request: SavedRemoval = { ...prepared, kind, message_id: messageId };
       let receipt: InboxRemovalResult;
@@ -142,7 +151,7 @@ export class InboxRemovalClient {
         // An indeterminate reply is reconciled by this key only, never by a second mutation.
         return this.readStatus(request);
       }
-      this.publish({ request, state: "found", receipt });
+      await this.publish({ request, state: "found", receipt });
       return receipt;
     });
   }

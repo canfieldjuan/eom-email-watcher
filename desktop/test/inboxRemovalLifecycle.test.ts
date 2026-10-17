@@ -21,6 +21,7 @@ test("new Clear saves via native prepare before dispatching its key", async () =
   assert.deepEqual(calls, [
     ["inbox_removal_prepare", { kind: "clear", messageId: null }],
     ["inbox_clear", { requestId: "signed-key" }],
+    ["inbox_removal_acknowledge", { requestId: "signed-key" }],
   ]);
 });
 
@@ -48,6 +49,7 @@ test("Delete preserves its literal parameter across prepare and mutation", async
   assert.deepEqual(calls, [
     ["inbox_removal_prepare", { kind: "delete", messageId }],
     ["inbox_delete", { requestId: "signed-key", messageId }],
+    ["inbox_removal_acknowledge", { requestId: "signed-key" }],
   ]);
 });
 
@@ -89,6 +91,7 @@ test("unknown Clear shows the approved note and only a new explicit Clear prepar
     calls.push(command);
     if (command === "inbox_removal_prepare") return { request_id: `key-${++sequence}` } as T;
     if (command === "inbox_removal_status") throw notFound;
+    if (command === "inbox_removal_acknowledge") return undefined as T;
     assert.equal(command, "inbox_clear");
     if (args?.requestId === "key-1") throw new Error("Lost before commit");
     assert.equal(args?.requestId, "key-2");
@@ -103,6 +106,7 @@ test("unknown Clear shows the approved note and only a new explicit Clear prepar
   await client.clear();
   assert.deepEqual(calls, [
     "inbox_removal_prepare", "inbox_clear", "inbox_removal_status", "inbox_removal_prepare", "inbox_clear",
+    "inbox_removal_acknowledge",
   ]);
   assert.deepEqual(client.statuses().map(record => [record.request.request_id, record.state]), [["key-2", "found"]]);
 });
@@ -167,7 +171,7 @@ test("recovery cannot inspect the client's prepared key before its sole dispatch
   const invoke: RemovalInvoke = async <T>(command: string) => {
     calls.push(command);
     if (command === "inbox_removal_prepare") { preparing.resolve(); return await prepared.promise as T; }
-    if (command === "inbox_removal_saved") return [savedClear] as T;
+    if (command === "inbox_removal_saved") return [] as T;
     return receipt as T;
   };
   const client = new InboxRemovalClient(invoke);
@@ -179,7 +183,7 @@ test("recovery cannot inspect the client's prepared key before its sole dispatch
   assert.deepEqual(calls, ["inbox_removal_prepare"]);
   prepared.resolve({ request_id: "signed-key" });
   await Promise.all([clearing, restoring]);
-  assert.deepEqual(calls, ["inbox_removal_prepare", "inbox_clear", "inbox_removal_saved", "inbox_removal_status"]);
+  assert.deepEqual(calls, ["inbox_removal_prepare", "inbox_clear", "inbox_removal_acknowledge", "inbox_removal_saved"]);
 });
 
 test("a renderer failure is not classified as a lost reply or used to repeat an RPC", async () => {
@@ -204,6 +208,7 @@ test("an older missing Clear recovered after a fresh Clear cannot describe the f
     if (command === "inbox_removal_saved") { listed.resolve(); return await listing.promise as T; }
     if (command === "inbox_removal_prepare") return { request_id: "new-key" } as T;
     if (command === "inbox_removal_status") throw notFound;
+    if (command === "inbox_removal_acknowledge") return undefined as T;
     assert.equal(command, "inbox_clear");
     return { ...receipt, request_id: "new-key" } as T;
   };
@@ -213,7 +218,7 @@ test("an older missing Clear recovered after a fresh Clear cannot describe the f
   const clearing = client.clear();
   listing.resolve([savedClear]);
   await Promise.all([restoring, clearing]);
-  assert.deepEqual(calls, ["inbox_removal_saved", "inbox_removal_prepare", "inbox_clear", "inbox_removal_status"]);
+  assert.deepEqual(calls, ["inbox_removal_saved", "inbox_removal_prepare", "inbox_clear", "inbox_removal_acknowledge", "inbox_removal_status"]);
   assert.deepEqual(client.statuses().map(record => [record.request.request_id, record.state]), [["new-key", "found"]]);
 });
 
@@ -254,4 +259,107 @@ test("missing Delete preserves its existing error rather than using the Clear no
   await client.restore();
   assert.deepEqual(client.statuses(), [{ request: saved, state: "missing", error: notFound }]);
   assert.deepEqual(inboxRemovalRecordStatus(client.statuses()[0], messageOf), { text: notFound.message, kind: "error" });
+});
+
+
+function completedClientJournal(acknowledgementError?: unknown) {
+  let saved: SavedRemoval[] = [];
+  let retired = false;
+  const calls: string[] = [];
+  const invoke: RemovalInvoke = async <T>(command: string) => {
+    calls.push(command);
+    if (command === "inbox_removal_prepare") {
+      saved = [savedClear];
+      return { request_id: savedClear.request_id } as T;
+    }
+    if (command === "inbox_removal_saved") return [...saved] as T;
+    if (command === "inbox_removal_acknowledge") {
+      if (acknowledgementError !== undefined) {
+        const error = acknowledgementError;
+        acknowledgementError = undefined;
+        throw error;
+      }
+      saved = [];
+      return undefined as T;
+    }
+    if (command === "inbox_clear") return receipt as T;
+    assert.equal(command, "inbox_removal_status");
+    if (retired) throw { code: "invalid_request", message: "Local removal request key has expired; start a new request" };
+    return receipt as T;
+  };
+  return { invoke, calls, saved: () => [...saved], retire: () => { retired = true; } };
+}
+
+test("completed receipt acknowledgement waits for rendering and prevents recovery after retirement", async () => {
+  const journal = completedClientJournal();
+  const rendering = deferred<void>();
+  const rendered = deferred<void>();
+  const client = new InboxRemovalClient(journal.invoke, async records => {
+    if (records.some(record => record.state === "found")) {
+      rendering.resolve();
+      await rendered.promise;
+    }
+  }, codeOf);
+  const clearing = client.clear();
+  await rendering.promise;
+  assert.deepEqual(journal.saved(), [savedClear]);
+  assert.deepEqual(journal.calls, ["inbox_removal_prepare", "inbox_clear"]);
+  rendered.resolve();
+  await clearing;
+  assert.deepEqual(journal.saved(), []);
+  assert.deepEqual(journal.calls, ["inbox_removal_prepare", "inbox_clear", "inbox_removal_acknowledge"]);
+  journal.retire();
+  const restarted = new InboxRemovalClient(journal.invoke, () => {}, codeOf);
+  await restarted.restore();
+  assert.deepEqual(restarted.statuses(), []);
+  assert.deepEqual(journal.calls, ["inbox_removal_prepare", "inbox_clear", "inbox_removal_acknowledge", "inbox_removal_saved"]);
+});
+
+test("failed rendering retains the journal entry for a status-only restart", async () => {
+  const journal = completedClientJournal();
+  const renderError = new Error("Renderer failed before receipt display");
+  const client = new InboxRemovalClient(journal.invoke, records => {
+    if (records.some(record => record.state === "found")) throw renderError;
+  }, codeOf);
+  await assert.rejects(client.clear(), renderError);
+  assert.deepEqual(journal.saved(), [savedClear]);
+  assert.deepEqual(journal.calls, ["inbox_removal_prepare", "inbox_clear"]);
+  const restarted = new InboxRemovalClient(journal.invoke, () => {}, codeOf);
+  await restarted.restore();
+  assert.deepEqual(journal.saved(), []);
+  assert.deepEqual(journal.calls, [
+    "inbox_removal_prepare", "inbox_clear", "inbox_removal_saved",
+    "inbox_removal_status", "inbox_removal_acknowledge",
+  ]);
+  assert.deepEqual(restarted.statuses(), [{ request: savedClear, state: "found", receipt }]);
+});
+
+test("acknowledgement failure keeps the rendered receipt and key without a retry", async () => {
+  const journal = completedClientJournal({ code: "operation_busy", message: "Existing busy outcome" });
+  const client = new InboxRemovalClient(journal.invoke, () => {}, codeOf);
+  assert.deepEqual(await client.clear(), receipt);
+  assert.deepEqual(client.statuses(), [{ request: savedClear, state: "found", receipt }]);
+  assert.deepEqual(journal.saved(), [savedClear]);
+  assert.deepEqual(journal.calls, ["inbox_removal_prepare", "inbox_clear", "inbox_removal_acknowledge"]);
+  const restarted = new InboxRemovalClient(journal.invoke, () => {}, codeOf);
+  await restarted.restore();
+  assert.deepEqual(journal.saved(), []);
+  assert.deepEqual(journal.calls, [
+    "inbox_removal_prepare", "inbox_clear", "inbox_removal_acknowledge",
+    "inbox_removal_saved", "inbox_removal_status", "inbox_removal_acknowledge",
+  ]);
+});
+
+
+test("rendered completed receipt never reappears as an expired error after retirement", async () => {
+  const journal = completedClientJournal();
+  const first = new InboxRemovalClient(journal.invoke, () => {}, codeOf);
+  assert.deepEqual(await first.clear(), receipt);
+  journal.retire();
+  const restarted = new InboxRemovalClient(journal.invoke, () => {}, codeOf);
+  await restarted.restore();
+  assert.deepEqual(restarted.statuses(), []);
+  assert.deepEqual(journal.calls, [
+    "inbox_removal_prepare", "inbox_clear", "inbox_removal_acknowledge", "inbox_removal_saved",
+  ]);
 });

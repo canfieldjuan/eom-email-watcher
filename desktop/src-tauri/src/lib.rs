@@ -1777,6 +1777,25 @@ async fn inbox_removal_status(
 }
 
 #[tauri::command]
+async fn inbox_removal_acknowledge(
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    request_id: String,
+) -> Result<(), EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        delivery.run_engine_exclusive(&engine, |engine| {
+            engine.acknowledge_rendered_inbox_removal(request_id)
+        })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn inbox_delete(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
@@ -2655,6 +2674,7 @@ pub fn run() {
             inbox_removal_prepare,
             inbox_removal_saved,
             inbox_removal_status,
+            inbox_removal_acknowledge,
             mail_account_activate,
             mail_account_connect,
             mail_account_disconnect,

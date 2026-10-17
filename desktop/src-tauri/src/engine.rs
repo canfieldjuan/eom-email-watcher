@@ -1999,11 +1999,29 @@ impl Engine {
             .map_err(|_| EngineError::host("host_error", "Local removal recovery is unavailable"))
     }
 
+    pub(crate) fn acknowledge_rendered_inbox_removal(
+        &self,
+        request_id: String,
+    ) -> Result<(), EngineError> {
+        self.reconcile_inbox_removal_status(request_id, None, None, true)
+            .map(|_| ())
+    }
+
     pub(crate) fn recover_inbox_removal_status(
         &self,
         request_id: String,
         kind: Option<String>,
         message_id: Option<String>,
+    ) -> Result<InboxRemovalResult, EngineError> {
+        self.reconcile_inbox_removal_status(request_id, kind, message_id, false)
+    }
+
+    fn reconcile_inbox_removal_status(
+        &self,
+        request_id: String,
+        kind: Option<String>,
+        message_id: Option<String>,
+        rendered: bool,
     ) -> Result<InboxRemovalResult, EngineError> {
         self.with_operation_lock_location(|path| {
             let saved = crate::inbox_removal::read(path).map_err(|_| {
@@ -2016,10 +2034,13 @@ impl Engine {
                 (Some(saved.kind), saved.message_id)
             });
             let result = self.inbox_removal_status(request_id.clone(), kind, message_id);
-            if result
-                .as_ref()
-                .is_err_and(|error| error.code == "not_found")
-            {
+            let discard = match &result {
+                Ok(receipt) => rendered && receipt.outcome == InboxRemovalOutcome::Completed,
+                // request() records the diagnostic. Invalid is never evidence
+                // that the request did not commit; preserve its original error.
+                Err(error) => matches!(error.code.as_str(), "not_found" | "invalid_request"),
+            };
+            if discard {
                 crate::inbox_removal::forget(path, &request_id).map_err(|_| {
                     EngineError::host("host_error", "Local removal recovery is unavailable")
                 })?;
@@ -4073,13 +4094,132 @@ print(json.dumps({'protocol':1,'ok':True,'operation':request['operation'],'data'
     }
 
     #[test]
-    fn native_journal_invalid_or_failed_lookup_never_discards_recovery_identity() {
-        for code in [
-            "invalid_request",
-            "runtime_error",
-            "operation_busy",
-            "not_found_extra",
+    fn native_journal_bookkeeping_render_ack_retires_only_settled_identity() {
+        for (outcome, requested, completed, pending, kept) in [
+            ("deferred", 2, 1, 1, 1),
+            ("completed", 1, 1, 0, 0),
+            ("completed", 0, 0, 0, 0),
         ] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = native_journal_engine(directory.path());
+            let prepared = engine
+                .prepare_saved_inbox_removal("clear".into(), None)
+                .unwrap();
+            fs::write(directory.path().join("status.json"), serde_json::to_vec(&json!({
+                "request_id": prepared.request_id, "intent_ids": [], "outcome": outcome,
+                "requested": requested, "completed": completed, "pending": pending, "message": null
+            })).unwrap()).unwrap();
+            let found = engine
+                .recover_inbox_removal_status(prepared.request_id.clone(), None, None)
+                .unwrap();
+            assert_eq!(
+                (found.requested, found.completed, found.pending),
+                (requested, completed, pending)
+            );
+            assert_eq!(
+                engine.saved_inbox_removals().unwrap().len(),
+                1,
+                "A status read is not a render acknowledgement"
+            );
+            let restarted = native_journal_engine(directory.path());
+            assert_eq!(restarted.saved_inbox_removals().unwrap().len(), 1);
+            restarted
+                .acknowledge_rendered_inbox_removal(prepared.request_id)
+                .unwrap();
+            assert_eq!(restarted.saved_inbox_removals().unwrap().len(), kept);
+            let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+            assert!(
+                !calls
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .any(|call| call["operation"] == "inbox.clear"
+                        || call["operation"] == "inbox.delete")
+            );
+        }
+    }
+
+    #[test]
+    fn native_journal_bookkeeping_ack_refuses_busy_before_status_or_discard() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = native_journal_engine(directory.path());
+        let prepared = engine
+            .prepare_saved_inbox_removal("clear".into(), None)
+            .unwrap();
+        fs::write(
+            directory.path().join("status.json"),
+            serde_json::to_vec(&json!({
+                "request_id": prepared.request_id, "intent_ids": [], "outcome": "completed",
+                "requested": 1, "completed": 1, "pending": 0, "message": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lock = directory.path().join("watcher.sqlite3.check.lock");
+        let busy = HostOperationLock::acquire(&lock).unwrap();
+        assert_eq!(
+            engine
+                .acknowledge_rendered_inbox_removal(prepared.request_id.clone())
+                .unwrap_err()
+                .code,
+            "operation_busy"
+        );
+        assert_eq!(engine.saved_inbox_removals().unwrap().len(), 1);
+        let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+        assert!(
+            !calls
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .any(|call| call["operation"] == "inbox.removal.status")
+        );
+        drop(busy);
+        engine
+            .acknowledge_rendered_inbox_removal(prepared.request_id)
+            .unwrap();
+        assert!(engine.saved_inbox_removals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_journal_bookkeeping_invalid_key_discards_only_client_identity() {
+        for message in [
+            "Local removal request key has expired; start a new request",
+            "Malformed removal key",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = native_journal_engine(directory.path());
+            let prepared = engine
+                .prepare_saved_inbox_removal("clear".into(), None)
+                .unwrap();
+            fs::write(
+                directory.path().join("status-error.json"),
+                serde_json::to_vec(&json!({
+                    "code": "invalid_request", "message": message
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let result = engine.recover_inbox_removal_status(prepared.request_id, None, None);
+            assert_eq!(result.unwrap_err().code, "invalid_request");
+            assert!(engine.saved_inbox_removals().unwrap().is_empty());
+            assert!(
+                native_journal_engine(directory.path())
+                    .saved_inbox_removals()
+                    .unwrap()
+                    .is_empty()
+            );
+            let calls = fs::read_to_string(directory.path().join("journal-rpc.jsonl")).unwrap();
+            assert!(
+                !calls
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .any(|call| call["operation"] == "inbox.clear"
+                        || call["operation"] == "inbox.delete")
+            );
+        }
+    }
+
+    #[test]
+    fn native_journal_transient_or_unclassified_lookup_keeps_recovery_identity() {
+        for code in ["runtime_error", "operation_busy", "not_found_extra"] {
             let directory = tempfile::tempdir().unwrap();
             let engine = native_journal_engine(directory.path());
             let prepared = engine
