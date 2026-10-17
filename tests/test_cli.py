@@ -1,11 +1,13 @@
 import json
+import os
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from eom_email_watcher import cli, engine_api
+from eom_email_watcher import cli, engine_api, private_storage
 from eom_email_watcher.db import AdmissionProvenance, Store
 from eom_email_watcher.engine_api import ApiError
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
@@ -53,11 +55,15 @@ def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch,
     assert "Baseline initialized" in output.out
 
 
-def test_doctor_uses_the_active_imap_provider_checks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+@pytest.fixture
+def doctor_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request):
     state_directory = tmp_path / "state"
-    state_directory.mkdir(mode=0o700)
+    if private_storage.is_windows():
+        anchor = request.getfixturevalue("native_private_storage")
+        state_directory = anchor / "state"
+        private_storage.connect_windows.ensure_private_directory(state_directory, root=anchor)
+    else:
+        state_directory.mkdir(mode=0o700)
     account = SimpleNamespace(provider="imap", account_id=f"imap-{'a' * 32}")
 
     class FakeStore:
@@ -89,13 +95,127 @@ def test_doctor_uses_the_active_imap_provider_checks(
     monkeypatch.setattr(cli, "mail_account_connected", lambda _config, _account: True)
     monkeypatch.setattr(cli.shutil, "which", lambda _name: "/usr/bin/notify-send")
 
-    assert cli._doctor(config.path) == 0
+    return config
+
+
+def test_doctor_uses_the_active_imap_provider_checks(doctor_runtime, capsys) -> None:
+    assert cli._doctor(doctor_runtime.path) == 0
 
     checks = json.loads(capsys.readouterr().out)
     assert checks["mail_provider_connection"] == {"ok": True, "provider": "imap"}
     assert checks["mail_account_credentials"] == {"ok": True, "provider": "imap"}
     assert "oauth_credentials" not in checks
     assert "oauth_token" not in checks
+
+
+def test_doctor_windows_fixture_reuses_native_private_anchor(tmp_path, monkeypatch, request):
+    anchor = tmp_path / "validated-native-anchor"
+    anchor.mkdir()
+    monkeypatch.setattr(private_storage, "is_windows", lambda: True)
+    original_get = pytest.FixtureRequest.getfixturevalue
+
+    def supplied_anchor(self, name):
+        if name == "native_private_storage":
+            return anchor
+        return original_get(self, name)
+
+    def require_anchor(path, *, root):
+        assert root == anchor, "doctor fixture trusted the ordinary pytest temp root"
+        assert path == anchor / "state"
+        path.mkdir()
+
+    monkeypatch.setattr(pytest.FixtureRequest, "getfixturevalue", supplied_anchor)
+    monkeypatch.setattr(
+        private_storage.connect_windows, "ensure_private_directory", require_anchor,
+    )
+    config = request.getfixturevalue("doctor_runtime")
+    assert config.database_file.parent == anchor / "state"
+
+
+def test_doctor_windows_uses_shared_directory_validation(
+    doctor_runtime, monkeypatch, capsys
+):
+    state = doctor_runtime.database_file.parent
+    state.chmod(0o755)
+    checked = []
+    monkeypatch.setattr(private_storage, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        private_storage.connect_windows, "validate_private_directory",
+        lambda path, *, root: checked.append((path, root)),
+    )
+
+    monkeypatch.setattr(
+        private_storage.connect_windows, "ensure_private_directory",
+        lambda *args, **kwargs: pytest.fail("doctor must not create or repair storage"),
+    )
+    assert cli._doctor(doctor_runtime.path) == 0
+    checks = json.loads(capsys.readouterr().out)
+    assert checks["state_directory"] == {"ok": True, "mode": oct(state.stat().st_mode & 0o777)}
+    assert checked == [(state, state)]
+
+
+@pytest.mark.parametrize("mode, expected", [(0o700, True), (0o750, False), (0o755, False)])
+@pytest.mark.skipif(os.name == "nt", reason="POSIX0700 privacy contract")
+def test_doctor_posix_preserves_exact_private_mode(
+    doctor_runtime, monkeypatch, capsys, mode, expected
+):
+    state = doctor_runtime.database_file.parent
+    state.chmod(mode)
+    monkeypatch.setattr(
+        private_storage.connect_windows, "validate_private_directory",
+        lambda *args, **kwargs: pytest.fail("POSIX doctor must retain its own mode check"),
+    )
+    assert cli._doctor(doctor_runtime.path) == (0 if expected else 1)
+    assert json.loads(capsys.readouterr().out)["state_directory"] == {
+        "ok": expected, "mode": oct(mode),
+    }
+
+
+@pytest.mark.parametrize("error", [PermissionError("unsafe ACL"), FileNotFoundError("missing")])
+def test_doctor_windows_refuses_unsafe_directory(doctor_runtime, monkeypatch, capsys, error):
+    state = doctor_runtime.database_file.parent
+    before = list(state.iterdir())
+    monkeypatch.setattr(private_storage, "is_windows", lambda: True)
+
+    def refuse(path, *, root):
+        assert path == root == state
+        raise error
+
+    monkeypatch.setattr(private_storage.connect_windows, "validate_private_directory", refuse)
+    monkeypatch.setattr(
+        cli, "configured_mailbox_identity",
+        lambda *_: pytest.fail("unsafe directory must stop doctor before dependent checks"),
+    )
+    assert cli._doctor(doctor_runtime.path) == 1
+    checks = json.loads(capsys.readouterr().out)
+    assert checks["config"]["ok"] is False
+    assert "Private storage is unsafe" in checks["config"]["error"]
+    assert "state_directory" not in checks
+    assert list(state.iterdir()) == before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows DACL privacy contract")
+@pytest.mark.parametrize("unsafe", [False, True], ids=["private", "everyone-read"])
+def test_doctor_native_windows_dacl(doctor_runtime, capsys, unsafe):
+    state = doctor_runtime.database_file.parent
+    before = list(state.iterdir())
+    if unsafe:
+        subprocess.run(
+            ["icacls", str(state), "/grant", "*S-1-1-0:(R)"],
+            check=True, capture_output=True, text=True,
+        )
+    else:
+        private_storage.connect_windows.validate_private_directory(state, root=state)
+    acl = subprocess.check_output(["icacls", str(state)])
+    assert cli._doctor(doctor_runtime.path) == (1 if unsafe else 0)
+    checks = json.loads(capsys.readouterr().out)
+    if unsafe:
+        assert checks["config"]["ok"] is False
+        assert "Private storage is unsafe" in checks["config"]["error"]
+    else:
+        assert checks["state_directory"]["ok"] is True
+    assert subprocess.check_output(["icacls", str(state)]) == acl
+    assert list(state.iterdir()) == before
 
 
 def test_setup_connects_a_replacement_for_unidentified_migrated_history(

@@ -212,27 +212,6 @@ def test_private_storage_publication_preserves_previous_bytes(tmp_path, monkeypa
     assert list(tmp_path.iterdir()) == [path]
 
 
-@pytest.fixture
-def native_private_storage():
-    """Isolated public data outside Local AppData, with the actual SDK DACL."""
-    if os.name != "nt":
-        pytest.skip("native Windows DACL and reparse controls")
-    import shutil
-    import uuid
-    from pathlib import Path
-
-    from connect_automate import connect_windows
-
-    anchor = Path.home()
-    connect_windows.validate_private_directory(anchor, root=anchor)
-    root = anchor / f"ew-privacy-qualification-{uuid.uuid4().hex}"
-    connect_windows.ensure_private_directory(root, root=anchor)
-    try:
-        yield root
-    finally:
-        shutil.rmtree(root)
-
-
 def test_native_private_storage_default_custom_and_sqlite_auxiliaries(
     native_private_storage, monkeypatch
 ):

@@ -29,6 +29,17 @@ def _refusal(path: Path, cause: OSError) -> PrivateStorageError:
     )
 
 
+def validate_directory(path: Path) -> None:
+    """Inspect an existing Windows directory without creating or repairing it."""
+    if not is_windows():
+        return
+    absolute = absolute_lexical_path(path)
+    try:
+        connect_windows.validate_private_directory(absolute, root=absolute)
+    except OSError as exc:
+        raise _refusal(absolute, exc) from exc
+
+
 def ensure_directory(path: Path, *, root: Path | None = None) -> None:
     """Create only below a verified existing anchor, never repair existing ACLs."""
     if not is_windows():

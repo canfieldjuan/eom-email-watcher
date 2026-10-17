@@ -90,9 +90,15 @@ def _doctor(config_path: Path) -> int:
     try:
         config, store, model = _runtime(config_path)
         checks["config"] = {"ok": True, "path": str(config.path), "senders": len(config.senders)}
+        state_directory = config.database_file.parent
+        if private_storage.is_windows():
+            private_storage.validate_directory(state_directory)
+            state_private = True
+        else:
+            state_private = stat.S_IMODE(state_directory.stat().st_mode) == 0o700
         checks["state_directory"] = {
-            "ok": stat.S_IMODE(config.database_file.parent.stat().st_mode) == 0o700,
-            "mode": oct(stat.S_IMODE(config.database_file.parent.stat().st_mode)),
+            "ok": state_private,
+            "mode": oct(stat.S_IMODE(state_directory.stat().st_mode)),
         }
         provider, account_id = configured_mailbox_identity(store)
         active_account = store.mail_account(provider, account_id)

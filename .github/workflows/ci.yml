@@ -42,6 +42,11 @@ jobs:
       - run: uv sync --locked --all-groups
       - run: >-
           uv run pytest
+          tests/test_cli.py::test_doctor_uses_the_active_imap_provider_checks
+          tests/test_cli.py::test_doctor_windows_fixture_reuses_native_private_anchor
+          tests/test_cli.py::test_doctor_windows_uses_shared_directory_validation
+          tests/test_cli.py::test_doctor_windows_refuses_unsafe_directory
+          tests/test_cli.py::test_doctor_native_windows_dacl
           tests/test_config.py::test_packaged_tzdata_supports_default_zone_without_system_database
           tests/test_engine_api.py::test_read_operations_are_versioned_and_do_not_expose_token_paths
           tests/test_engine_api.py::test_check_defers_delivery_until_state_checked_ack

@@ -269,3 +269,24 @@ def assert_private_file():
         else:
             assert path.stat().st_mode & 0o777 == 0o600
     return check
+
+
+@pytest.fixture
+def native_private_storage():
+    """Isolated public data outside Local AppData, with the actual SDK DACL."""
+    if os.name != "nt":
+        pytest.skip("native Windows DACL and reparse controls")
+    import shutil
+    import uuid
+    from pathlib import Path
+
+    from connect_automate import connect_windows
+
+    anchor = Path.home()
+    connect_windows.validate_private_directory(anchor, root=anchor)
+    root = anchor / f"ew-privacy-qualification-{uuid.uuid4().hex}"
+    connect_windows.ensure_private_directory(root, root=anchor)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root)
