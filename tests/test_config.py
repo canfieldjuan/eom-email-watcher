@@ -2,6 +2,7 @@ import ast
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo, reset_tzpath
 
 import pytest
@@ -26,6 +27,45 @@ from eom_email_watcher.config import (
     remove_senders,
     update_settings,
 )
+
+
+def test_windows_runtime_refuses_unsafe_storage_before_creating_files(tmp_path, monkeypatch):
+    """Contract private roots: exercise the runtime owner and real SDK dispatch.
+
+    The ACL result is simulated on Linux; native DACL twins live in cutover tests.
+    """
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    monkeypatch.setattr(
+        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
+    )
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: False)
+    config = SimpleNamespace(
+        path=tmp_path / "config.toml",
+        gmail_token_file=tmp_path / "read.json",
+        gmail_send_token_file=tmp_path / "send.json",
+        database_file=tmp_path / "mail.db",
+    )
+    with pytest.raises(OSError, match="unsafe"):
+        config_module.secure_runtime_paths(config)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_windows_empty_config_candidate_privacy_refusal_cleans_owned_file(tmp_path, monkeypatch):
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    monkeypatch.setattr(
+        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
+    )
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda path: path.is_dir())
+    candidate = tmp_path / "candidate"
+    with pytest.raises(OSError, match="unsafe"):
+        config_module._write_private_windows_file(candidate, b"public-fixture")
+    assert not candidate.exists(), "Privacy refusal retained its new empty candidate"
 
 
 def write_config(

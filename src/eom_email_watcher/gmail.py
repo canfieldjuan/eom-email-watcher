@@ -26,6 +26,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow, WSGITimeoutError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from . import private_storage
 from .config import normalize_address
 from .mailbox import (
     INBOX_LOCATION,
@@ -694,6 +695,7 @@ class GmailGateway:
         token_file: Path,
         remaining_timeout: Callable[[], float] | None = None,
     ) -> GmailGateway:
+        private_storage.prepare_file(token_file)
         operation_timeout = (
             validate_operation_timeout(remaining_timeout())
             if remaining_timeout is not None
@@ -748,8 +750,7 @@ class GmailGateway:
                         raise GmailAuthorizationRejected(
                             "Gmail rejected the configured authorization"
                         ) from exc
-                    token_file.write_text(credentials.to_json(), encoding="utf-8")
-                    token_file.chmod(0o600)
+                    private_storage.write_text(token_file, credentials.to_json())
                 if not credentials or not credentials.valid:
                     raise GmailAuthorizationRejected(
                         "Gmail is not authorized. Run: eom-mail-watch setup"
@@ -782,6 +783,7 @@ class GmailGateway:
         *,
         force_reauthorize: bool = False,
     ) -> tuple[GmailGateway, bool]:
+        private_storage.prepare_file(token_file)
         resolved_credentials_file = resolve_gmail_credentials_file(credentials_file)
         if not resolved_credentials_file.is_file():
             raise GmailError(
@@ -803,8 +805,7 @@ class GmailGateway:
                         except RefreshError:
                             credentials = None
                         else:
-                            token_file.write_text(credentials.to_json(), encoding="utf-8")
-                            token_file.chmod(0o600)
+                            private_storage.write_text(token_file, credentials.to_json())
                 authorization_changed = not credentials or not credentials.valid
                 if authorization_changed:
                     flow = InstalledAppFlow.from_client_secrets_file(
@@ -821,8 +822,7 @@ class GmailGateway:
                         )
                     except WSGITimeoutError as exc:
                         raise GmailError("Gmail authorization timed out; retry setup") from exc
-                    token_file.write_text(credentials.to_json(), encoding="utf-8")
-                    token_file.chmod(0o600)
+                    private_storage.write_text(token_file, credentials.to_json())
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry setup") from exc
         assert credentials is not None

@@ -1,6 +1,7 @@
 """Schema-32 upgrade fixtures and transactional schema-33 failure probes."""
 
 import errno
+import os
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,68 @@ from test_db import Store
 from test_thread_derived import derived, follow, seed
 
 from eom_email_watcher import thread_migration
+
+
+def test_windows_unsafe_retained_backup_refuses_before_sqlite_open(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backup = thread_migration.write_backup(store.path, db)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(
+        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
+    )
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda path: path != backup)
+    connect = sqlite3.connect
+    opened = []
+
+    def observe(*args, **kwargs):
+        opened.append(args[0])
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", observe)
+    with pytest.raises(OSError, match="unsafe"):
+        store.initialize()
+    assert opened == [], "An unsafe retained backup was checked only after SQLite opened"
+    assert store.path.read_bytes() == before
+    assert backup.exists()
+
+
+def test_windows_retiring_backup_does_not_block_private_database_reads(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backup = thread_migration.write_backup(store.path, db)
+    monkeypatch.setattr(
+        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
+    )
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: True)
+    validate = connect_windows.validate_private_regular_file
+
+    def retire_between_enumeration_and_validation(path, **kwargs):
+        if path == backup:
+            backup.unlink()
+        return validate(path, **kwargs)
+
+    monkeypatch.setattr(
+        connect_windows, "validate_private_regular_file", retire_between_enumeration_and_validation
+    )
+    with store.connection() as db:
+        assert db.execute("SELECT 1").fetchone()[0] == 1
+    assert not backup.exists()
 
 
 def legacy_store(tmp_path: Path) -> Store:
@@ -64,7 +127,12 @@ def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatc
     def inspect_backup(db):
         backups = list(tmp_path.glob("mail.db.pre-v33.*.bak"))
         assert len(backups) == 1
-        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+        if os.name == "nt":
+            from connect_automate.connect_windows import validate_private_regular_file
+
+            validate_private_regular_file(backups[0], root=tmp_path)
+        else:
+            assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
         assert snapshot(backups[0]) == before
         observed.append(True)
         rebuild(db)
@@ -103,7 +171,12 @@ def test_failed_rebuild_rolls_back_and_keeps_newest_backup(tmp_path, monkeypatch
     backups = list(tmp_path.glob("mail.db.pre-v33.*.bak"))
     assert len(backups) == 1 and backups[0] != old
     assert snapshot(backups[0]) == before
-    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    if os.name == "nt":
+        from connect_automate.connect_windows import validate_private_regular_file
+
+        validate_private_regular_file(backups[0], root=tmp_path)
+    else:
+        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
 
 
 def test_backup_full_disk_does_not_start_migration(tmp_path, monkeypatch):

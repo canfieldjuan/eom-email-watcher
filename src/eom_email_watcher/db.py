@@ -21,7 +21,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from connect_automate import connect
 from connect_automate.locking import connect_operation_lock
 
-from . import body_state, deployment, reconcile_state, source_locks, thread_migration
+from . import (
+    body_state,
+    deployment,
+    private_storage,
+    reconcile_state,
+    source_locks,
+    thread_migration,
+)
 from .automation.rules import (
     MAX_AUTOMATION_ATTACHMENTS,
     MAX_AUTOMATION_RULES,
@@ -5872,8 +5879,11 @@ class Store:
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         with database_admission():
+            private_storage.validate_database(self.path)
+            thread_migration.validate_backups(self.path)
             connection = sqlite3.connect(self.path, factory=_DerivedConnection)
             try:
+                private_storage.validate_file(self.path)
                 connection.execute("PRAGMA recursive_triggers = ON")
                 connection.execute("PRAGMA secure_delete = ON")
                 connection.row_factory = sqlite3.Row
@@ -5957,6 +5967,7 @@ class Store:
             return source_locks.protocol_notice(db)
 
     def initialize(self) -> None:
+        private_storage.validate_database(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Serialize backup plus migration across simultaneous desktop/scheduler
         # starts. Version is also read inside BEGIN IMMEDIATE below.
@@ -5989,6 +6000,7 @@ class Store:
                     logging.getLogger(__name__).warning("Source-lock cutover deferred: %s", exc)
 
     def _initialize_locked(self) -> None:
+        private_storage.validate_database(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         migration_observed_at = datetime.now(UTC).isoformat()
         with self.connection() as db:

@@ -27,6 +27,7 @@ from filelock import FileLock
 from tomlkit import aot, document, dumps, inline_table, parse, table
 from tomlkit.items import AoT, Array
 
+from . import private_storage
 from .text import utf8_size, within_utf8_bytes
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
@@ -606,7 +607,7 @@ def load_config(path: Path | None = None) -> Config:
 
 
 def _absolute_lexical_path(path: Path) -> Path:
-    return Path(os.path.abspath(os.fspath(path.expanduser())))
+    return private_storage.absolute_lexical_path(path)
 
 
 def _directory_open_flags() -> int:
@@ -733,13 +734,17 @@ def _config_serialization_lock():
     lock_path = _config_serialization_lock_path()
     if os.name != "posix" or not hasattr(os, "geteuid"):
         try:
+            private_storage.prepare_file(lock_path)
             lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             lock = FileLock(str(lock_path))
             lock.acquire()
+        except private_storage.PrivateStorageError as exc:
+            raise ConfigError(str(exc)) from exc
         except OSError as exc:
             raise ConfigError("Configuration is unavailable or requires manual repair") from exc
         body_failed = False
         try:
+            private_storage.validate_file(lock_path)
             yield
         except BaseException:
             body_failed = True
@@ -912,6 +917,8 @@ def _config_mutation_source(path: Path):
             raise ConfigError(
                 f"Configuration not found: {path}. Copy config.example.toml and edit it."
             ) from exc
+        except private_storage.PrivateStorageError as exc:
+            raise ConfigError(str(exc)) from exc
         except (_UnsafeConfigPath, OSError) as exc:
             raise ConfigError("Configuration is unavailable or requires manual repair") from exc
         yield _ConfigMutationSource(read_path, identity, content)
@@ -1072,6 +1079,7 @@ def _read_admission_config(
         raise _UnsafeConfigPath from exc
     if not _non_posix_admission_file_is_safe(inspected):
         raise _UnsafeConfigPath
+    private_storage.validate_file(absolute)
     flags = (
         os.O_RDONLY
         | getattr(os, "O_BINARY", 0)
@@ -1139,6 +1147,8 @@ def _load_runtime_config_from_reader(
         raise ConfigError(
             f"Configuration not found: {config_path}. Copy config.example.toml and edit it."
         ) from exc
+    except private_storage.PrivateStorageError as exc:
+        raise ConfigError(str(exc)) from exc
     except (OSError, _UnsafeConfigPath) as exc:
         raise ConfigError(
             "Configuration is unavailable or requires manual repair"
@@ -3340,6 +3350,7 @@ def _read_safe_windows_file(path: Path) -> tuple[os.stat_result, bytes]:
         raise _UnsafeConfigPath from exc
     if not _is_safe_windows_file_stat(inspected):
         raise _UnsafeConfigPath
+    private_storage.validate_file(path)
     try:
         file_fd = os.open(
             path,
@@ -3506,6 +3517,7 @@ def _read_optional_safe_windows_file(
 def _write_private_windows_file(path: Path, content: bytes) -> tuple[os.stat_result, bytes]:
     file_fd: int | None = None
     try:
+        private_storage.prepare_file(path)
         file_fd = os.open(
             path,
             os.O_WRONLY
@@ -3515,7 +3527,24 @@ def _write_private_windows_file(path: Path, content: bytes) -> tuple[os.stat_res
             | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
-        os.chmod(path, 0o600)
+        created_identity = _windows_replacement_identity(os.fstat(file_fd))
+        try:
+            private_storage.validate_file(path)
+        except private_storage.PrivateStorageError:
+            # This owner created the empty candidate. Remove only that object,
+            # before a marker/candidate can be mistaken for recoverable content.
+            os.close(file_fd)
+            file_fd = None
+            try:
+                current = os.lstat(path)
+            except FileNotFoundError:
+                pass
+            else:
+                if _windows_replacement_identity(current) == created_identity:
+                    path.unlink()
+            raise
+        if not private_storage.is_windows():
+            os.chmod(path, 0o600)
         remaining = memoryview(content)
         while remaining:
             written = os.write(file_fd, remaining)
@@ -3847,6 +3876,7 @@ def _atomic_create(path: Path, content: str) -> None:
     temporary: Path | None = None
     published = False
     try:
+        private_storage.prepare_file(path)
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
@@ -3856,10 +3886,12 @@ def _atomic_create(path: Path, content: str) -> None:
             delete=False,
         ) as stream:
             temporary = Path(stream.name)
+            private_storage.validate_file(temporary)
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.chmod(0o600)
+        if not private_storage.is_windows():
+            temporary.chmod(0o600)
         try:
             os.link(temporary, path)
             published = True
@@ -3998,7 +4030,8 @@ def initialize_config(
     content = dumps(initial).encode("utf-8")
 
     if os.name != "posix":
-        config_path = path.expanduser().resolve()
+        config_path = _absolute_lexical_path(path)
+        private_storage.prepare_file(config_path)
         config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         return _initialize_config_non_posix(config_path, content)
 
@@ -4181,6 +4214,16 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
 def secure_runtime_paths(
     config: Config, *, secure_config_path: bool = True
 ) -> None:
+    if private_storage.is_windows():
+        for path in (
+            config.path,
+            config.gmail_token_file,
+            config.gmail_send_token_file,
+            config.database_file,
+        ):
+            private_storage.prepare_file(path)
+        private_storage.validate_database(config.database_file)
+        return
     for path in {
         config.path.parent,
         config.gmail_token_file.parent,

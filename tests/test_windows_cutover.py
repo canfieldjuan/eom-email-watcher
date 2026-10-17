@@ -17,6 +17,399 @@ from eom_email_watcher import windows_cutover
 from eom_email_watcher.source_locks import SOURCE_LOCK_PROTOCOL, SourceProtocolUnavailable
 
 
+def _simulate_windows_storage(monkeypatch):
+    from types import SimpleNamespace
+
+    from eom_email_watcher import private_storage
+
+    monkeypatch.setattr(
+        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
+    )
+
+
+@pytest.mark.parametrize(
+    "owner",
+    ["imap_read", "imap_write", "cache_read", "cache_write", "local_model",
+     "gateway_model", "database", "backup", "token_install"],
+)
+def test_private_storage_owners_refuse_before_use(tmp_path, monkeypatch, owner):
+    """Contract privacy-before-use: Linux seam simulation, not native ACL proof."""
+    import sqlite3
+    from dataclasses import asdict
+    from pathlib import Path
+
+    import msal
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import engine_api, imap, microsoft365, model, thread_migration
+    from eom_email_watcher.db import Store
+
+    path = tmp_path / "private.json"
+    source = tmp_path / "staged.json"
+    credentials = imap.ImapCredentials(
+        email_address="user@example.com", host="imap.example.com", port=993,
+        security="tls", username="user@example.com", password="public-fixture",
+    )
+    path.write_text(json.dumps(asdict(credentials), sort_keys=True))
+    if owner.startswith("cache"):
+        path.write_text(msal.SerializableTokenCache().serialize())
+    if owner.endswith("model"):
+        path.write_text("public-fixture-token")
+    source.write_bytes(b"public-staged-token")
+    path.chmod(0o600)
+    before = {entry.name: entry.read_bytes() for entry in tmp_path.iterdir()}
+    connection = sqlite3.connect(":memory:")
+    _simulate_windows_storage(monkeypatch)
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: False)
+    try:
+        with pytest.raises((OSError, imap.ImapError, microsoft365.Microsoft365Error,
+                            model.ModelError)) as refused:
+            if owner == "imap_read":
+                imap.load_credentials(path)
+            elif owner == "imap_write":
+                imap.write_credentials(path, credentials)
+            elif owner == "cache_read":
+                microsoft365._load_cache(path)
+            elif owner == "cache_write":
+                microsoft365._write_private_cache(path, msal.SerializableTokenCache())
+            elif owner == "local_model":
+                model.LocalModel("http://127.0.0.1:1234/v1", "fixture", 1, path)._headers()
+            elif owner == "gateway_model":
+                model.GatewayModel("https://example.com", 1, path, Path("unused-ca"))._headers()
+            elif owner == "database":
+                with Store(tmp_path / "mail.db").connection() as db:
+                    db.execute("SELECT 1")
+            elif owner == "backup":
+                thread_migration.write_backup(tmp_path / "mail.db", connection)
+            else:
+                engine_api._install_private_token(source, path)
+        assert str(tmp_path) in str(refused.value)
+        assert "folder private" in str(refused.value)
+        assert {entry.name: entry.read_bytes() for entry in tmp_path.iterdir()} == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("provider", ["gmail", "send"])
+@pytest.mark.parametrize("authorize", [False, True])
+def test_private_storage_google_refuses_before_credential_effect(
+    tmp_path, monkeypatch, provider, authorize
+):
+    """Contract privacy before reads, refresh or consent; never contact Google."""
+    from types import SimpleNamespace
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import gmail, outbound
+
+    client = tmp_path / "public-client.json"
+    token = tmp_path / "token.json"
+    client.write_text("{}")
+    token.write_text("{}")
+    effects = []
+    credentials = SimpleNamespace(
+        valid=True, expired=False, refresh_token="public-fixture", to_json=lambda: "{}"
+    )
+
+    def read(*args, **kwargs):
+        effects.append("read")
+        return credentials
+
+    def consent(**kwargs):
+        effects.append("consent")
+        return credentials
+
+    module = gmail if provider == "gmail" else outbound
+    monkeypatch.setattr(module.Credentials, "from_authorized_user_file", read)
+    monkeypatch.setattr(
+        module.InstalledAppFlow, "from_client_secrets_file",
+        lambda *args, **kwargs: SimpleNamespace(run_local_server=consent),
+    )
+    monkeypatch.setattr(module, "build", lambda *args, **kwargs: SimpleNamespace())
+    _simulate_windows_storage(monkeypatch)
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: False)
+    gateway = gmail.GmailGateway if provider == "gmail" else outbound.GmailSender
+    with pytest.raises(OSError, match="unsafe"):
+        if authorize:
+            gateway.authorize(client, token)
+        elif provider == "gmail":
+            gateway.from_token(client, token)
+        else:
+            gateway.from_token(token)
+    assert effects == []
+    assert token.read_text() == "{}"
+    assert {p.name for p in tmp_path.iterdir()} == {client.name, token.name}
+
+
+@pytest.mark.parametrize("provider", ["mail", "calendar"])
+def test_private_storage_microsoft_refuses_before_consent(tmp_path, monkeypatch, provider):
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import microsoft365, microsoft_calendar
+
+    _simulate_windows_storage(monkeypatch)
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: False)
+    module = microsoft365 if provider == "mail" else microsoft_calendar
+    effects = []
+
+    def effect(*args, **kwargs):
+        effects.append("authorization-client")
+        raise AssertionError("Consent entry was reached before privacy refusal")
+
+    monkeypatch.setattr(module, "load_microsoft_public_client", lambda _path: {})
+    monkeypatch.setattr(module, "_new_public_client", effect)
+    cls = (microsoft365.Microsoft365Gateway if provider == "mail"
+           else microsoft_calendar.MicrosoftCalendarReadAuthorization)
+    with pytest.raises(OSError, match="unsafe"):
+        cls.authorize_with_status(tmp_path / "public-client", tmp_path / "token")
+    assert effects == []
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("owner", ["mailbox_principal", "cached_principal", "calendar_read"])
+def test_private_storage_calendar_refuses_before_lock_creation(tmp_path, monkeypatch, owner):
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import microsoft_calendar
+    from eom_email_watcher.microsoft365 import Microsoft365Error
+
+    path = tmp_path / "cache.json"
+    path.write_text("{}")
+    _simulate_windows_storage(monkeypatch)
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: False)
+    monkeypatch.setattr(microsoft_calendar, "load_microsoft_public_client", lambda _path: {})
+    with pytest.raises((OSError, Microsoft365Error)):
+        if owner == "mailbox_principal":
+            microsoft_calendar.microsoft_mailbox_principal(tmp_path / "public-client", path)
+        elif owner == "cached_principal":
+            microsoft_calendar.microsoft_cached_mailbox_principal(path)
+        else:
+            microsoft_calendar.MicrosoftCalendarReadAuthorization.from_token(
+                tmp_path / "public-client", path
+            )
+    assert list(tmp_path.iterdir()) == [path], "Unsafe storage was used to create a cache lock"
+    assert path.read_text() == "{}"
+
+
+def test_private_storage_publication_preserves_previous_bytes(tmp_path, monkeypatch):
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    path = tmp_path / "token.json"
+    path.write_bytes(b"previous-public-fixture")
+    _simulate_windows_storage(monkeypatch)
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: True)
+    private_storage.write_text(path, "new-public-fixture")
+    assert path.read_bytes() == b"new-public-fixture"
+    # Reject a new file's inherited ACL inside the actual SDK publication owner.
+    monkeypatch.setattr(
+        connect_windows, "_private_windows_acl", lambda candidate: candidate in {path, tmp_path}
+    )
+    with pytest.raises(OSError, match="unsafe"):
+        private_storage.write_text(path, "must-not-be-written")
+    assert path.read_bytes() == b"new-public-fixture"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.fixture
+def native_private_storage():
+    """Isolated public data outside Local AppData, with the actual SDK DACL."""
+    if os.name != "nt":
+        pytest.skip("native Windows DACL and reparse controls")
+    import shutil
+    import uuid
+    from pathlib import Path
+
+    from connect_automate import connect_windows
+
+    anchor = Path.home()
+    connect_windows.validate_private_directory(anchor, root=anchor)
+    root = anchor / f"ew-privacy-qualification-{uuid.uuid4().hex}"
+    connect_windows.ensure_private_directory(root, root=anchor)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root)
+
+
+def test_native_private_storage_default_custom_and_sqlite_auxiliaries(
+    native_private_storage, monkeypatch
+):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import msal
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import (
+        config,
+        engine_api,
+        imap,
+        microsoft365,
+        model,
+        private_storage,
+        runtime,
+        thread_migration,
+    )
+    from eom_email_watcher.db import Store
+
+    root = native_private_storage
+    assert not root.is_relative_to(Path(os.environ["LOCALAPPDATA"]))
+    state = root / "home" / ".local" / "state" / "eom-email-watcher"
+    monkeypatch.setenv("STATE_DIRECTORY", str(state))
+    config_path = root / "home" / ".config" / "eom-email-watcher" / "config.toml"
+    initial = config.initialize_config(
+        config_path, timezone="UTC", model_base_url="http://127.0.0.1:1234/v1",
+        model_name="public-fixture",
+    )
+    updated = config.update_settings(config_path, {"poll_interval_minutes": 7})
+    assert updated.poll_interval_minutes == 7
+    assert updated.path == config_path
+    assert initial.database_file.parent == state
+    config.secure_runtime_paths(updated)
+    connect_windows.validate_private_regular_file(config_path, root=root)
+
+    store = Store(updated.database_file)
+    store.initialize()
+    with store.connection() as db:
+        db.execute("CREATE TABLE privacy_fixture(value TEXT)")
+        db.execute("INSERT INTO privacy_fixture VALUES ('public-fixture')")
+        db.commit()
+        for suffix in ("", "-wal", "-shm"):
+            path = store.path.with_name(store.path.name + suffix)
+            assert path.is_file(), suffix
+            connect_windows.validate_private_regular_file(path, root=root)
+        backup = thread_migration.write_backup(store.path, db)
+        connect_windows.validate_private_regular_file(backup, root=root)
+
+    for provider, prefix in (("gmail", "gmail"), ("microsoft365", "microsoft365"),
+                             ("imap", "imap")):
+        account = SimpleNamespace(provider=provider, account_id=f"{prefix}-" + "a" * 32)
+        token = runtime.mail_account_token_file(updated, account)
+        assert token.parent == state / "mail-accounts"
+        private_storage.prepare_file(token, root=state)
+        if provider == "microsoft365":
+            microsoft365._write_private_cache(token, msal.SerializableTokenCache())
+            microsoft365._load_cache(token)
+            for profile in ("read", "proposal", "write"):
+                calendar = runtime.microsoft_calendar_token_file(updated, account, profile)
+                microsoft365._write_private_cache(calendar, msal.SerializableTokenCache())
+                microsoft365._load_cache(calendar)
+                connect_windows.validate_private_regular_file(calendar, root=state)
+        elif provider == "imap":
+            saved = imap.ImapCredentials(
+                "user@example.com", "imap.example.com", 993, "tls",
+                "user@example.com", "public-fixture",
+            )
+            imap.write_credentials(token, saved)
+            assert imap.load_credentials(token) == saved
+        else:
+            private_storage.write_text(token, "public-fixture-token")
+        connect_windows.validate_private_regular_file(token, root=state)
+        installed = token.with_name(token.name + ".installed")
+        engine_api._install_private_token(token, installed)
+        assert installed.read_bytes() == token.read_bytes()
+        connect_windows.validate_private_regular_file(installed, root=state)
+
+    model_token = state / "model-token"
+    private_storage.write_text(model_token, "public-model-token")
+    assert model.LocalModel(
+        "http://127.0.0.1:1234/v1", "fixture", 1, model_token
+    )._headers() == {"Authorization": "Bearer public-model-token"}
+    assert model.GatewayModel(
+        "https://example.com", 1, model_token, root / "unused-public-ca"
+    )._headers()["Authorization"] == "Bearer public-model-token"
+
+
+@pytest.mark.parametrize("principal", ["*S-1-1-0", "*S-1-5-32-545"])
+@pytest.mark.parametrize("kind", ["root", "descendant", "file", "wal", "shm", "journal", "backup"])
+def test_native_private_storage_refuses_extra_principals_without_mutation(
+    native_private_storage, principal, kind
+):
+    import subprocess
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import thread_migration
+    from eom_email_watcher.db import Store
+
+    root = native_private_storage
+    directory = root if kind == "root" else root / "state"
+    connect_windows.ensure_private_directory(directory, root=root)
+    store = Store(directory / "mail.db")
+    store.initialize()
+    if kind in {"wal", "shm", "journal"}:
+        target = store.path.with_name(store.path.name + "-" + kind)
+        target.touch()
+    elif kind == "backup":
+        with store.connection() as db:
+            target = thread_migration.write_backup(store.path, db)
+    else:
+        target = {"root": root, "descendant": directory, "file": store.path}[kind]
+    before = store.path.read_bytes()
+    subprocess.run(["icacls", str(target), "/grant", principal + ":(R)"], check=True,
+                   capture_output=True, text=True)
+    acl = subprocess.check_output(["icacls", str(target)])
+    with pytest.raises(OSError, match="unsafe"), store.connection() as db:
+        db.execute("PRAGMA user_version = 999")
+    assert store.path.read_bytes() == before
+    assert subprocess.check_output(["icacls", str(target)]) == acl
+
+
+@pytest.mark.parametrize("kind", ["root", "descendant", "file"])
+def test_native_private_storage_reparse_refuses_without_mutation(native_private_storage, kind):
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+    from eom_email_watcher.db import Store
+
+    root = native_private_storage
+    actual = root / "actual"
+    connect_windows.ensure_private_directory(actual, root=root)
+    store = Store(actual / "mail.db")
+    store.initialize()
+    before = store.path.read_bytes()
+    alias = root / "alias"
+    if kind == "file":
+        alias.symlink_to(store.path)
+        candidate = alias
+    else:
+        alias.symlink_to(actual, target_is_directory=True)
+        candidate = alias / store.path.name
+    with pytest.raises(OSError, match="unsafe"):
+        if kind == "descendant":
+            private_storage.validate_file(candidate, root=root)
+        else:
+            with Store(candidate).connection() as db:
+                db.execute("PRAGMA user_version = 999")
+    assert store.path.read_bytes() == before
+
+
+def test_native_private_storage_windows_branch_omission_breaks_refusal(
+    native_private_storage, monkeypatch
+):
+    import subprocess
+
+    from eom_email_watcher import private_storage
+    from eom_email_watcher.db import Store
+
+    root = native_private_storage
+    store = Store(root / "mail.db")
+    store.initialize()
+    subprocess.run(["icacls", str(root), "/grant", "*S-1-1-0:(R)"], check=True,
+                   capture_output=True, text=True)
+
+    def refusal_oracle():
+        with pytest.raises(OSError, match="unsafe"), store.connection() as db:
+            db.execute("SELECT 1")
+
+    refusal_oracle()
+    monkeypatch.setattr(private_storage, "is_windows", lambda: False)
+    with pytest.raises(pytest.fail.Exception, match="DID NOT RAISE"):
+        refusal_oracle()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="actual PowerShell process getter exception semantics")
 @pytest.mark.parametrize("native_error", [0, 5, 6, 87])
 def test_native_product_handle_open_preserves_win32_error(tmp_path, native_error):

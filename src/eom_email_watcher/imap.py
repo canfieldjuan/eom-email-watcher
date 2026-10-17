@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import unquote_to_bytes
 
+from . import private_storage
 from .config import normalize_address
 from .mailbox import (
     INBOX_LOCATION,
@@ -279,17 +280,19 @@ def credentials_from_connection(value: object) -> ImapCredentials:
 
 
 def write_credentials(path: Path, credentials: ImapCredentials) -> None:
-    path.write_text(json.dumps(asdict(credentials), sort_keys=True), encoding="utf-8")
-    path.chmod(0o600)
+    private_storage.write_text(path, json.dumps(asdict(credentials), sort_keys=True))
 
 
 def load_credentials(path: Path) -> ImapCredentials:
     try:
+        private_storage.validate_file(path)
         if path.stat().st_size > MAX_CREDENTIAL_FILE_BYTES:
             raise ImapError("imap_configuration_error", "Saved mail server credentials are invalid")
         value = json.loads(path.read_text(encoding="utf-8"))
     except ImapError:
         raise
+    except private_storage.PrivateStorageError as exc:
+        raise ImapError("imap_configuration_error", str(exc)) from exc
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ImapError(
             "imap_configuration_error", "Saved mail server credentials are invalid"

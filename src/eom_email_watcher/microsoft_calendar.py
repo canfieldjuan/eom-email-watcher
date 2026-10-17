@@ -20,6 +20,7 @@ import msal
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
+from . import private_storage
 from .config import normalize_validated_address
 from .microsoft365 import (
     AUTHORIZATION_TIMEOUT_SECONDS,
@@ -333,6 +334,7 @@ def microsoft_mailbox_principal(
     token_file: Path,
 ) -> MicrosoftPrincipal:
     """Resolve the immutable principal from the existing Mail.Read cache."""
+    private_storage.prepare_file(token_file)
     configuration = load_microsoft_public_client(credentials_file)
     if not token_file.is_file():
         raise MicrosoftAuthorizationRejected("Microsoft mailbox is not authorized")
@@ -365,6 +367,7 @@ def microsoft_mailbox_principal(
 
 def microsoft_cached_mailbox_principal(token_file: Path) -> MicrosoftPrincipal:
     """Read the immutable mailbox principal from the cache without token acquisition."""
+    private_storage.prepare_file(token_file)
     if not token_file.is_file():
         raise MicrosoftAuthorizationRejected("Microsoft mailbox is not authorized")
     try:
@@ -407,6 +410,7 @@ class MicrosoftCalendarAuthorization:
         credentials_file: Path,
         token_file: Path,
     ) -> Self:
+        private_storage.prepare_file(token_file)
         configuration = load_microsoft_public_client(credentials_file)
         if not token_file.is_file():
             raise MicrosoftAuthorizationRejected("Microsoft calendar is not authorized")
@@ -467,6 +471,7 @@ class MicrosoftCalendarAuthorization:
         credentials_file: Path,
         token_file: Path,
     ) -> tuple[Self, bool]:
+        private_storage.prepare_file(token_file)
         configuration = load_microsoft_public_client(credentials_file)
         cache = msal.SerializableTokenCache()
         try:

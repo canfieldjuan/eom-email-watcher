@@ -13,6 +13,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from . import private_storage
+
 SEND_SCOPES = ("https://www.googleapis.com/auth/gmail.send",)
 
 
@@ -53,6 +55,7 @@ class GmailSender:
 
     @classmethod
     def authorize(cls, credentials_file: Path, token_file: Path) -> GmailSender:
+        private_storage.prepare_file(token_file)
         if not credentials_file.exists():
             raise SendError(f"OAuth desktop credentials not found: {credentials_file}")
         flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SEND_SCOPES)
@@ -60,19 +63,18 @@ class GmailSender:
             host="127.0.0.1", port=0, open_browser=True, prompt="consent"
         )
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        token_file.write_text(credentials.to_json(), encoding="utf-8")
-        token_file.chmod(0o600)
+        private_storage.write_text(token_file, credentials.to_json())
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
 
     @classmethod
     def from_token(cls, token_file: Path) -> GmailSender:
+        private_storage.prepare_file(token_file)
         if not token_file.exists():
             raise SendError("Gmail sending is not authorized. Run: eom-mail-watch setup-send")
         credentials = Credentials.from_authorized_user_file(str(token_file), SEND_SCOPES)
         if credentials.expired and credentials.refresh_token:
             credentials.refresh(Request())
-            token_file.write_text(credentials.to_json(), encoding="utf-8")
-            token_file.chmod(0o600)
+            private_storage.write_text(token_file, credentials.to_json())
         if not credentials.valid:
             raise SendError("Gmail send token is invalid. Run: eom-mail-watch setup-send")
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
