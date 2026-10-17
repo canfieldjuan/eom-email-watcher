@@ -1656,19 +1656,24 @@ def test_full_proof_deadline_failure_preserves_receipt(full_proof_timing):
 
 def test_full_proof_store_open_span_preserves_populated_database(tmp_path):
     import sqlite3
+    from contextlib import closing
 
     import prove_windows_cutover_full as proof
 
     database = tmp_path / "public.db"
-    with sqlite3.connect(database) as db:
+    with closing(sqlite3.connect(database)) as db, db:
         db.execute("CREATE TABLE public_fixture(value TEXT)")
         db.execute("INSERT INTO public_fixture VALUES ('retained')")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
     report = proof.measure_store_connections(database)
     assert len(report["samples_seconds"]) == 5
     assert all(sample >= 0 for sample in report["samples_seconds"])
     assert report["max_seconds"] == max(report["samples_seconds"])
-    with sqlite3.connect(database) as db:
+    with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT value FROM public_fixture").fetchall() == [("retained",)]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
 
 
 def test_full_proof_store_span_reports_each_cycle_and_median(monkeypatch):
