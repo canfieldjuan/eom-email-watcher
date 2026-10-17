@@ -590,6 +590,40 @@ def email_database_evidence(
     return quick_check, schema_version, job_row, interrupted_rows
 
 
+def expected_reference_inbox_row(
+    selected: dict[str, object],
+    *,
+    job_id: str,
+    app_id: str,
+    capability_id: str,
+    updated_at: str,
+    instance_id: str,
+    parameters: dict[str, object],
+    output: dict[str, object],
+) -> dict[str, object]:
+    # The whole completed v2 inbox row. Its feature list is the selected discovery item's
+    # acknowledgment, which the invocation persists as the job's dispatch requirement.
+    return {
+        "job_id": job_id,
+        "capability_id": capability_id,
+        "capability_version": selected["capability"]["version"],
+        "status": "completed",
+        "updated_at": updated_at,
+        "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+        "provider": {
+            "app_id": app_id,
+            "version": selected["provider"]["version"],
+            "instance_id": instance_id,
+        },
+        "parameters": parameters,
+        "required_manifest_features": list(selected["acknowledged_manifest_features"]),
+        "outputs": [output],
+        "dispatch_state": "terminal",
+        "queue_ahead": 0,
+        "next_attempt_at": None,
+    }
+
+
 def require_proof_checks(checks: dict[str, bool]) -> None:
     failed_checks = sorted(name for name, passed in checks.items() if not passed)
     if failed_checks:
@@ -1613,42 +1647,26 @@ def main() -> None:
                     and inspection_job is not None
                     and reference_results_by_job
                     == {
-                        translation_request_id: {
-                            "job_id": translation_request_id,
-                            "capability_id": TRANSLATE_CAPABILITY_ID,
-                            "capability_version": translation["capability"]["version"],
-                            "status": "completed",
-                            "updated_at": translation_job.updated_at,
-                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
-                            "provider": {
-                                "app_id": REFERENCE_APP_ID,
-                                "version": translation["provider"]["version"],
-                                "instance_id": reference_instance_id,
-                            },
-                            "parameters": {"target-language": "Spanish"},
-                            "outputs": [translation_output],
-                            "dispatch_state": "terminal",
-                            "queue_ahead": 0,
-                            "next_attempt_at": None,
-                        },
-                        inspection_request_id: {
-                            "job_id": inspection_request_id,
-                            "capability_id": INSPECT_CAPABILITY_ID,
-                            "capability_version": inspection["capability"]["version"],
-                            "status": "completed",
-                            "updated_at": inspection_job.updated_at,
-                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
-                            "provider": {
-                                "app_id": REFERENCE_APP_ID,
-                                "version": inspection["provider"]["version"],
-                                "instance_id": reference_instance_id,
-                            },
-                            "parameters": {},
-                            "outputs": [inspection_output],
-                            "dispatch_state": "terminal",
-                            "queue_ahead": 0,
-                            "next_attempt_at": None,
-                        },
+                        translation_request_id: expected_reference_inbox_row(
+                            translation,
+                            job_id=translation_request_id,
+                            app_id=REFERENCE_APP_ID,
+                            capability_id=TRANSLATE_CAPABILITY_ID,
+                            updated_at=translation_job.updated_at,
+                            instance_id=reference_instance_id,
+                            parameters={"target-language": "Spanish"},
+                            output=translation_output,
+                        ),
+                        inspection_request_id: expected_reference_inbox_row(
+                            inspection,
+                            job_id=inspection_request_id,
+                            app_id=REFERENCE_APP_ID,
+                            capability_id=INSPECT_CAPABILITY_ID,
+                            updated_at=inspection_job.updated_at,
+                            instance_id=reference_instance_id,
+                            parameters={},
+                            output=inspection_output,
+                        ),
                     }
                 ),
                 "reference_removal_preserves_watcher": (
