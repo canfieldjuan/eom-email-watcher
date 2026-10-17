@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import json
 import runpy
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -12,7 +14,11 @@ import pytest
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import config_admission_snapshot
 from eom_email_watcher.db import AdmissionProvenance
-from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
+from eom_email_watcher.mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    MailboxGateway,
+)
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
 
@@ -21,6 +27,7 @@ PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-local-proof.py"))
 FIXTURE_PART_ID = PROOF_SCRIPT["FIXTURE_PART_ID"]
 FIXTURE_MODEL_DIGEST = PROOF_SCRIPT["FIXTURE_MODEL_DIGEST"]
 FIXTURE_MAILBOX_IDENTITY_KEY = PROOF_SCRIPT["FIXTURE_MAILBOX_IDENTITY_KEY"]
+FixtureGmail = PROOF_SCRIPT["FixtureGmail"]
 FixtureModelHandler = PROOF_SCRIPT["FixtureModelHandler"]
 install_fixture_mailbox = PROOF_SCRIPT["install_fixture_mailbox"]
 require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
@@ -222,6 +229,134 @@ def test_proof_requests_carry_admission_for_admission_required_operations(
         "code": "invalid_request",
         "message": "admission_token is invalid",
     }
+
+
+def _gateway_members() -> list[str]:
+    return sorted(
+        name
+        for name, value in vars(MailboxGateway).items()
+        if not name.startswith("_") and callable(value)
+    )
+
+
+def test_fixture_gmail_implements_every_mailbox_gateway_member() -> None:
+    # A gateway member the double lacks fails here on every change, not first in
+    # the nightly full proof (issue #275).
+    members = _gateway_members()
+    assert "set_operation_timeout" in members
+    for name in members:
+        expected = inspect.signature(getattr(MailboxGateway, name)).parameters
+        actual = inspect.signature(getattr(FixtureGmail, name)).parameters
+        assert [(p.name, p.kind, p.default) for p in actual.values()] == [
+            (p.name, p.kind, p.default) for p in expected.values()
+        ], name
+
+
+def test_fixture_gmail_operation_timeout_uses_production_validation() -> None:
+    gateway = FixtureGmail(b"%PDF")
+    for invalid in (0, -1, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError, match="positive finite"):
+            gateway.set_operation_timeout(invalid)
+    gateway.set_operation_timeout(2.5)
+
+    assert gateway.operation_timeouts == [2.5]
+    assert gateway.mailbox_address() == "fixture@example.invalid"
+    with pytest.raises(AssertionError, match="does not poll"):
+        gateway.initial_cursor()
+
+
+def _fixture_attachment_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        FIXTURE_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
+    runtime.store.add_message(
+        message_id="fixture-message",
+        thread_id=None,
+        sender="fixture@example.invalid",
+        sender_name="Fixture Sender",
+        subject="Fixture document",
+        received_at="2026-08-29T12:00:00+00:00",
+        provider=DEFAULT_MAIL_PROVIDER,
+        account_id=DEFAULT_MAIL_ACCOUNT_ID,
+        mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+        admission=AdmissionProvenance(
+            kind="exact_sender",
+            selector_id="sender:fixture@example.invalid",
+            display_name="Fixture Sender",
+            mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+            admitted_at="2026-09-19T12:00:00+00:00",
+        ),
+    )
+    runtime.store.replace_attachments(
+        "fixture-message",
+        (
+            AttachmentDescriptor(
+                FIXTURE_PART_ID,
+                "fixture-attachment",
+                "fixture.pdf",
+                "application/pdf",
+                1,
+                0,
+            ),
+        ),
+    )
+    install_fixture_mailbox(runtime)
+    return runtime
+
+
+def test_fixture_gmail_serves_the_real_deadline_bounded_attachment_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _fixture_attachment_runtime(tmp_path, monkeypatch)
+    gateway = FixtureGmail(b"%PDF-fixture")
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", staticmethod(lambda *_args: gateway))
+
+    content = engine_api._generic_attachment_content(
+        runtime,
+        "fixture-message",
+        FIXTURE_PART_ID,
+        operation_deadline=time.monotonic() + 30,
+    )
+
+    # The engine set the remaining deadline on the gateway before reading bytes.
+    assert content == b"%PDF-fixture"
+    assert len(gateway.operation_timeouts) == 1
+    assert 0 < gateway.operation_timeouts[0] <= 30
+
+
+def test_fixture_gmail_expired_deadline_reads_no_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _fixture_attachment_runtime(tmp_path, monkeypatch)
+    reads: list[tuple[str, str, str | None]] = []
+
+    class RecordingFixtureGmail(FixtureGmail):
+        def attachment_bytes(self, message_id, part_id, attachment_id):
+            reads.append((message_id, part_id, attachment_id))
+            return super().attachment_bytes(message_id, part_id, attachment_id)
+
+    gateway = RecordingFixtureGmail(b"%PDF-fixture")
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", staticmethod(lambda *_args: gateway))
+
+    with pytest.raises(engine_api._AutomationDispatchBudgetExhausted):
+        engine_api._generic_attachment_content(
+            runtime,
+            "fixture-message",
+            FIXTURE_PART_ID,
+            operation_deadline=time.monotonic() - 1,
+        )
+
+    assert reads == []
+    assert gateway.operation_timeouts == []
 
 
 def test_proof_check_gate_accepts_only_complete_success() -> None:
