@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import runpy
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -12,6 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 from connect_automate import connect, entitlement
+from test_connect_v2_engine_api import OUTPUT_ID, PDF, REQUEST_ID, capability, seeded_runtime
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import DEFAULT_RETENTION_DAYS, config_admission_snapshot
@@ -31,6 +34,7 @@ FIXTURE_MODEL_DIGEST = PROOF_SCRIPT["FIXTURE_MODEL_DIGEST"]
 FIXTURE_MAILBOX_IDENTITY_KEY = PROOF_SCRIPT["FIXTURE_MAILBOX_IDENTITY_KEY"]
 FixtureGmail = PROOF_SCRIPT["FixtureGmail"]
 FixtureModelHandler = PROOF_SCRIPT["FixtureModelHandler"]
+expected_reference_inbox_row = PROOF_SCRIPT["expected_reference_inbox_row"]
 email_database_evidence = PROOF_SCRIPT["email_database_evidence"]
 fixture_message_times = PROOF_SCRIPT["fixture_message_times"]
 gmail_from_token = PROOF_SCRIPT["gmail_from_token"]
@@ -475,6 +479,85 @@ def test_email_database_evidence_checks_schema_functions_through_store_owner(
     assert schema_version == SCHEMA_VERSION
     assert job_row is None
     assert interrupted_rows == []
+
+
+@pytest.mark.parametrize(
+    "acknowledged", [(), ("fixed-parameters-v1",)], ids=["unacknowledged", "fixed-parameters"]
+)
+def test_reference_inbox_expectation_is_the_real_completed_v2_row(
+    tmp_path: Path, acknowledged: tuple[str, ...]
+) -> None:
+    # The proof compares whole inbox rows; this keeps its expectation tied to the real
+    # projection, including the feature list persisted from the selected discovery item.
+    _, runtime = seeded_runtime(tmp_path)
+    selected = replace(capability(), acknowledged_manifest_features=acknowledged)
+    job = connect.prepare_capability_job(
+        selected, PDF, "application/pdf", "invoice.pdf", job_id=REQUEST_ID
+    )
+    runtime.store.create_connect_job(
+        message_id="message-1",
+        part_id="2",
+        protocol_version=2,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        request_json=job.request_json,
+        job_id=REQUEST_ID,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        required_manifest_features=selected.acknowledged_manifest_features,
+        capability_produces=selected.produces,
+    )
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="text/plain",
+        display_name="translation.txt",
+        byte_size=2,
+        sha256=hashlib.sha256(b"ok").hexdigest(),
+        payload=b"ok",
+    )
+    completed = runtime.store.transition_connect_job(
+        job_id=REQUEST_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    rows, _ = runtime.store.query_inbox(limit=5)
+    (actual,) = rows[0]["attachments"][0]["capability_results"]
+
+    def expectation(item: dict[str, object]) -> dict[str, object]:
+        return expected_reference_inbox_row(
+            item,
+            job_id=REQUEST_ID,
+            app_id=selected.app_id,
+            capability_id=selected.capability_id,
+            updated_at=completed.updated_at,
+            instance_id=selected.instance_id,
+            parameters={},
+            output={
+                "artifact_id": OUTPUT_ID,
+                "media_type": "text/plain",
+                "display_name": "translation.txt",
+                "byte_size": 2,
+                "sha256": hashlib.sha256(b"ok").hexdigest(),
+            },
+        )
+
+    public = selected.public_dict()
+    assert actual == expectation(public)
+    wrong = [] if acknowledged else ["fixed-parameters-v1"]
+    assert actual != expectation({**public, "acknowledged_manifest_features": wrong})
+    missing = expectation(public)
+    missing.pop("required_manifest_features", None)
+    assert actual != missing
 
 
 def test_proof_check_gate_accepts_only_complete_success() -> None:
