@@ -115,16 +115,23 @@ jobs:
           tests/test_gmail_recovery_retention.py
           tests/test_thread_bodies_round4.py
           tests/test_thread_bodies.py
-          tests/test_thread_reconcile.py::test_check_backfills_vendor_mail_before_current_poll_cursor
-          tests/test_service.py::test_exact_allowlist_and_dedup
-          tests/test_service.py::test_public_check_processes_current_pending_work_without_watch_selectors
-          tests/test_source_exclusion.py::test_legacy_drain_timeout_keeps_marker_unset_and_retry_adopts
-          tests/test_source_exclusion.py::test_selected_legacy_operation_excludes_drain_until_mutation_finishes
-          tests/test_source_exclusion.py::test_legacy_cleanup_batches_are_bounded_and_do_not_split_units
-          tests/test_source_exclusion.py::test_legacy_cleanup_context_does_not_authorize_nested_connect
-          tests/test_source_exclusion.py::test_post_with_refused_outcome_reconciles_without_second_post
-          tests/test_connect_v2_engine_api.py::test_automation_submission_requires_connect_entitlement_before_provider_post
-          tests/test_connect_v2_engine_api.py::test_connect_entitlement_is_rechecked_after_source_fetch_before_provider_post
+          tests/test_certificate_expiry_ledger.py
+          tests/test_cli.py
+          tests/test_connect_v2_engine_api.py
+          tests/test_db.py
+          tests/test_deferred_removal.py
+          tests/test_engine_api.py
+          tests/test_ntfy_disclosure_migration.py
+          tests/test_positive_deployment.py
+          tests/test_removal_refusal.py
+          tests/test_service.py
+          tests/test_source_exclusion.py
+          tests/test_source_observations.py
+          tests/test_thread_bodies_review.py
+          tests/test_thread_derived.py
+          tests/test_thread_migration.py
+          tests/test_thread_reconcile.py
+          tests/test_thread_reconcile_round2.py
           --junitxml=${{ runner.temp }}/ew-source-cutover/native-integration.xml
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
@@ -191,10 +198,10 @@ jobs:
             ${{ runner.temp }}/ew-source-cutover/full/java-version.txt
             ${{ runner.temp }}/ew-source-cutover/full/installer.*
           if-no-files-found: error
-      - name: Verify Windows engine process-tree lifecycle
+      - name: Verify Windows engine process-tree and removal lifecycle
         run: >-
-          cargo test --release --manifest-path desktop/src-tauri/Cargo.toml
-          engine::tests::windows_job_ -- --test-threads=1
+          cargo test --release --lib --manifest-path desktop/src-tauri/Cargo.toml
+          -- --test-threads=1
       - name: Re-run packaged engine acceptance smoke
         shell: pwsh
         run: |
