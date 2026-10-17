@@ -1,6 +1,6 @@
 # Windows private storage — separate #269 contract
 
-Status: **PROPOSED, CONTRACT ONLY.** Juan authorized this session to own #269 separately, contract first. Implementation requires his explicit acceptance of this contract. No production code, path transition, installed-app change or native privacy claim is included here.
+Status: **ACCEPTED.** Juan accepted this contract and authorized its implementation as the separate #269 repair: "Accept contract and implement (Recommended)" (direct operator answer, 2026-10-17 UTC). This acceptance commit contains no production code, path transition, installed-app change or native privacy claim.
 
 ## Root cause and baseline
 
@@ -82,10 +82,10 @@ Only after this separate slice is implemented, reviewed and qualified may it lan
 
 ## Acceptance, implementation summary and gap audit
 
-Acceptance required: Juan accepts this root/path/refusal/publication contract before production code. Oversight technical review does not supply operator authority. Record his exact acceptance before implementation.
+Acceptance recorded: direct operator answer "Accept contract and implement (Recommended)" (2026-10-17 UTC). This authorizes the root/path/refusal/publication contract above. Oversight technical review alone does not supply operator authority.
 
 Implementation summary: contract only. No runtime code or tests changed and no native result claimed.
 
 Cold diff audit: the proposed change is this plan only; its source inventory is pinned to the baseline above. A durable copy and source hashes accompany the proposal. Corrected older mixed-tree evidence is not reused as current proof.
 
-Gap audit: **NOT DONE**. Contract acceptance, fail-first reproduction, implementation, native Windows privacy/auxiliary-file proof, full gates, separate merge, and forward integration/final #261 qualification remain outstanding.
+Gap audit: **NOT DONE**. Fail-first reproduction, implementation, native Windows privacy/auxiliary-file proof, full gates, separate merge, and forward integration/final #261 qualification remain outstanding.
