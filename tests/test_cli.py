@@ -56,10 +56,12 @@ def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch,
 
 
 @pytest.fixture
-def doctor_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def doctor_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request):
     state_directory = tmp_path / "state"
     if private_storage.is_windows():
-        private_storage.connect_windows.ensure_private_directory(state_directory, root=tmp_path)
+        anchor = request.getfixturevalue("native_private_storage")
+        state_directory = anchor / "state"
+        private_storage.connect_windows.ensure_private_directory(state_directory, root=anchor)
     else:
         state_directory.mkdir(mode=0o700)
     account = SimpleNamespace(provider="imap", account_id=f"imap-{'a' * 32}")
@@ -104,6 +106,30 @@ def test_doctor_uses_the_active_imap_provider_checks(doctor_runtime, capsys) -> 
     assert checks["mail_account_credentials"] == {"ok": True, "provider": "imap"}
     assert "oauth_credentials" not in checks
     assert "oauth_token" not in checks
+
+
+def test_doctor_windows_fixture_reuses_native_private_anchor(tmp_path, monkeypatch, request):
+    anchor = tmp_path / "validated-native-anchor"
+    anchor.mkdir()
+    monkeypatch.setattr(private_storage, "is_windows", lambda: True)
+    original_get = pytest.FixtureRequest.getfixturevalue
+
+    def supplied_anchor(self, name):
+        if name == "native_private_storage":
+            return anchor
+        return original_get(self, name)
+
+    def require_anchor(path, *, root):
+        assert root == anchor, "doctor fixture trusted the ordinary pytest temp root"
+        assert path == anchor / "state"
+        path.mkdir()
+
+    monkeypatch.setattr(pytest.FixtureRequest, "getfixturevalue", supplied_anchor)
+    monkeypatch.setattr(
+        private_storage.connect_windows, "ensure_private_directory", require_anchor,
+    )
+    config = request.getfixturevalue("doctor_runtime")
+    assert config.database_file.parent == anchor / "state"
 
 
 def test_doctor_windows_uses_shared_directory_validation(
