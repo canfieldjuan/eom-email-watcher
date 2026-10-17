@@ -4,6 +4,7 @@ import errno
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,146 @@ def test_migration_owner_excludes_runtime_tracking_during_messages_rebuild(tmp_p
         assert db.execute("PRAGMA user_version").fetchone()[0] == 36
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_migration_owner_preserves_row_evidence_across_schema_step(tmp_path):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    seed(store)
+    assert derived(store)["vendor_id"] == vendor
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        db.execute("UPDATE mail_accounts SET active=active")
+        before = [tuple(row) for row in db.execute("SELECT * FROM derived_changed_config")]
+        assert before == [("mail_accounts",)]
+        during = set()
+
+        def inspect_drop(sql):
+            if sql == "DROP TABLE messages":
+                # SQLite can repeat a trace statement while processing triggers.
+                # Keep every distinct observed tracker state, not callback counts.
+                during.add(
+                    tuple(
+                        tuple(row)
+                        for row in db.execute(
+                            "SELECT name FROM sqlite_temp_master "
+                            "WHERE type='trigger' AND name GLOB 'derived_*'"
+                        )
+                    )
+                )
+
+        db.set_trace_callback(inspect_drop)
+        thread_migration.rebuild_messages(db)
+        db.set_trace_callback(None)
+        assert during == {()}
+        assert (
+            db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'derived_*'"
+            ).fetchall()
+            == []
+        )
+        assert [tuple(row) for row in db.execute("SELECT * FROM derived_changed_config")] == before
+        db.execute("DELETE FROM vendor_addresses WHERE vendor_id = ?", (vendor,))
+        assert {row[0] for row in db.execute("SELECT * FROM derived_changed_config")} == {
+            "mail_accounts",
+            "vendor_addresses",
+        }
+        db.execute("UPDATE messages SET sender=sender WHERE message_id='m'")
+        assert [row[0] for row in db.execute("SELECT * FROM derived_changed_messages")] == ["m"]
+    assert derived(store)["vendor_id"] is None
+    assert follow(store)[0]["followed"] == 0
+    store.initialize()
+    assert derived(store)["vendor_id"] is None
+    with store.connection() as db:
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.parametrize(
+    "table, expected",
+    [
+        ("messages", True),
+        ("mail_accounts", True),
+        ("message_bodies", True),
+        ("message_body_unavailable", True),
+        ("thread_follow", True),
+        ("logical_messages", False),
+        ("messages_delete_attachments", False),
+    ],
+)
+def test_migration_tracking_boundary_uses_referenced_tables(tmp_path, table, expected):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        assert owner.tracking_references_replaced_tables(db, {table}) is expected
+        assert (
+            owner.tracking_references_replaced_tables(db, {"logical_messages", table}) is expected
+        )
+        assert owner.tracking_references_replaced_tables(db, set()) is False
+        db.execute("UPDATE mail_accounts SET active=active")
+        triggers = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_temp_master WHERE type='trigger' AND name GLOB 'derived_*'"
+        )}
+        assert triggers
+        for replaced in ({table}, {"logical_messages", table}, set()):
+            suspend = expected and bool(replaced)
+            with owner.schema_step(db, replaced_tables=replaced):
+                assert db._derived_enabled is (not suspend)
+                assert {row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_temp_master "
+                    "WHERE type='trigger' AND name GLOB 'derived_*'"
+                )} == (set() if suspend else triggers)
+            assert db._derived_enabled is True
+            assert {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_temp_master "
+                "WHERE type='trigger' AND name GLOB 'derived_*'"
+            )} == triggers
+
+
+def test_unchanged_reopen_keeps_tracking_across_view_and_trigger_refresh(tmp_path, monkeypatch):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    seed(store)
+    connection = Store.connection
+    recompute = database._recompute_derived
+    member = database._thread_member
+    statements, evidence, touched = [], [], []
+
+    @contextmanager
+    def observe_connection(self):
+        with connection(self) as db:
+            db.set_trace_callback(statements.append)
+            yield db
+
+    def observe_recompute(db, changed):
+        if changed:
+            tracked = db.execute(
+                "SELECT 1 FROM sqlite_temp_master WHERE name='derived_changed_messages'"
+            ).fetchone()
+            evidence.append(
+                (
+                    bool(tracked),
+                    [tuple(row) for row in db.execute("SELECT * FROM derived_changed_config")],
+                    [tuple(row) for row in db.execute("SELECT * FROM derived_changed_messages")],
+                )
+            )
+        return recompute(db, changed)
+
+    def observe_member(db, row, vendor):
+        touched.append(row["message_id"])
+        return member(db, row, vendor)
+
+    monkeypatch.setattr(Store, "connection", observe_connection)
+    monkeypatch.setattr(database, "_recompute_derived", observe_recompute)
+    monkeypatch.setattr(database, "_thread_member", observe_member)
+    store.initialize()
+    assert "DROP VIEW IF EXISTS logical_messages" in statements
+    assert "DROP TRIGGER IF EXISTS messages_delete_recipients_and_locations" in statements
+    assert evidence == [(True, [], [])]
+    assert touched == []
+    assert len(follow(store)) == 1
+
 
 
 @pytest.fixture
