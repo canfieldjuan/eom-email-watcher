@@ -34,6 +34,7 @@ class Engine:
     def __init__(self, binary, config, folder, environment):
         self.binary, self.config = binary, config
         self.folder, self.environment = folder, environment
+        self.operation_timings = []
 
     def request(self, operation, payload=None):
         value = {
@@ -63,14 +64,71 @@ class Engine:
         return process
 
     def call(self, operation, payload=None):
+        started = time.monotonic()
         process = self.start(operation, payload)
         stdout, stderr = process.communicate(timeout=150)
+        elapsed = time.monotonic() - started
         value = json.loads(stdout)
         assert process.returncode == 0 and value["ok"], (operation, value, stderr)
+        timing = {"operation": operation, "elapsed_seconds": elapsed}
+        self.operation_timings.append(timing)
         with (self.folder / "operations.jsonl").open("a", encoding="utf-8") as stream:
             (self.folder / "operations.jsonl").chmod(0o600)
-            stream.write(json.dumps({"operation": operation, "result": value}) + "\n")
+            stream.write(json.dumps({**timing, "result": value}) + "\n")
         return value["data"]
+
+
+def measure_startup_delivery(engine, database):
+    """Time installed IPC work under the native host lock; never show real toasts."""
+    from connect_automate.locking import connect_operation_lock
+
+    from eom_email_watcher.thread_migration import _backup_paths
+
+    location = Path(engine.call("host.operation_lock")["path"])
+    # Prove that the installed Python contender observes the held native lock.
+    # Rust HostOperationLock's interoperability is exercised by its existing
+    # real-engine contract test; this proof uses that same public lock owner.
+    with connect_operation_lock(location, "Native timing proof lock is busy"):
+        contender = engine.start("notifications.pending", {"limit": 25})
+        stdout, stderr = contender.communicate(timeout=150)
+        value = json.loads(stdout)
+        assert contender.returncode == 2 and not value["ok"], (value, stderr)
+        assert value["error"] == {
+            "code": "runtime_error",
+            "message": "Another watcher operation is already running",
+        }, value
+
+    backup_count = len(_backup_paths(database))
+    offset = len(engine.operation_timings)
+    started = time.monotonic()
+    measured_location = Path(engine.call("host.operation_lock")["path"])
+    assert measured_location == location, "Host lock path changed after contention proof"
+    with connect_operation_lock(measured_location, "Native timing proof lock is busy"):
+        items = engine.call("notifications.pending_under_host_lock", {"limit": 25})["items"]
+        assert 1 <= len(items) <= 25, "Startup proof requires real pending fixture intents"
+        for item in items:
+            acknowledgement = engine.call(
+                "notifications.ack",
+                {key: item[key] for key in (
+                    "message_id", "kind", "analysis_at", "subject_type", "subject_id", "revision"
+                )},
+            )
+            assert acknowledgement["status"] in {"acknowledged", "already_acknowledged"}
+        remaining = engine.call("notifications.count_under_host_lock")["count"]
+    elapsed = time.monotonic() - started
+    # Fixed accepted oracle: lib.rs STARTUP_DELIVERY_TIMEOUT, not the proof's
+    # per-process safety timeout. Native failure never permits a budget raise.
+    assert elapsed < 30, f"Startup delivery IPC exceeded its 30 s deadline: {elapsed}"
+    return {
+        "total_seconds": elapsed,
+        "deadline_seconds": 30,
+        "ipc_calls": engine.operation_timings[offset:],
+        "pending_intents": len(items),
+        "remaining_intents": remaining,
+        "backup_count": backup_count,
+        "host_lock_contention_proved": True,
+        "scope": "Installed IPC and host-lock work; native toast rendering is not timed",
+    }
 
 
 def scalar(database, sql, values=()):
@@ -271,10 +329,12 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
             )
             assert provider.submission_count(old_job_id) == 1, "Orphan POST was resubmitted"
             # All subsequent effects are public IPC through the installed new image.
-            new.call("settings.update", {"retention_days": 1})
+            new.call("settings.update", {"retention_days": 1, "notifications_enabled": True})
             mail.append("retained-sent", sent=True, reply_to="retained-root")
             mail.append("new-attachment", pdf=True)
             check = new.call("watcher.check")
+            check_seconds = new.operation_timings[-1]["elapsed_seconds"]
+            startup_delivery = measure_startup_delivery(new, database)
             assert (
                 scalar(database, "SELECT COUNT(*) FROM messages WHERE subject LIKE 'expired-%'")
                 == 0
@@ -320,6 +380,8 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                 "java_runtime": (folder / "java-version.txt").read_text(),
                 "predecessor_schema": 34,
                 "source_drain_seconds": elapsed,
+                "public_check_seconds": check_seconds,
+                "startup_delivery": startup_delivery,
                 "orphan_posts": provider.submission_count(old_job_id),
                 "total_posts": provider.post_attempt_count(),
                 "poll": check,
