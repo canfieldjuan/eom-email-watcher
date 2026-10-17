@@ -14,6 +14,7 @@ from typing import Literal, Protocol, TextIO
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from . import private_storage
 from .scheduling import (
     SCHEDULING_SYSTEM_PROMPT,
     SchedulingAttemptResult,
@@ -322,6 +323,8 @@ class LocalModel:
         self.require_auth = require_auth
 
     def _headers(self) -> dict[str, str]:
+        if self.api_token_file:
+            private_storage.validate_file(self.api_token_file, allow_missing=True)
         if self.api_token_file and self.api_token_file.exists():
             token = self.api_token_file.read_text(encoding="utf-8").strip()
             if token:
@@ -466,6 +469,7 @@ class GatewayModel:
 
     def _headers(self) -> dict[str, str]:
         try:
+            private_storage.validate_file(self.api_token_file)
             with self._open_readonly(self.api_token_file) as stream:
                 metadata = os.fstat(stream.fileno())
                 if (
@@ -479,6 +483,8 @@ class GatewayModel:
                 ):
                     raise ModelError("Inference gateway credential is invalid")
                 token = stream.read(MAX_GATEWAY_TOKEN_BYTES + 1).strip()
+        except private_storage.PrivateStorageError as exc:
+            raise ModelError(str(exc)) from exc
         except OSError as exc:
             raise ModelError("Inference gateway credential is unavailable") from exc
         except UnicodeError as exc:

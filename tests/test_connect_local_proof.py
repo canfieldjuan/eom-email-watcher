@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import runpy
 import threading
+import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
 import pytest
+from connect_automate import connect, entitlement
+from test_connect_v2_engine_api import OUTPUT_ID, PDF, REQUEST_ID, capability, seeded_runtime
 
 from eom_email_watcher import engine_api
-from eom_email_watcher.db import AdmissionProvenance
-from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
+from eom_email_watcher.config import DEFAULT_RETENTION_DAYS, config_admission_snapshot
+from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, Store
+from eom_email_watcher.mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    MailboxGateway,
+)
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
 
@@ -20,7 +32,14 @@ PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-local-proof.py"))
 FIXTURE_PART_ID = PROOF_SCRIPT["FIXTURE_PART_ID"]
 FIXTURE_MODEL_DIGEST = PROOF_SCRIPT["FIXTURE_MODEL_DIGEST"]
 FIXTURE_MAILBOX_IDENTITY_KEY = PROOF_SCRIPT["FIXTURE_MAILBOX_IDENTITY_KEY"]
+FixtureGmail = PROOF_SCRIPT["FixtureGmail"]
 FixtureModelHandler = PROOF_SCRIPT["FixtureModelHandler"]
+expected_reference_inbox_row = PROOF_SCRIPT["expected_reference_inbox_row"]
+email_database_evidence = PROOF_SCRIPT["email_database_evidence"]
+fixture_message_times = PROOF_SCRIPT["fixture_message_times"]
+gmail_from_token = PROOF_SCRIPT["gmail_from_token"]
+instrumented_client_factory = PROOF_SCRIPT["instrumented_client_factory"]
+refuse_gmail = PROOF_SCRIPT["refuse_gmail"]
 install_fixture_mailbox = PROOF_SCRIPT["install_fixture_mailbox"]
 require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
 privacy_projection = PROOF_SCRIPT["privacy_projection"]
@@ -117,13 +136,14 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
         FIXTURE_MAILBOX_IDENTITY_KEY,
         legacy_status="replacement",
     )
+    received_at, admitted_at = fixture_message_times()
     runtime.store.add_message(
         message_id="fixture-message",
         thread_id=None,
         sender="fixture@example.invalid",
         sender_name="Fixture Sender",
         subject="Fixture document",
-        received_at="2026-08-29T12:00:00+00:00",
+        received_at=received_at,
         provider=DEFAULT_MAIL_PROVIDER,
         account_id=DEFAULT_MAIL_ACCOUNT_ID,
         mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
@@ -132,7 +152,7 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
             selector_id="sender:fixture@example.invalid",
             display_name="Fixture Sender",
             mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
-            admitted_at="2026-09-19T12:00:00+00:00",
+            admitted_at=admitted_at,
         ),
     )
     runtime.store.replace_attachments(
@@ -184,6 +204,360 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
         "operation": "connect.attachment.capabilities",
         "protocol": 1,
     }
+
+
+def test_proof_requests_carry_admission_for_admission_required_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    load_runtime(config_path)
+
+    pump = request(config_path, "connect.queue.pump")
+
+    # The Contract Watch pump is admission-required; the proof must bind it to
+    # the engine's own configuration admission snapshot (issue #270).
+    assert "connect.queue.pump" in engine_api.ADMISSION_REQUIRED_OPERATIONS
+    assert pump["admission_token"] == config_admission_snapshot(config_path).token
+    pumped = engine_api._response(pump)
+    assert pumped["ok"] is True, pumped
+    assert pumped["operation"] == "connect.queue.pump"
+    for operation in (
+        "inbox.recent",
+        "connect.attachment.capabilities",
+        "connect.attachment.invoke",
+        "connect.output.present",
+        "connect.output.export",
+    ):
+        assert operation not in engine_api.ADMISSION_REQUIRED_OPERATIONS
+        assert "admission_token" not in request(config_path, operation)
+
+    # The engine guard is unchanged: the same request without its token is refused.
+    bare = {key: value for key, value in pump.items() if key != "admission_token"}
+    assert engine_api._response(bare)["error"] == {
+        "code": "invalid_request",
+        "message": "admission_token is invalid",
+    }
+
+
+def _gateway_members() -> list[str]:
+    return sorted(
+        name
+        for name, value in vars(MailboxGateway).items()
+        if not name.startswith("_") and callable(value)
+    )
+
+
+def test_fixture_gmail_implements_every_mailbox_gateway_member() -> None:
+    # A gateway member the double lacks fails here on every change, not first in
+    # the nightly full proof (issue #275).
+    members = _gateway_members()
+    assert "set_operation_timeout" in members
+    gateway = FixtureGmail(b"%PDF")
+    for name in members:
+        # The bound member of a real instance: an instance attribute with the same
+        # name would shadow the method and fail here.
+        member = getattr(gateway, name)
+        assert inspect.ismethod(member), name
+        expected = inspect.signature(getattr(MailboxGateway, name)).parameters
+        actual = inspect.signature(member.__func__).parameters
+        assert [(p.name, p.kind, p.default) for p in actual.values()] == [
+            (p.name, p.kind, p.default) for p in expected.values()
+        ], name
+    with pytest.raises(AssertionError, match="does not read fixture message content"):
+        gateway.content("fixture-message", 1, scope=frozenset())
+
+
+def test_fixture_message_times_stay_inside_retention_at_any_clock() -> None:
+    # Fixed calendar dates aged out of the retention window and would have made
+    # the retained-source check refuse the fixture once time passed.
+    for now in (
+        datetime(2026, 10, 17, 2, 0, tzinfo=UTC),
+        datetime(2027, 3, 1, tzinfo=UTC),
+        datetime(2035, 1, 1, tzinfo=UTC),
+    ):
+        received_at, admitted_at = fixture_message_times(now)
+        received = datetime.fromisoformat(received_at)
+        admitted = datetime.fromisoformat(admitted_at)
+        assert now - timedelta(days=DEFAULT_RETENTION_DAYS) < received < admitted < now
+
+
+def test_fixture_gmail_operation_timeout_uses_production_validation() -> None:
+    gateway = FixtureGmail(b"%PDF")
+    for invalid in (0, -1, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError, match="positive finite"):
+            gateway.set_operation_timeout(invalid)
+    gateway.set_operation_timeout(2.5)
+
+    assert gateway.operation_timeouts == [2.5]
+    assert gateway.mailbox_address() == "fixture@example.invalid"
+    with pytest.raises(AssertionError, match="does not poll"):
+        gateway.initial_cursor()
+
+
+def _fixture_attachment_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        FIXTURE_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
+    received_at, admitted_at = fixture_message_times()
+    runtime.store.add_message(
+        message_id="fixture-message",
+        thread_id=None,
+        sender="fixture@example.invalid",
+        sender_name="Fixture Sender",
+        subject="Fixture document",
+        received_at=received_at,
+        provider=DEFAULT_MAIL_PROVIDER,
+        account_id=DEFAULT_MAIL_ACCOUNT_ID,
+        mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+        admission=AdmissionProvenance(
+            kind="exact_sender",
+            selector_id="sender:fixture@example.invalid",
+            display_name="Fixture Sender",
+            mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+            admitted_at=admitted_at,
+        ),
+    )
+    runtime.store.replace_attachments(
+        "fixture-message",
+        (
+            AttachmentDescriptor(
+                FIXTURE_PART_ID,
+                "fixture-attachment",
+                "fixture.pdf",
+                "application/pdf",
+                1,
+                0,
+            ),
+        ),
+    )
+    install_fixture_mailbox(runtime)
+    return runtime
+
+
+def test_fixture_gmail_serves_the_real_deadline_bounded_attachment_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _fixture_attachment_runtime(tmp_path, monkeypatch)
+    gateway = FixtureGmail(b"%PDF-fixture")
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", staticmethod(lambda *_args: gateway))
+
+    content = engine_api._generic_attachment_content(
+        runtime,
+        "fixture-message",
+        FIXTURE_PART_ID,
+        operation_deadline=time.monotonic() + 30,
+    )
+
+    # The engine set the remaining deadline on the gateway before reading bytes.
+    assert content == b"%PDF-fixture"
+    assert len(gateway.operation_timeouts) == 1
+    assert 0 < gateway.operation_timeouts[0] <= 30
+
+
+def test_fixture_gmail_expired_deadline_reads_no_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _fixture_attachment_runtime(tmp_path, monkeypatch)
+    reads: list[tuple[str, str, str | None]] = []
+
+    class RecordingFixtureGmail(FixtureGmail):
+        def attachment_bytes(self, message_id, part_id, attachment_id):
+            reads.append((message_id, part_id, attachment_id))
+            return super().attachment_bytes(message_id, part_id, attachment_id)
+
+    gateway = RecordingFixtureGmail(b"%PDF-fixture")
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", staticmethod(lambda *_args: gateway))
+
+    with pytest.raises(engine_api._AutomationDispatchBudgetExhausted):
+        engine_api._generic_attachment_content(
+            runtime,
+            "fixture-message",
+            FIXTURE_PART_ID,
+            operation_deadline=time.monotonic() - 1,
+        )
+
+    assert reads == []
+    assert gateway.operation_timeouts == []
+
+
+def _signature_call_shapes(callable_) -> list[tuple[tuple[object, ...], dict[str, object]]]:
+    """Every-parameter positional and keyword calls admitted by a real signature."""
+    parameters = [
+        parameter
+        for parameter in inspect.signature(callable_).parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ]
+    values = {parameter.name: object() for parameter in parameters}
+    positional = tuple(
+        values[parameter.name]
+        for parameter in parameters
+        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    keyword_only = {
+        parameter.name: values[parameter.name]
+        for parameter in parameters
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    return [((), {}), (positional, keyword_only), ((), values)]
+
+
+def test_instrumented_client_factory_forwards_every_sdk_call_shape() -> None:
+    # The proof replaces connect._client; the SDK calls it with a timeout, so a
+    # zero-argument wrapper broke the interrupted-job phase (issue #281).
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    submissions: list[str] = []
+
+    def original(*args: object, **kwargs: object) -> httpx.Client:
+        calls.append((args, kwargs))
+        return httpx.Client(
+            base_url="http://provider.invalid",
+            transport=httpx.MockTransport(lambda _request: httpx.Response(202)),
+        )
+
+    def record(request: httpx.Request) -> None:
+        if request.method == "POST" and request.url.path == "/v2/jobs":
+            submissions.append(request.url.path)
+
+    factory = instrumented_client_factory(original, record)
+    shapes = _signature_call_shapes(connect._client)
+    assert ((), {"timeout_seconds": shapes[2][1]["timeout_seconds"]}) == shapes[2]
+    for args, kwargs in shapes:
+        with factory(*args, **kwargs) as client:
+            client.post("/v2/jobs")
+            client.get("/v2/manifest")
+    assert calls == shapes
+    assert submissions == ["/v2/jobs"] * len(shapes)
+
+
+def test_gmail_from_token_double_accepts_every_real_factory_call_shape() -> None:
+    gateway = FixtureGmail(b"%PDF")
+    opened = gmail_from_token(lambda: gateway).__func__
+    refused = gmail_from_token(refuse_gmail("must not open Gmail")).__func__
+    for args, kwargs in _signature_call_shapes(engine_api.GmailGateway.from_token):
+        assert opened(*args, **kwargs) is gateway
+        with pytest.raises(AssertionError, match="must not open Gmail"):
+            refused(*args, **kwargs)
+
+
+def test_proof_entitlement_doubles_match_sdk_signatures() -> None:
+    # The proof replaces these SDK callables with a bound zero-argument method and
+    # a *feature_ids lambda; a changed SDK signature must fail here first.
+    assert list(inspect.signature(entitlement.connect_entitlement_decision).parameters) == []
+    features = list(inspect.signature(entitlement.feature_entitlements_active).parameters.values())
+    assert [(parameter.name, parameter.kind) for parameter in features] == [
+        ("feature_ids", inspect.Parameter.VAR_POSITIONAL)
+    ]
+
+
+def test_email_database_evidence_checks_schema_functions_through_store_owner(
+    tmp_path: Path,
+) -> None:
+    # The current schema's CHECK constraints call application SQL functions that only
+    # Store.connection registers; quick_check must run with them, not on a bare connection.
+    store = Store(tmp_path / "watcher.sqlite3")
+    store.initialize()
+
+    quick_check, schema_version, job_row, interrupted_rows = email_database_evidence(
+        store, "proof-job", "interrupted-proof-job"
+    )
+
+    assert quick_check == "ok"
+    assert schema_version == SCHEMA_VERSION
+    assert job_row is None
+    assert interrupted_rows == []
+
+
+@pytest.mark.parametrize(
+    "acknowledged", [(), ("fixed-parameters-v1",)], ids=["unacknowledged", "fixed-parameters"]
+)
+def test_reference_inbox_expectation_is_the_real_completed_v2_row(
+    tmp_path: Path, acknowledged: tuple[str, ...]
+) -> None:
+    # The proof compares whole inbox rows; this keeps its expectation tied to the real
+    # projection, including the feature list persisted from the selected discovery item.
+    _, runtime = seeded_runtime(tmp_path)
+    selected = replace(capability(), acknowledged_manifest_features=acknowledged)
+    job = connect.prepare_capability_job(
+        selected, PDF, "application/pdf", "invoice.pdf", job_id=REQUEST_ID
+    )
+    runtime.store.create_connect_job(
+        message_id="message-1",
+        part_id="2",
+        protocol_version=2,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        request_json=job.request_json,
+        job_id=REQUEST_ID,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        required_manifest_features=selected.acknowledged_manifest_features,
+        capability_produces=selected.produces,
+    )
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="text/plain",
+        display_name="translation.txt",
+        byte_size=2,
+        sha256=hashlib.sha256(b"ok").hexdigest(),
+        payload=b"ok",
+    )
+    completed = runtime.store.transition_connect_job(
+        job_id=REQUEST_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    rows, _ = runtime.store.query_inbox(limit=5)
+    (actual,) = rows[0]["attachments"][0]["capability_results"]
+
+    def expectation(item: dict[str, object]) -> dict[str, object]:
+        return expected_reference_inbox_row(
+            item,
+            job_id=REQUEST_ID,
+            app_id=selected.app_id,
+            capability_id=selected.capability_id,
+            updated_at=completed.updated_at,
+            instance_id=selected.instance_id,
+            parameters={},
+            output={
+                "artifact_id": OUTPUT_ID,
+                "media_type": "text/plain",
+                "display_name": "translation.txt",
+                "byte_size": 2,
+                "sha256": hashlib.sha256(b"ok").hexdigest(),
+            },
+        )
+
+    public = selected.public_dict()
+    assert actual == expectation(public)
+    wrong = [] if acknowledged else ["fixed-parameters-v1"]
+    assert actual != expectation({**public, "acknowledged_manifest_features": wrong})
+    missing = expectation(public)
+    missing.pop("required_manifest_features", None)
+    assert actual != missing
 
 
 def test_proof_check_gate_accepts_only_complete_success() -> None:

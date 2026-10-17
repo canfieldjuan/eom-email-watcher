@@ -30,7 +30,7 @@ from connect_automate.locking import (
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from . import deployment, removal, source_locks
+from . import deployment, private_storage, removal, source_locks
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -489,6 +489,8 @@ def _mail_accounts_public(runtime: Runtime) -> dict[str, object]:
 
 
 def _install_private_token(source: Path, destination: Path) -> None:
+    private_storage.validate_file(source)
+    private_storage.prepare_file(destination)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     local_copy: Path | None = None
     try:
@@ -501,6 +503,7 @@ def _install_private_token(source: Path, destination: Path) -> None:
                 ".readonly-token-",
                 ".json",
                 content,
+                private=True,
             )
             os.replace(local_copy, destination)
             local_copy = None
@@ -595,6 +598,7 @@ def _authorize_gmail_account(
     authorization_parent = (
         token_file.parent if token_file is not None else runtime.config.database_file.parent
     )
+    private_storage.ensure_directory(authorization_parent)
     authorization_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(
         prefix=".gmail-authorization-",
@@ -748,6 +752,7 @@ def _authorize_microsoft_account(
         if account is not None
         else runtime.config.database_file.parent
     )
+    private_storage.ensure_directory(authorization_parent, root=runtime.config.database_file.parent)
     authorization_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(
         prefix=".microsoft365-authorization-",
@@ -871,6 +876,7 @@ def _connect_imap_account(
         if account is not None
         else runtime.config.database_file.parent
     )
+    private_storage.ensure_directory(authorization_parent, root=runtime.config.database_file.parent)
     authorization_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(
         prefix=".imap-authorization-",
@@ -1687,6 +1693,7 @@ def _calendar_connect(request: dict[str, object], profile: str) -> dict[str, obj
         except Microsoft365Error as exc:
             raise ApiError("calendar_error", str(exc)) from exc
         token_file = microsoft_calendar_token_file(runtime.config, account, profile)
+        private_storage.prepare_file(token_file, root=runtime.config.database_file.parent)
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             authorization_directory = tempfile.TemporaryDirectory(
@@ -2862,7 +2869,11 @@ def _attachment_destination(value: object) -> Path:
     return resolved
 
 
-def _write_private_file(destination: Path, prefix: str, suffix: str, content: bytes) -> Path:
+def _write_private_file(
+    destination: Path, prefix: str, suffix: str, content: bytes, *, private: bool = False
+) -> Path:
+    if private:
+        private_storage.ensure_directory(destination)
     descriptor, raw_path = tempfile.mkstemp(
         prefix=prefix,
         suffix=suffix,
@@ -2871,6 +2882,8 @@ def _write_private_file(destination: Path, prefix: str, suffix: str, content: by
     path = Path(raw_path)
     try:
         with os.fdopen(descriptor, "wb") as stream:
+            if private:
+                private_storage.validate_file(path)
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
@@ -6606,7 +6619,7 @@ def _response(request: object) -> dict[str, object]:
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
         }
-    except RuntimeError as exc:
+    except (RuntimeError, private_storage.PrivateStorageError) as exc:
         return {
             "error": {"code": "runtime_error", "message": str(exc)},
             "ok": False,

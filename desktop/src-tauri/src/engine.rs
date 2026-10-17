@@ -6751,6 +6751,51 @@ timezone = "UTC"
             .prepare_saved_inbox_removal("clear".into(), None)
             .expect("durably prepare without accepting")
             .request_id;
+        // Exercise the native journal's real atomic writer below the database
+        // root already validated by host.operation_lock. The shared SDK owns
+        // Windows ACL inspection; native code adds no second ACL policy.
+        let assert_journal_private = || {
+            let operation_lock = database_path.with_file_name("watcher.sqlite3.check.lock");
+            let journal = crate::inbox_removal::journal_path(&operation_lock);
+            assert!(journal.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            #[cfg(windows)]
+            {
+                let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap();
+                let proof = Command::new("uv")
+                    .args(["run", "--project"])
+                    .arg(project_root)
+                    .args(["python", "-c"])
+                    .arg(
+                        "import sys; from pathlib import Path; \
+                         from connect_automate.connect_windows import \
+                         validate_private_directory, validate_private_regular_file; \
+                         root=Path(sys.argv[1]); \
+                         validate_private_directory(root, root=root); \
+                         validate_private_regular_file(Path(sys.argv[2]), root=root)",
+                    )
+                    .arg(directory.path())
+                    .arg(&journal)
+                    .output()
+                    .expect("run shared SDK journal privacy proof");
+                assert!(
+                    proof.status.success(),
+                    "native recovery journal must inherit private DB root: {}",
+                    String::from_utf8_lossy(&proof.stderr)
+                );
+            }
+        };
+        assert_journal_private();
         let reopened = real_engine(config_path.clone());
         let reopened_snapshot = reopened.admission_snapshot().unwrap();
         reopened.install_admission_binding(
@@ -6792,6 +6837,7 @@ timezone = "UTC"
             .unwrap()
             .request_id;
         assert_ne!(unaccepted, saved_key);
+        assert_journal_private();
         // Discard the mutation response, then recover from a fresh transport.
         engine.clear_saved_inbox(saved_key.clone()).unwrap();
         assert_eq!(

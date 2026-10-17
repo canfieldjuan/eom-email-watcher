@@ -1,7 +1,9 @@
 """D-removal: real migration, frozen requests, and shared eligibility owners."""
 
+import os
 import sqlite3
 import stat
+from contextlib import closing
 from datetime import timedelta
 
 import pytest
@@ -1265,9 +1267,11 @@ def test_schema36_upgrade_backups_precede_any_write_and_preserve_rows(
     version,
 ):
     store = prior_store(tmp_path, monkeypatch, version)
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db:
         before = db.execute("SELECT * FROM messages ORDER BY message_id").fetchall()
         assert db.execute("PRAGMA user_version").fetchone()[0] == version
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
     original = thread_migration.write_backup
     seen = []
 
@@ -1278,8 +1282,13 @@ def test_schema36_upgrade_backups_precede_any_write_and_preserve_rows(
             "SELECT 1 FROM sqlite_master WHERE name='message_removal_requests'"
         ).fetchone()
         result = original(path, db, target_schema=target_schema)
-        assert stat.S_IMODE(result.stat().st_mode) == 0o600
-        with sqlite3.connect(result) as snapshot:
+        if os.name == "nt":
+            from connect_automate.connect_windows import validate_private_regular_file
+
+            validate_private_regular_file(result, root=result.parent)
+        else:
+            assert stat.S_IMODE(result.stat().st_mode) == 0o600
+        with closing(sqlite3.connect(result)) as snapshot:
             assert snapshot.execute("PRAGMA user_version").fetchone()[0] == version
             assert (
                 snapshot.execute("SELECT * FROM messages ORDER BY message_id").fetchall() == before
@@ -1288,6 +1297,8 @@ def test_schema36_upgrade_backups_precede_any_write_and_preserve_rows(
                 assert snapshot.execute("SELECT text FROM message_bodies").fetchone()[0] == (
                     "retained body"
                 )
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            snapshot.execute("SELECT 1")
         seen.append(result)
         return result
 
@@ -1308,13 +1319,17 @@ def test_schema36_upgrade_backups_precede_any_write_and_preserve_rows(
 def test_schema35_binary_refuses36_before_any_ddl(tmp_path, monkeypatch):
     store = database.Store(tmp_path / "mail.db")
     store.initialize()
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db:
         before = db.execute("SELECT name,sql FROM sqlite_master ORDER BY name").fetchall()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
     monkeypatch.setattr(database, "SCHEMA_VERSION", 35)
     with pytest.raises(RuntimeError, match="newer than supported"):
         store.initialize()
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db:
         assert db.execute("SELECT name,sql FROM sqlite_master ORDER BY name").fetchall() == before
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
 
 
 @pytest.mark.parametrize("step", range(1, 10))
@@ -1326,8 +1341,10 @@ def test_schema36_ddl_fault_rolls_back_everything_and_keeps_private_backup(
     from eom_email_watcher import removal
 
     store = prior_store(tmp_path, monkeypatch, 35)
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db:
         before = tuple(db.iterdump())
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
     original = removal.ensure_schema
 
     def fail(db):
@@ -1346,14 +1363,23 @@ def test_schema36_ddl_fault_rolls_back_everything_and_keeps_private_backup(
     monkeypatch.setattr(removal, "ensure_schema", fail)
     with pytest.raises(RuntimeError, match="injected v36 DDL fault"):
         store.initialize()
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 35
         assert tuple(db.iterdump()) == before
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
     backups = list(tmp_path.glob("*.pre-v36.*.bak"))
     assert len(backups) == 1
-    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
-    with sqlite3.connect(backups[0]) as db:
+    if os.name == "nt":
+        from connect_automate.connect_windows import validate_private_regular_file
+
+        validate_private_regular_file(backups[0], root=backups[0].parent)
+    else:
+        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    with closing(sqlite3.connect(backups[0])) as db:
         assert tuple(db.iterdump()) == before
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
     monkeypatch.setattr(removal, "ensure_schema", original)
     store.initialize()
     assert not backups[0].exists()
@@ -1363,8 +1389,10 @@ def test_schema36_backup_full_disk_does_not_start_migration(tmp_path, monkeypatc
     import errno
 
     store = prior_store(tmp_path, monkeypatch, 35)
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db:
         before = tuple(db.iterdump())
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
 
     def full(*args, **kwargs):
         raise OSError(errno.ENOSPC, "public full-disk fixture")
@@ -1372,9 +1400,11 @@ def test_schema36_backup_full_disk_does_not_start_migration(tmp_path, monkeypatc
     monkeypatch.setattr(thread_migration, "write_backup", full)
     with pytest.raises(OSError, match="public full-disk fixture"):
         store.initialize()
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 35
         assert tuple(db.iterdump()) == before
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
 
 
 def test_schema36_foreign_keys_prevent_unbound_intents_and_cascade_only_metadata(tmp_path):
@@ -3078,13 +3108,15 @@ def test_saved_unfollow_upgrade_excludes_old_writer_and_second_runtime(tmp_path,
         migrating = pool.submit(store.initialize)
         try:
             assert reached.wait(5), "Migration did not reach uncommitted conversion"
-            with sqlite3.connect(store.path, timeout=0) as old:
+            with closing(sqlite3.connect(store.path, timeout=0)) as old:
                 assert old.execute("PRAGMA user_version").fetchone()[0] == 35
                 assert not old.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='message_removal_requests'"
                 ).fetchone()
                 with pytest.raises(sqlite3.OperationalError, match="database is locked"):
                     old.execute("BEGIN IMMEDIATE")
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                old.execute("SELECT 1")
             with (
                 pytest.raises(OperationLockBusy),
                 connect_operation_lock(

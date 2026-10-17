@@ -12,6 +12,8 @@ from pathlib import Path
 
 from connect_automate.locking import connect_operation_lock
 
+from . import private_storage
+
 ADMISSION_KINDS = (
     "exact_sender",
     "vendor_address",
@@ -119,11 +121,13 @@ def require_migration_owner(owner, db):
 def write_backup(path: Path, db: sqlite3.Connection, *, target_schema: int = 33) -> Path:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     target = path.with_name(f"{path.name}.pre-v{target_schema}.{stamp}.{uuid.uuid4().hex}.bak")
+    private_storage.prepare_file(target)
     # VACUUM INTO accepts an empty file. Exclusive creation establishes privacy
     # before SQLite writes any data and cannot overwrite an existing backup.
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
     try:
+        private_storage.validate_file(target)
         db.execute("VACUUM INTO ?", (str(target),))
     except Exception:
         target.unlink()
@@ -131,13 +135,34 @@ def write_backup(path: Path, db: sqlite3.Connection, *, target_schema: int = 33)
     return target
 
 
+def _backup_paths(path: Path, *, target_schema: int | None = None) -> list[Path]:
+    prefix = f"{path.name}.pre-v"
+    backups = []
+    for entry in path.parent.iterdir():
+        if entry.name.startswith(prefix) and entry.name.endswith(".bak"):
+            version, separator, _ = entry.name[len(prefix) :].partition(".")
+            if not separator or not re.fullmatch(r"[0-9]+", version):
+                continue
+            if target_schema is not None and version != str(target_schema):
+                continue
+            try:
+                private_storage.validate_file(entry)
+            except FileNotFoundError:
+                # Another initializer can retire an enumerated backup. Absence
+                # removes it from this set; an unsafe existing file still fails.
+                continue
+            if entry.is_file():
+                backups.append(entry)
+    return sorted(backups)
+
+
+def validate_backups(path: Path) -> None:
+    if private_storage.is_windows():
+        _backup_paths(path)
+
+
 def cleanup_backups(path: Path, *, success: bool, target_schema: int = 33) -> None:
-    prefix = f"{path.name}.pre-v{target_schema}."
-    backups = sorted(
-        entry
-        for entry in path.parent.iterdir()
-        if entry.name.startswith(prefix) and entry.name.endswith(".bak") and entry.is_file()
-    )
+    backups = _backup_paths(path, target_schema=target_schema)
     for backup in backups if success else backups[:-1]:
         backup.unlink()
 

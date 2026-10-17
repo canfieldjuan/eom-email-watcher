@@ -1,10 +1,11 @@
 """Schema-32 upgrade fixtures and transactional schema-33 failure probes."""
 
 import errno
+import os
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -33,9 +34,9 @@ def test_migration_owner_excludes_runtime_tracking_during_messages_rebuild(tmp_p
         thread_migration.check_database(db)
     store.initialize()
     with store.connection() as db:
-        assert [tuple(row) for row in db.execute(
-            "SELECT * FROM messages ORDER BY message_id"
-        )] == before
+        assert [
+            tuple(row) for row in db.execute("SELECT * FROM messages ORDER BY message_id")
+        ] == before
         assert db.execute("PRAGMA user_version").fetchone()[0] == 36
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -117,23 +118,32 @@ def test_migration_tracking_boundary_uses_referenced_tables(tmp_path, table, exp
         )
         assert owner.tracking_references_replaced_tables(db, set()) is False
         db.execute("UPDATE mail_accounts SET active=active")
-        triggers = {row[0] for row in db.execute(
-            "SELECT name FROM sqlite_temp_master WHERE type='trigger' AND name GLOB 'derived_*'"
-        )}
+        triggers = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_temp_master WHERE type='trigger' AND name GLOB 'derived_*'"
+            )
+        }
         assert triggers
         for replaced in ({table}, {"logical_messages", table}, set()):
             suspend = expected and bool(replaced)
             with owner.schema_step(db, replaced_tables=replaced):
                 assert db._derived_enabled is (not suspend)
-                assert {row[0] for row in db.execute(
+                assert {
+                    row[0]
+                    for row in db.execute(
+                        "SELECT name FROM sqlite_temp_master "
+                        "WHERE type='trigger' AND name GLOB 'derived_*'"
+                    )
+                } == (set() if suspend else triggers)
+            assert db._derived_enabled is True
+            assert {
+                row[0]
+                for row in db.execute(
                     "SELECT name FROM sqlite_temp_master "
                     "WHERE type='trigger' AND name GLOB 'derived_*'"
-                )} == (set() if suspend else triggers)
-            assert db._derived_enabled is True
-            assert {row[0] for row in db.execute(
-                "SELECT name FROM sqlite_temp_master "
-                "WHERE type='trigger' AND name GLOB 'derived_*'"
-            )} == triggers
+                )
+            } == triggers
 
 
 def test_unchanged_reopen_keeps_tracking_across_view_and_trigger_refresh(tmp_path, monkeypatch):
@@ -180,7 +190,6 @@ def test_unchanged_reopen_keeps_tracking_across_view_and_trigger_refresh(tmp_pat
     assert len(follow(store)) == 1
 
 
-
 @pytest.fixture
 def schema35_binary(monkeypatch):
     """Keep the original rebuild/backup oracle before the additive v36 lift."""
@@ -195,10 +204,98 @@ def schema35_binary(monkeypatch):
 def assert_empty_schema36(store):
     with store.connection() as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 36
-        for table in ("message_removal_requests", "message_removal_intents",
-                      "message_removal_targets"):
+        for table in (
+            "message_removal_requests",
+            "message_removal_intents",
+            "message_removal_targets",
+        ):
             assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.parametrize("target_schema", [33, 36])
+def test_windows_unsafe_retained_backup_refuses_before_sqlite_open(
+    tmp_path, monkeypatch, target_schema
+):
+    import os
+    from types import SimpleNamespace
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backup = thread_migration.write_backup(store.path, db, target_schema=target_schema)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"})))
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda path: path != backup)
+    connect = sqlite3.connect
+    opened = []
+
+    def observe(*args, **kwargs):
+        opened.append(args[0])
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", observe)
+    with pytest.raises(OSError, match="unsafe"):
+        store.initialize()
+    assert opened == [], "An unsafe retained backup was checked only after SQLite opened"
+    assert store.path.read_bytes() == before
+    assert backup.exists()
+
+
+def test_windows_retiring_backup_does_not_block_private_database_reads(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from connect_automate import connect_windows
+
+    from eom_email_watcher import private_storage
+
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backup = thread_migration.write_backup(store.path, db)
+    monkeypatch.setattr(private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"})))
+    monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: True)
+    validate = connect_windows.validate_private_regular_file
+
+    def retire_between_enumeration_and_validation(path, **kwargs):
+        if path == backup:
+            backup.unlink()
+        return validate(path, **kwargs)
+
+    monkeypatch.setattr(
+        connect_windows, "validate_private_regular_file", retire_between_enumeration_and_validation
+    )
+    with store.connection() as db:
+        assert db.execute("SELECT 1").fetchone()[0] == 1
+    assert not backup.exists()
+
+
+@pytest.mark.parametrize("target_schema", [33, 36])
+def test_backup_inventory_and_cleanup_keep_schema_namespaces_separate(tmp_path, target_schema):
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backups = {
+            version: thread_migration.write_backup(store.path, db, target_schema=version)
+            for version in (33, 36)
+        }
+    unrelated = tmp_path / "mail1.db.pre-v36.public.bak"
+    malformed = tmp_path / "mail.db.pre-vunknown.public.bak"
+    unrelated.write_bytes(b"public unrelated file")
+    malformed.write_bytes(b"public unrelated file")
+    assert set(thread_migration._backup_paths(store.path)) == set(backups.values())
+    assert thread_migration._backup_paths(store.path, target_schema=target_schema) == [
+        backups[target_schema]
+    ]
+    thread_migration.cleanup_backups(store.path, success=True, target_schema=target_schema)
+    assert not backups[target_schema].exists()
+    assert backups[36 if target_schema == 33 else 33].exists()
+    assert unrelated.read_bytes() == b"public unrelated file"
+    assert malformed.read_bytes() == b"public unrelated file"
 
 
 def legacy_store(tmp_path: Path) -> Store:
@@ -209,7 +306,7 @@ def legacy_store(tmp_path: Path) -> Store:
     seed(store, to=("recipient@example.com",))
     # Only this disposable fixture rewrites its schema catalog. This reconstructs
     # the prior closed CHECK without running the migration under test to do it.
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db, db:
         sql = db.execute("SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0]
         widened = (
             "admission_kind IN ("
@@ -230,7 +327,7 @@ def legacy_store(tmp_path: Path) -> Store:
 
 
 def snapshot(path):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db:
         return (
             db.execute("PRAGMA user_version").fetchone()[0],
             db.execute("SELECT * FROM messages").fetchall(),
@@ -243,8 +340,28 @@ def snapshot(path):
         )
 
 
+def test_fixture_sqlite_connections_are_closed(tmp_path, monkeypatch):
+    connect = sqlite3.connect
+    opened = []
+
+    def capture(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        opened.append(db)
+        return db
+
+    monkeypatch.setattr(sqlite3, "connect", capture)
+    store = legacy_store(tmp_path)
+    assert snapshot(store.path)[0] == 32
+    assert opened
+    for db in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            db.execute("SELECT 1")
+
+
 def test_upgrade_preserves_records_and_schema_and_backfills(
-    tmp_path, monkeypatch, schema35_binary,
+    tmp_path,
+    monkeypatch,
+    schema35_binary,
 ):
     store = legacy_store(tmp_path)
     before = snapshot(store.path)
@@ -254,7 +371,12 @@ def test_upgrade_preserves_records_and_schema_and_backfills(
     def inspect_backup(db):
         backups = list(tmp_path.glob("mail.db.pre-v33.*.bak"))
         assert len(backups) == 1
-        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+        if os.name == "nt":
+            from connect_automate.connect_windows import validate_private_regular_file
+
+            validate_private_regular_file(backups[0], root=tmp_path)
+        else:
+            assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
         assert snapshot(backups[0]) == before
         observed.append(True)
         rebuild(db)
@@ -279,7 +401,9 @@ def test_upgrade_preserves_records_and_schema_and_backfills(
 
 
 def test_failed_rebuild_rolls_back_and_keeps_newest_backup(
-    tmp_path, monkeypatch, schema35_binary,
+    tmp_path,
+    monkeypatch,
+    schema35_binary,
 ):
     store = legacy_store(tmp_path)
     before = snapshot(store.path)
@@ -300,7 +424,12 @@ def test_failed_rebuild_rolls_back_and_keeps_newest_backup(
     backups = list(tmp_path.glob("mail.db.pre-v33.*.bak"))
     assert len(backups) == 1 and backups[0] != old
     assert snapshot(backups[0]) == before
-    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+    if os.name == "nt":
+        from connect_automate.connect_windows import validate_private_regular_file
+
+        validate_private_regular_file(backups[0], root=tmp_path)
+    else:
+        assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
 
 
 def test_backup_full_disk_does_not_start_migration(tmp_path, monkeypatch):

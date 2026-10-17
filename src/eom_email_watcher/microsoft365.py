@@ -20,6 +20,7 @@ import msal
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
+from . import private_storage
 from .config import normalize_address
 from .mailbox import (
     INBOX_LOCATION,
@@ -216,6 +217,7 @@ def _profile_address(result: dict[str, Any], account: object) -> str:
 
 
 def _load_cache(path: Path) -> msal.SerializableTokenCache:
+    private_storage.validate_file(path)
     cache = msal.SerializableTokenCache()
     try:
         serialized = path.read_text(encoding="utf-8")
@@ -228,6 +230,9 @@ def _load_cache(path: Path) -> msal.SerializableTokenCache:
 
 
 def _write_private_cache(path: Path, cache: msal.SerializableTokenCache) -> None:
+    if private_storage.is_windows():
+        private_storage.write_text(path, cache.serialize())
+        return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary: Path | None = None
     try:
@@ -438,6 +443,7 @@ class Microsoft365Gateway:
         *,
         client: httpx.Client | None = None,
     ) -> Microsoft365Gateway:
+        private_storage.prepare_file(token_file)
         operation_timeout = (
             validate_operation_timeout(remaining_timeout())
             if remaining_timeout is not None
@@ -510,6 +516,7 @@ class Microsoft365Gateway:
         force_reauthorize: bool = False,
         client: httpx.Client | None = None,
     ) -> tuple[Microsoft365Gateway, bool]:
+        private_storage.prepare_file(token_file)
         if token_file.is_file() and not force_reauthorize:
             return cls.from_token(credentials_file, token_file, client=client), False
         configuration = load_microsoft_public_client(credentials_file)

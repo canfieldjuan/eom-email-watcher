@@ -10,8 +10,9 @@ import subprocess
 import tempfile
 import threading
 import time
-from contextlib import ExitStack, suppress
-from datetime import UTC, datetime
+from collections.abc import Callable
+from contextlib import ExitStack, closing, suppress
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
@@ -30,14 +31,23 @@ from connect_reference_provider import (
 from fixture_toml import toml_path_literal
 
 from eom_email_watcher import engine_api
-from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount
-from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
+from eom_email_watcher.config import config_admission_snapshot
+from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount, Store
+from eom_email_watcher.mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    MailboxChanges,
+    MessageContent,
+    MessageMetadata,
+    validate_operation_timeout,
+)
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
 
 FIXTURE_PART_ID = "fixture-mime-part"
 FIXTURE_MODEL_DIGEST = "b8693e6b4f5f228844ef5a842c7e7a332d9b2fa9e1241a423ef1de7928065b79"
 FIXTURE_MAILBOX_IDENTITY_KEY = hashlib.sha256(b"connect-local-proof-mailbox-v1").hexdigest()
+FIXTURE_MAILBOX_ADDRESS = "fixture@example.invalid"
 
 
 class FixtureModelHandler(BaseHTTPRequestHandler):
@@ -319,11 +329,47 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
 
 
 class FixtureGmail:
+    """The proof's mailbox double; it implements every mailbox.MailboxGateway member.
+
+    Members the PDF proof never reaches fail loudly instead of returning invented
+    mailbox data (issue #275).
+    """
+
     def __init__(self, content: bytes):
-        self.content = content
+        # Not `content`: that name is the MailboxGateway message-content member.
+        self.attachment_content = content
+        self.operation_timeouts: list[float] = []
+
+    def set_operation_timeout(self, timeout_seconds: float) -> None:
+        # The engine bounds each mailbox phase by its remaining deadline; accept
+        # exactly what production gateways accept and keep the bound for review.
+        self.operation_timeouts.append(validate_operation_timeout(timeout_seconds))
+
+    def mailbox_address(self) -> str:
+        return FIXTURE_MAILBOX_ADDRESS
 
     def mailbox_identity_key(self) -> str:
         return FIXTURE_MAILBOX_IDENTITY_KEY
+
+    def initial_cursor(self) -> str:
+        raise AssertionError("The PDF proof does not poll the fixture mailbox")
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        raise AssertionError("The PDF proof does not poll the fixture mailbox")
+
+    def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
+        raise AssertionError("The PDF proof does not recover fixture mailbox history")
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        raise AssertionError("The PDF proof does not read fixture message metadata")
+
+    def content(
+        self, message_id: str, body_char_limit: int, *, scope: frozenset[str]
+    ) -> MessageContent:
+        raise AssertionError("The PDF proof does not read fixture message content")
+
+    def stored_body(self, message_id: str, *, scope: frozenset[str]) -> tuple[str, int]:
+        raise AssertionError("The PDF proof does not read fixture stored bodies")
 
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if (message_id, part_id, attachment_id) != (
@@ -332,7 +378,50 @@ class FixtureGmail:
             "fixture-attachment",
         ):
             raise AssertionError("Unexpected fixture attachment identity")
-        return self.content
+        return self.attachment_content
+
+
+def gmail_from_token(opened: Callable[[], FixtureGmail]) -> staticmethod:
+    """A GmailGateway.from_token double accepting every call the real factory accepts.
+
+    The proof replaces this engine factory; positional-only lambdas broke as soon
+    as a caller passed a keyword (issue #281).
+    """
+    return staticmethod(lambda *_args, **_kwargs: opened())
+
+
+def refuse_gmail(message: str) -> Callable[[], FixtureGmail]:
+    def opened() -> FixtureGmail:
+        raise AssertionError(message)
+
+    return opened
+
+
+def instrumented_client_factory(
+    original: Callable[..., httpx.Client],
+    hook: Callable[[httpx.Request], None],
+) -> Callable[..., httpx.Client]:
+    """Wrap connect._client, forwarding the SDK's own arguments unchanged (issue #281)."""
+
+    def factory(*args: object, **kwargs: object) -> httpx.Client:
+        client = original(*args, **kwargs)
+        client.event_hooks["request"].append(hook)
+        return client
+
+    return factory
+
+
+def fixture_message_times(now: datetime | None = None) -> tuple[str, str]:
+    """Received and admitted times for the fixture message, inside retention.
+
+    Fixed calendar dates age out of the retention window, after which the
+    retained-source check refuses the fixture before any provider is reached.
+    """
+    current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+    return (
+        (current - timedelta(days=2)).isoformat(),
+        (current - timedelta(days=1)).isoformat(),
+    )
 
 
 def write_config(path: Path) -> None:
@@ -386,7 +475,7 @@ def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
             DEFAULT_MAIL_PROVIDER,
             DEFAULT_MAIL_ACCOUNT_ID,
             display_name="Fixture mailbox",
-            address="fixture@example.invalid",
+            address=FIXTURE_MAILBOX_ADDRESS,
             active=True,
         )
     token_file = mail_account_token_file(runtime.config, account)
@@ -402,12 +491,17 @@ def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
 
 
 def request(config_path: Path, operation: str, payload: dict[str, object] | None = None):
-    return {
+    value: dict[str, object] = {
         "protocol": 1,
         "operation": operation,
         "config_path": str(config_path),
         "payload": payload or {},
     }
+    # Admission-required operations carry the token from the engine's own
+    # configuration admission issuer, as the host does (issue #270).
+    if operation in engine_api.ADMISSION_REQUIRED_OPERATIONS:
+        value["admission_token"] = config_admission_snapshot(config_path).token
+    return value
 
 
 def wait_for_capability(available: bool, timeout_seconds: float = 15) -> dict[str, object]:
@@ -471,6 +565,63 @@ def positive_seconds(value: str) -> int:
     if seconds <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return seconds
+
+
+def email_database_evidence(
+    store: Store, request_id: str, interrupted_request_id: str
+) -> tuple[str, int, sqlite3.Row | None, list[sqlite3.Row]]:
+    with store.connection() as database:
+        quick_check = database.execute("PRAGMA quick_check").fetchone()[0]
+        schema_version = database.execute("PRAGMA user_version").fetchone()[0]
+        job_row = database.execute(
+            """SELECT job_id, protocol_version, capability_id, capability_version,
+            provider_app_id, provider_app_version, provider_instance_id,
+            input_media_type, input_byte_size, input_sha256, source_app_id,
+            status, request_json, result_json
+            FROM connect_attachment_jobs WHERE job_id = ?""",
+            (request_id,),
+        ).fetchone()
+        interrupted_rows = database.execute(
+            """SELECT job_id, provider_instance_id, status, error_code,
+            error_retryable
+            FROM connect_attachment_jobs WHERE job_id = ?""",
+            (interrupted_request_id,),
+        ).fetchall()
+    return quick_check, schema_version, job_row, interrupted_rows
+
+
+def expected_reference_inbox_row(
+    selected: dict[str, object],
+    *,
+    job_id: str,
+    app_id: str,
+    capability_id: str,
+    updated_at: str,
+    instance_id: str,
+    parameters: dict[str, object],
+    output: dict[str, object],
+) -> dict[str, object]:
+    # The whole completed v2 inbox row. Its feature list is the selected discovery item's
+    # acknowledgment, which the invocation persists as the job's dispatch requirement.
+    return {
+        "job_id": job_id,
+        "capability_id": capability_id,
+        "capability_version": selected["capability"]["version"],
+        "status": "completed",
+        "updated_at": updated_at,
+        "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+        "provider": {
+            "app_id": app_id,
+            "version": selected["provider"]["version"],
+            "instance_id": instance_id,
+        },
+        "parameters": parameters,
+        "required_manifest_features": list(selected["acknowledged_manifest_features"]),
+        "outputs": [output],
+        "dispatch_state": "terminal",
+        "queue_ahead": 0,
+        "next_attempt_at": None,
+    }
 
 
 def require_proof_checks(checks: dict[str, bool]) -> None:
@@ -656,13 +807,14 @@ def main() -> None:
             write_config(config_path)
             runtime = load_runtime(config_path)
             fixture_account = install_fixture_mailbox(runtime)
+            received_at, admitted_at = fixture_message_times()
             runtime.store.add_message(
                 message_id="fixture-message",
                 thread_id=None,
                 sender="fixture@example.invalid",
                 sender_name="Fixture Sender",
                 subject="Fixture document",
-                received_at="2026-08-29T12:00:00+00:00",
+                received_at=received_at,
                 provider=fixture_account.provider,
                 account_id=fixture_account.account_id,
                 mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
@@ -671,7 +823,7 @@ def main() -> None:
                     selector_id="sender:fixture@example.invalid",
                     display_name="Fixture Sender",
                     mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
-                    admitted_at="2026-09-19T12:00:00+00:00",
+                    admitted_at=admitted_at,
                 ),
             )
             runtime.store.replace_attachments(
@@ -725,7 +877,7 @@ def main() -> None:
                 "confirmed": False,
             }
             original_from_token = engine_api.GmailGateway.__dict__["from_token"]
-            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             try:
                 response = engine_api._response(
                     request(
@@ -816,9 +968,7 @@ def main() -> None:
                 )
             automation_fire = automation_fires[0]
             automation_deadline = time.monotonic() + model_timeout_seconds + 30
-            engine_api.GmailGateway.from_token = staticmethod(
-                lambda *_args: FixtureGmail(pdf)
-            )
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             try:
                 while automation_fire.state not in {
                     "completed",
@@ -879,7 +1029,7 @@ def main() -> None:
                 raise RuntimeError(
                     f"Expected one Document Summarizer database: {provider_databases}"
                 )
-            with sqlite3.connect(provider_databases[0]) as provider_database:
+            with closing(sqlite3.connect(provider_databases[0])) as provider_database:
                 provider_profile_rows = provider_database.execute(
                     """SELECT p.summary_profile
                     FROM connect_jobs AS c
@@ -906,10 +1056,8 @@ def main() -> None:
                     },
                 )
             denied_manifest_body = denied_manifest.json()
-            engine_api.GmailGateway.from_token = staticmethod(
-                lambda *_args: (_ for _ in ()).throw(
-                    AssertionError("completed result replay reopened Gmail while unentitled")
-                )
+            engine_api.GmailGateway.from_token = gmail_from_token(
+                refuse_gmail("completed result replay reopened Gmail while unentitled")
             )
             try:
                 cached_while_expired = engine_api._response(
@@ -1008,10 +1156,8 @@ def main() -> None:
                 "confirmed": False,
             }
             stale_post_attempts_before = reference_provider.post_attempt_count()
-            engine_api.GmailGateway.from_token = staticmethod(
-                lambda *_args: (_ for _ in ()).throw(
-                    AssertionError("stale capability selection reached Gmail")
-                )
+            engine_api.GmailGateway.from_token = gmail_from_token(
+                refuse_gmail("stale capability selection reached Gmail")
             )
             try:
                 stale_response = engine_api._response(
@@ -1024,7 +1170,7 @@ def main() -> None:
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
             stale_post_attempts_after = reference_provider.post_attempt_count()
-            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             try:
                 translation_response = engine_api._response(
                     request(
@@ -1151,18 +1297,14 @@ def main() -> None:
             interrupted_result: dict[str, object] = {}
             interrupted_provider_submissions = 0
 
-            def instrumented_connect_client() -> httpx.Client:
-                client = original_connect_client_factory()
+            def record_request(request: httpx.Request) -> None:
+                nonlocal interrupted_provider_submissions
+                if request.method == "POST" and request.url.path == "/v2/jobs":
+                    interrupted_provider_submissions += 1
 
-                def record_request(request: httpx.Request) -> None:
-                    nonlocal interrupted_provider_submissions
-                    if request.method == "POST" and request.url.path == "/v2/jobs":
-                        interrupted_provider_submissions += 1
-
-                client.event_hooks["request"].append(record_request)
-                return client
-
-            connect._client = instrumented_connect_client
+            connect._client = instrumented_client_factory(
+                original_connect_client_factory, record_request
+            )
 
             def invoke_interrupted_job() -> None:
                 try:
@@ -1177,7 +1319,7 @@ def main() -> None:
                     interrupted_result["error_type"] = type(error).__name__
 
             FixtureModelHandler.pause_one_generation()
-            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            engine_api.GmailGateway.from_token = gmail_from_token(lambda: FixtureGmail(pdf))
             interrupted_thread = threading.Thread(
                 target=invoke_interrupted_job,
                 name="connect-interrupted-invocation",
@@ -1209,12 +1351,12 @@ def main() -> None:
             after_job_restart = wait_for_capability(True)
             gmail_reconciliation_reads = 0
 
-            def reject_gmail_reopen(*_args: object) -> FixtureGmail:
+            def reject_gmail_reopen() -> FixtureGmail:
                 nonlocal gmail_reconciliation_reads
                 gmail_reconciliation_reads += 1
                 raise AssertionError("Provider reconciliation must not reopen Gmail")
 
-            engine_api.GmailGateway.from_token = staticmethod(reject_gmail_reopen)
+            engine_api.GmailGateway.from_token = gmail_from_token(reject_gmail_reopen)
             try:
                 reconciliation_deadline = time.monotonic() + 15
                 while True:
@@ -1244,23 +1386,9 @@ def main() -> None:
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
 
-            with sqlite3.connect(runtime.config.database_file) as database:
-                quick_check = database.execute("PRAGMA quick_check").fetchone()[0]
-                schema_version = database.execute("PRAGMA user_version").fetchone()[0]
-                job_row = database.execute(
-                    """SELECT job_id, protocol_version, capability_id, capability_version,
-                    provider_app_id, provider_app_version, provider_instance_id,
-                    input_media_type, input_byte_size, input_sha256, source_app_id,
-                    status, request_json, result_json
-                    FROM connect_attachment_jobs WHERE job_id = ?""",
-                    (request_id,),
-                ).fetchone()
-                interrupted_rows = database.execute(
-                    """SELECT job_id, provider_instance_id, status, error_code,
-                    error_retryable
-                    FROM connect_attachment_jobs WHERE job_id = ?""",
-                    (interrupted_invocation["request_id"],),
-                ).fetchall()
+            quick_check, schema_version, job_row, interrupted_rows = email_database_evidence(
+                runtime.store, request_id, interrupted_invocation["request_id"]
+            )
             if job_row is None:
                 raise RuntimeError("Connect proof result was not durable")
             durable_request = json.loads(job_row[12])
@@ -1519,42 +1647,26 @@ def main() -> None:
                     and inspection_job is not None
                     and reference_results_by_job
                     == {
-                        translation_request_id: {
-                            "job_id": translation_request_id,
-                            "capability_id": TRANSLATE_CAPABILITY_ID,
-                            "capability_version": translation["capability"]["version"],
-                            "status": "completed",
-                            "updated_at": translation_job.updated_at,
-                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
-                            "provider": {
-                                "app_id": REFERENCE_APP_ID,
-                                "version": translation["provider"]["version"],
-                                "instance_id": reference_instance_id,
-                            },
-                            "parameters": {"target-language": "Spanish"},
-                            "outputs": [translation_output],
-                            "dispatch_state": "terminal",
-                            "queue_ahead": 0,
-                            "next_attempt_at": None,
-                        },
-                        inspection_request_id: {
-                            "job_id": inspection_request_id,
-                            "capability_id": INSPECT_CAPABILITY_ID,
-                            "capability_version": inspection["capability"]["version"],
-                            "status": "completed",
-                            "updated_at": inspection_job.updated_at,
-                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
-                            "provider": {
-                                "app_id": REFERENCE_APP_ID,
-                                "version": inspection["provider"]["version"],
-                                "instance_id": reference_instance_id,
-                            },
-                            "parameters": {},
-                            "outputs": [inspection_output],
-                            "dispatch_state": "terminal",
-                            "queue_ahead": 0,
-                            "next_attempt_at": None,
-                        },
+                        translation_request_id: expected_reference_inbox_row(
+                            translation,
+                            job_id=translation_request_id,
+                            app_id=REFERENCE_APP_ID,
+                            capability_id=TRANSLATE_CAPABILITY_ID,
+                            updated_at=translation_job.updated_at,
+                            instance_id=reference_instance_id,
+                            parameters={"target-language": "Spanish"},
+                            output=translation_output,
+                        ),
+                        inspection_request_id: expected_reference_inbox_row(
+                            inspection,
+                            job_id=inspection_request_id,
+                            app_id=REFERENCE_APP_ID,
+                            capability_id=INSPECT_CAPABILITY_ID,
+                            updated_at=inspection_job.updated_at,
+                            instance_id=reference_instance_id,
+                            parameters={},
+                            output=inspection_output,
+                        ),
                     }
                 ),
                 "reference_removal_preserves_watcher": (

@@ -12,9 +12,11 @@ import json
 import os
 import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -35,6 +37,8 @@ class Engine:
     def __init__(self, binary, config, folder, environment):
         self.binary, self.config = binary, config
         self.folder, self.environment = folder, environment
+        self.operation_timings = []
+        self._bound_admission = None
 
     def request(self, operation, payload=None):
         value = {
@@ -44,8 +48,21 @@ class Engine:
             "payload": payload or {},
         }
         if operation in ADMISSION_REQUIRED_OPERATIONS:
-            value["admission_token"] = self.call("config.admission.snapshot")["token"]
+            value["admission_token"] = (
+                self._bound_admission if self._bound_admission is not None
+                else self.call("config.admission.snapshot")["token"]
+            )
         return json.dumps(value)
+
+    @contextmanager
+    def admission_binding(self):
+        """Match desktop admission activation; retain one token for this scope only."""
+        assert self._bound_admission is None, "Startup admission binding already active"
+        self._bound_admission = self.call("config.admission.snapshot")["token"]
+        try:
+            yield dict(self.operation_timings[-1])
+        finally:
+            self._bound_admission = None
 
     def start(self, operation, payload=None):
         command = self.request(operation, payload)
@@ -64,14 +81,112 @@ class Engine:
         return process
 
     def call(self, operation, payload=None):
+        started = time.monotonic()
         process = self.start(operation, payload)
         stdout, stderr = process.communicate(timeout=150)
+        elapsed = time.monotonic() - started
         value = json.loads(stdout)
         assert process.returncode == 0 and value["ok"], (operation, value, stderr)
+        timing = {"operation": operation, "elapsed_seconds": elapsed}
+        self.operation_timings.append(timing)
         with (self.folder / "operations.jsonl").open("a", encoding="utf-8") as stream:
             (self.folder / "operations.jsonl").chmod(0o600)
-            stream.write(json.dumps({"operation": operation, "result": value}) + "\n")
+            stream.write(json.dumps({**timing, "result": value}) + "\n")
         return value["data"]
+
+
+def measure_store_connections(database):
+    """Measure actual open/close work, including privacy checks, without SQL writes."""
+    from eom_email_watcher.db import Store
+
+    store = Store(database)
+    samples = []
+    for _ in range(5):
+        started = time.monotonic()
+        with store.connection():
+            pass
+        samples.append(time.monotonic() - started)
+    return {
+        "samples_seconds": samples,
+        "median_seconds": statistics.median(samples),
+        "max_seconds": max(samples),
+        "scope": "In-process Store.connection open/close, including validation; no SQL writes",
+    }
+
+
+def measure_startup_delivery(engine, database):
+    """Time installed IPC work under the native host lock; never show real toasts."""
+    from connect_automate.locking import connect_operation_lock
+
+    from eom_email_watcher.thread_migration import _backup_paths
+
+    # Desktop installs admission before activating StartupDeliveryWorker and
+    # request_inner reuses that binding. Generic proof calls still refresh it.
+    with engine.admission_binding() as admission_timing:
+        location = Path(engine.call("host.operation_lock")["path"])
+        # Prove that the installed Python contender observes the held native lock.
+        # Rust HostOperationLock interoperability has its existing real-engine test.
+        with connect_operation_lock(location, "Native timing proof lock is busy"):
+            contender = engine.start("notifications.pending", {"limit": 25})
+            stdout, stderr = contender.communicate(timeout=150)
+            value = json.loads(stdout)
+            assert contender.returncode == 2 and not value["ok"], (value, stderr)
+            assert value["error"] == {
+                "code": "runtime_error",
+                "message": "Another watcher operation is already running",
+            }, value
+            backup_count = len(_backup_paths(database))
+            store_open = measure_store_connections(database)
+
+        offset = len(engine.operation_timings)
+        items, remaining = [], None
+        started = time.monotonic()
+        try:
+            measured_location = Path(engine.call("host.operation_lock")["path"])
+            assert measured_location == location, "Host lock path changed after contention proof"
+            with connect_operation_lock(measured_location, "Native timing proof lock is busy"):
+                items = engine.call("notifications.pending_under_host_lock", {"limit": 25})["items"]
+                assert 1 <= len(items) <= 25, "Startup proof requires real pending fixture intents"
+                for item in items:
+                    acknowledgement = engine.call(
+                        "notifications.ack",
+                        {key: item[key] for key in (
+                            "message_id", "kind", "analysis_at",
+                            "subject_type", "subject_id", "revision"
+                        )},
+                    )
+                    assert acknowledgement["status"] in {"acknowledged", "already_acknowledged"}
+                remaining = engine.call("notifications.count_under_host_lock")["count"]
+        finally:
+            elapsed = time.monotonic() - started
+            report = {
+                "total_seconds": elapsed,
+                "deadline_seconds": 30,
+                "ipc_calls": engine.operation_timings[offset:],
+                "pending_intents": len(items),
+                "remaining_intents": remaining,
+                "backup_count": backup_count,
+                "host_lock_contention_proved": True,
+                "store_open": store_open,
+                "no_store_round_trip": {
+                    **admission_timing,
+                    "owner": (
+                        "engine_api._config_admission_snapshot / config.config_admission_snapshot"
+                    ),
+                    "scope": (
+                        "Installed process round trip plus config read/validation; no Store open"
+                    ),
+                },
+                "scope": "Installed IPC and host-lock work; native toast rendering is not timed",
+            }
+            # Preserve the evidence even when the oracle or an IPC/identity check fails.
+            write_private(
+                engine.folder / "startup-delivery.json", json.dumps(report, indent=2).encode()
+            )
+        # Fixed accepted oracle: lib.rs STARTUP_DELIVERY_TIMEOUT, not the proof's
+        # per-process safety timeout. Native failure never permits a budget raise.
+        assert elapsed < 30, f"Startup delivery IPC exceeded its 30 s deadline: {elapsed}"
+        return report
 
 
 def scalar(database, sql, values=()):
@@ -333,10 +448,12 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
             )
             assert provider.submission_count(old_job_id) == 1, "Orphan POST was resubmitted"
             # All subsequent effects are public IPC through the installed new image.
-            new.call("settings.update", {"retention_days": 1})
+            new.call("settings.update", {"retention_days": 1, "notifications_enabled": True})
             mail.append("retained-sent", sent=True, reply_to="retained-root")
             mail.append("new-attachment", pdf=True)
             check = new.call("watcher.check")
+            check_seconds = new.operation_timings[-1]["elapsed_seconds"]
+            startup_delivery = measure_startup_delivery(new, database)
             assert (
                 scalar(database, "SELECT COUNT(*) FROM messages WHERE subject LIKE 'expired-%'")
                 == 0
@@ -421,6 +538,8 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                 "java_runtime": (folder / "java-version.txt").read_text(),
                 "predecessor_schema": 34,
                 "source_drain_seconds": elapsed,
+                "public_check_seconds": check_seconds,
+                "startup_delivery": startup_delivery,
                 "orphan_posts": provider.submission_count(old_job_id),
                 "total_posts": provider.post_attempt_count(),
                 "poll": check,
