@@ -28,6 +28,13 @@ def ensure_schema(db):
         db.execute(statement)
 
 
+def _content_available_sql(db, alias):
+    """Share body-only removal eligibility; legacy schemas have no targets."""
+    from . import removal
+
+    return removal.available_sql(alias, include_unfollow=True) if removal.has_schema(db) else "1"
+
+
 def pending(db, scope, *, cutoff, now, limit=None, exclude=()):
     from .db import _followed_message_sql, _logical_messages_past_cutoff_sql
 
@@ -40,6 +47,7 @@ def pending(db, scope, *, cutoff, now, limit=None, exclude=()):
             f"""SELECT m.message_id FROM logical_messages m JOIN thread_follow f
         ON {_followed_message_sql("m")}
         WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
+        AND ({_content_available_sql(db, "m")})
         AND m.message_id NOT IN (SELECT message_id FROM message_bodies)
         AND m.message_id NOT IN (SELECT message_id FROM message_body_unavailable)
         AND m.message_id NOT IN ({expired})
@@ -110,7 +118,7 @@ def recompute(db):
     # source locks; hiding it from the projection is not deletion authority.
     held = []
     if removal.has_schema(db):
-        eligible_content = removal.available_sql("m", include_unfollow=True)
+        eligible_content = _content_available_sql(db, "m")
         held = [r[0] for r in db.execute(
             f"SELECT m.message_id FROM messages m WHERE NOT ({eligible_content})"
         )]

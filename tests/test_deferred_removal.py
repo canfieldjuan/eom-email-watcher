@@ -4615,3 +4615,124 @@ def test_followed_purge_completes_without_fresh_unfollow_acceptance(tmp_path, qu
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
         assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
         assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+
+
+@pytest.fixture
+def refollowed_body_removal(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+    from test_thread_bodies import prepare_derived
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api, removal
+    from eom_email_watcher.reconcile_state import ReconcileState
+
+    store = held_runtime(tmp_path, monkeypatch)
+    body_state.record(store, "m", None, reason="source_gone", fetched_at=NOW)
+    with store.connection() as db:
+        vendor = db.execute("SELECT vendor_id FROM vendor_addresses").fetchone()[0]
+    with removal.operation_scope(store.path) as operation:
+        store.remove_vendor_address(vendor, "vendor@example.com", now=NOW, operation=operation)
+    store.add_vendor_address(vendor, "vendor@example.com", now=NOW)
+    # Returning source evidence clears a prior unavailable marker without
+    # cancelling the accepted body-only removal or granting body-fetch authority.
+    store.record_message_location(
+        provider="gmail", account_id="mailbox", mailbox_identity_key=KEY,
+        provider_message_id="m", locations=frozenset({"inbox"}),
+        headers_observed=False, now=NOW + timedelta(seconds=1),
+    )
+    body_state.record(store, "m", ("late body", 9), fetched_at=NOW)
+    with store.connection() as db:
+        assert db.execute("SELECT 1 FROM thread_follow WHERE followed=1").fetchone()
+        assert db.execute("SELECT 1 FROM message_removal_targets WHERE state='pending'").fetchone()
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
+        assert not removal.message_available(db, "m", include_unfollow=True)
+    assert not store.source_start("m", include_unfollow=True)
+    state = ReconcileState(store, ("gmail", "mailbox", KEY))
+    progress = prepare_derived(state)
+    return engine_api._runtime({}), state, progress
+
+
+@pytest.mark.parametrize("reader", ["pending", "remains", "complete", "coverage", "reconcile"])
+def test_refollowed_removal_body_readers_agree(refollowed_body_removal, reader):
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import reconcile, reconcile_state
+
+    watcher, state, progress = refollowed_body_removal
+    if reader in {"pending", "remains"}:
+        with watcher.store.connection() as db:
+            assert body_state.pending(
+                db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
+                limit=1 if reader == "remains" else None,
+            ) == [], "Accepted unfollow target must not remain body work"
+    else:
+        if reader == "reconcile":
+            reconcile.run(watcher, KEY, "unavailable", label_selectors=(), now=NOW)
+        else:
+            state.complete(progress)
+        assert not state.stale(), "Accepted unfollow target must not keep reconciliation stale"
+        with watcher.store.connection() as db:
+            assert reconcile_state.coverage_current(db, state.scope, now=NOW)
+    assert watcher.gateway.body_calls == [], "Accepted unfollow target must not be re-fetched"
+
+
+@pytest.mark.parametrize("limit", [None, 0, 1, 2])
+@pytest.mark.parametrize("exclude", [(), ("z-eligible",)])
+def test_refollowed_body_selection_keeps_eligible_bounded_work(
+    refollowed_body_removal, limit, exclude
+):
+    from test_thread_reconcile import seed
+
+    watcher, state, _ = refollowed_body_removal
+    seed(watcher.store, "z-eligible", rfc_message_id="eligible@vendor")
+    with watcher.store.connection() as db:
+        assert body_state.pending(
+            db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
+            limit=limit, exclude=exclude,
+        ) == ([] if limit == 0 or exclude else ["z-eligible"])
+
+
+def test_body_selection_without_removal_schema_keeps_legacy_behavior(tmp_path, monkeypatch):
+    from test_thread_bodies import body_runner
+
+    from eom_email_watcher import removal
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(database, "SCHEMA_VERSION", 35)
+        watcher, state, _ = body_runner(tmp_path, legacy, {})
+    with watcher.store.connection() as db:
+        assert not removal.has_schema(db)
+        assert body_state.pending(
+            db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
+        ) == ["m"]
+    assert watcher.store.source_start("m", include_unfollow=True)
+    body_state.record(watcher.store, "m", ("legacy body", 11), fetched_at=NOW)
+    with watcher.store.connection() as db:
+        assert not removal.has_schema(db)
+        assert body_state.pending(
+            db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
+        ) == []
+
+
+def test_completed_unfollow_target_can_fetch_and_record_body_again(refollowed_body_removal):
+    from eom_email_watcher import removal, source_locks
+
+    watcher, state, _ = refollowed_body_removal
+    source_locks.qualify_protocol(watcher.store, fresh=False)
+    source_locks.qualify_protocol(watcher.store, fresh=False)
+    with watcher.store.connection() as db:
+        request = db.execute("SELECT request_id FROM message_removal_requests").fetchone()[0]
+        assert removal.outcome(db, request).completed == 1
+        assert body_state.pending(
+            db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
+        ) == ["m"]
+    assert watcher.store.source_start("m", include_unfollow=True)
+    body_state.record(watcher.store, "m", ("new body", 8), fetched_at=NOW)
+    with watcher.store.connection() as db:
+        assert db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0] == (
+            "new body"
+        )
+        assert body_state.pending(
+            db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
+        ) == []
