@@ -325,6 +325,7 @@ def test_production_check_loads_runtime_after_acquiring_lock(
         }
     )
     lock_held = False
+    operation_owner = object()
     monkeypatch.setattr(cli, "load_config", lambda path: stale_config, raising=False)
 
     def runtime(path: Path):
@@ -339,13 +340,14 @@ def test_production_check_loads_runtime_after_acquiring_lock(
         assert database_file == stale_config.database_file
         lock_held = True
         try:
-            yield
+            yield operation_owner
         finally:
             lock_held = False
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
 
-    def run_watcher_check(config, store, model, *, dry_run: bool):
+    def run_watcher_check(config, store, model, *, dry_run: bool, operation):
+        assert operation is operation_owner
         assert config is fresh_config
         assert dry_run is False
         return {"retention_days": fresh_config.retention_days}
@@ -360,6 +362,7 @@ def test_production_check_loads_runtime_after_acquiring_lock(
 
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
     assert len(pumped) == 1
+    assert pumped[0][0].operation is operation_owner
     assert pumped[0][1] == 25
 
 
@@ -368,6 +371,7 @@ def test_dry_run_loads_runtime_after_acquiring_production_lock(
 ) -> None:
     config = _check_config(tmp_path)
     lock_held = False
+    operation_owner = object()
     monkeypatch.setattr(cli, "load_config", lambda path: config, raising=False)
 
     def runtime(path: Path):
@@ -380,17 +384,17 @@ def test_dry_run_loads_runtime_after_acquiring_production_lock(
         assert database_file == config.database_file
         lock_held = True
         try:
-            yield
+            yield operation_owner
         finally:
             lock_held = False
 
     monkeypatch.setattr(cli, "_runtime", runtime)
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
-    monkeypatch.setattr(
-        cli,
-        "run_watcher_check",
-        lambda config, store, model, *, dry_run: {"dry_run": dry_run},
-    )
+    def check(config, store, model, *, dry_run, operation):
+        assert operation is operation_owner
+        return {"dry_run": dry_run}
+
+    monkeypatch.setattr(cli, "run_watcher_check", check)
 
     assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
     assert lock_held is False
@@ -420,6 +424,7 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
             return 2
 
     lock_held = False
+    operation_owner = object()
     monkeypatch.setattr(cli, "load_config", lambda path: stale_config, raising=False)
 
     def runtime(path: Path):
@@ -434,13 +439,14 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
         assert database_file == stale_config.database_file
         lock_held = True
         try:
-            yield
+            yield operation_owner
         finally:
             lock_held = False
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
 
-    def run_watcher_check(config, store, model, *, dry_run: bool):
+    def run_watcher_check(config, store, model, *, dry_run: bool, operation):
+        assert operation is operation_owner
         assert config is fresh_config
         assert dry_run is False
         return {
@@ -464,6 +470,7 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
 
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
     assert len(pumped) == 1
+    assert pumped[0][0].operation is operation_owner
     assert pumped[0][1] == 25
     assert json.loads(capsys.readouterr().out) == {
         "active": False,

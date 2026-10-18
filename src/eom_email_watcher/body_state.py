@@ -28,8 +28,15 @@ def ensure_schema(db):
         db.execute(statement)
 
 
+def _content_available_sql(db, alias):
+    """Share body-only removal eligibility; legacy schemas have no targets."""
+    from . import removal
+
+    return removal.CONTENT.available_sql(alias) if removal.has_schema(db) else "1"
+
+
 def pending(db, scope, *, cutoff, now, limit=None, exclude=()):
-    from .db import _effective_message_identity_sql, _logical_messages_past_cutoff_sql
+    from .db import _followed_message_sql, _logical_messages_past_cutoff_sql
 
     expired, parameters = _logical_messages_past_cutoff_sql(
         cutoff.timestamp(), now.timestamp(), include_recovery=False
@@ -38,10 +45,9 @@ def pending(db, scope, *, cutoff, now, limit=None, exclude=()):
         str(row[0])
         for row in db.execute(
             f"""SELECT m.message_id FROM logical_messages m JOIN thread_follow f
-        ON f.provider=m.provider AND f.account_id=m.account_id
-        AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
-        AND f.thread_key=m.thread_key
-        WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=? AND f.followed=1
+        ON {_followed_message_sql("m")}
+        WHERE f.provider=? AND f.account_id=? AND f.mailbox_identity_key=?
+        AND ({_content_available_sql(db, "m")})
         AND m.message_id NOT IN (SELECT message_id FROM message_bodies)
         AND m.message_id NOT IN (SELECT message_id FROM message_body_unavailable)
         AND m.message_id NOT IN ({expired})
@@ -69,17 +75,19 @@ def sources(db, message_id, scope, folders):
 
 
 def record(store, message_id, body, *, fetched_at, reason=None):
-    from .db import _effective_message_identity_sql
+    from . import removal
+    from .db import _followed_message_sql
 
     with store.connection() as db:
         db.execute("BEGIN IMMEDIATE")
+        # A refollow cannot revive content already accepted for body-only removal.
+        if not removal.CONTENT.message_available(db, message_id):
+            return
         # The derived input owner may have deleted or unfollowed this source.
         present = db.execute(
             f"""SELECT 1 FROM logical_messages m JOIN thread_follow f
-            ON f.provider=m.provider AND f.account_id=m.account_id
-            AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
-        AND f.thread_key=m.thread_key
-            WHERE m.message_id=? AND f.followed=1""",
+            ON {_followed_message_sql("m")}
+            WHERE m.message_id=?""",
             (message_id,),
         ).fetchone()
         if present is None:
@@ -99,17 +107,21 @@ def record(store, message_id, body, *, fetched_at, reason=None):
 
 
 def recompute(db):
-    from . import source_locks
-    from .db import SOURCE_CLEANUP_LOCK_BATCH_SIZE, _effective_message_identity_sql, _unit_rows
+    from . import removal, source_locks
+    from .db import SOURCE_CLEANUP_LOCK_BATCH_SIZE, _followed_message_sql, _unit_rows
 
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_bodies'").fetchone():
         return
     eligible = f"""SELECT m.message_id FROM logical_messages m JOIN thread_follow f
-        ON f.provider=m.provider AND f.account_id=m.account_id
-        AND f.mailbox_identity_key={_effective_message_identity_sql("m")}
-        AND f.thread_key=m.thread_key
-        WHERE f.followed=1"""
+        ON {_followed_message_sql("m")}"""
+    # A durable target remains physical until the completion owner acquires its
+    # source locks; hiding it from the projection is not deletion authority.
     held = []
+    if removal.has_schema(db):
+        eligible_content = _content_available_sql(db, "m")
+        held = [r[0] for r in db.execute(
+            f"SELECT m.message_id FROM messages m WHERE NOT ({eligible_content})"
+        )]
     # This runs in the same write transaction as follow/attribution, so the
     # protocol marker cannot change between the admission read and cleanup.
     ready = source_locks.protocol_ready(db)

@@ -30,6 +30,7 @@ from windows_cutover_fixture import (
 from windows_qualification_environment import powershell_environment
 
 from eom_email_watcher.engine_api import ADMISSION_REQUIRED_OPERATIONS
+from eom_email_watcher.source_locks import source_lock_path
 
 
 class Engine:
@@ -225,6 +226,67 @@ def attachment(database, subject):
         ).fetchall()
     assert len(result) == 1, result
     return result[0]
+
+
+def prove_removal_recovery(new, database):
+    """Retain the real pending receipt across restart before releasing its source."""
+    expected_clear = scalar(database, "SELECT COUNT(*) FROM logical_messages")
+    assert expected_clear >= 2, "The populated removal proof needs retained messages"
+    with sqlite3.connect(database) as db:
+        source_id = db.execute(
+            "SELECT message_id FROM messages ORDER BY message_id LIMIT 1"
+        ).fetchone()[0]
+
+    def retained_storage():
+        with sqlite3.connect(database) as db:
+            return {
+                table: db.execute(f"SELECT * FROM {table} ORDER BY message_id").fetchall()
+                for table in (
+                    "messages", "message_bodies", "message_body_unavailable", "message_locations",
+                )
+            }
+
+    before = retained_storage()
+    # Qualification has already completed: only the canonical mapped stripe,
+    # not a legacy source filename, excludes the current completion owner.
+    holder = subprocess.Popen(
+        [sys.executable, "-c", """
+import sys
+from pathlib import Path
+from connect_automate.locking import connect_operation_lock
+with connect_operation_lock(Path(sys.argv[1]),'busy'):
+ print('REMOVAL_SOURCE_HELD',flush=True)
+ sys.stdin.read(1)
+""", str(source_lock_path(database, source_id))],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=new.environment,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "REMOVAL_SOURCE_HELD"
+        # Persist only the opaque key before mutation and discard its response.
+        prepared = new.call("inbox.removal.prepare", {"kind": "clear"})
+        request_file = new.folder / "removal-request.json"
+        write_private(request_file, json.dumps(prepared).encode())
+        new.call("inbox.clear", prepared)
+        recovered_key = json.loads(request_file.read_text())["request_id"]
+        resumed = Engine(new.binary, new.config, new.folder, new.environment)
+        frozen = resumed.call(
+            "inbox.removal.status", {"request_id": recovered_key, "kind": "clear"}
+        )
+        assert holder.poll() is None, "Source holder ended before status recovery"
+        assert frozen["outcome"] == "deferred", "Missing held-pending installed proof"
+        assert (frozen["requested"], frozen["completed"], frozen["pending"]) == (
+            expected_clear, 0, expected_clear
+        ), frozen
+        assert frozen["request_id"] == recovered_key and frozen["intent_ids"]
+        assert retained_storage() == before, "Held acceptance/restart changed physical storage"
+        assert scalar(database, "SELECT COUNT(*) FROM logical_messages") == 0
+        return resumed, recovered_key, frozen, expected_clear
+    finally:
+        if holder.poll() is None:
+            holder.stdin.write("x")
+            holder.stdin.flush()
+            assert holder.wait(timeout=10) == 0
 
 
 def run(args):
@@ -429,6 +491,45 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                 )
                 == 2
             )
+            resumed, recovered_key, pending_receipt, expected_clear = prove_removal_recovery(
+                new, database
+            )
+            # The holder is now released. Only the ordinary check resumes physical
+            # completion; initialization/status above must never have done so.
+            resumed.call("watcher.check")
+            frozen = resumed.call(
+                "inbox.removal.status", {"request_id": recovered_key, "kind": "clear"}
+            )
+            assert frozen["outcome"] == "completed", frozen
+            assert (frozen["requested"], frozen["completed"], frozen["pending"]) == (
+                expected_clear, expected_clear, 0
+            ), frozen
+            assert frozen["request_id"] == recovered_key
+            assert frozen["intent_ids"], frozen
+            assert scalar(database, "SELECT COUNT(*) FROM messages") == 0
+            assert scalar(database, "SELECT COUNT(*) FROM message_bodies") == 0
+            assert scalar(database, "SELECT COUNT(*) FROM message_body_unavailable") == 0
+            empty_key = resumed.call("inbox.removal.prepare", {"kind": "clear"})
+            empty = resumed.call("inbox.clear", empty_key)
+            assert (empty["requested"], empty["completed"], empty["pending"]) == (0, 0, 0)
+            assert empty["intent_ids"] == [] and empty["outcome"] == "completed"
+            mail.append("after-frozen-clear")
+            resumed.call("watcher.check")
+            assert scalar(
+                database, "SELECT COUNT(*) FROM messages WHERE subject=?", ("after-frozen-clear",)
+            ) == 1
+            assert scalar(database, "SELECT COUNT(*) FROM messages") == 1
+            assert resumed.call("inbox.clear", {"request_id": recovered_key}) == {
+                **frozen, "deleted": expected_clear
+            }
+            assert resumed.call("inbox.clear", empty_key) == empty
+            assert scalar(
+                database, "SELECT COUNT(*) FROM messages WHERE subject=?", ("after-frozen-clear",)
+            ) == 1, "A retained request selected a later arrival"
+            assert resumed.call(
+                "inbox.removal.status", {"request_id": recovered_key}
+            ) == frozen
+            assert provider.post_attempt_count() == 2, "Receipt retry submitted source work"
             new.call("health.get")
             result = {
                 "result": "PASS",
@@ -442,6 +543,9 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                 "orphan_posts": provider.submission_count(old_job_id),
                 "total_posts": provider.post_attempt_count(),
                 "poll": check,
+                "removal_receipts": {
+                    "held_restart": pending_receipt, "populated": frozen, "empty": empty,
+                },
                 "proof": [
                     "TLS IMAP Inbox/Sent",
                     "local analysis",
@@ -450,6 +554,12 @@ with connect_operation_lock(connect_source_lock_path(Path(sys.argv[1]),sys.argv[
                     "orphan GET without second POST",
                     "new installed Connect POST",
                     "receipt-gated timeout and retry",
+                    "opaque removal key persisted before mutation",
+                    "removal status after discarded response and client restart",
+                    "mapped source held across deferred acceptance and status-only restart",
+                    "held physical storage unchanged and logical targets invisible",
+                    "ordinary check completes after source release",
+                    "populated and zero-target retries exclude later arrivals",
                 ],
                 "build_inventory": inventory,
             }

@@ -5,17 +5,218 @@ import os
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
 from test_db import Store
 from test_thread_derived import derived, follow, seed
 
+from eom_email_watcher import db as database
 from eom_email_watcher import thread_migration
 
 
-def test_windows_unsafe_retained_backup_refuses_before_sqlite_open(tmp_path, monkeypatch):
+def test_migration_owner_excludes_runtime_tracking_during_messages_rebuild(tmp_path):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    seed(store)
+    with store.connection() as db:
+        before = [tuple(row) for row in db.execute("SELECT * FROM messages ORDER BY message_id")]
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        # A migration can update an input before replacing its schema. Runtime
+        # TEMP triggers must never span the DROP/RENAME intermediate state.
+        db.execute("UPDATE mail_accounts SET active=active")
+        thread_migration.rebuild_messages(db)
+        database._recompute_derived(db, database.DERIVED_INPUT_TABLES)
+        thread_migration.check_database(db)
+    store.initialize()
+    with store.connection() as db:
+        assert [
+            tuple(row) for row in db.execute("SELECT * FROM messages ORDER BY message_id")
+        ] == before
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_migration_owner_preserves_row_evidence_across_schema_step(tmp_path):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Vendor")
+    store.add_vendor_address(vendor, "vendor@example.com")
+    seed(store)
+    assert derived(store)["vendor_id"] == vendor
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        db.execute("UPDATE mail_accounts SET active=active")
+        before = [tuple(row) for row in db.execute("SELECT * FROM derived_changed_config")]
+        assert before == [("mail_accounts",)]
+        during = set()
+
+        def inspect_drop(sql):
+            if sql == "DROP TABLE messages":
+                # SQLite can repeat a trace statement while processing triggers.
+                # Keep every distinct observed tracker state, not callback counts.
+                during.add(
+                    tuple(
+                        tuple(row)
+                        for row in db.execute(
+                            "SELECT name FROM sqlite_temp_master "
+                            "WHERE type='trigger' AND name GLOB 'derived_*'"
+                        )
+                    )
+                )
+
+        db.set_trace_callback(inspect_drop)
+        thread_migration.rebuild_messages(db)
+        db.set_trace_callback(None)
+        assert during == {()}
+        assert (
+            db.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'derived_*'"
+            ).fetchall()
+            == []
+        )
+        assert [tuple(row) for row in db.execute("SELECT * FROM derived_changed_config")] == before
+        db.execute("DELETE FROM vendor_addresses WHERE vendor_id = ?", (vendor,))
+        assert {row[0] for row in db.execute("SELECT * FROM derived_changed_config")} == {
+            "mail_accounts",
+            "vendor_addresses",
+        }
+        db.execute("UPDATE messages SET sender=sender WHERE message_id='m'")
+        assert [row[0] for row in db.execute("SELECT * FROM derived_changed_messages")] == ["m"]
+    assert derived(store)["vendor_id"] is None
+    assert follow(store)[0]["followed"] == 0
+    store.initialize()
+    assert derived(store)["vendor_id"] is None
+    with store.connection() as db:
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.parametrize(
+    "table, expected",
+    [
+        ("messages", True),
+        ("mail_accounts", True),
+        ("message_bodies", True),
+        ("message_body_unavailable", True),
+        ("thread_follow", True),
+        ("logical_messages", False),
+        ("messages_delete_attachments", False),
+    ],
+)
+def test_migration_tracking_boundary_uses_referenced_tables(tmp_path, table, expected):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        assert owner.tracking_references_replaced_tables(db, {table}) is expected
+        assert (
+            owner.tracking_references_replaced_tables(db, {"logical_messages", table}) is expected
+        )
+        assert owner.tracking_references_replaced_tables(db, set()) is False
+        db.execute("UPDATE mail_accounts SET active=active")
+        triggers = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_temp_master WHERE type='trigger' AND name GLOB 'derived_*'"
+            )
+        }
+        assert triggers
+        for replaced in ({table}, {"logical_messages", table}, set()):
+            suspend = expected and bool(replaced)
+            with owner.schema_step(db, replaced_tables=replaced):
+                assert db._derived_enabled is (not suspend)
+                assert {
+                    row[0]
+                    for row in db.execute(
+                        "SELECT name FROM sqlite_temp_master "
+                        "WHERE type='trigger' AND name GLOB 'derived_*'"
+                    )
+                } == (set() if suspend else triggers)
+            assert db._derived_enabled is True
+            assert {
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_temp_master "
+                    "WHERE type='trigger' AND name GLOB 'derived_*'"
+                )
+            } == triggers
+
+
+def test_unchanged_reopen_keeps_tracking_across_view_and_trigger_refresh(tmp_path, monkeypatch):
+    store = Store(tmp_path / "schema36.sqlite3")
+    store.initialize()
+    seed(store)
+    connection = Store.connection
+    recompute = database._recompute_derived
+    member = database._thread_member
+    statements, evidence, touched = [], [], []
+
+    @contextmanager
+    def observe_connection(self):
+        with connection(self) as db:
+            db.set_trace_callback(statements.append)
+            yield db
+
+    def observe_recompute(db, changed):
+        if changed:
+            tracked = db.execute(
+                "SELECT 1 FROM sqlite_temp_master WHERE name='derived_changed_messages'"
+            ).fetchone()
+            evidence.append(
+                (
+                    bool(tracked),
+                    [tuple(row) for row in db.execute("SELECT * FROM derived_changed_config")],
+                    [tuple(row) for row in db.execute("SELECT * FROM derived_changed_messages")],
+                )
+            )
+        return recompute(db, changed)
+
+    def observe_member(db, row, vendor):
+        touched.append(row["message_id"])
+        return member(db, row, vendor)
+
+    monkeypatch.setattr(Store, "connection", observe_connection)
+    monkeypatch.setattr(database, "_recompute_derived", observe_recompute)
+    monkeypatch.setattr(database, "_thread_member", observe_member)
+    store.initialize()
+    assert "DROP VIEW IF EXISTS logical_messages" in statements
+    assert "DROP TRIGGER IF EXISTS messages_delete_recipients_and_locations" in statements
+    assert evidence == [(True, [], [])]
+    assert touched == []
+    assert len(follow(store)) == 1
+
+
+@pytest.fixture
+def schema35_binary(monkeypatch):
+    """Keep the original rebuild/backup oracle before the additive v36 lift."""
+    monkeypatch.setattr(database, "SCHEMA_VERSION", 35)
+
+    def current_binary():
+        monkeypatch.setattr(database, "SCHEMA_VERSION", 36)
+
+    return current_binary
+
+
+def assert_empty_schema36(store):
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        for table in (
+            "message_removal_requests",
+            "message_removal_intents",
+            "message_removal_targets",
+        ):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.parametrize("target_schema", [33, 36])
+def test_windows_unsafe_retained_backup_refuses_before_sqlite_open(
+    tmp_path, monkeypatch, target_schema
+):
     import os
     from types import SimpleNamespace
 
@@ -26,11 +227,9 @@ def test_windows_unsafe_retained_backup_refuses_before_sqlite_open(tmp_path, mon
     store = Store(tmp_path / "mail.db")
     store.initialize()
     with store.connection() as db:
-        backup = thread_migration.write_backup(store.path, db)
+        backup = thread_migration.write_backup(store.path, db, target_schema=target_schema)
     before = store.path.read_bytes()
-    monkeypatch.setattr(
-        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
-    )
+    monkeypatch.setattr(private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"})))
     monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda path: path != backup)
     connect = sqlite3.connect
     opened = []
@@ -58,9 +257,7 @@ def test_windows_retiring_backup_does_not_block_private_database_reads(tmp_path,
     store.initialize()
     with store.connection() as db:
         backup = thread_migration.write_backup(store.path, db)
-    monkeypatch.setattr(
-        private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"}))
-    )
+    monkeypatch.setattr(private_storage, "os", SimpleNamespace(**(vars(os) | {"name": "nt"})))
     monkeypatch.setattr(connect_windows, "_private_windows_acl", lambda _path: True)
     validate = connect_windows.validate_private_regular_file
 
@@ -75,6 +272,30 @@ def test_windows_retiring_backup_does_not_block_private_database_reads(tmp_path,
     with store.connection() as db:
         assert db.execute("SELECT 1").fetchone()[0] == 1
     assert not backup.exists()
+
+
+@pytest.mark.parametrize("target_schema", [33, 36])
+def test_backup_inventory_and_cleanup_keep_schema_namespaces_separate(tmp_path, target_schema):
+    store = Store(tmp_path / "mail.db")
+    store.initialize()
+    with store.connection() as db:
+        backups = {
+            version: thread_migration.write_backup(store.path, db, target_schema=version)
+            for version in (33, 36)
+        }
+    unrelated = tmp_path / "mail1.db.pre-v36.public.bak"
+    malformed = tmp_path / "mail.db.pre-vunknown.public.bak"
+    unrelated.write_bytes(b"public unrelated file")
+    malformed.write_bytes(b"public unrelated file")
+    assert set(thread_migration._backup_paths(store.path)) == set(backups.values())
+    assert thread_migration._backup_paths(store.path, target_schema=target_schema) == [
+        backups[target_schema]
+    ]
+    thread_migration.cleanup_backups(store.path, success=True, target_schema=target_schema)
+    assert not backups[target_schema].exists()
+    assert backups[36 if target_schema == 33 else 33].exists()
+    assert unrelated.read_bytes() == b"public unrelated file"
+    assert malformed.read_bytes() == b"public unrelated file"
 
 
 def legacy_store(tmp_path: Path) -> Store:
@@ -137,7 +358,11 @@ def test_fixture_sqlite_connections_are_closed(tmp_path, monkeypatch):
             db.execute("SELECT 1")
 
 
-def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatch):
+def test_upgrade_preserves_records_and_schema_and_backfills(
+    tmp_path,
+    monkeypatch,
+    schema35_binary,
+):
     store = legacy_store(tmp_path)
     before = snapshot(store.path)
     rebuild = thread_migration.rebuild_messages
@@ -168,9 +393,18 @@ def test_upgrade_preserves_records_and_schema_and_backfills(tmp_path, monkeypatc
     assert not list(tmp_path.glob("mail.db.pre-v33.*.bak"))
     store.initialize()
     assert observed == [True]
+    schema35_binary()
+    store.initialize()
+    assert_empty_schema36(store)
+    assert snapshot(store.path)[1:4] == before[1:4]
+    assert observed == [True]
 
 
-def test_failed_rebuild_rolls_back_and_keeps_newest_backup(tmp_path, monkeypatch):
+def test_failed_rebuild_rolls_back_and_keeps_newest_backup(
+    tmp_path,
+    monkeypatch,
+    schema35_binary,
+):
     store = legacy_store(tmp_path)
     before = snapshot(store.path)
     with store.connection() as db:
@@ -214,21 +448,34 @@ def test_backup_full_disk_does_not_start_migration(tmp_path, monkeypatch):
     assert snapshot(store.path) == before
 
 
-def test_simultaneous_initializers_rebuild_once(tmp_path, monkeypatch):
+def test_simultaneous_initializers_rebuild_once(tmp_path, monkeypatch, schema35_binary):
     store = legacy_store(tmp_path)
     rebuild = thread_migration.rebuild_messages
     observed = []
+    backup = thread_migration.write_backup
+    backup_targets = []
+
+    def track_backup(path, db, *, target_schema=33):
+        backup_targets.append(target_schema)
+        return backup(path, db, target_schema=target_schema)
 
     def count_rebuild(db):
         observed.append(True)
         rebuild(db)
 
     monkeypatch.setattr(thread_migration, "rebuild_messages", count_rebuild)
+    monkeypatch.setattr(thread_migration, "write_backup", track_backup)
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _: Store(store.path).initialize(), range(2)))
     assert observed == [True]
     assert snapshot(store.path)[0] == 35
     assert derived(store)["vendor_id"] is not None
+    schema35_binary()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: Store(store.path).initialize(), range(2)))
+    assert_empty_schema36(store)
+    assert observed == [True]
+    assert backup_targets == [33, 36]
 
 
 @pytest.mark.parametrize(

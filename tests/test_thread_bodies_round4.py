@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from conftest import local_removal
 from test_connect_v2_engine_api import seeded_runtime
 from test_service import FakeModel
 from test_thread_bodies import followed
@@ -21,7 +22,7 @@ def test_deferred_cutover_keeps_ordinary_work(tmp_path, action):
     if action == "purge":
         runtime.store.purge(1)
     elif action == "delete":
-        runtime.store.delete_message("message-1")
+        local_removal(runtime.store, "delete_message", "message-1")
     elif action == "notifications":
         engine_api._pending_notification_payloads(runtime, 25)
     else:
@@ -79,7 +80,7 @@ def test_deferred_cutover_does_not_prevent_scheduled_poll(tmp_path, monkeypatch)
     monkeypatch.setattr(
         service,
         "Watcher",
-        lambda *_: SimpleNamespace(
+        lambda *_, operation: SimpleNamespace(
             check=lambda **_: calls.append("polled") or {"active": True, "purged": 0}
         ),
     )

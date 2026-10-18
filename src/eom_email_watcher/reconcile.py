@@ -8,7 +8,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from . import body_state
+from . import body_state, removal
 from .mailbox import (
     MailboxError,
     MailboxMessageInvalid,
@@ -126,7 +126,8 @@ def sent_identity(gateway, scope):
 
 def observe(watcher, identity, active, sent_scope, now):
     state = ReconcileState(
-        watcher.store, (watcher.mailbox.provider, watcher.mailbox.account_id, identity)
+        watcher.store, (watcher.mailbox.provider, watcher.mailbox.account_id, identity),
+        operation=watcher.operation,
     )
     state.observe(
         active=active,
@@ -208,6 +209,14 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
 
     def fetch(item, *, gap=False, since=cutoff):
         nonlocal added
+        if not watcher.store.source_start(
+            provider=provider,
+            account_id=watcher.mailbox.account_id,
+            mailbox_identity_key=identity,
+            provider_message_id=item["source_id"],
+            eligibility=removal.RECORD,
+        ):
+            return
         source = watcher.store.reconcile_source(*state.scope, item["source_id"])
         if source is not None:
             if source["received_epoch"] is None or source["received_epoch"] < since.timestamp():
@@ -312,6 +321,10 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                             source_id = copy[0]
                             if copy in work["skipped"]:
                                 continue
+                            if not watcher.store.source_start(
+                                message_id, eligibility=removal.CONTENT
+                            ):
+                                break
                             if not getattr(watcher.gateway, "reconcile_transport_budget", False):
                                 budget.before_call()
                             try:

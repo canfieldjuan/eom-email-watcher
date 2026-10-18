@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher import deployment, engine_api
+from eom_email_watcher import deployment, engine_api, removal
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = tuple(sorted(path.name for path in (ROOT / "systemd").iterdir()))
@@ -83,7 +83,7 @@ def test_startup_refusal_uses_api_envelope(monkeypatch, operation):
     (b"", "invalid_json"),
     (b"{" + b" " * engine_api.MAX_REQUEST_BYTES, "request_too_large"),
     (b'{"protocol":99,"operation":"health.get"}', "unsupported_protocol"),
-])
+], ids=["empty", "oversized", "unsupported-protocol"])
 def test_api_parses_and_bounds_before_admission(monkeypatch, raw, code):
     import io
     import json
@@ -134,9 +134,18 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
     def persist(*args):
         raise refusal
 
+    source_checks = []
+
+    def source_start(message_id, *, eligibility):
+        assert eligibility is removal.CONTENT
+        source_checks.append(message_id)
+        return True
+
     runtime = SimpleNamespace(
         store=SimpleNamespace(
             source_locks=lambda *args, **kwargs: nullcontext(),
+            connect_job=lambda _: SimpleNamespace(message_id="public-message"),
+            source_start=source_start,
             connect_dispatch=lambda _: SimpleNamespace(
                 source_available=True, required_manifest_features=()
             ),
@@ -175,6 +184,7 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
                 inactive_dispatch_state="waiting",
             )
     assert observed.value is refusal
+    assert source_checks == (["public-message"] if path == "legacy" else [])
 
 
 def test_database_connection_checks_each_later_open(tmp_path, paired_deployment):

@@ -7,9 +7,11 @@ from pathlib import Path
 from threading import Barrier, Event
 
 import pytest
+from conftest import local_removal
 from test_db import Store, _coalesced_pair, _source_scope
 
 from eom_email_watcher import db as db_module
+from eom_email_watcher import thread_migration
 
 FIRST = datetime(2090, 1, 1, tzinfo=UTC)
 
@@ -278,13 +280,14 @@ def test_source_observations_deleted_with_unit(tmp_path: Path):
     store.record_message_location(
         **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
     )
-    store.delete_message(root)
+    local_removal(store, "delete_message", root)
     with store.connection() as db:
         assert db.execute("SELECT count(*) FROM message_source_observations").fetchone()[0] == 0
 
 
-def test_migration_is_conservative_and_rolls_back(tmp_path: Path, monkeypatch):
-    store, root, _ = _coalesced_pair(tmp_path)
+def test_migration_is_conservative_and_rolls_back(tmp_path: Path, monkeypatch, pre36_schema):
+    with pre36_schema():
+        store, root, _ = _coalesced_pair(tmp_path)
     scope = _source_scope(store, root)
     store.record_message_location(
         **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
@@ -328,7 +331,7 @@ def test_cleanup_removes_all_source_observations(tmp_path: Path, operation):
         **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
     )
     if operation == "clear":
-        store.clear_messages()
+        local_removal(store, "request_removal", "clear", {})
     else:
         store.purge_with_outcome(1, now=FIRST)
     with store.connection() as db:
@@ -411,9 +414,10 @@ def test_source_key_isolation(tmp_path: Path, field, value):
         )
 
 
-def test_real_schema30_upgrade_creates_table_atomically(tmp_path: Path, monkeypatch):
+def test_real_schema30_upgrade_creates_table_atomically(tmp_path: Path, monkeypatch, pre36_schema):
     """Construct a schema-30 file without dropping or editing the source database."""
-    original, root, _ = _coalesced_pair(tmp_path)
+    with pre36_schema():
+        original, root, _ = _coalesced_pair(tmp_path)
     scope = _source_scope(original, root)
     original.record_message_location(
         **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
@@ -483,7 +487,10 @@ def test_delayed_initializer_does_not_repeat_header_invalidation(tmp_path: Path,
 
     class DelayedConnection:
         def __init__(self, db):
-            self.db = db
+            object.__setattr__(self, "db", db)
+
+        def __setattr__(self, name, value):
+            setattr(self.db, name, value)
 
         def __getattr__(self, name):
             return getattr(self.db, name)
@@ -507,13 +514,23 @@ def test_delayed_initializer_does_not_repeat_header_invalidation(tmp_path: Path,
             with super().connection() as db:
                 yield DelayedConnection(db)
 
+    def initialize_contender():
+        with thread_migration.upgrade_owner(store.path) as owner:
+            DelayedStore(store.path)._initialize_locked(owner)
+
     with ThreadPoolExecutor(max_workers=1) as executor:
         # Probe the SQL transaction owner independently of the new outer upgrade
         # lock, including contenders from a binary that does not know that lock.
-        pending = executor.submit(DelayedStore(store.path)._initialize_locked)
+        pending = executor.submit(initialize_contender)
         try:
             assert before_lock.wait(timeout=15)
-            store.initialize()
+            # The older SQL contender does not know the native upgrade lock.
+            # Exercise the existing observation migration owner, then commit its
+            # version before the delayed initializer acquires SQLite's writer.
+            with store.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db_module._migrate_source_observations(db, datetime.now(UTC).isoformat())
+                db.execute(f"PRAGMA user_version = {db_module.SCHEMA_VERSION}")
             store.record_message_location(
                 **scope, locations=frozenset({"inbox"}), headers_observed=True, now=FIRST
             )

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from conftest import local_removal
 from test_service import (
     FakeModel,
     SentPollingGateway,
@@ -350,7 +351,7 @@ def test_recovery_backoff_still_finishes_pending_body_checkpoint(tmp_path, monke
         now=now,
     )
     body_state.record(store, "m", ("body", 4), fetched_at=now)
-    store.delete_message("m")
+    local_removal(store, "delete_message", "m")
     assert service._gmail_recovery_backoff_admission(store) is not None
     monkeypatch.setattr(
         service, "load_configured_mailbox", lambda *a: pytest.fail("loaded mailbox")

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import local_removal
 from connect_automate import connect
 from fixture_toml import toml_path_literal
 
@@ -51,7 +52,11 @@ from pathlib import Path
 
 from eom_email_watcher.db import Store
 
-deleted = Store(Path(sys.argv[1])).delete_message(sys.argv[2])
+from eom_email_watcher.removal import acceptance_scope
+
+store = Store(Path(sys.argv[1]))
+with acceptance_scope(store) as acceptance:
+    deleted = store.delete_message(sys.argv[2], acceptance=acceptance)
 print("deleted" if deleted else "missing", flush=True)
 """
 
@@ -352,7 +357,7 @@ def test_source_delete_recovers_provider_owned_unbound_automation_fire(
         )
     assert runtime.store.automation_fire(fire.fire_id).job_id is None  # type: ignore[union-attr]
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
 
     retained = runtime.store.automation_fire(fire.fire_id)
     retained_attempt = runtime.store.automation_fire_attempts(fire.fire_id)
@@ -388,16 +393,7 @@ def test_source_delete_recovers_provider_owned_unbound_automation_fire(
     assert runtime.store.connect_job(created.job_id) is None
 
 
-@pytest.mark.parametrize(
-    ("terminal_status", "expected_reason"),
-    (("completed", "connect_completed"), ("failed", "PDF_MALFORMED")),
-)
-def test_source_delete_preserves_unbound_terminal_automation_outcome(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    terminal_status: str,
-    expected_reason: str,
-) -> None:
+def _unbound_terminal_automation_outcome(tmp_path, monkeypatch, terminal_status):
     _, runtime = seeded_runtime(tmp_path)
     selected, fire, attempt = seed_contract_fire(runtime)
     install_automation_dispatch_fakes(
@@ -444,7 +440,24 @@ def test_source_delete_preserves_unbound_terminal_automation_outcome(
         )
     assert runtime.store.automation_fire(fire.fire_id).job_id is None  # type: ignore[union-attr]
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    return runtime, fire, attempt, created
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_reason"),
+    (("completed", "connect_completed"), ("failed", "PDF_MALFORMED")),
+)
+def test_source_delete_preserves_unbound_terminal_automation_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+    expected_reason: str,
+) -> None:
+    runtime, fire, _attempt, created = _unbound_terminal_automation_outcome(
+        tmp_path, monkeypatch, terminal_status,
+    )
+
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
 
     retained = runtime.store.automation_fire(fire.fire_id)
     retained_attempts = runtime.store.automation_fire_attempts(fire.fire_id)
@@ -455,6 +468,59 @@ def test_source_delete_preserves_unbound_terminal_automation_outcome(
     assert len(retained_attempts) == 1
     assert retained_attempts[0].job_id == created.job_id
     assert runtime.store.connect_job(created.job_id) is None
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_reason"),
+    (("completed", "connect_completed"), ("failed", "PDF_MALFORMED")),
+)
+def test_deferred_source_delete_binds_unbound_terminal_outcome_before_invalidation(
+    tmp_path, monkeypatch, terminal_status, expected_reason,
+):
+    from eom_email_watcher import source_locks
+
+    runtime, fire, attempt, created = _unbound_terminal_automation_outcome(
+        tmp_path, monkeypatch, terminal_status,
+    )
+    for i in range(32):
+        runtime.store.add_message(
+            message_id=f"held-copy-{i}", thread_id=None,
+            sender="private@example.com", sender_name="Private Sender",
+            subject="Private subject", received_at="2026-08-30T12:00:00+00:00",
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            admission=exact_sender_admission("private@example.com", "Private Sender"),
+        )
+    with runtime.store.connection() as db:
+        db.execute(
+            "UPDATE messages SET logical_of=? WHERE message_id LIKE 'held-copy-%'",
+            (fire.message_id,),
+        )
+        db.execute("DELETE FROM maintenance_state WHERE key='source_lock_protocol'")
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+
+    outcome = local_removal(
+        runtime.store, "request_removal", "delete", {"message_id": fire.message_id},
+    )
+    assert (outcome.requested, outcome.completed, outcome.pending) == (1, 0, 1)
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 33
+        assert not db.execute("SELECT 1 FROM logical_messages").fetchone()
+    retained = runtime.store.automation_fire(fire.fire_id)
+    assert retained is not None
+    assert (retained.state, retained.reason, retained.job_id) == (
+        terminal_status, expected_reason, created.job_id,
+    )
+    attempts = runtime.store.automation_fire_attempts(fire.fire_id)
+    assert len(attempts) == 1
+    assert attempts[0].dispatch_request_id == attempt.dispatch_request_id
+    assert attempts[0].job_id == created.job_id
+    assert runtime.store.connect_job(created.job_id) is None
+
+    source_locks.qualify_protocol(runtime.store, fresh=False)
+    with runtime.store.connection() as db:
+        assert not db.execute("SELECT 1 FROM messages").fetchone()
+    assert runtime.store.automation_fire(fire.fire_id) == retained
+    assert runtime.store.automation_fire_attempts(fire.fire_id) == attempts
 
 
 def test_automation_join_rejects_persisted_effectful_authority_after_manifest_drift(
@@ -2236,7 +2302,7 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     assert still_paused.state == "entitlement_paused"
     assert runtime.store.automation_fire_settlement_due() is False
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
     retained = runtime.store.automation_fire(fire.fire_id)
     assert retained is not None
     assert retained.state == "entitlement_paused"
@@ -2505,7 +2571,7 @@ def test_interactive_join_authorizes_automation_origin_job_submission(
     assert still_paused.state == "entitlement_paused"
     assert runtime.store.automation_fire_settlement_due() is False
 
-    assert runtime.store.delete_message(fire.message_id) is True
+    assert local_removal(runtime.store, "delete_message", fire.message_id) is True
     retained = runtime.store.automation_fire(fire.fire_id)
     assert retained is not None
     assert retained.state == "entitlement_paused"
@@ -2787,7 +2853,7 @@ def test_confirmed_pending_automation_is_deleted_with_its_source_and_receipt(
         )
     )
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     assert runtime.store.automation_fire(fire.fire_id) is None
     assert runtime.store.automation_fire_attempts(fire.fire_id) == []
@@ -2841,7 +2907,7 @@ def test_provider_owned_paused_fire_survives_source_delete_and_records_terminal_
         )
     runtime.store.initialize()
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     retained = runtime.store.automation_fire(fire.fire_id)
     assert retained is not None
@@ -2916,7 +2982,7 @@ def test_source_delete_preserves_unsettled_terminal_automation_outcome(
             error={"code": "PDF_MALFORMED", "message": "Invalid PDF", "retryable": False},
         )
 
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     settled = runtime.store.automation_fire(fire.fire_id)
     assert settled is not None
@@ -4303,7 +4369,7 @@ def test_late_terminal_after_source_cleanup_is_returned_without_persistence(
         provider_app_id=job.provider_app_id,
         provider_instance_id=job.provider_instance_id,
     )
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     class CompletingClient:
         def __init__(self, capability_value):
@@ -4328,6 +4394,7 @@ def test_late_terminal_after_source_cleanup_is_returned_without_persistence(
 
 
 def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
+    assert_private_file,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
@@ -4451,7 +4518,7 @@ def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
     assert exported_path.name.startswith("email-watcher-output-")
     assert exported_path.suffix == ".bin"
     assert exported_path.read_bytes() == opaque_payload
-    assert exported_path.stat().st_mode & 0o777 == 0o600
+    assert_private_file(exported_path)
     assert "run-me.exe" not in exported_path.name
     assert "dangerous-content-must-not-reach-the-dom" not in str(exported)
 
@@ -5636,7 +5703,7 @@ def test_source_cleanup_wins_before_retry_and_prevents_another_post(
     engine_api._response(
         api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
     )
-    assert runtime.store.delete_message("message-1") is True
+    assert local_removal(runtime.store, "delete_message", "message-1") is True
 
     pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
 

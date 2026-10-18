@@ -21,7 +21,10 @@ import {
 import { automationOutcomeIdentity, automationOutcomeStatus } from "./automationOutcome";
 import { hasInboxAutomationConfirmation, inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
-import { inboxClearView, type InboxClearResult } from "./inboxRemoval";
+import {
+  InboxRemovalClient, inboxClearView, inboxRemovalStatus, inboxRemovalRecordStatus,
+  type InboxRemovalRecord,
+} from "./inboxRemoval";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import { mailAccountDetail } from "./mailAccountDetail";
 import {
@@ -592,6 +595,7 @@ app.innerHTML = `
         </form>
       </details>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
+      <div id="inbox-removal-statuses" aria-live="polite"></div>
       <ul id="inbox-list" class="inbox-list" aria-label="Recent watched messages"></ul>
       <div class="inbox-page-actions">
         <button id="inbox-load-more" type="button" hidden>Load more</button>
@@ -878,6 +882,8 @@ const expiryLedgerRows = requiredElement<HTMLTableSectionElement>("#expiry-ledge
 const coiSetup = mountCoiSetup(requiredElement<HTMLElement>("#coi-setup"), invoke, errorMessage, openConnectHealth);
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
+const inboxRemovalStatuses = requiredElement<HTMLDivElement>("#inbox-removal-statuses");
+const inboxRemovalClient = new InboxRemovalClient(invoke, renderInboxRemovalStatuses, errorCode);
 const inboxSenderNavigation = requiredElement<HTMLElement>("#inbox-sender-nav");
 const inboxSenderError = requiredElement<HTMLParagraphElement>("#inbox-sender-error");
 const inboxHeading = requiredElement<HTMLElement>("#inbox-heading");
@@ -2573,6 +2579,34 @@ function inboxMutationInFlight(): boolean {
   return inboxClearInFlight || inboxDeletionsInFlight.size > 0;
 }
 
+function renderInboxRemovalStatuses(records: readonly InboxRemovalRecord[], error?: unknown): void {
+  inboxRemovalStatuses.replaceChildren();
+  for (const record of records) {
+    const status = inboxRemovalRecordStatus(record, errorMessage);
+    const paragraph = document.createElement("p");
+    paragraph.className = "status";
+    paragraph.dataset.kind = status.kind;
+    paragraph.textContent = status.text;
+    inboxRemovalStatuses.append(paragraph);
+  }
+  if (error !== undefined) {
+    const paragraph = document.createElement("p");
+    paragraph.className = "status";
+    paragraph.dataset.kind = "error";
+    paragraph.textContent = errorMessage(error);
+    inboxRemovalStatuses.append(paragraph);
+  }
+}
+
+async function refreshInboxRemovalStatuses(): Promise<void> {
+  try {
+    await inboxRemovalClient.restore();
+    renderInboxRemovalStatuses(inboxRemovalClient.statuses());
+  } catch (error) {
+    renderInboxRemovalStatuses(inboxRemovalClient.statuses(), error);
+  }
+}
+
 function resumeInboxReloadAfterMutation(): void {
   if (inboxMutationInFlight() || !inboxReloadAfterMutation) return;
   inboxReloadAfterMutation = false;
@@ -2609,18 +2643,22 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
   setInboxControlsBusy(true);
   renderInbox(inboxItems);
   try {
-    await invoke<void>("inbox_delete", { messageId: item.message_id });
+    const result = await inboxRemovalClient.delete(item.message_id);
+    if (!result) return;
     expandedInboxMessages.delete(item.message_id);
     clearMessageOwnedUiState(item.message_id);
     inboxItems = inboxItems.filter((candidate) => candidate.message_id !== item.message_id);
     renderInbox(inboxItems);
-    inboxStatus.textContent = `Deleted "${item.subject}" from local history. The source email was not changed.`;
-    inboxStatus.dataset.kind = "success";
+    const status = inboxRemovalStatus(result);
+    inboxStatus.textContent = result.outcome === "completed"
+      ? `Deleted "${item.subject}" from local history. The source email was not changed.` : status.text;
+    inboxStatus.dataset.kind = status.kind;
   } catch (error) {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
   } finally {
     inboxDeletionsInFlight.delete(item.message_id);
+    inboxReloadAfterMutation = true;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
     resumeInboxReloadAfterMutation();
@@ -2639,7 +2677,8 @@ async function clearInboxHistory(): Promise<void> {
   setInboxControlsBusy(true);
   renderInbox(inboxItems);
   try {
-    const result = await invoke<InboxClearResult>("inbox_clear");
+    const result = await inboxRemovalClient.clear();
+    if (!result) return;
     const view = inboxClearView(inboxItems, result);
     const retained = new Set(view.retained.map(item => item.message_id));
     for (const item of inboxItems) {
@@ -2665,6 +2704,7 @@ async function clearInboxHistory(): Promise<void> {
     inboxStatus.dataset.kind = "error";
   } finally {
     inboxClearInFlight = false;
+    inboxReloadAfterMutation = true;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
     resumeInboxReloadAfterMutation();
@@ -2740,6 +2780,7 @@ async function loadInbox(
   inboxNextCursor = page.next_cursor;
   inboxLoadMore.hidden = inboxNextCursor === null;
   renderInbox(inboxItems);
+  void refreshInboxRemovalStatuses();
   if (releaseAutomationRefreshFences(automationDecisionRefreshRequired, generation, append)) {
     renderInbox(inboxItems);
   }

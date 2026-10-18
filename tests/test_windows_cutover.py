@@ -1485,3 +1485,61 @@ def test_native_preinstall_abort_restores_scheduled_task(tmp_path):
         assert not (root / windows_cutover.RECEIPT_NAME).exists()
     finally:
         powershell("Unregister-ScheduledTask -TaskName $env:EW_TASK -Confirm:$false")
+
+
+def test_installed_removal_proof_keeps_real_pending_receipt_across_status_restart(
+    tmp_path, monkeypatch,
+):
+    import prove_windows_cutover_full as proof
+    from test_thread_bodies import body_runner
+    from test_thread_reconcile import NOW, seed
+
+    from eom_email_watcher import body_state, engine_api, source_locks
+    from eom_email_watcher.db import Store
+    from eom_email_watcher.runtime import Runtime
+
+    watcher, _, _ = body_runner(tmp_path, monkeypatch, {})
+    store = watcher.store
+    seed(store, "other", rfc_message_id="other@fixture", thread_id="other-thread")
+    body_state.record(store, "m", ("public held body", 16), fetched_at=NOW)
+    with store.connection() as db:
+        assert source_locks.protocol_ready(db)
+    # Only the in-process twin shortens an existing wait. The installed proof
+    # keeps the unmodified production deadline and actual subprocess transport.
+    monkeypatch.setattr(source_locks, "SOURCE_LOCK_WAIT_SECONDS", 0.05)
+    calls = []
+
+    def removal_api(client, operation, payload=None):
+        # A fresh actual Store for every call exercises initialization/status
+        # without manufacturing a receipt or patching source qualification.
+        reopened = Store(store.path)
+        reopened.initialize()
+        runtime = Runtime(watcher.config, reopened, watcher.model)
+        with monkeypatch.context() as active:
+            active.setattr(engine_api, "_runtime", lambda _: runtime)
+            reply = engine_api._response({
+                "protocol": 1, "operation": operation, "payload": payload or {},
+            })
+        assert reply["ok"], reply
+        calls.append(operation)
+        return reply["data"]
+
+    monkeypatch.setattr(proof.Engine, "call", removal_api)
+    client = proof.Engine(
+        "unused-source-twin", tmp_path / "unused.toml", tmp_path, dict(os.environ),
+    )
+    resumed, key, pending, expected = proof.prove_removal_recovery(client, store.path)
+    assert pending["outcome"] == "deferred", "Missing held-pending installed proof"
+    assert (pending["requested"], pending["completed"], pending["pending"]) == (
+        expected, 0, expected
+    )
+    assert expected == 2
+    assert resumed is not client
+    assert calls == ["inbox.removal.prepare", "inbox.clear", "inbox.removal.status"]
+    assert proof.scalar(store.path, "SELECT COUNT(*) FROM messages") == 2
+    assert proof.scalar(store.path, "SELECT COUNT(*) FROM logical_messages") == 0
+    assert resumed.call("inbox.removal.status", {"request_id": key, "kind": "clear"}) == pending
+    source_locks.qualify_protocol(Store(store.path), fresh=False)
+    settled = resumed.call("inbox.removal.status", {"request_id": key, "kind": "clear"})
+    assert (settled["requested"], settled["completed"], settled["pending"]) == (2, 2, 0)
+    assert proof.scalar(store.path, "SELECT COUNT(*) FROM messages") == 0

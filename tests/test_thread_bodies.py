@@ -4,6 +4,7 @@ import sqlite3
 from datetime import timedelta
 
 import pytest
+from conftest import local_removal
 from test_thread_reconcile import KEY, NOW, seed, state_store
 
 from eom_email_watcher import mime
@@ -67,7 +68,10 @@ def test_unfollow_deletes_body_and_sets_durable_checkpoint(tmp_path):
 
     store, state, vendor = followed(tmp_path)
     body_state.record(store, "m", ("local text", 10), fetched_at=NOW)
-    store.remove_vendor_address(vendor, "vendor@example.com")
+    from eom_email_watcher.removal import operation_scope
+
+    with operation_scope(store.path) as operation:
+        store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
     with store.connection() as db:
         assert db.execute("PRAGMA secure_delete").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM message_bodies").fetchone()[0] == 0
@@ -255,16 +259,16 @@ def test_bodyless_old_or_unfollowed_message_is_never_fetched(tmp_path, monkeypat
         assert not body_state.pending(db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW)
 
 
-@pytest.mark.parametrize("method", ["delete_message", "clear_messages"])
+@pytest.mark.parametrize("method", ["delete", "clear"])
 def test_all_message_deletions_schedule_checkpoint_without_marker_inheritance(tmp_path, method):
     from eom_email_watcher import body_state
 
     store, state, _ = followed(tmp_path)
     body_state.record(store, "m", ("body", 4), fetched_at=NOW)
-    if method == "delete_message":
-        store.delete_message("m")
+    if method == "delete":
+        local_removal(store, "delete_message", "m")
     else:
-        store.clear_messages()
+        local_removal(store, "request_removal", "clear", {})
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
         assert db.execute(
@@ -286,7 +290,7 @@ def test_busy_checkpoint_remains_pending_until_reader_finishes(tmp_path):
     try:
         reader.execute("BEGIN")
         assert reader.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
-        store.delete_message("m")
+        local_removal(store, "delete_message", "m")
         assert not body_state.checkpoint(store)
         with store.connection() as db:
             assert db.execute(
@@ -578,9 +582,14 @@ def legacy_body_store(tmp_path, monkeypatch):
 
 def test_schema35_upgrade_retains_mail_and_invalidates_coverage_once(tmp_path, monkeypatch):
     from eom_email_watcher import body_state
+    from eom_email_watcher import db as database
 
     store = legacy_body_store(tmp_path, monkeypatch)
-    store.initialize()
+    # Prove the original schema-35 boundary explicitly, then its additive v36
+    # successor. Neither open may invalidate coverage after the one-time lift.
+    with monkeypatch.context() as prior:
+        prior.setattr(database, "SCHEMA_VERSION", 35)
+        store.initialize()
     with store.connection() as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 35
         assert db.execute("SELECT message_id FROM messages").fetchone()[0] == "m"
@@ -595,6 +604,15 @@ def test_schema35_upgrade_retains_mail_and_invalidates_coverage_once(tmp_path, m
         )
     store.initialize()
     with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        for table in ("message_removal_requests", "message_removal_intents",
+                      "message_removal_targets"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert db.execute("SELECT message_id FROM messages").fetchone()[0] == "m"
+        assert db.execute("SELECT 1 FROM reconcile_coverage").fetchone()
+    store.initialize()
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
         assert db.execute("SELECT 1 FROM reconcile_coverage").fetchone()
 
 
@@ -662,7 +680,7 @@ def test_checkpoint_never_clears_a_newer_deletion(tmp_path, monkeypatch):
     seed(store, "n")
     for message_id in ("m", "n"):
         body_state.record(store, message_id, ("body", 4), fetched_at=NOW)
-    store.delete_message("m")
+    local_removal(store, "delete_message", "m")
     original = store.connection
     injected = False
 
@@ -678,7 +696,7 @@ def test_checkpoint_never_clears_a_newer_deletion(tmp_path, monkeypatch):
             if sql == "PRAGMA wal_checkpoint(TRUNCATE)" and not injected:
                 result = self.db.execute(sql).fetchall()[0]
                 injected = True
-                store.delete_message("n")
+                local_removal(store, "delete_message", "n")
                 return SimpleNamespace(fetchone=lambda: result)
             return self.db.execute(sql, *args)
 
