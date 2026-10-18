@@ -8997,3 +8997,31 @@ def test_calendar_cancelled_replay_never_accepts_invalid_proposal_version(tmp_pa
             proposal_sha256=proposal.proposal_sha256,
             decision="confirm",
         )
+
+@pytest.mark.parametrize("reader", ["projection", "inbox"])
+def test_calendar_outcome_reads_run_and_write_from_one_snapshot(tmp_path, monkeypatch, reader):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    bound_read = db_module._automation_run_for_message
+    advanced = False
+
+    def handoff_after_bound_read(db, message_id, **kwargs):
+        nonlocal advanced
+        row = bound_read(db, message_id, **kwargs)
+        if message_id == "local-scheduling" and not advanced:
+            advanced = True
+            store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+        return row
+
+    monkeypatch.setattr(db_module, "_automation_run_for_message", handoff_after_bound_read)
+    if reader == "projection":
+        result = store.calendar_write_outcome_for_message("local-scheduling")
+    else:
+        result = next(
+            item for item in store.recent(10) if item["message_id"] == "local-scheduling"
+        )["calendar_write_outcome"]
+    assert advanced
+    assert store.automation_run(authorized.run_id).state == "writing"
+    # The controlled handoff commits after the projection's bound read. That
+    # snapshot must stay entirely authorized, not borrow the newer write status.
+    assert result["state_version"] == authorized.state_version
+    assert result["status"] == "authorized"

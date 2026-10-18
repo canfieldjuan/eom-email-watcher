@@ -1600,13 +1600,15 @@ class AutomationCalendarWriteCancelled:
 
 
 def calendar_write_outcome(
-    run: AutomationRun, write: AutomationCalendarWrite | sqlite3.Row,
+    run: AutomationRun | sqlite3.Row,
+    write: AutomationCalendarWrite | sqlite3.Row,
 ) -> dict[str, object]:
     """Content-free projection for a current write or immutable cancellation event."""
+    run_values = asdict(run) if isinstance(run, AutomationRun) else run
     values = asdict(write) if isinstance(write, AutomationCalendarWrite) else write
     return {
-        "run_id": run.run_id,
-        "state_version": run.state_version,
+        "run_id": run_values["run_id"],
+        "state_version": run_values["state_version"],
         "transaction_id": values["transaction_id"],
         "status": values["status"],
         "failure_code": values["failure_code"],
@@ -1940,10 +1942,23 @@ def _cancel_automation_source(
     return True
 
 
-def _automation_run_for_message(db: sqlite3.Connection, message_id: str) -> sqlite3.Row | None:
+def _automation_run_for_message(
+    db: sqlite3.Connection,
+    message_id: str,
+    *,
+    with_calendar_write: bool = False,
+) -> sqlite3.Row | None:
     record_eligible = removal.RECORD.available_sql("m") if removal.has_schema(db) else "1"
+    columns = "r.*"
+    calendar_join = ""
+    if with_calendar_write:
+        columns = (
+            "r.run_id,r.state_version,w.transaction_id,w.status,w.failure_code,w.graph_event_id"
+        )
+        calendar_join = "JOIN automation_calendar_writes w ON w.run_id=r.run_id"
     row = db.execute(
-        f"""SELECT r.* FROM automation_runs AS r
+        f"""SELECT {columns} FROM automation_runs AS r
+        {calendar_join}
         LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
         JOIN logical_messages AS m
           ON m.provider = r.provider
@@ -1971,16 +1986,9 @@ def _calendar_write_outcome_for_message(
     db: sqlite3.Connection,
     message_id: str,
 ) -> dict[str, object] | None:
-    row = _automation_run_for_message(db, message_id)
-    if row is None:
-        return None
-    write = db.execute(
-        "SELECT * FROM automation_calendar_writes WHERE run_id=?",
-        (row["run_id"],),
-    ).fetchone()
-    if write is None:
-        return None
-    return calendar_write_outcome(_automation_run(row), _automation_calendar_write(write))
+    # Resolve source/RECORD binding and both ledger rows in one SQLite snapshot.
+    row = _automation_run_for_message(db, message_id, with_calendar_write=True)
+    return calendar_write_outcome(row, row) if row is not None else None
 
 
 def _calendar_proposal_generation(

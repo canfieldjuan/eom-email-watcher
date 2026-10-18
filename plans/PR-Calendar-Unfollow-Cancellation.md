@@ -273,8 +273,14 @@ The accepted policy is implemented at its existing owners:
   floor and immutable proposal transitions. Fresh approval requires write
   authorization and creates a new transaction; old replay creates no work.
 - `db.calendar_write_outcome` is the common content-free projection for current
-  writes and immutable cancellations. Inbox and decision reads use the existing
-  bound source/RECORD owner. The decision transport adds the optional projection.
+  writes and immutable cancellations. Inbox reads select the binding, run version
+  and write metadata in one joined SQLite statement through the existing
+  source/RECORD owner. My initial implementation in `55b05e0` read the run and
+  write separately: deterministic handoff probes reproduced an old version paired
+  with a newer status in both the getter and inbox. The owner now returns one
+  coherent snapshot; no downstream status correction or extra filtering is used.
+  The decision transport adds the same optional projection under its existing
+  exclusive operation owner.
 - `desktop/src/calendarOutcome.ts` owns inbox/decision wording. Production
   rendering works without a proposal, renders as text and has no stale action.
   Decision refresh prefers a newer outcome and leaves old buttons disabled until
@@ -322,7 +328,7 @@ formatter. The latter has its own fail-before/pass-after regression. These were
 unpublished working changes, not failures attributed to a different commit.
 
 Earlier full Python invocations were deliberately interrupted before completion
-for the final refusal-boundary, fixture-lock and omitted native DTO corrections. Their raw outputs are
+for the refusal-boundary, fixture-lock, omitted native DTO and read-snapshot corrections. Their raw outputs are
 retained as interrupted pre-final evidence, not completed qualifications. The new
 API regression explicitly binds config.database_file to Store.path, and the common
 calendar fixture now uses the existing service config's database path. Final
