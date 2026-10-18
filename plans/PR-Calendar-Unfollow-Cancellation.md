@@ -1,6 +1,15 @@
-# Calendar cancellation after accepted unfollow — proposed contract
+# Calendar cancellation after accepted unfollow — accepted contract
 
-Refs #290. **Contract only; operator acceptance is required before implementation.**
+Refs #290. **Accepted; implementation must follow this contract.**
+
+## Acceptance
+
+On 2026-10-18 the operator accepted contract commit
+`377fa0ed1ea3ad08f1ad03a3e27e79df75dc926d` and authorized implementation, verbatim:
+**“Accept contract and implement (Recommended)”**. This acceptance record is a
+separate commit before tests or production changes. The
+[oversight technical review](https://github.com/canfieldjuan/eom-email-watcher/pull/291#issuecomment-6255236832)
+agrees with the owner/storage boundary; it does not replace operator authority.
 
 Baseline: merged main `9fc701e157cad3de91a2207dca02551a21937bb0` (#261).
 All source anchors below refer to that revision. Refresh the inventory if main
@@ -248,10 +257,10 @@ verification. Production, tests, dependencies, workflows and schema are untouche
 All current behavior statements are anchored to source or explicitly historical
 evidence. Future policy and tests above are requirements, not passing results.
 
-**NOT DONE:** operator acceptance; implementation; fail-first/current-base proof;
+**NOT DONE:** implementation; fail-first/current-base proof;
 focused/full/native/installed Windows qualification; final-head review and
-oversight PASS; merge. Do not implement or merge this proposal until acceptance
-is recorded separately. After implementation, require clean local == actual
+oversight PASS; merge. Acceptance is recorded separately above. After
+implementation, require clean local == actual
 remote, all required checks green, fresh review reconciled with zero unresolved
 threads/no changes requested, and posted exact-head oversight PASS; merge with a
 merge commit and verify its tree equals the reviewed head. No install/promotion.
