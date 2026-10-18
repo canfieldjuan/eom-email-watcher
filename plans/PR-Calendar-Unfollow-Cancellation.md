@@ -415,3 +415,30 @@ a bodyless/held fixture assumption, a singular payload accessor) and test-format
 errors were classified separately; no production assertion was weakened.
 
 Full/native and final-head remote gates remain required before completion.
+
+
+### Full-gate failure classification: explicit metadata eligibility inventory
+
+The full gate on `9b6b7a09db9e50151c1a8fc2f12f80a03008d26d` stopped in
+`test_eligibility_callers_cannot_default_or_downgrade_content`: its exact RECORD
+owner inventory omitted `_automation_run_for_message`. The RECORD predicate was
+introduced in local `55b05e0fa4177b8d6eade61054a489cc6017f350` and moved into that
+shared reader in `3cf0c65034e9cf5e4490349cb178b685f3dea9ec`. This is my missed
+contract-test inventory update, not a reason to switch retained status to CONTENT
+or bypass the test. The accepted “Durable, content-free status” contract explicitly
+requires the source/RECORD lookup after proposal removal. Production callers are
+the retained outcome projection and the calendar-decision source-binding lookup;
+subsequent creation/adoption remains under its existing CONTENT and consent owners.
+
+The test now names that one accepted metadata owner while keeping exact
+`seen_record` equality, every existing CONTENT owner assertion, explicit
+`source_start` eligibility and no-default checks. The added runtime regression
+proves the two existing lifecycle boundaries separately: held removal keeps
+CONTENT admission and `message_source` unavailable despite readable exact six-field
+status and a physically retained body; completed removal keeps the proposal absent
+and the unfollowed body-adoption owner refuses to repopulate removed content.
+The first probe incorrectly assumed CONTENT permanently rejects completed targets;
+that new test assumption was rejected against the existing pending-only eligibility
+SQL and followed-adoption owner before correction. No pre-existing assertion changed. This assertion maps to the accepted contract’s metadata-versus-content
+boundary. No production eligibility predicate, guard, fixture policy or skip changes.
+The failed full run is preserved as failed qualification; all final gates remain.
