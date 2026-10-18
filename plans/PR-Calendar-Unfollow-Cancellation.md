@@ -343,9 +343,9 @@ threads/changes requested; merge with a merge commit and reviewed-tree equality.
 No installation/promotion or #278 work.
 
 
-## Proposed origin amendment — awaiting operator acceptance
+## Accepted origin amendment
 
-**STOP before further implementation or an implementation push.** A public Store
+A public Store
 reproduction found that a followed, approved calendar source with neither a cached
 body nor an unavailable marker remains authorized after unfollow and can enter
 writing. No provider was called. The pre-unfollow capture starts from body-bearing
@@ -357,8 +357,8 @@ The bounded proposal adds the trusted calendar-admission before-image and derive
 follow-loss origin to the accepted change surface, while keeping body-removal
 selection/targets/receipts, source identity, schema, endpoints, recovery, initial
 proposal policy and all publication/merge gates unchanged. It authorizes no
-inferred-unfollow fallback in begin, readers or the UI. It is proposed, not accepted
-or implemented.
+inferred-unfollow fallback in begin, readers or the UI. The operator accepted this bounded extension; implementation and qualification
+remain required.
 
 The complete proposal and reproduction are posted at
 [issuecomment-6255876370](https://github.com/canfieldjuan/eom-email-watcher/pull/291#issuecomment-6255876370).
@@ -366,7 +366,10 @@ Durable aliases: `calendar-follow-loss-amendment`, SHA256
 `a38f38e72e5fb0262553c2e993494b220e597ba84da7d768c79bd97c708fc71a`;
 `no-body-unfollow-observation`, SHA256
 `d3a82bb4e8ea1a27c595eb6469b90aa5d4b022caf74e8bbcdfcb3a52a9f9440c`.
-The operator has been asked to accept this amendment. Full Python qualification is
+The operator accepted the amendment directly in this session: **“Accept amendment
+and implement (Recommended)”**. Acceptance is recorded in this plan alone before
+any amendment code. Oversight independently relayed **“Accept (Recommended)”**.
+Full Python qualification is
 incomplete; deliberately interrupted runs remain retained as incomplete evidence.
 The published contract-only head's green CI does not qualify the implementation.
 No implementation push, merge, installation or promotion has occurred.
