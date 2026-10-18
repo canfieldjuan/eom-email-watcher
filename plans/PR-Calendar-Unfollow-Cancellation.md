@@ -341,3 +341,32 @@ qualification, automatic review/reconciliation and posted oversight PASS; merge.
 Require clean local == actual remote, required checks green and no unresolved
 threads/changes requested; merge with a merge commit and reviewed-tree equality.
 No installation/promotion or #278 work.
+
+
+## Proposed origin amendment — awaiting operator acceptance
+
+**STOP before further implementation or an implementation push.** A public Store
+reproduction found that a followed, approved calendar source with neither a cached
+body nor an unavailable marker remains authorized after unfollow and can enter
+writing. No provider was called. The pre-unfollow capture starts from body-bearing
+units (`db._capture_followed_content_sql`, pinned-base line 5733, introduced by
+`e6b3e21fb99e05c67bf714f456429b39c197f747`), so removal acceptance never receives
+that source. My local `55b05e0` calendar implementation relied on that receipt path.
+
+The bounded proposal adds the trusted calendar-admission before-image and derived
+follow-loss origin to the accepted change surface, while keeping body-removal
+selection/targets/receipts, source identity, schema, endpoints, recovery, initial
+proposal policy and all publication/merge gates unchanged. It authorizes no
+inferred-unfollow fallback in begin, readers or the UI. It is proposed, not accepted
+or implemented.
+
+The complete proposal and reproduction are posted at
+[issuecomment-6255876370](https://github.com/canfieldjuan/eom-email-watcher/pull/291#issuecomment-6255876370).
+Durable aliases: `calendar-follow-loss-amendment`, SHA256
+`a38f38e72e5fb0262553c2e993494b220e597ba84da7d768c79bd97c708fc71a`;
+`no-body-unfollow-observation`, SHA256
+`d3a82bb4e8ea1a27c595eb6469b90aa5d4b022caf74e8bbcdfcb3a52a9f9440c`.
+The operator has been asked to accept this amendment. Full Python qualification is
+incomplete; deliberately interrupted runs remain retained as incomplete evidence.
+The published contract-only head's green CI does not qualify the implementation.
+No implementation push, merge, installation or promotion has occurred.
