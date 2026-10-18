@@ -373,3 +373,45 @@ Full Python qualification is
 incomplete; deliberately interrupted runs remain retained as incomplete evidence.
 The published contract-only head's green CI does not qualify the implementation.
 No implementation push, merge, installation or promotion has occurred.
+
+
+## Origin amendment implementation and assertion map
+
+The pre-existing body capture was introduced by
+`e6b3e21fb99e05c67bf714f456429b39c197f747`; local calendar implementation
+`55b05e0fa4177b8d6eade61054a489cc6017f350` incorrectly treated its body-only
+receipt as the complete revocation signal. The accepted amendment repairs that
+assumption at `_capture_followed_calendar_sql` / `_recompute_derived`, using
+`_automation_message_binding_sql` and the existing logical follow owner. Calendar
+run IDs and body-only entries occupy distinct keys in the existing TEMP evidence
+table; physical selection consumes only the original body-only entries. No new
+persistent table, schema, API, body receipt or Connect invalidation is introduced.
+The guarded transaction invokes `_cancel_automation_source` once for each
+previously followed, bound authorized admission that lost logical follow.
+
+Changed assertions map to the accepted amendment as follows:
+
+| Test / change | Accepted invariant |
+| --- | --- |
+| Bodyless approved unfollow / selected-work replay | Admission-first cancellation survives restart, keeps its UUID, removes preparation and selects no provider work; body-removal receipts remain empty. |
+| Guarded-transaction negative | A raw input write cannot bypass the native acceptance transaction; rejection rolls back the entire mutation. |
+| Body/marker/none × physical aliases | Only existing retained content creates frozen body targets and receipts; all bound approved admissions receive the same cause. |
+| Rollback: added bodyless parameter | Existing injected-event-failure assertions remain intact; bodyless cancellation and follow loss roll back together. |
+| Refollow: added bodyless case | Existing denial, fresh proposal/version/consent/UUID and immutable old-admission replay assertions remain intact; the old held-body case is unchanged. |
+| Bodyless provider-owned states | Writing, uncertain lookup and completed identities/events/proposals survive unchanged when no body-removal receipt exists. |
+| Authentic schema-35 upgrade and schema-36 rebuild | A genuine older schema upgrades, TEMP admission evidence survives replacement, runtime triggers are absent during DDL, integrity and foreign keys remain valid, and subsequent guarded unfollow cancels. |
+| Migration dependency parameters | All added TEMP SQL dependencies use the existing migration suspension boundary; no DDL workaround. |
+| Logical alias move | A vanished physical thread does not cancel an admission whose logical unit is still followed; subsequent logical unfollow does. |
+| Same-source Connect preservation | Calendar-only cancellation leaves the real Connect job and dispatch byte-for-byte equivalent. |
+| Never-followed initial proposal | An unrelated config input cannot fabricate a follow-loss before-image or alter existing initial preparation. |
+
+The declared bodyless policy probe failed with `authorized` versus `cancelled`
+before the origin fix, and passed after. The new raw-SQL probe failed with
+`DID NOT RAISE` before the native transaction check. The logical-alias probe failed
+with `source_unavailable` versus `write_authorized` before canonical resolution.
+These were found and corrected locally before publication, in the same bounded
+round. Initial test setup errors (work-wrapper access, unsupported marker reason,
+a bodyless/held fixture assumption, a singular payload accessor) and test-format
+errors were classified separately; no production assertion was weakened.
+
+Full/native and final-head remote gates remain required before completion.

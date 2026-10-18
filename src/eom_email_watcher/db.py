@@ -1942,6 +1942,22 @@ def _cancel_automation_source(
     return True
 
 
+def _automation_message_binding_sql(run: str, identity: str, message: str) -> str:
+    """Bind a live physical source to its immutable automation admission."""
+    return f"""{message}.provider={run}.provider AND {message}.account_id={run}.account_id
+        AND (
+            ({identity}.mailbox_identity_key IS NOT NULL
+             AND {message}.mailbox_identity_key={identity}.mailbox_identity_key
+             AND message_source_key({message}.provider,{message}.account_id,
+                    {message}.provider_message_id,{message}.mailbox_identity_key)
+                    ={run}.source_message_key)
+            OR ({identity}.mailbox_identity_key IS NULL
+                AND {message}.mailbox_identity_key IS NULL
+                AND message_source_key({message}.provider,{message}.account_id,
+                        {message}.provider_message_id)={run}.source_message_key)
+        )"""
+
+
 def _automation_run_for_message(
     db: sqlite3.Connection,
     message_id: str,
@@ -1960,22 +1976,7 @@ def _automation_run_for_message(
         f"""SELECT {columns} FROM automation_runs AS r
         {calendar_join}
         LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-        JOIN logical_messages AS m
-          ON m.provider = r.provider
-         AND m.account_id = r.account_id
-         AND (
-             (i.mailbox_identity_key IS NOT NULL
-              AND m.mailbox_identity_key = i.mailbox_identity_key
-              AND message_source_key(
-                    m.provider, m.account_id, m.provider_message_id,
-                    m.mailbox_identity_key
-                  ) = r.source_message_key)
-             OR (i.mailbox_identity_key IS NULL
-                 AND m.mailbox_identity_key IS NULL
-                 AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id
-                     ) = r.source_message_key)
-         )
+        JOIN logical_messages AS m ON {_automation_message_binding_sql("r", "i", "m")}
         WHERE m.message_id = ? AND ({record_eligible})""",
         (message_id,),
     ).fetchone()
@@ -2087,22 +2088,7 @@ def _mark_automation_sources_unavailable(
             FROM automation_runs AS r
             LEFT JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
             LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-            JOIN messages AS m
-              ON m.provider = r.provider
-             AND m.account_id = r.account_id
-             AND (
-                 (i.mailbox_identity_key IS NOT NULL
-                  AND m.mailbox_identity_key = i.mailbox_identity_key
-                  AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id,
-                        m.mailbox_identity_key
-                      ) = r.source_message_key)
-                 OR (i.mailbox_identity_key IS NULL
-                     AND m.mailbox_identity_key IS NULL
-                     AND message_source_key(
-                            m.provider, m.account_id, m.provider_message_id
-                         ) = r.source_message_key)
-             )
+            JOIN messages AS m ON {_automation_message_binding_sql("r", "i", "m")}
             WHERE m.message_id IN ({placeholders})
             ORDER BY r.run_id""",
             tuple(chunk),
@@ -5915,7 +5901,7 @@ def _capture_followed_content_sql(scopes: str | None) -> str:
         f"EXISTS (SELECT 1 FROM ({scopes}) scope "
         f"WHERE {_derived_scope_match_sql('m', 'scope')})"
     )
-    return f"""INSERT OR IGNORE INTO derived_previous_followed
+    return f"""INSERT OR IGNORE INTO derived_previous_followed(message_id)
         SELECT member.message_id FROM (
             SELECT DISTINCT COALESCE(content.logical_of,content.message_id) AS canonical
             FROM (SELECT message_id FROM message_bodies UNION
@@ -5927,12 +5913,30 @@ def _capture_followed_content_sql(scopes: str | None) -> str:
         WHERE {condition};"""
 
 
+def _capture_followed_calendar_sql(scopes: str | None) -> str:
+    """Retain approved, bound admissions before a follow input can change."""
+    condition = "1" if scopes is None else (
+        f"EXISTS (SELECT 1 FROM ({scopes}) scope "
+        f"WHERE {_derived_scope_match_sql('m', 'scope')})"
+    )
+    return f"""INSERT OR IGNORE INTO derived_previous_followed(message_id,calendar_run_id)
+        SELECT source.message_id,r.run_id FROM automation_runs r
+        JOIN automation_calendar_writes w ON w.run_id=r.run_id AND w.status='authorized'
+        LEFT JOIN automation_run_source_identities i ON i.run_id=r.run_id
+        JOIN messages source ON {_automation_message_binding_sql("r", "i", "source")}
+        JOIN messages m ON m.message_id=COALESCE(source.logical_of,source.message_id)
+        JOIN thread_follow f ON {_followed_message_sql("m")}
+        WHERE r.state='write_authorized' AND {condition};"""
+
+
 def _track_derived_rows(db: sqlite3.Connection) -> None:
     """Connection-local row evidence; no extra persistent state or writer lists."""
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='message_derived'").fetchone():
         return
     db.execute("CREATE TEMP TABLE derived_changed_messages(message_id TEXT PRIMARY KEY)")
-    db.execute("CREATE TEMP TABLE derived_previous_followed(message_id TEXT PRIMARY KEY)")
+    db.execute("""CREATE TEMP TABLE derived_previous_followed(
+        message_id TEXT NOT NULL, calendar_run_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(message_id,calendar_run_id))""")
     db.execute("""CREATE TEMP TABLE derived_changed_threads (
         provider TEXT, account_id TEXT, identity TEXT, thread_key TEXT,
         UNIQUE(provider, account_id, identity, thread_key))""")
@@ -5953,6 +5957,7 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
                     BEFORE {event} ON main.{table}
                     WHEN NOT EXISTS (SELECT 1 FROM derived_changed_config)
                     BEGIN {_capture_followed_content_sql(None)}
+                    {_capture_followed_calendar_sql(None)}
                     INSERT OR IGNORE INTO derived_changed_config VALUES ('{table}'); END""")
             evidence = reconcile_state.coverage_input_sql(table, event) if coverage else ""
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
@@ -5987,6 +5992,7 @@ def _track_derived_rows(db: sqlite3.Connection) -> None:
                     WHEN NOT EXISTS (SELECT 1 FROM derived_changed_config)
                       AND EXISTS ({fresh_scopes})
                     BEGIN {_capture_followed_content_sql(fresh_scopes)}
+                    {_capture_followed_calendar_sql(fresh_scopes)}
                     INSERT OR IGNORE INTO derived_changed_threads {scopes}; END""")
             db.execute(f"""CREATE TEMP TRIGGER derived_{table}_{event}
                 AFTER {event}{update} ON main.{table} BEGIN {"".join(statements)} END""")
@@ -6157,11 +6163,33 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
         AND f.thread_key=thread_watermarks.thread_key AND f.followed=1)""")
 
     if tracked and removal.has_schema(db):
+        # Consume the admission before-image here, before physical body cleanup.
+        # This does not fabricate body-removal evidence or invalidate Connect.
+        admissions = db.execute(f"""SELECT DISTINCT r.*,w.transaction_id
+            FROM derived_previous_followed prior
+            JOIN automation_runs r ON r.run_id=prior.calendar_run_id
+            JOIN automation_calendar_writes w ON w.run_id=r.run_id AND w.status='authorized'
+            WHERE r.state='write_authorized' AND NOT EXISTS (
+                SELECT 1 FROM messages source
+                JOIN messages m ON m.message_id=COALESCE(source.logical_of,source.message_id)
+                JOIN thread_follow f ON {_followed_message_sql("m")}
+                WHERE source.message_id=prior.message_id)""").fetchall()
+        if admissions:
+            authority = getattr(db, "_removal_transaction", None)
+            if type(authority) is not removal._RuntimeTransaction:
+                raise RuntimeError("Fresh unfollow requires its guarded write transaction")
+            authority.require(db)
+        for admission in admissions:
+            _cancel_automation_source(
+                db, admission, updated_at=datetime.now(UTC).isoformat(), cause="thread_unfollowed"
+            )
         # Only units followed before one of this transaction's input writes
         # can become fresh unfollows. The shared helper tests current membership,
         # retained content and pending targets, then uses the one issuer/freeze.
         db._accepted_unfollow = removal.accept_unfollow_units(
-            db, [r[0] for r in db.execute("SELECT message_id FROM derived_previous_followed")],
+            db, [r[0] for r in db.execute(
+                "SELECT message_id FROM derived_previous_followed WHERE calendar_run_id=''"
+            )],
             now=datetime.now(UTC), authority=getattr(db, "_removal_transaction", None),
         )
     body_state.recompute(db)
@@ -6189,6 +6217,9 @@ class _DerivedConnection(sqlite3.Connection):
         "thread_follow",
         "message_bodies",
         "message_body_unavailable",
+        "automation_runs",
+        "automation_calendar_writes",
+        "automation_run_source_identities",
     }
     _derived_enabled = False
     _derived_ready = False
