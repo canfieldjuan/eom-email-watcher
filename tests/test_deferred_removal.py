@@ -4992,8 +4992,16 @@ def test_interactive_paused_result_rejects_reused_foreign_source(tmp_path, monke
     )
     monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.ACTIVE,
+    )
     engine_api._dispatch_automation_fire(runtime, fire.fire_id)
     job_id = attempt.dispatch_request_id
+    admitted = store.automation_fire(fire.fire_id)
+    assert admitted.state == "submitted" and admitted.reason == "connect_admitted"
+    assert admitted.job_id == job_id
     assert store.claim_connect_lane_head(
         provider_app_id=selected.app_id,
         provider_instance_id=selected.instance_id,
