@@ -94,11 +94,14 @@ test("production calendar segment renders outcome without payload or confirmatio
   const start = source.indexOf("let calendarProposal: HTMLElement | null = null;");
   const end = source.indexOf('const attachments = document.createElement("ul");', start);
   assert.ok(start >= 0 && end > start);
-  const segment = stripTypeScriptTypes(source.slice(start, end) + "globalThis.rendered = calendarProposal;");
+  const mount = 'if (calendarProposal) card.append(calendarProposal);';
+  assert.ok(source.indexOf(mount, end) > end, "the calendar status must mount without a payload gate");
+  const segment = stripTypeScriptTypes(source.slice(start, end) + mount + "globalThis.rendered = calendarProposal;");
   for (const outcome of [cancelled, { ...cancelled, status: "completed" }, { ...cancelled, status: "unresolved" }]) {
     const nodes: any[] = [];
+    const card = { children: [] as any[], append(node: any) { this.children.push(node); } };
     const context: any = {
-      item: { calendar_proposal: null, calendar_write_outcome: outcome }, calendarOutcomeNotice,
+      card, item: { calendar_proposal: null, calendar_write_outcome: outcome }, calendarOutcomeNotice,
       document: { createElement(tag: string) {
         const node = { tag, textContent: "", children: [] as any[],
           set innerHTML(_value: string) { assert.fail("calendar status must render text"); },
@@ -108,6 +111,7 @@ test("production calendar segment renders outcome without payload or confirmatio
       } },
     };
     runInNewContext(segment, context);
+    assert.equal(card.children[0], context.rendered);
     assert.equal(context.rendered.children[0].textContent, calendarOutcomeNotice(outcome as CalendarWriteOutcome, "proposal").text);
     assert.equal(nodes.filter(node => node.tag === "button").length, 0);
     assert.equal(nodes.some(node => node.textContent.includes("Meeting request")), false);

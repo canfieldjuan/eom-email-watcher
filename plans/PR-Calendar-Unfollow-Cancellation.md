@@ -54,7 +54,7 @@ Existing validated observation, before this contract:
 | `db.py:12050 recoverable_automation_runs`, `:12967 reserve_automation_extraction`, `:12298 record_automation_proposal` | Preparation and versioned consent material; these must support fresh preparation without reviving cancelled consent. |
 | `db.py:14126 _hydrate_inbox_rows` | Calendar UI currently depends on a surviving proposal payload and excludes generic source-unavailable outcomes. |
 | `engine_api.py:2646 _calendar_automation_decide`, `:2572 _hide_locked_automation_previews` | Bound decision transport and entitlement-aware projection. |
-| `desktop/src/main.ts:190 CalendarProposalPreview`, `:1745` calendar rendering; `desktop/src-tauri/src/lib.rs:2106 calendar_proposal_decide` | Existing calendar preview, status/decision UI, and native bridge. |
+| `desktop/src/main.ts:190 CalendarProposalPreview`, `:1745` calendar rendering; `desktop/src-tauri/src/lib.rs:2106 calendar_proposal_decide`; `desktop/src-tauri/src/engine.rs:1099 CalendarDecisionResult`, `:1172 InboxItem` | Existing calendar preview, status/decision UI, and typed native bridge. The native DTOs must carry the same optional outcome. |
 | `microsoft_calendar.py:898 create_calendar_event`, `:1024 find_calendar_event_by_transaction` | Provider idempotency key and bounded reconciliation lookup. |
 
 Existing controls to preserve include
@@ -280,8 +280,15 @@ The accepted policy is implemented at its existing owners:
   Decision refresh prefers a newer outcome and leaves old buttons disabled until
   a fresh projection renders. Fresh pending/declined proposals keep their own
   existing wording while the old cancelled admission remains in history.
+- `desktop/src-tauri/src/engine.rs` forwards the shared optional metadata through
+  both typed DTOs to Tauri serialization. A cold audit of implementation commit
+  `55b05e0fa4177b8d6eade61054a489cc6017f350` caught my omitted native reader: Serde
+  discarded the field in inbox and decision results. Both actual round-trip
+  regressions failed with Null instead of the outcome before the owner fix.
+  All write statuses round-trip without proposal payloads; legacy absence remains
+  accepted, and malformed/partial outcome objects are refused.
 - `docs/THREAD_VIEW_CONTRACT.md` records this accepted policy amendment. Provider,
-  schema, dependencies, workflows and native transport are unchanged.
+  schema, dependencies, workflows and native command endpoints are unchanged.
 
 ### Changed-assertion map
 
@@ -300,7 +307,8 @@ no-event, uncertain-write and rejected-write wording become exact runtime checks
 of the common formatter. The former adjacency check for decision refresh now
 checks the new projection choice and executes that production segment against a
 newer completed outcome. All other original controls/interval/invitation/assertions
-remain. Added production-segment rendering verifies exact text with no proposal,
+remain. Existing Rust assertions remain; the added native serialization and
+legacy/partial-shape probes exercise the actual DTO boundary. Added production-segment rendering verifies exact text with no proposal,
 HTML write or confirmation button; the fresh-decline regression protects the
 existing wording. No assertion is skipped or relaxed.
 
@@ -314,7 +322,7 @@ formatter. The latter has its own fail-before/pass-after regression. These were
 unpublished working changes, not failures attributed to a different commit.
 
 Earlier full Python invocations were deliberately interrupted before completion
-for the final refusal-boundary and fixture-lock corrections. Their raw outputs are
+for the final refusal-boundary, fixture-lock and omitted native DTO corrections. Their raw outputs are
 retained as interrupted pre-final evidence, not completed qualifications. The new
 API regression explicitly binds config.database_file to Store.path, and the common
 calendar fixture now uses the existing service config's database path. Final
