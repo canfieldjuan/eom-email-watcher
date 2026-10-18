@@ -32,7 +32,7 @@ def _content_available_sql(db, alias):
     """Share body-only removal eligibility; legacy schemas have no targets."""
     from . import removal
 
-    return removal.available_sql(alias, include_unfollow=True) if removal.has_schema(db) else "1"
+    return removal.CONTENT.available_sql(alias) if removal.has_schema(db) else "1"
 
 
 def pending(db, scope, *, cutoff, now, limit=None, exclude=()):
@@ -81,7 +81,7 @@ def record(store, message_id, body, *, fetched_at, reason=None):
     with store.connection() as db:
         db.execute("BEGIN IMMEDIATE")
         # A refollow cannot revive content already accepted for body-only removal.
-        if not removal.message_available(db, message_id, include_unfollow=True):
+        if not removal.CONTENT.message_available(db, message_id):
             return
         # The derived input owner may have deleted or unfollowed this source.
         present = db.execute(

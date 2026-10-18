@@ -19,6 +19,7 @@ from connect_automate.entitlement import (
     feature_entitlements_active,
 )
 
+from . import removal
 from .config import (
     Config,
     admission_sender_display_name,
@@ -639,7 +640,9 @@ def process_scheduling_automations(
                         processed += 1
                         review_required += 1
                         continue
-                    if not store.source_start(automation_run_id=run.run_id):
+                    if not store.source_start(
+                        automation_run_id=run.run_id, eligibility=removal.CONTENT
+                    ):
                         continue
                     metadata = mailbox.gateway.metadata(work.provider_message_id)
                     if (
@@ -649,7 +652,7 @@ def process_scheduling_automations(
                         raise MailboxMessageUnavailable(
                             "Scheduling source is no longer in the inbox"
                         )
-                    if not store.source_start(work.message_id, include_unfollow=True):
+                    if not store.source_start(work.message_id, eligibility=removal.CONTENT):
                         continue
                     content = mailbox.gateway.content(
                         work.provider_message_id, body_char_limit,
@@ -953,7 +956,9 @@ def process_scheduling_proposals(
                 attendees = tuple(item.email for item in extraction.attendees)
                 candidates = _proposal_candidates(extraction, observed_at=attempt_time)
                 request_sha256 = _proposal_request_sha256(attendees, candidates)
-                if not store.source_start(automation_run_id=work.run.run_id):
+                if not store.source_start(
+                    automation_run_id=work.run.run_id, eligibility=removal.CONTENT
+                ):
                     continue
                 result = find_meeting_time(access.authorization, attendees, candidates)
             except MicrosoftAuthorizationRejected as exc:
@@ -1339,7 +1344,9 @@ def _deliver_automation_review_intent(
             ntfy_url=config.ntfy_url,
             ntfy_content_disclosure_acknowledged=(config.ntfy_content_disclosure_acknowledged),
             dry_run=dry_run,
-            source_start=lambda: store.source_start(automation_run_id=intent.subject_id),
+            source_start=lambda: store.source_start(
+                automation_run_id=intent.subject_id, eligibility=removal.CONTENT
+            ),
         )
         if not delivery.delivered:
             return False
@@ -2599,8 +2606,11 @@ class Watcher:
         candidates = (*message_ids, *(i for i in known_locations if i not in batch))
         for provider_message_id in candidates:
             if not self.store.source_start(
-                provider=self.mailbox.provider, account_id=self.mailbox.account_id,
-                mailbox_identity_key=mailbox_identity_key, provider_message_id=provider_message_id,
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=provider_message_id,
+                eligibility=removal.RECORD,
             ):
                 continue
             if self.store.has_seen_message(
@@ -2955,7 +2965,9 @@ class Watcher:
                     self.config.ntfy_content_disclosure_acknowledged
                 ),
                 dry_run=dry_run,
-                source_start=lambda: self.store.source_start(message.message_id),
+                source_start=lambda: self.store.source_start(
+                    message.message_id, eligibility=removal.CONTENT
+                ),
             )
             if not delivery.delivered:
                 return 0
@@ -3002,7 +3014,9 @@ class Watcher:
                 ),
                 partial_summary=partial_summary,
                 dry_run=dry_run,
-                source_start=lambda: self.store.source_start(message.message_id),
+                source_start=lambda: self.store.source_start(
+                    message.message_id, eligibility=removal.CONTENT
+                ),
             )
             if not delivery.delivered:
                 return 0

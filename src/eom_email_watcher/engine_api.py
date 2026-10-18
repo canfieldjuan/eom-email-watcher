@@ -2971,7 +2971,7 @@ def _verified_mailbox_attachment_bytes(
     *,
     source_provider_message_id: str | None = None,
 ) -> bytes:
-    if not runtime.store.source_start(source.message_id):
+    if not runtime.store.source_start(source.message_id, eligibility=removal.CONTENT):
         raise ApiError(
             "connect_source_unavailable",
             "The source attachment is no longer available for handoff.",
@@ -3561,7 +3561,9 @@ def _run_connect_job(
 ) -> dict[str, object]:
     if content is not None:
         current = runtime.store.connect_job(job.job_id)
-        if current is None or not runtime.store.source_start(current.message_id):
+        if current is None or not runtime.store.source_start(
+            current.message_id, eligibility=removal.CONTENT
+        ):
             raise ApiError(
                 "connect_source_unavailable",
                 "The source attachment is no longer available for handoff.",
@@ -5661,7 +5663,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         job = None
 
     with runtime.store.source_locks((message_id,)):
-        if not runtime.store.source_start(message_id):
+        if not runtime.store.source_start(message_id, eligibility=removal.CONTENT):
             raise ApiError(
                 "connect_source_unavailable",
                 "The source attachment is no longer available for handoff.",

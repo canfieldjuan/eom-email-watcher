@@ -2894,7 +2894,7 @@ def _certificate_assert_projection(
             raise RuntimeError("Stored certificate policy projection is inconsistent")
 
 
-def _automation_source_available_sql(alias: str) -> str:
+def _automation_source_available_sql(alias: str, *, eligibility) -> str:
     """Resolve the existing run source key through live and frozen bindings."""
     return f"""NOT EXISTS (
         SELECT 1 FROM (
@@ -2925,12 +2925,16 @@ def _automation_source_available_sql(alias: str) -> str:
                 AND source.mailbox_identity_key IS NULL
                 AND message_source_key(source.provider,source.account_id,
                         source.provider_message_id)={alias}.source_message_key)
-          ) AND NOT ({removal.available_sql("source")})
+          ) AND NOT ({eligibility.available_sql("source")})
     )"""
 
 
-def _automation_source_available(db: sqlite3.Connection, run_id: str) -> bool:
-    eligible = _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+def _automation_source_available(db: sqlite3.Connection, run_id: str, *, eligibility) -> bool:
+    eligible = (
+        _automation_source_available_sql("r", eligibility=eligibility)
+        if removal.has_schema(db)
+        else "1"
+    )
     row = db.execute(
         f"SELECT ({eligible}) FROM automation_runs r WHERE r.run_id=?", (run_id,),
     ).fetchone()
@@ -2946,8 +2950,8 @@ def _connect_source_available(db: sqlite3.Connection, job: ConnectJob) -> bool:
         WHERE fire.job_id=? AND identity.message_id=? AND identity.part_id=?""",
         (job.job_id, job.message_id, job.part_id),
     ).fetchall()
-    return removal.message_available(
-        db, job.message_id, require_source=False, retained_bindings=bindings,
+    return removal.CONTENT.message_available(
+        db, job.message_id, require_source=False, retained_bindings=bindings
     )
 
 
@@ -3028,8 +3032,8 @@ def _certificate_source_for_job(
     else:
         raise CertificateResultInvalid("certificate source identity is unavailable")
 
-    if not removal.message_available(
-        db, job.message_id, require_source=False, retained_bindings=(source,),
+    if not removal.CONTENT.message_available(
+        db, job.message_id, require_source=False, retained_bindings=(source,)
     ):
         return None, tuple(fire_ids)
 
@@ -4085,7 +4089,7 @@ def _refresh_logical_messages_view(db: sqlite3.Connection) -> None:
     always the current ones.
     """
     db.execute("DROP VIEW IF EXISTS logical_messages")
-    eligible = " AND " + removal.available_sql("messages") if removal.has_schema(db) else ""
+    eligible = " AND " + removal.RECORD.available_sql("messages") if removal.has_schema(db) else ""
     db.execute(
         "CREATE VIEW logical_messages AS SELECT * FROM messages WHERE logical_of IS NULL" + eligible
     )
@@ -5983,6 +5987,7 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
         )
     body_state.recompute(db)
 
+
 class _DerivedCursor(sqlite3.Cursor):
     def execute(self, sql, parameters=()):
         self.connection._prepare_derived_write(sql, parameters)
@@ -6640,8 +6645,11 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             eligible = (
-                removal.retained_available_sql("certificate", message_id_field="source_message_id")
-                if removal.has_schema(db) else "1"
+                removal.CONTENT.retained_available_sql(
+                    "certificate", message_id_field="source_message_id"
+                )
+                if removal.has_schema(db)
+                else "1"
             )
             rows = db.execute(
                 f"""SELECT certificate.certificate_id, policy.policy_id, policy.ordinal,
@@ -9563,9 +9571,12 @@ class Store:
     def reconcile_source(self, provider, account_id, mailbox_identity_key, source_id):
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.source_available(
-                db, provider=provider, account_id=account_id,
-                mailbox_identity_key=mailbox_identity_key, provider_message_id=source_id,
+            if not removal.RECORD.source_available(
+                db,
+                provider=provider,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=source_id,
             ):
                 return None
             row = db.execute(
@@ -9605,7 +9616,7 @@ class Store:
                 _stored_source_membership_sql() + " LIMIT 1",
                 (provider, account_id, mailbox_identity_key, metadata.message_id),
             ).fetchone()
-            if row is None or not removal.message_available(db, row["logical_id"]):
+            if row is None or not removal.RECORD.message_available(db, row["logical_id"]):
                 return
             logical_id = row["logical_id"]
             _record_locations(
@@ -9714,28 +9725,37 @@ class Store:
         return (canonical, *others)
 
     def source_start(
-        self, message_id=None, *, provider=None, account_id=None,
-        mailbox_identity_key=None, provider_message_id=None, include_unfollow=False,
+        self,
+        message_id=None,
+        *,
+        provider=None,
+        account_id=None,
+        mailbox_identity_key=None,
+        provider_message_id=None,
+        eligibility,
         automation_run_id=None,
     ) -> bool:
         """Serialize source admission with acceptance; release before external work."""
+        if eligibility is not removal.CONTENT and eligibility is not removal.RECORD:
+            raise TypeError("source_start requires CONTENT or RECORD eligibility")
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if automation_run_id is not None:
-                return _automation_source_available(db, automation_run_id)
+                return _automation_source_available(db, automation_run_id, eligibility=eligibility)
             if message_id is not None:
-                return removal.message_available(db, message_id, include_unfollow=include_unfollow)
-            return removal.source_available(
-                db, provider=provider, account_id=account_id,
+                return eligibility.message_available(db, message_id)
+            return eligibility.source_available(
+                db,
+                provider=provider,
+                account_id=account_id,
                 mailbox_identity_key=mailbox_identity_key,
                 provider_message_id=provider_message_id,
-                include_unfollow=include_unfollow,
             )
 
     def message_source(self, message_id: str) -> MessageSource:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 raise KeyError(message_id)
             row = db.execute(
                 """SELECT message_id, provider, account_id, provider_message_id,
@@ -9846,9 +9866,13 @@ class Store:
         ).fetchone()
         if account is None or account["mailbox_identity_key"] != mailbox_identity_key:
             raise MailboxIdentityChanged("mailbox identity changed")
-        if not removal.source_available(
-            db, message_id=message_id, provider=provider, account_id=account_id,
-            mailbox_identity_key=mailbox_identity_key, provider_message_id=source_message_id,
+        if not removal.RECORD.source_available(
+            db,
+            message_id=message_id,
+            provider=provider,
+            account_id=account_id,
+            mailbox_identity_key=mailbox_identity_key,
+            provider_message_id=source_message_id,
         ):
             return False
         if admission.kind == "gmail_user_label" and (
@@ -9892,7 +9916,7 @@ class Store:
                 rfc_message_id,
                 other_than=source_message_id,
             )
-        if logical_id is not None and not removal.message_available(db, logical_id):
+        if logical_id is not None and not removal.RECORD.message_available(db, logical_id):
             return False
         if provider == "imap":
             thread_ids = tuple(
@@ -10206,7 +10230,7 @@ class Store:
                 f"{_stored_source_membership_sql()} LIMIT 1",
                 (provider, account_id, mailbox_identity_key, provider_message_id),
             ).fetchone()
-            if row is None or not removal.message_available(db, row["logical_id"]):
+            if row is None or not removal.RECORD.message_available(db, row["logical_id"]):
                 return 0
             recorded = _record_locations(
                 db,
@@ -10530,7 +10554,7 @@ class Store:
             ).fetchone()
             if job is None:
                 raise RuntimeError("Connect dispatch is missing its job")
-            eligible = removal.message_available(db, str(job["message_id"]))
+            eligible = removal.CONTENT.message_available(db, str(job["message_id"]))
             values = dict(row)
             values["source_available"] = bool(row["source_available"]) and eligible
         return self._connect_dispatch(values)
@@ -10878,7 +10902,7 @@ class Store:
                 return None
             if row["claim_dispatch_state"] != "dispatching" and not bool(row["claim_is_due"]):
                 return None
-            eligible = removal.message_available(db, str(row["message_id"]))
+            eligible = removal.CONTENT.message_available(db, str(row["message_id"]))
             if (not eligible and row["claim_dispatch_state"] == "waiting"
                     and not bool(row["claim_submission_possible"])):
                 return None
@@ -11182,7 +11206,7 @@ class Store:
         stamp = created_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 raise KeyError((message_id, part_id))
             if (
                 db.execute(
@@ -11915,7 +11939,7 @@ class Store:
             ).fetchone()
             if current is None or current["status"] != expected_state:
                 raise RuntimeError("Connect job resubmission lost its expected-state race")
-            if not removal.message_available(db, str(current["message_id"])):
+            if not removal.CONTENT.message_available(db, str(current["message_id"])):
                 raise KeyError(str(current["message_id"]))
             is_v2 = int(current["protocol_version"]) == 2
             if is_v2:
@@ -11988,12 +12012,13 @@ class Store:
             parameters.extend((provider, account_id))
         parameters.append(limit)
         with self.connection() as db:
+            eligible = removal.CONTENT.available_sql("m") if removal.has_schema(db) else "1"
             rows = db.execute(
                 f"""SELECT message_id, provider, account_id, provider_message_id,
                 mailbox_identity_key, thread_id, sender, sender_name, subject, received_at,
                 attempts, fallback_notified_at, analysis_request_id, analysis_context_at,
-                analysis_body_char_limit FROM logical_messages
-                WHERE status = 'pending' AND COALESCE(analysis_retryable, 1) = 1
+                analysis_body_char_limit FROM logical_messages AS m
+                WHERE ({eligible}) AND status = 'pending' AND COALESCE(analysis_retryable, 1) = 1
                 AND (next_retry_at IS NULL OR next_retry_at <= ?){scope}
                 ORDER BY received_at LIMIT ?""",
                 parameters,
@@ -12008,12 +12033,14 @@ class Store:
     ) -> bool:
         _require_mailbox_identity_key(mailbox_identity_key)
         with self.connection() as db:
+            eligible = removal.CONTENT.available_sql("m") if removal.has_schema(db) else "1"
             row = db.execute(
-                """SELECT 1 FROM logical_messages AS m
+                f"""SELECT 1 FROM logical_messages AS m
                 JOIN mail_accounts AS a
                   ON a.provider = m.provider AND a.account_id = m.account_id
                  AND a.mailbox_identity_key = m.mailbox_identity_key
-                WHERE m.status = 'pending' AND COALESCE(m.analysis_retryable, 1) = 1
+                WHERE ({eligible}) AND m.status = 'pending'
+                  AND COALESCE(m.analysis_retryable, 1) = 1
                   AND m.provider = ? AND m.account_id = ? AND m.mailbox_identity_key = ?
                 LIMIT 1""",
                 (provider, account_id, mailbox_identity_key),
@@ -12110,7 +12137,7 @@ class Store:
     def automation_extraction_payloads(self, run_id: str) -> list[AutomationExtractionPayload]:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not _automation_source_available(db, run_id):
+            if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                 return []
             rows = db.execute(
                 """SELECT * FROM automation_extraction_payloads
@@ -12226,7 +12253,7 @@ class Store:
     def automation_proposal(self, run_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not _automation_source_available(db, run_id):
+            if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                 return None
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
@@ -12240,7 +12267,7 @@ class Store:
     def automation_proposal_for_message(self, message_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 return None
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
@@ -12381,7 +12408,7 @@ class Store:
         created_at = stamp.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not _automation_source_available(db, run_id):
+            if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                 raise KeyError(run_id)
             row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             extraction = db.execute(
@@ -12962,12 +12989,9 @@ class Store:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not _automation_source_available(db, run_id):
+            if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                 raise KeyError(run_id)
-            row = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             if row is None:
                 raise KeyError(run_id)
             if (
@@ -13114,12 +13138,9 @@ class Store:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not _automation_source_available(db, run_id):
+            if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                 raise KeyError(run_id)
-            row = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             payload = db.execute(
                 "SELECT * FROM automation_extraction_payloads WHERE payload_id = ?",
                 (payload_id,),
@@ -13192,8 +13213,7 @@ class Store:
                 payload_id=payload_id,
             )
             updated = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?",
-                (run_id,),
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
             ).fetchone()
         if updated is None:
             raise RuntimeError("Automation extraction failure was not readable")
@@ -13240,12 +13260,9 @@ class Store:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not _automation_source_available(db, run_id):
+            if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                 raise KeyError(run_id)
-            row = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             payload = db.execute(
                 "SELECT * FROM automation_extraction_payloads WHERE payload_id = ?",
                 (payload_id,),
@@ -13327,8 +13344,7 @@ class Store:
                 payload_sha256=result_sha256,
             )
             updated = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?",
-                (run_id,),
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
             ).fetchone()
         if updated is None:
             raise RuntimeError("Automation extraction result was not readable")
@@ -13470,7 +13486,7 @@ class Store:
         context_at = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 raise KeyError(message_id)
             row = db.execute(
                 """SELECT status, analysis_request_id, analysis_context_at,
@@ -13502,12 +13518,14 @@ class Store:
     ) -> list[AnalyzedMessage]:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
+            eligible = removal.CONTENT.available_sql("m") if removal.has_schema(db) else "1"
             rows = db.execute(
-                """SELECT message_id, sender, sender_name, subject, received_at, attempts,
+                f"""SELECT message_id, sender, sender_name, subject, received_at, attempts,
                 fallback_notified_at, category, priority, summary, action_required,
                 suggested_action, deadline_text, deadline_iso, confidence,
-                analysis_body_chars, analysis_body_source_chars FROM logical_messages
-                WHERE status = 'analyzed' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                analysis_body_chars, analysis_body_source_chars FROM logical_messages AS m
+                WHERE ({eligible}) AND status = 'analyzed'
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY received_at LIMIT ?""",
                 (stamp, limit),
             ).fetchall()
@@ -13589,7 +13607,7 @@ class Store:
     def mark_fallback_notified(self, message_id: str) -> None:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 return
             db.execute(
                 "UPDATE messages SET fallback_notified_at = ? WHERE message_id = ?",
@@ -13631,7 +13649,7 @@ class Store:
         stamp = admitted_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 raise KeyError(message_id)
             source = db.execute(
                 """SELECT status, provider, account_id, provider_message_id, discovered_at,
@@ -13808,7 +13826,7 @@ class Store:
     def mark_delivery_complete(self, message_id: str, notified: bool) -> None:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 return
             db.execute(
                 """UPDATE messages SET status='summarized', next_retry_at=NULL,
@@ -13824,8 +13842,11 @@ class Store:
     ) -> list[NotificationIntent]:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            message_eligible = removal.CONTENT.available_sql("m") if removal.has_schema(db) else "1"
             source_eligible = (
-                _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+                _automation_source_available_sql("r", eligibility=removal.CONTENT)
+                if removal.has_schema(db)
+                else "1"
             )
             rows = db.execute(
                 f"""SELECT subject_type, subject_id, revision, message_id, kind,
@@ -13839,10 +13860,11 @@ class Store:
                 sender, sender_name, subject, analysis_at, priority, summary,
                 suggested_action, deadline_iso, last_error,
                 analysis_body_chars, analysis_body_source_chars, received_at AS sort_at
-                FROM logical_messages
-                WHERE (status = 'analyzed' AND notified_at IS NULL)
-                   OR (status = 'pending' AND last_error IS NOT NULL
-                       AND fallback_notified_at IS NULL)
+                FROM logical_messages AS m
+                WHERE ({message_eligible}) AND (
+                    (status = 'analyzed' AND notified_at IS NULL)
+                    OR (status = 'pending' AND last_error IS NOT NULL
+                        AND fallback_notified_at IS NULL))
                 UNION ALL
                 SELECT 'automation_run' AS subject_type, r.run_id AS subject_id,
                     CAST(r.state_version AS TEXT) AS revision, r.run_id AS message_id,
@@ -13901,15 +13923,19 @@ class Store:
     def notification_intent_count(self) -> int:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            message_eligible = removal.CONTENT.available_sql("m") if removal.has_schema(db) else "1"
             source_eligible = (
-                _automation_source_available_sql("r") if removal.has_schema(db) else "1"
+                _automation_source_available_sql("r", eligibility=removal.CONTENT)
+                if removal.has_schema(db)
+                else "1"
             )
             row = db.execute(
                 f"""SELECT
-                    (SELECT COUNT(*) FROM logical_messages
-                     WHERE (status = 'analyzed' AND notified_at IS NULL)
-                        OR (status = 'pending' AND last_error IS NOT NULL
-                            AND fallback_notified_at IS NULL))
+                    (SELECT COUNT(*) FROM logical_messages AS m
+                     WHERE ({message_eligible}) AND (
+                         (status = 'analyzed' AND notified_at IS NULL)
+                         OR (status = 'pending' AND last_error IS NOT NULL
+                             AND fallback_notified_at IS NULL)))
                     +
                     (SELECT COUNT(*) FROM automation_runs AS r
                      WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
@@ -13948,7 +13974,7 @@ class Store:
             stamp = datetime.now(UTC).isoformat()
             with self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
-                if not _automation_source_available(db, run_id):
+                if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                     raise KeyError(run_id)
                 row = db.execute(
                     """SELECT state, state_version, review_notified_at
@@ -13979,7 +14005,7 @@ class Store:
         stamp = datetime.now(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not removal.message_available(db, message_id):
+            if not removal.CONTENT.message_available(db, message_id):
                 raise KeyError(message_id)
             row = db.execute(
                 """SELECT status, analysis_at, fallback_notified_at, notified_at, last_error

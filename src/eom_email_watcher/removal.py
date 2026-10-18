@@ -254,119 +254,134 @@ def has_schema(db):
     )
 
 
-def available_sql(alias, *, include_unfollow=False):
-    """The one frozen-target predicate, for stored rows and candidate sources.
+@dataclass(frozen=True)
+class _Eligibility:
+    """Explicit operation policy sharing one frozen-target implementation."""
 
-    Aliases are static SQL names supplied by owners, never request input. Stable
-    stored identity and frozen source membership survive canonical promotion;
-    neither gives an old request authority over a reused id in another binding.
-    A legacy source can lack a stored identity and location; its intent keeps
-    the effective binding for later provider starts, even after the row is gone.
-    """
-    kinds = "1" if include_unfollow else "i.kind IN ('delete','clear')"
-    return f"""NOT EXISTS (
-        SELECT 1 FROM message_removal_targets t
-        JOIN message_removal_intents i ON i.intent_id=t.intent_id
-        WHERE t.state='pending' AND i.state='pending' AND {kinds}
-        AND t.provider={alias}.provider AND t.account_id={alias}.account_id
-        AND (
-            (t.message_id={alias}.message_id
-             AND t.stored_identity_key IS {alias}.mailbox_identity_key
-             AND t.provider_message_id={alias}.provider_message_id)
-            OR (t.provider_message_id={alias}.provider_message_id
-                AND i.mailbox_identity_key IS {alias}.mailbox_identity_key)
-            OR EXISTS (SELECT 1 FROM json_each(t.source_identities_json) s
-                WHERE json_extract(s.value,'$.provider')={alias}.provider
-                AND json_extract(s.value,'$.account_id')={alias}.account_id
-                AND json_extract(s.value,'$.mailbox_identity_key')
-                    IS {alias}.mailbox_identity_key
-                AND json_extract(s.value,'$.provider_message_id')={alias}.provider_message_id)
-        ))"""
+    _include_unfollow: bool
+
+    def available_sql(self, alias):
+        """The one frozen-target predicate, for stored rows and candidate sources.
+
+        Aliases are static SQL names supplied by owners, never request input. Stable
+        stored identity and frozen source membership survive canonical promotion;
+        neither gives an old request authority over a reused id in another binding.
+        A legacy source can lack a stored identity and location; its intent keeps
+        the effective binding for later provider starts, even after the row is gone.
+        """
+        kinds = "1" if self._include_unfollow else "i.kind IN ('delete','clear')"
+        return f"""NOT EXISTS (
+            SELECT 1 FROM message_removal_targets t
+            JOIN message_removal_intents i ON i.intent_id=t.intent_id
+            WHERE t.state='pending' AND i.state='pending' AND {kinds}
+            AND t.provider={alias}.provider AND t.account_id={alias}.account_id
+            AND (
+                (t.message_id={alias}.message_id
+                 AND t.stored_identity_key IS {alias}.mailbox_identity_key
+                 AND t.provider_message_id={alias}.provider_message_id)
+                OR (t.provider_message_id={alias}.provider_message_id
+                    AND i.mailbox_identity_key IS {alias}.mailbox_identity_key)
+                OR EXISTS (SELECT 1 FROM json_each(t.source_identities_json) s
+                    WHERE json_extract(s.value,'$.provider')={alias}.provider
+                    AND json_extract(s.value,'$.account_id')={alias}.account_id
+                    AND json_extract(s.value,'$.mailbox_identity_key')
+                        IS {alias}.mailbox_identity_key
+                    AND json_extract(s.value,'$.provider_message_id')={alias}.provider_message_id)
+            ))"""
+
+    def retained_available_sql(self, alias, *, message_id_field="message_id"):
+        """Apply target eligibility to a live or frozen, retained source binding."""
+        bound_id = f"{alias}.{message_id_field}"
+        live = f"""live.message_id={bound_id} AND live.provider={alias}.provider
+            AND live.account_id={alias}.account_id
+            AND live.mailbox_identity_key IS {alias}.mailbox_identity_key"""
+        return f"""NOT EXISTS (
+            SELECT 1 FROM (
+                SELECT live.message_id,live.provider,live.account_id,
+                    live.mailbox_identity_key,live.provider_message_id
+                FROM messages live WHERE {live}
+                UNION ALL
+                SELECT frozen.message_id,frozen.provider,frozen.account_id,
+                    frozen.stored_identity_key AS mailbox_identity_key,frozen.provider_message_id
+                FROM message_removal_targets frozen
+                JOIN message_removal_intents intent ON intent.intent_id=frozen.intent_id
+                WHERE frozen.message_id={bound_id} AND frozen.provider={alias}.provider
+                    AND frozen.account_id={alias}.account_id
+                    AND intent.mailbox_identity_key IS {alias}.mailbox_identity_key
+                    AND NOT EXISTS (SELECT 1 FROM messages live WHERE {live})
+            ) candidate WHERE NOT ({self.available_sql("candidate")})
+        )"""
+
+    def source_available(
+        self,
+        db,
+        *,
+        provider,
+        account_id,
+        mailbox_identity_key,
+        provider_message_id,
+        message_id=None,
+    ):
+        if not has_schema(db):
+            return True
+        return bool(
+            db.execute(
+                f"""SELECT {self.available_sql("source")} FROM (
+                SELECT ? AS message_id, ? AS provider, ? AS account_id,
+                    ? AS mailbox_identity_key, ? AS provider_message_id) source""",
+                (message_id, provider, account_id, mailbox_identity_key, provider_message_id),
+            ).fetchone()[0]
+        )
+
+    def message_available(
+        self,
+        db,
+        message_id,
+        *,
+        require_source=True,
+        retained_bindings=(),
+    ):
+        schema = has_schema(db)
+        # A retained receipt belongs to its frozen source, not to an unrelated live
+        # row that happens to reuse the same local id. Check every retained binding
+        # before considering the live row as evidence for this operation.
+        if schema:
+            for binding in retained_bindings:
+                available = db.execute(
+                    f"""SELECT ({self.retained_available_sql("retained")})
+                        FROM (SELECT ? AS message_id,? AS provider,? AS account_id,
+                            ? AS mailbox_identity_key) retained""",
+                    (
+                        message_id,
+                        binding["provider"],
+                        binding["account_id"],
+                        binding["mailbox_identity_key"],
+                    ),
+                ).fetchone()[0]
+                if not available:
+                    return False
+        eligible = self.available_sql("m") if schema else "1"
+        row = db.execute(
+            f"""SELECT ({eligible}),provider,account_id,mailbox_identity_key
+                FROM messages m WHERE m.message_id=?""",
+            (message_id,),
+        ).fetchone()
+        if row is not None and (
+            not retained_bindings
+            or any(
+                (row[1], row[2], row[3])
+                == (binding["provider"], binding["account_id"], binding["mailbox_identity_key"])
+                for binding in retained_bindings
+            )
+        ):
+            return bool(row[0])
+        # Existing source-less terminal receipts remain valid only when no pending
+        # target in their retained bindings withheld eligibility above.
+        return not require_source
 
 
-def retained_available_sql(alias, *, message_id_field="message_id", include_unfollow=False):
-    """Apply target eligibility to a live or frozen, retained source binding."""
-    bound_id = f"{alias}.{message_id_field}"
-    live = f"""live.message_id={bound_id} AND live.provider={alias}.provider
-        AND live.account_id={alias}.account_id
-        AND live.mailbox_identity_key IS {alias}.mailbox_identity_key"""
-    return f"""NOT EXISTS (
-        SELECT 1 FROM (
-            SELECT live.message_id,live.provider,live.account_id,
-                live.mailbox_identity_key,live.provider_message_id
-            FROM messages live WHERE {live}
-            UNION ALL
-            SELECT frozen.message_id,frozen.provider,frozen.account_id,
-                frozen.stored_identity_key AS mailbox_identity_key,frozen.provider_message_id
-            FROM message_removal_targets frozen
-            JOIN message_removal_intents intent ON intent.intent_id=frozen.intent_id
-            WHERE frozen.message_id={bound_id} AND frozen.provider={alias}.provider
-                AND frozen.account_id={alias}.account_id
-                AND intent.mailbox_identity_key IS {alias}.mailbox_identity_key
-                AND NOT EXISTS (SELECT 1 FROM messages live WHERE {live})
-        ) candidate WHERE NOT ({available_sql("candidate", include_unfollow=include_unfollow)})
-    )"""
-
-
-def source_available(
-    db,
-    *,
-    provider,
-    account_id,
-    mailbox_identity_key,
-    provider_message_id,
-    message_id=None,
-    include_unfollow=False,
-):
-    if not has_schema(db):
-        return True
-    return bool(
-        db.execute(
-            f"""SELECT {available_sql("source", include_unfollow=include_unfollow)} FROM (
-            SELECT ? AS message_id, ? AS provider, ? AS account_id,
-                ? AS mailbox_identity_key, ? AS provider_message_id) source""",
-            (message_id, provider, account_id, mailbox_identity_key, provider_message_id),
-        ).fetchone()[0]
-    )
-
-
-def message_available(
-    db,
-    message_id,
-    *,
-    include_unfollow=False,
-    require_source=True,
-    retained_bindings=(),
-):
-    schema = has_schema(db)
-    eligible = available_sql("m", include_unfollow=include_unfollow) if schema else "1"
-    row = db.execute(
-        f"SELECT ({eligible}) FROM messages m WHERE m.message_id=?",
-        (message_id,),
-    ).fetchone()
-    if row is not None:
-        return bool(row[0])
-    if require_source:
-        return False
-    # Existing source-less terminal receipts remain valid. If the live row has
-    # disappeared during an accepted request, its immutable retained binding
-    # selects the frozen source candidates for the SAME eligibility predicate.
-    if schema:
-        for binding in retained_bindings:
-            candidates = db.execute(
-                f"""SELECT ({retained_available_sql("retained", include_unfollow=include_unfollow)})
-                    FROM (SELECT ? AS message_id,? AS provider,? AS account_id,
-                        ? AS mailbox_identity_key) retained""",
-                (
-                    message_id,
-                    binding["provider"],
-                    binding["account_id"],
-                    binding["mailbox_identity_key"],
-                ),
-            ).fetchall()
-            if any(not candidate[0] for candidate in candidates):
-                return False
-    return True
+CONTENT = _Eligibility(True)
+RECORD = _Eligibility(False)
 
 
 def freeze(db, key, kind, message_ids, *, accepted_at):
@@ -432,7 +447,7 @@ def _accept_in_transaction(db, key, kind, parameters, message_ids, *, now, autho
     validate_key(db, key, kind, fingerprint, now=now)
     if kind == "delete":
         message_ids = [parameters["message_id"]]
-        if not message_available(db, message_ids[0]):
+        if not RECORD.message_available(db, message_ids[0]):
             raise KeyError(message_ids[0])
     elif kind == "clear":
         message_ids = [r[0] for r in db.execute("SELECT message_id FROM logical_messages")]
@@ -664,7 +679,7 @@ def accept_unfollow_units(db, candidates, *, now, authority):
             (canonical,),
         ).fetchone():
             continue
-        if any(not message_available(db, row_id, include_unfollow=True) for row_id in unit.rows):
+        if any(not CONTENT.message_available(db, row_id) for row_id in unit.rows):
             continue
         if not db.execute(
             "SELECT 1 FROM message_bodies WHERE message_id IN (SELECT value FROM json_each(?)) "

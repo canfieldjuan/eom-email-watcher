@@ -11,7 +11,7 @@ from conftest import local_removal
 from test_thread_bodies import followed, legacy_body_store
 from test_thread_reconcile import NOW
 
-from eom_email_watcher import body_state, thread_migration
+from eom_email_watcher import body_state, removal, thread_migration
 from eom_email_watcher import db as database
 
 
@@ -801,9 +801,11 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
         if owner in {"notification_intents", "notification_intent_count"}:
             return getattr(store, owner)()
         if owner == "notification_source_start":
-            return store.source_start(target_id)
+            return store.source_start(target_id, eligibility=removal.CONTENT)
         if owner == "notification_review_start":
-            return store.source_start(automation_run_id=notification.subject_id)
+            return store.source_start(
+                automation_run_id=notification.subject_id, eligibility=removal.CONTENT
+            )
         if owner == "mark_fallback_notified":
             return store.mark_fallback_notified(target_id)
         if owner == "mark_delivery_complete":
@@ -861,7 +863,7 @@ def test_source_decision_serializes_with_real_acceptance(tmp_path, monkeypatch, 
                 provider_instance_id=selected.instance_id,
             )
         if owner == "source_start":
-            return store.source_start(target_id)
+            return store.source_start(target_id, eligibility=removal.CONTENT)
         if owner == "message_source":
             return store.message_source(target_id)
         if owner == "mark_analyzed":
@@ -1601,13 +1603,10 @@ def test_missing_source_eligibility_preserves_retained_binding(tmp_path, monkeyp
         assert binding != dict(provider="gmail", account_id="mailbox", mailbox_identity_key=KEY)
     with store.connection() as db:
         db.execute("DELETE FROM messages")
-        assert removal.message_available(
-            db,
-            "m",
-            require_source=False,
-            retained_bindings=(binding,),
+        assert removal.RECORD.message_available(
+            db, "m", require_source=False, retained_bindings=(binding,)
         ) is (changed is not None)
-        assert not removal.message_available(db, "m")
+        assert not removal.RECORD.message_available(db, "m")
         db.execute(
             "INSERT INTO maintenance_state VALUES('source_lock_protocol',?,?)",
             (source_locks.SOURCE_LOCK_PROTOCOL, NOW.isoformat()),
@@ -1615,11 +1614,8 @@ def test_missing_source_eligibility_preserves_retained_binding(tmp_path, monkeyp
     source_locks.qualify_protocol(store, fresh=False)
     with store.connection() as db:
         assert removal.outcome(db, accepted["data"]["request_id"]).completed == 1
-        assert removal.message_available(
-            db,
-            "m",
-            require_source=False,
-            retained_bindings=(binding,),
+        assert removal.RECORD.message_available(
+            db, "m", require_source=False, retained_bindings=(binding,)
         )
 
 
@@ -1772,7 +1768,7 @@ def test_frozen_alias_source_membership_survives_missing_row(
         before = dict(source)
         source[changed] = "e" * 64 if changed == "mailbox_identity_key" else "unrelated"
         assert source != before
-    assert store.source_start(**source)
+    assert store.source_start(**source, eligibility=removal.CONTENT)
 
     def accept():
         with removal.acceptance_scope(store) as acceptance:
@@ -1784,14 +1780,14 @@ def test_frozen_alias_source_membership_survives_missing_row(
         with ThreadPoolExecutor(max_workers=1) as pool:
             reply = pool.submit(accept).result(timeout=10)
         assert reply.pending == 1
-        assert store.source_start(**source) is (changed is not None)
+        assert store.source_start(**source, eligibility=removal.CONTENT) is (changed is not None)
         with store.connection() as db:
             assert db.execute(
                 "SELECT 1 FROM message_removal_targets WHERE message_id=?",
                 (target_id,),
             ).fetchone()
             db.execute("DELETE FROM messages WHERE message_id=?", (target_id,))
-        assert store.source_start(**source) is (changed is not None)
+        assert store.source_start(**source, eligibility=removal.CONTENT) is (changed is not None)
 
 
 def test_reconcile_source_does_not_expose_accepted_physical_target(tmp_path, monkeypatch):
@@ -2906,8 +2902,8 @@ def test_saved_unfollow_conversion_is_atomic_and_body_only(tmp_path, monkeypatch
             assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
             assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
             assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
-            assert not removal.message_available(db, "m", include_unfollow=True)
-            assert removal.message_available(db, "m")
+            assert not removal.CONTENT.message_available(db, "m")
+            assert removal.RECORD.message_available(db, "m")
         store.initialize()
         with store.connection() as db:
             assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
@@ -3164,8 +3160,8 @@ def test_saved_unfollow_conversion_freezes_complete_unit_from_retained_alias_or_
         assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
         assert removal.outcome(db, key).requested == 1
-        assert not removal.message_available(db, "m", include_unfollow=True)
-        assert not removal.message_available(db, "copy-00", include_unfollow=True)
+        assert not removal.CONTENT.message_available(db, "m")
+        assert not removal.CONTENT.message_available(db, "copy-00")
         assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
     source_locks.qualify_protocol(store, fresh=False)
     with store.connection() as db:
@@ -3513,7 +3509,7 @@ def test_old_alias_request_preserves_reused_binding_and_new_request_freezes_its_
             "SELECT provider,account_id,mailbox_identity_key,provider_message_id "
             "FROM messages WHERE message_id='copy-00'"
         ).fetchone()) == new_binding
-        assert removal.message_available(db, "copy-00")
+        assert removal.RECORD.message_available(db, "copy-00")
     assert local_removal(
         store, "request_removal", "delete", parameters, request_id=old_key, now=NOW,
     ) == pending
@@ -3529,7 +3525,7 @@ def test_old_alias_request_preserves_reused_binding_and_new_request_freezes_its_
             "SELECT provider,account_id,mailbox_identity_key,provider_message_id "
             "FROM messages WHERE message_id='copy-00'"
         ).fetchone()) == new_binding
-        assert removal.message_available(db, "copy-00")
+        assert removal.RECORD.message_available(db, "copy-00")
     new_key = removal.issue_key(store, "delete", parameters, retention_days=30, now=NOW)
     new_result = local_removal(
         store, "request_removal", "delete", parameters, request_id=new_key, now=NOW,
@@ -3765,9 +3761,7 @@ def test_operation_segment_retains_bounded_native_legacy_guard_fallback(tmp_path
 
 
 @pytest.mark.parametrize("refollow", [False, True])
-def test_unfollow_during_inflight_body_fetch_uses_current_adoption_eligibility(
-    tmp_path, refollow
-):
+def test_unfollow_during_inflight_body_fetch_uses_current_adoption_eligibility(tmp_path, refollow):
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
@@ -3775,7 +3769,7 @@ def test_unfollow_during_inflight_body_fetch_uses_current_adoption_eligibility(
     started, land = threading.Event(), threading.Event()
 
     def fetch_and_adopt():
-        assert store.source_start("m", include_unfollow=True)
+        assert store.source_start("m", eligibility=removal.CONTENT)
         started.set()
         assert land.wait(5), "Body fetch was not released"
         body_state.record(store, "m", ("late local body", 15), fetched_at=NOW)
@@ -3805,7 +3799,8 @@ def test_unfollow_during_inflight_body_fetch_uses_current_adoption_eligibility(
 
 
 @pytest.mark.parametrize(
-    "owner,projection_missing", [("join", False), ("join", True), ("replay", False)],
+    "owner,projection_missing",
+    [("join", False), ("join", True), ("replay", False)],
 )
 @pytest.mark.parametrize("paused", [False, True])
 @pytest.mark.parametrize("physical_missing", [False, True])
@@ -3950,7 +3945,6 @@ def test_v1_late_summary_is_not_adopted_after_real_acceptance(tmp_path, monkeypa
     assert reply["error"]["message"] == "Connect job disappeared before its status could persist"
 
 
-
 def test_vendor_writer_uses_owning_operation_segment_before_its_write(tmp_path, monkeypatch):
     from contextlib import contextmanager
 
@@ -3996,7 +3990,6 @@ def test_vendor_writer_uses_owning_operation_segment_before_its_write(tmp_path, 
         with store._source_cleanup_locks(("m",)) as acquired:
             assert acquired
     assert store.vendor(vendor)["display_name"] == "Renamed Vendor"
-
 
 
 @pytest.mark.parametrize("invalid", ["forged", "copied", "stale", "wrong_path"])
@@ -4049,10 +4042,17 @@ def test_derived_writer_refuses_source_held_segment_and_allows_after_exit(
     assert store.vendor(vendor)["display_name"] == "Allowed rename"
 
 
-@pytest.mark.parametrize("operation", [
-    "vendors.create", "vendors.rename", "vendors.addresses.add",
-    "vendors.addresses.remove", "vendors.delete", "mail.accounts.activate",
-])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "vendors.create",
+        "vendors.rename",
+        "vendors.addresses.add",
+        "vendors.addresses.remove",
+        "vendors.delete",
+        "mail.accounts.activate",
+    ],
+)
 def test_public_derived_entries_never_call_ownerless_writer(tmp_path, monkeypatch, operation):
     from contextlib import contextmanager
 
@@ -4095,9 +4095,6 @@ def test_public_derived_entries_never_call_ownerless_writer(tmp_path, monkeypatc
     assert len(observed) == 1
     with pytest.raises(RuntimeError, match="runtime operation owner"):
         observed[0].require(store.path)
-
-
-
 
 
 def test_recovery_completion_uses_same_derived_write_owner(tmp_path, monkeypatch):
@@ -4207,9 +4204,15 @@ def test_fresh_unfollow_preserves_before_evidence_when_legacy_identity_is_lost(t
         assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
 
 
-@pytest.mark.parametrize("writer", [
-    "location", "headers", "own_address", "other_account_address",
-])
+@pytest.mark.parametrize(
+    "writer",
+    [
+        "location",
+        "headers",
+        "own_address",
+        "other_account_address",
+    ],
+)
 def test_derived_input_unfollow_is_bounded_and_keeps_unrelated_body(tmp_path, monkeypatch, writer):
     from contextlib import contextmanager
     from types import SimpleNamespace
@@ -4279,7 +4282,9 @@ def test_derived_input_unfollow_is_bounded_and_keeps_unrelated_body(tmp_path, mo
 
 @pytest.mark.parametrize("marker", [False, True])
 def test_fresh_held_unfollow_freezes_whole_unit_and_refollow_does_not_cancel(
-    tmp_path, monkeypatch, marker,
+    tmp_path,
+    monkeypatch,
+    marker,
 ):
     from test_removal_refusal import held_runtime
 
@@ -4300,8 +4305,8 @@ def test_fresh_held_unfollow_freezes_whole_unit_and_refollow_does_not_cancel(
             assert (result.requested, result.completed, result.pending) == (1, 0, 1)
             assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == 33
             assert db.execute("SELECT COUNT(*) FROM logical_messages").fetchone()[0] == 1
-            assert not removal.message_available(db, "m", include_unfollow=True)
-            assert not removal.message_available(db, "copy-00", include_unfollow=True)
+            assert not removal.CONTENT.message_available(db, "m")
+            assert not removal.CONTENT.message_available(db, "copy-00")
             assert db.execute(
                 "SELECT COUNT(*) FROM message_bodies",
             ).fetchone()[0] == int(not marker)
@@ -4324,7 +4329,6 @@ def test_fresh_held_unfollow_freezes_whole_unit_and_refollow_does_not_cancel(
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
         assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
         assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
-
 
 
 def test_reconcile_keeps_first_recipients_and_does_not_invent_unfollow(tmp_path):
@@ -4356,7 +4360,6 @@ def test_reconcile_keeps_first_recipients_and_does_not_invent_unfollow(tmp_path)
         assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == 1
         assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "retained body"
         assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
-
 
 
 def test_fresh_unfollow_acceptance_failure_rolls_back_inputs_and_derived_state(
@@ -4454,7 +4457,6 @@ def test_thread_relocation_uses_old_scope_without_removing_still_followed_unit(t
         }
 
 
-
 @pytest.mark.parametrize("scope", ["global", "local"])
 def test_derived_before_capture_matches_scope_and_only_retained_content(tmp_path, scope):
     from test_thread_reconcile import seed
@@ -4535,7 +4537,6 @@ def test_domain_add_owner_move_keeps_before_content_and_does_not_invent_unfollow
             assert (result.requested, result.completed, result.pending) == (1, 1, 0)
 
 
-
 def test_logical_reparent_accepts_new_unfollow_through_original_body_owner(tmp_path):
     from test_thread_reconcile import seed
 
@@ -4564,7 +4565,6 @@ def test_logical_reparent_accepts_new_unfollow_through_original_body_owner(tmp_p
         assert not db.execute("SELECT 1 FROM suppressed_messages").fetchone()
 
 
-
 def test_full_before_capture_runs_once_and_covers_later_local_writes(tmp_path, monkeypatch):
     from eom_email_watcher import removal
 
@@ -4589,7 +4589,6 @@ def test_full_before_capture_runs_once_and_covers_later_local_writes(tmp_path, m
     with store.connection() as db:
         assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
         assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "retained body"
-
 
 
 @pytest.mark.parametrize("qualified", [False, True])
@@ -4646,8 +4645,8 @@ def refollowed_body_removal(tmp_path, monkeypatch):
         assert db.execute("SELECT 1 FROM message_removal_targets WHERE state='pending'").fetchone()
         assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
         assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()
-        assert not removal.message_available(db, "m", include_unfollow=True)
-    assert not store.source_start("m", include_unfollow=True)
+        assert not removal.CONTENT.message_available(db, "m")
+    assert not store.source_start("m", eligibility=removal.CONTENT)
     state = ReconcileState(store, ("gmail", "mailbox", KEY))
     progress = prepare_derived(state)
     return engine_api._runtime({}), state, progress
@@ -4706,7 +4705,7 @@ def test_body_selection_without_removal_schema_keeps_legacy_behavior(tmp_path, m
         assert body_state.pending(
             db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
         ) == ["m"]
-    assert watcher.store.source_start("m", include_unfollow=True)
+    assert watcher.store.source_start("m", eligibility=removal.CONTENT)
     body_state.record(watcher.store, "m", ("legacy body", 11), fetched_at=NOW)
     with watcher.store.connection() as db:
         assert not removal.has_schema(db)
@@ -4727,7 +4726,7 @@ def test_completed_unfollow_target_can_fetch_and_record_body_again(refollowed_bo
         assert body_state.pending(
             db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
         ) == ["m"]
-    assert watcher.store.source_start("m", include_unfollow=True)
+    assert watcher.store.source_start("m", eligibility=removal.CONTENT)
     body_state.record(watcher.store, "m", ("new body", 8), fetched_at=NOW)
     with watcher.store.connection() as db:
         assert db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0] == (
@@ -4736,3 +4735,627 @@ def test_completed_unfollow_target_can_fetch_and_record_body_again(refollowed_bo
         assert body_state.pending(
             db, state.scope, cutoff=NOW - timedelta(days=30), now=NOW,
         ) == []
+
+
+# B2/B6: explicit content admission differs from retained header eligibility.
+def accept_held_unfollow(store):
+    from eom_email_watcher import removal
+
+    with store.connection() as db:
+        vendor = db.execute("SELECT vendor_id FROM vendor_addresses").fetchone()[0]
+    with removal.operation_scope(store.path) as operation:
+        change = store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
+    assert change.notice
+    with store.connection() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM message_removal_intents "
+                "WHERE kind='unfollow' AND state='pending'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert db.execute("SELECT 1 FROM logical_messages WHERE message_id='m'").fetchone()
+
+
+def test_model_read_rechecks_content_after_reservation(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api
+
+    store = held_runtime(tmp_path, monkeypatch)
+    watcher = engine_api._runtime({})
+    original = store.reserve_analysis_request
+    reached = []
+
+    def reserve(*args, **kwargs):
+        result = original(*args, **kwargs)
+        accept_held_unfollow(store)
+        return result
+
+    def forbidden_content(*args, **kwargs):
+        reached.append("provider")
+        pytest.fail("accepted unfollow reached provider content fetch")
+
+    def forbidden_model(**kwargs):
+        reached.append("model")
+        pytest.fail("accepted unfollow reached model input")
+
+    monkeypatch.setattr(store, "reserve_analysis_request", reserve)
+    monkeypatch.setattr(watcher.gateway, "content", forbidden_content, raising=False)
+    monkeypatch.setattr(watcher.model, "analyze", forbidden_model)
+    with pytest.raises(KeyError, match="m"):
+        watcher._process_pending(
+            scope=frozenset({"inbox"}),
+            dry_run=False,
+            deliver_notifications=False,
+            retention_cutoff=NOW - timedelta(days=30),
+            retention_observed_at=NOW,
+            mailbox_identity_key=KEY,
+        )
+    assert reached == []
+    with store.connection() as db:
+        assert (
+            db.execute("SELECT status FROM messages WHERE message_id='m'").fetchone()[0]
+            == "pending"
+        )
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "private body"
+
+
+@pytest.mark.parametrize("kind", ["fallback", "analysis"])
+@pytest.mark.parametrize("accept_at", ["before", "desktop", "desktop_failure", "never"])
+def test_unfollow_notification_rechecks_content_for_each_channel(
+    tmp_path,
+    monkeypatch,
+    kind,
+    accept_at,
+):
+    from dataclasses import replace
+
+    from test_removal_refusal import held_runtime
+    from test_service import FakeModel
+
+    from eom_email_watcher import engine_api, notifications
+
+    store = held_runtime(tmp_path, monkeypatch)
+    watcher = engine_api._runtime({})
+    watcher.config = replace(
+        watcher.config,
+        notifications_enabled=True,
+        ntfy_topic="public-fixture-topic",
+        ntfy_content_disclosure_acknowledged=True,
+    )
+    message = store.pending()[0]
+    delivered = []
+
+    def desktop(*args, **kwargs):
+        delivered.append("desktop")
+        if accept_at in {"desktop", "desktop_failure"}:
+            accept_held_unfollow(store)
+        if accept_at == "desktop_failure":
+            raise notifications.NotificationError("public desktop transport failure")
+
+    monkeypatch.setattr(notifications, "_send_desktop", desktop)
+    monkeypatch.setattr(notifications, "_send_ntfy", lambda *a, **k: delivered.append("ntfy"))
+    if accept_at == "before":
+        accept_held_unfollow(store)
+    if kind == "fallback":
+        watcher._send_fallback(message, False)
+    else:
+        watcher._deliver_analysis(message, FakeModel().analyze(), False, partial_summary=False)
+    assert delivered == (
+        ["desktop", "ntfy"]
+        if accept_at == "never"
+        else ([] if accept_at == "before" else ["desktop"])
+    )
+
+
+@pytest.mark.parametrize("kind", ["fallback", "analysis"])
+def test_unfollow_native_content_queue_preserves_metadata_and_unrelated_item(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    from test_removal_refusal import held_runtime
+    from test_service import FakeModel
+    from test_thread_reconcile import KEY, seed
+
+    store = held_runtime(tmp_path, monkeypatch)
+    seed(store, "other", sender="other@example.net", rfc_message_id="other@example.net")
+    for message_id in ("m", "other"):
+        if kind == "analysis":
+            store.mark_analyzed(
+                message_id, FakeModel().analyze().model_dump(), mailbox_identity_key=KEY, now=NOW
+            )
+        else:
+            store.record_analysis_failure(message_id, "public failure", 0, retryable=False, now=NOW)
+    assert {intent.message_id for intent in store.notification_intents()} == {"m", "other"}
+    accept_held_unfollow(store)
+    assert [intent.message_id for intent in store.notification_intents(limit=1)] == ["other"]
+    assert store.notification_intent_count() == 1
+    assert [m.message_id for m in store.pending_delivery(limit=1)] == (
+        ["other"] if kind == "analysis" else []
+    )
+    with store.connection() as db:
+        assert {r[0] for r in db.execute("SELECT message_id FROM logical_messages")} == {
+            "m",
+            "other",
+        }
+        assert db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0] == (
+            "private body"
+        )
+
+
+@pytest.mark.parametrize("changed", ["provider", "account_id", "mailbox_identity_key"])
+def test_retained_connect_binding_cannot_adopt_through_foreign_live_row(
+    tmp_path,
+    monkeypatch,
+    changed,
+):
+    from test_certificate_expiry_ledger import (
+        INSTANCE_A,
+        _certificate_fire_job,
+        _record,
+        _result,
+    )
+    from test_connect_v2_engine_api import seeded_runtime
+
+    from eom_email_watcher import engine_api
+
+    _, runtime = seeded_runtime(tmp_path)
+    store = runtime.store
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    fire, job_id = _certificate_fire_job(store)
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+    )
+    retain_legacy_aliases(store, "message-1")
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "message-1"},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    with store.connection() as db:
+        foreign = dict(db.execute("SELECT * FROM messages WHERE message_id='message-1'").fetchone())
+        retained = dict(foreign)
+        foreign[changed] = "e" * 64 if changed == "mailbox_identity_key" else "different"
+        if changed == "mailbox_identity_key":
+            foreign["admission_mailbox_identity_key"] = foreign[changed]
+        db.execute("DELETE FROM messages")
+        db.execute(
+            "INSERT INTO messages("
+            + ",".join(foreign)
+            + ") VALUES("
+            + ",".join("?" for _ in foreign)
+            + ")",
+            tuple(foreign.values()),
+        )
+    current = store.connect_job(job_id, source_start=False)
+    assert current is not None
+    with store.connection() as db:
+        assert removal.CONTENT.message_available(db, "message-1")
+        assert removal.CONTENT.message_available(
+            db, "message-1", retained_bindings=(foreign,),
+        )
+        for bindings in ((foreign, retained), (retained, foreign)):
+            assert not removal.CONTENT.message_available(
+                db, "message-1", require_source=False, retained_bindings=bindings,
+            )
+        with pytest.raises(KeyError):
+            removal.CONTENT.message_available(db, "message-1", retained_bindings=({},))
+        assert not database._connect_source_available(db, current)
+    terminal = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="accepted",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    assert terminal.status == "completed"
+    assert store.connect_job(job_id) is None
+    assert store.list_certificate_expiry_ledger(today="2026-09-20") == []
+    with store.connection() as db:
+        assert not db.execute("SELECT 1 FROM certificate_records").fetchone()
+        assert db.execute("SELECT " + changed + " FROM messages").fetchone()[0] == foreign[changed]
+    assert store.automation_fire(fire.fire_id).state == "failed"
+
+
+@pytest.mark.parametrize("changed", ["provider", "account_id", "mailbox_identity_key"])
+def test_interactive_paused_result_rejects_reused_foreign_source(tmp_path, monkeypatch, changed):
+    import hashlib
+
+    from connect_automate import connect
+    from test_connect_v2_engine_api import (
+        OUTPUT_ID,
+        install_automation_dispatch_fakes,
+        seed_contract_fire,
+        seeded_runtime,
+    )
+
+    from eom_email_watcher import engine_api
+
+    _, runtime = seeded_runtime(tmp_path)
+    store = runtime.store
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **k: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: runtime)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    job_id = attempt.dispatch_request_id
+    assert store.claim_connect_lane_head(
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    store.authorize_connect_job_interactively(job_id)
+    submitted = store.automation_fire(fire.fire_id)
+    store.transition_automation_fire(
+        fire_id=fire.fire_id,
+        expected_state=submitted.state,
+        expected_version=submitted.state_version,
+        next_state="entitlement_paused",
+        reason="entitlement_inactive",
+    )
+    retain_legacy_aliases(store, "message-1")
+    accepted = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "inbox.delete",
+            "payload": {"message_id": "message-1"},
+        }
+    )
+    assert accepted["ok"] and accepted["data"]["pending"] == 1, accepted
+    with store.connection() as db:
+        foreign = dict(db.execute("SELECT * FROM messages WHERE message_id='message-1'").fetchone())
+        foreign[changed] = "e" * 64 if changed == "mailbox_identity_key" else "different"
+        if changed == "mailbox_identity_key":
+            foreign["admission_mailbox_identity_key"] = foreign[changed]
+        db.execute("DELETE FROM messages")
+        db.execute(
+            "INSERT INTO messages("
+            + ",".join(foreign)
+            + ") VALUES("
+            + ",".join("?" for _ in foreign)
+            + ")",
+            tuple(foreign.values()),
+        )
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="application/vnd.local-connect.cited-summary+json",
+        display_name="public-summary.json",
+        byte_size=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        payload=b"{}",
+    )
+    terminal = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="accepted",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    assert terminal.status == "completed"
+    assert store.connect_job(job_id, source_start=False) is None
+    settled = store.automation_fire(fire.fire_id)
+    assert settled.state == "completed" and settled.reason == "connect_completed"
+    with store.connection() as db:
+        assert not db.execute(
+            "SELECT 1 FROM connect_attachment_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+
+
+@pytest.mark.parametrize("arrival", ["reconcile", "capture"])
+def test_held_unfollow_rearrival_refreshes_only_record_metadata(tmp_path, monkeypatch, arrival):
+    from dataclasses import replace
+
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import KEY
+
+    from eom_email_watcher import engine_api, notifications, reconcile
+    from eom_email_watcher.mailbox import FolderObservation
+    from eom_email_watcher.reconcile_state import ReconcileState
+
+    store = held_runtime(tmp_path, monkeypatch)
+    watcher = engine_api._runtime({})
+    accept_held_unfollow(store)
+    state = ReconcileState(store, ("gmail", "mailbox", KEY))
+    calls = []
+    original_metadata = watcher.gateway.metadata
+
+    def metadata(source):
+        calls.append(source)
+        return replace(original_metadata(source), subject="Fresh header")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("held unfollow metadata arrival restarted content work")
+
+    monkeypatch.setattr(watcher.gateway, "metadata", metadata)
+    monkeypatch.setattr(watcher.gateway, "content", forbidden, raising=False)
+    monkeypatch.setattr(watcher.gateway, "stored_body", forbidden)
+    monkeypatch.setattr(watcher.model, "analyze", forbidden)
+    monkeypatch.setattr(notifications, "_send_desktop", forbidden)
+    monkeypatch.setattr(notifications, "_send_ntfy", forbidden)
+    with store.connection() as db:
+        db.execute("DELETE FROM message_locations WHERE message_id='m'")
+        before = [
+            tuple(r)
+            for r in db.execute(
+                "SELECT message_id,status,analysis_request_id,analysis_at "
+                "FROM messages ORDER BY message_id"
+            )
+        ]
+    if arrival == "reconcile":
+        unit = reconcile._unit("public")
+        unit["listed"] = True
+        progress = state.load_or_start(
+            NOW,
+            30,
+            dict(
+                stage="discovery",
+                units=[unit],
+                folders=["inbox"],
+                replay_discovery=True,
+            ),
+        )
+        state.put_items(progress, "discovery", "public", (reconcile.ReconcileItem("m"),), "inbox")
+        reconcile.run(watcher, KEY, "unavailable", label_selectors=(), now=NOW)
+        assert calls == ["m"]
+    else:
+        assert (
+            watcher._capture_ids(
+                ("m",),
+                mailbox_identity_key=KEY,
+                label_selectors=(),
+                gated_allowed=True,
+                vendor_snapshot=store.vendor_index(),
+                checked_at=NOW,
+                retention_cutoff=NOW - timedelta(days=30),
+                folders=frozenset({"inbox"}),
+                known_locations={"m": FolderObservation(frozenset({"inbox"}), complete=True)},
+                dry_run=False,
+                dry_run_messages=[],
+            )
+            == 0
+        )
+        assert calls == []
+    with store.connection() as db:
+        assert [
+            tuple(r)
+            for r in db.execute(
+                "SELECT message_id,status,analysis_request_id,analysis_at "
+                "FROM messages ORDER BY message_id"
+            )
+        ] == before
+        assert db.execute(
+            "SELECT 1 FROM message_locations WHERE message_id='m' AND location='inbox'"
+        ).fetchone()
+        assert db.execute("SELECT text FROM message_bodies WHERE message_id='m'").fetchone()[0] == (
+            "private body"
+        )
+        assert removal.RECORD.message_available(db, "m")
+        assert not removal.CONTENT.message_available(db, "m")
+    assert store.notification_intents() == []
+    assert store.notification_intent_count() == 0
+    assert watcher.model.calls == 0
+
+
+def test_eligibility_callers_cannot_default_or_downgrade_content():
+    import ast
+    import inspect
+    from pathlib import Path
+
+    root = Path(removal.__file__).parent
+    record_owners = {
+        "removal": {"_accept_in_transaction"},
+        "db": {
+            "_refresh_logical_messages_view",
+            "reconcile_source",
+            "record_reconcile_headers",
+            "_insert_message_in_transaction",
+            "record_message_location",
+        },
+    }
+    record_starts = {("service", "_capture_ids"), ("reconcile", "fetch")}
+    seen_record = set()
+    seen_starts = set()
+    seen_content = set()
+    old_api = {"available_sql", "retained_available_sql", "message_available", "source_available"}
+
+    def walk(node, module, owner=""):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner = node.name
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            callee = node.func
+            value = ast.unparse(callee.value)
+            if callee.attr in old_api:
+                assert value != "removal", (module, owner, "defaulted old API")
+                if value in {"removal.RECORD", "RECORD"}:
+                    assert owner in record_owners.get(module, set()), (
+                        module,
+                        owner,
+                        "content downgraded",
+                    )
+                    seen_record.add((module, owner))
+                if value in {"removal.CONTENT", "CONTENT"}:
+                    seen_content.add((module, owner))
+            if callee.attr == "source_start":
+                choice = [k.value for k in node.keywords if k.arg == "eligibility"]
+                expected = (
+                    "removal.RECORD" if (module, owner) in record_starts else "removal.CONTENT"
+                )
+                assert len(choice) == 1 and ast.unparse(choice[0]) == expected, (module, owner)
+                seen_starts.add((module, owner))
+        for child in ast.iter_child_nodes(node):
+            walk(child, module, owner)
+
+    for path in root.rglob("*.py"):
+        walk(ast.parse(path.read_text()), path.stem)
+    assert seen_record == {
+        (module, owner) for module, owners in record_owners.items() for owner in owners
+    }
+    assert record_starts <= seen_starts
+    assert {
+        ("db", "message_source"),
+        ("db", "reserve_analysis_request"),
+        ("db", "notification_intents"),
+        ("db", "notification_intent_count"),
+        ("db", "pending_delivery"),
+        ("db", "pending"),
+        ("db", "has_current_pending_mailbox_work"),
+        ("db", "_connect_source_available"),
+    } <= seen_content
+    assert (
+        inspect.signature(database.Store.source_start).parameters["eligibility"].default
+        is inspect.Parameter.empty
+    )
+    for name in ("_automation_source_available", "_automation_source_available_sql"):
+        assert (
+            inspect.signature(getattr(database, name)).parameters["eligibility"].default
+            is inspect.Parameter.empty
+        )
+    assert not any(hasattr(removal, name) for name in old_api)
+
+
+@pytest.mark.parametrize("invalid", [None, 0, "", False, "CONTENT", object()])
+def test_source_start_requires_named_eligibility_owner(tmp_path, invalid):
+    store = database.Store(tmp_path / "unused.sqlite3")
+    with pytest.raises(TypeError, match="CONTENT or RECORD"):
+        store.source_start("m", eligibility=invalid)
+    with pytest.raises(TypeError, match="eligibility"):
+        store.source_start("m")
+
+def test_model_selection_excludes_held_unfollow_before_reservation(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+    from test_thread_reconcile import KEY, seed
+
+    from eom_email_watcher import engine_api
+
+    store = held_runtime(tmp_path, monkeypatch)
+    watcher = engine_api._runtime({})
+    accept_held_unfollow(store)
+    assert store.pending() == [], "Accepted body-removal target remains model work"
+    assert not store.has_current_pending_mailbox_work("gmail", "mailbox", KEY)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("accepted unfollow started model reservation/content")
+
+    monkeypatch.setattr(store, "reserve_analysis_request", forbidden)
+    monkeypatch.setattr(watcher.gateway, "content", forbidden, raising=False)
+    monkeypatch.setattr(watcher.model, "analyze", forbidden)
+    assert watcher._process_pending(
+        scope=frozenset({"inbox"}),
+        dry_run=False,
+        deliver_notifications=False,
+        retention_cutoff=NOW - timedelta(days=30),
+        retention_observed_at=NOW,
+        mailbox_identity_key=KEY,
+    ) == (0, 0)
+    seed(store, "other", sender="other@example.net", rfc_message_id="other@example.net")
+    assert [m.message_id for m in store.pending(limit=1)] == ["other"]
+    assert store.has_current_pending_mailbox_work("gmail", "mailbox", KEY)
+    with store.connection() as db:
+        assert db.execute("SELECT 1 FROM logical_messages WHERE message_id='m'").fetchone()
+
+
+@pytest.mark.parametrize("selector", ["recoverable", "proposable"])
+def test_scheduling_selection_does_not_reselect_held_unfollow(tmp_path, monkeypatch, selector):
+    from test_service import (
+        SCHEDULING_FIXTURE_NOW,
+        AnyAutomationGateway,
+        ExtractionModel,
+        ProposalAuthorization,
+        admit_scheduling_run,
+        allow_automation_processing,
+        config,
+        proposing_automation_run,
+    )
+
+    from eom_email_watcher import service
+
+    cfg = config(tmp_path)
+    store = database.Store(cfg.database_file)
+    store.initialize()
+    vendor = store.create_vendor("Scheduling vendor")
+    store.add_vendor_address(vendor, "trusted@example.com")
+    make_run = proposing_automation_run if selector == "proposable" else None
+    if make_run:
+        _, blocked = make_run(cfg, store, monkeypatch)
+    else:
+        _, blocked = admit_scheduling_run(store, monkeypatch)
+    with store.connection() as db:
+        message_id = db.execute(
+            "SELECT message_id FROM messages WHERE provider_message_id='schedule-1'"
+        ).fetchone()[0]
+    body_state.record(
+        store, message_id, ("private scheduling body", 23), fetched_at=SCHEDULING_FIXTURE_NOW
+    )
+    retain_legacy_aliases(store, message_id)
+    with removal.operation_scope(store.path) as operation:
+        changed = store.remove_vendor_address(
+            vendor,
+            "trusted@example.com",
+            now=SCHEDULING_FIXTURE_NOW,
+            operation=operation,
+        )
+    assert changed.notice
+    selected = (
+        store.proposable_automation_runs
+        if selector == "proposable"
+        else store.recoverable_automation_runs
+    )
+    state = store.automation_run(blocked.run_id)
+    observed = []
+    allow_automation_processing(monkeypatch, AnyAutomationGateway())
+    monkeypatch.setattr(
+        service, "_scheduling_proposal_authorization", lambda *a, **k: ProposalAuthorization()
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("held unfollow reached scheduling Graph/model work")
+
+    monkeypatch.setattr(service, "find_meeting_time", forbidden)
+    for _ in range(2):
+        if selector == "proposable":
+            result = service.process_scheduling_proposals(
+                cfg, store, limit=1, now=SCHEDULING_FIXTURE_NOW
+            )
+        else:
+            result = service.process_scheduling_automations(
+                cfg,
+                store,
+                ExtractionModel([]),
+                limit=1,
+                now=SCHEDULING_FIXTURE_NOW,
+            )
+        assert result.processed == 0
+        assert store.automation_run(blocked.run_id) == state
+        observed.append([work.run.run_id for work in selected(limit=1)])
+    print("held-unfollow scheduling selection", selector, "state", state.state, "ticks", observed)
+    assert observed == [[], []], "Refused scheduling work is selected again on each tick"
+    if make_run:
+        _, eligible = make_run(cfg, store, monkeypatch, provider_message_id="schedule-eligible")
+    else:
+        _, eligible = admit_scheduling_run(
+            store, monkeypatch, provider_message_id="schedule-eligible"
+        )
+    assert [work.run.run_id for work in selected(limit=1)] == [eligible.run_id]
+    assert store.automation_run(blocked.run_id) == state

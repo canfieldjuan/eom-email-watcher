@@ -8,7 +8,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from . import body_state
+from . import body_state, removal
 from .mailbox import (
     MailboxError,
     MailboxMessageInvalid,
@@ -210,8 +210,11 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
     def fetch(item, *, gap=False, since=cutoff):
         nonlocal added
         if not watcher.store.source_start(
-            provider=provider, account_id=watcher.mailbox.account_id,
-            mailbox_identity_key=identity, provider_message_id=item["source_id"],
+            provider=provider,
+            account_id=watcher.mailbox.account_id,
+            mailbox_identity_key=identity,
+            provider_message_id=item["source_id"],
+            eligibility=removal.RECORD,
         ):
             return
         source = watcher.store.reconcile_source(*state.scope, item["source_id"])
@@ -318,7 +321,9 @@ def run(watcher, identity, sent_scope, *, label_selectors, now=None, vendor_snap
                             source_id = copy[0]
                             if copy in work["skipped"]:
                                 continue
-                            if not watcher.store.source_start(message_id, include_unfollow=True):
+                            if not watcher.store.source_start(
+                                message_id, eligibility=removal.CONTENT
+                            ):
                                 break
                             if not getattr(watcher.gateway, "reconcile_transport_budget", False):
                                 budget.before_call()

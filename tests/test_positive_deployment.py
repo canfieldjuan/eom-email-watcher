@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher import deployment, engine_api
+from eom_email_watcher import deployment, engine_api, removal
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = tuple(sorted(path.name for path in (ROOT / "systemd").iterdir()))
@@ -135,11 +135,17 @@ def test_connect_persistence_keeps_deployment_identity(monkeypatch, path):
         raise refusal
 
     source_checks = []
+
+    def source_start(message_id, *, eligibility):
+        assert eligibility is removal.CONTENT
+        source_checks.append(message_id)
+        return True
+
     runtime = SimpleNamespace(
         store=SimpleNamespace(
             source_locks=lambda *args, **kwargs: nullcontext(),
             connect_job=lambda _: SimpleNamespace(message_id="public-message"),
-            source_start=lambda message_id: source_checks.append(message_id) or True,
+            source_start=source_start,
             connect_dispatch=lambda _: SimpleNamespace(
                 source_available=True, required_manifest_features=()
             ),
