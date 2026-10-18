@@ -2413,17 +2413,12 @@ def test_non_posix_lock_fallback_preserves_publication_oserror(
         raise OSError("publication failed")
 
 
-@pytest.mark.parametrize(
-    "release_failure",
-    [OSError("PRIVATE_RELEASE_DETAIL"), RuntimeError("PRIVATE_RELEASE_DETAIL")],
-    ids=["os-error", "runtime-error"],
-)
-def test_non_posix_lock_release_failure_preserves_body_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    release_failure: Exception,
-) -> None:
+@pytest.fixture
+def broken_release_lock(tmp_path, monkeypatch, release_failure):
+    """Keep real acquisition; inject only the release failure under test."""
+    real_lock_type = config_module.FileLock
+    acquired_locks = []
+
     class NonPosixOs:
         name = "nt"
 
@@ -2431,22 +2426,45 @@ def test_non_posix_lock_release_failure_preserves_body_error(
             return getattr(os, name)
 
     class BrokenReleaseLock:
-        def acquire(self) -> None:
-            return None
+        def __init__(self, path):
+            self.real_lock = real_lock_type(path, mode=0o600)
+            acquired_locks.append(self.real_lock)
 
-        def release(self) -> None:
+        def acquire(self):
+            return self.real_lock.acquire()
+
+        def release(self):
             raise release_failure
 
     monkeypatch.setattr(config_module, "os", NonPosixOs())
-    monkeypatch.setattr(config_module, "FileLock", lambda _path: BrokenReleaseLock())
+    monkeypatch.setattr(config_module, "FileLock", BrokenReleaseLock)
     monkeypatch.delenv("STATE_DIRECTORY", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    try:
+        yield
+    finally:
+        for lock in acquired_locks:
+            lock.release()
+            assert not lock.is_locked
 
+
+@pytest.mark.parametrize(
+    "release_failure",
+    [OSError("PRIVATE_RELEASE_DETAIL"), RuntimeError("PRIVATE_RELEASE_DETAIL")],
+    ids=["os-error", "runtime-error"],
+)
+def test_non_posix_lock_release_failure_preserves_body_error(
+    broken_release_lock,
+    caplog: pytest.LogCaptureFixture,
+    release_failure: Exception,
+    assert_private_file,
+) -> None:
     with (
         caplog.at_level("WARNING"),
         pytest.raises(ValueError, match="body classification"),
         config_module._config_serialization_lock(),
     ):
+        assert_private_file(config_module._config_serialization_lock_path())
         raise ValueError("body classification")
 
     assert "PRIVATE_RELEASE_DETAIL" not in caplog.text
@@ -2459,28 +2477,10 @@ def test_non_posix_lock_release_failure_preserves_body_error(
     ids=["os-error", "runtime-error"],
 )
 def test_non_posix_lock_release_failure_after_success_is_fixed_and_secret_free(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    broken_release_lock,
     release_failure: Exception,
+    assert_private_file,
 ) -> None:
-    class NonPosixOs:
-        name = "nt"
-
-        def __getattr__(self, name: str):
-            return getattr(os, name)
-
-    class BrokenReleaseLock:
-        def acquire(self) -> None:
-            return None
-
-        def release(self) -> None:
-            raise release_failure
-
-    monkeypatch.setattr(config_module, "os", NonPosixOs())
-    monkeypatch.setattr(config_module, "FileLock", lambda _path: BrokenReleaseLock())
-    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-
     with (
         pytest.raises(
             ConfigError,
@@ -2488,7 +2488,7 @@ def test_non_posix_lock_release_failure_after_success_is_fixed_and_secret_free(
         ) as failure,
         config_module._config_serialization_lock(),
     ):
-        pass
+        assert_private_file(config_module._config_serialization_lock_path())
 
     assert "PRIVATE_RELEASE_DETAIL" not in str(failure.value)
 
