@@ -1,3 +1,4 @@
+import { calendarOutcomeNotice, latestCalendarOutcome, type CalendarWriteOutcome } from "./calendarOutcome";
 import { inboxAdmissionLabel, type InboxAdmissionKind } from "./inboxAdmission";
 import { activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult } from "./connectIdentity";
 import { collectCapabilityParameters } from "./connectParameters";
@@ -177,6 +178,7 @@ interface InboxItem {
   body_source_chars?: number | null;
   attachments: InboxAttachment[];
   calendar_proposal: CalendarProposalPreview | null;
+  calendar_write_outcome?: CalendarWriteOutcome | null;
   admission: InboxAdmission | null;
 }
 
@@ -221,6 +223,7 @@ interface CalendarProposalPreview {
 }
 
 interface CalendarDecisionResult {
+  calendar_write_outcome?: CalendarWriteOutcome | null;
   run_id: string;
   state: string;
   state_version: number;
@@ -1824,22 +1827,9 @@ function renderInbox(items: InboxItem[]): void {
       onlineMeeting.textContent = "Teams link: No";
       const note = document.createElement("p");
       note.className = "calendar-proposal-note";
-      if (proposal.state === "completed") {
-        note.textContent = "The calendar event was created.";
-      } else if (
-        proposal.state === "writing" ||
-        proposal.state === "unresolved" ||
-        proposal.state === "reconciling"
-      ) {
-        note.textContent =
-          "The write result is uncertain. Email Watcher will reconcile it without creating a second event.";
-      } else if (proposal.state === "failed") {
-        note.textContent = "Microsoft definitively rejected the event creation request.";
-      } else if (proposal.state === "declined") {
-        note.textContent = "You declined this calendar proposal. No event was created.";
-      } else {
-        note.textContent = "No calendar event has been created.";
-      }
+      note.textContent = calendarOutcomeNotice(
+        item.calendar_write_outcome, "proposal", proposal.state,
+      ).text;
       calendarProposal.append(
         heading,
         subject,
@@ -1886,22 +1876,14 @@ function renderInbox(items: InboxItem[]): void {
               runId: proposal.run_id,
               stateVersion: proposal.state_version,
             });
-            let statusMessage: string;
-            let statusKind: "success" | "error" | "warning";
-            if (result.state === "completed") {
-              statusMessage = "Calendar event created.";
-              statusKind = "success";
-            } else if (result.state === "declined") {
-              statusMessage = "Calendar proposal declined.";
-              statusKind = "success";
-            } else if (result.state === "failed") {
-              statusMessage = "Microsoft rejected the calendar event creation.";
-              statusKind = "error";
-            } else {
-              statusMessage = "Calendar decision saved; Email Watcher will reconcile the result.";
-              statusKind = "warning";
-            }
             await loadInbox();
+            const refreshed = inboxItems.find((row) => row.message_id === item.message_id);
+            const notice = calendarOutcomeNotice(
+              latestCalendarOutcome(result.calendar_write_outcome, refreshed?.calendar_write_outcome),
+              "decision", result.state,
+            );
+            const statusMessage = notice.text;
+            const statusKind = notice.kind;
             inboxStatus.textContent = statusMessage;
             inboxStatus.dataset.kind = statusKind;
           } catch (error) {
@@ -1909,9 +1891,6 @@ function renderInbox(items: InboxItem[]): void {
             await loadInbox();
             inboxStatus.textContent = statusMessage;
             inboxStatus.dataset.kind = "error";
-          } finally {
-            confirm.disabled = false;
-            decline.disabled = false;
           }
         };
         decline.addEventListener("click", () => void decide("decline"));
@@ -1919,6 +1898,16 @@ function renderInbox(items: InboxItem[]): void {
         actions.append(decline, confirm);
         calendarProposal.append(actions);
       }
+    }
+
+    if (!item.calendar_proposal && item.calendar_write_outcome) {
+      calendarProposal = document.createElement("section");
+      calendarProposal.className = "calendar-proposal";
+      calendarProposal.setAttribute("aria-label", "Calendar status");
+      const note = document.createElement("p");
+      note.className = "calendar-proposal-note";
+      note.textContent = calendarOutcomeNotice(item.calendar_write_outcome, "proposal").text;
+      calendarProposal.append(note);
     }
 
     const attachments = document.createElement("ul");

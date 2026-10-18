@@ -251,16 +251,79 @@ one grouped push per accepted repair round. No downstream compensation.
 
 ## Implementation summary, cold audit and gap audit
 
-**Contract-only change:** this plan inventories merged source, specifies the
-terminal admission and handoff, shared status/notice, fresh-consent identity and
-verification. Production, tests, dependencies, workflows and schema are untouched.
-All current behavior statements are anchored to source or explicitly historical
-evidence. Future policy and tests above are requirements, not passing results.
+The accepted policy is implemented at its existing owners:
 
-**NOT DONE:** implementation; fail-first/current-base proof;
-focused/full/native/installed Windows qualification; final-head review and
-oversight PASS; merge. Acceptance is recorded separately above. After
-implementation, require clean local == actual
-remote, all required checks green, fresh review reconciled with zero unresolved
-threads/no changes requested, and posted exact-head oversight PASS; merge with a
-merge commit and verify its tree equals the reviewed head. No install/promotion.
+- `removal._accept_in_transaction` supplies the acceptance cause.
+  `db._cancel_automation_source` owns payload cleanup, cancellation, run version
+  and immutable event as one transaction. Purge and generic cleanup supply their
+  generic cause explicitly. The old begin-time cleanup special case uses this
+  same owner rather than leaving an authorized write behind.
+- `db._cancelled_calendar_admission` recognizes the exact original confirmation
+  and cancellation events. `AutomationCalendarWriteCancelled` is consumed by
+  begin/decision callers; unrelated stale/missing identities remain refused.
+  Historical cancellation survives replacement of the mutable current-write row.
+  The worker catches only `AutomationCalendarWriteStateChanged`; invariant errors
+  propagate. Its former broad catch came from `b49c165f` at baseline
+  `service.py:1109`, and the new real-ledger regression failed with DID NOT RAISE
+  before this correction. This is the contract's explicit no-swallowed-errors
+  consumer requirement, not a new recovery policy.
+- `db._scheduling_preparation_available_sql` is shared by selector and extraction
+  start, with legacy-schema preparation preserved. Refollow needs shared CONTENT
+  availability. The proposal owner retains monotonic generations using the write
+  floor and immutable proposal transitions. Fresh approval requires write
+  authorization and creates a new transaction; old replay creates no work.
+- `db.calendar_write_outcome` is the common content-free projection for current
+  writes and immutable cancellations. Inbox and decision reads use the existing
+  bound source/RECORD owner. The decision transport adds the optional projection.
+- `desktop/src/calendarOutcome.ts` owns inbox/decision wording. Production
+  rendering works without a proposal, renders as text and has no stale action.
+  Decision refresh prefers a newer outcome and leaves old buttons disabled until
+  a fresh projection renders. Fresh pending/declined proposals keep their own
+  existing wording while the old cancelled admission remains in history.
+- `docs/THREAD_VIEW_CONTRACT.md` records this accepted policy amendment. Provider,
+  schema, dependencies, workflows and native transport are unchanged.
+
+### Changed-assertion map
+
+All original Python assertions are retained. The existing generic cleanup test
+adds an exact generic-cause assertion. The engine decision test preserves every
+original result and binding assertion and adds the accepted optional metadata to
+its stub and expected response. New database, service and API tests cover the
+contract table above: actual immediate/held unfollow, restart/lost reply, both
+handoff orders, selected worker cancellation, rollback, exact replay/version,
+provider-owned found/absent/error recovery, refollow/content gating/fresh write
+permission/new transaction, immutable old history, binding reuse and metadata
+without content or entitlement renewal.
+
+In `desktop/test/calendarProposal.test.ts`, the former source-text checks for
+no-event, uncertain-write and rejected-write wording become exact runtime checks
+of the common formatter. The former adjacency check for decision refresh now
+checks the new projection choice and executes that production segment against a
+newer completed outcome. All other original controls/interval/invitation/assertions
+remain. Added production-segment rendering verifies exact text with no proposal,
+HTML write or confirmation button; the fresh-decline regression protects the
+existing wording. No assertion is skipped or relaxed.
+
+The cause, begin-result and writing-boundary omission mutations each failed at
+its behavior proof, then exact candidate bytes were restored. Local fixture/
+implementation errors found during development were classified before repairs:
+missing SQL interpolation at the extracted binding owner; legacy-schema removal
+references at the new shared preparation owner; invalid new fixture inputs and
+an unavailable test transpiler API; and stale-admission wording at the new common
+formatter. The latter has its own fail-before/pass-after regression. These were
+unpublished working changes, not failures attributed to a different commit.
+
+Earlier full Python invocations were deliberately interrupted before completion
+for the final refusal-boundary and fixture-lock corrections. Their raw outputs are
+retained as interrupted pre-final evidence, not completed qualifications. The new
+API regression explicitly binds config.database_file to Store.path, and the common
+calendar fixture now uses the existing service config's database path. Final
+qualification runs the entire Python test collection with `uv run --locked pytest`,
+under umask 022 and fresh empty XDG config/data and external temporary directories.
+The CI coverage job remains required; no test oracle or collection is reduced.
+
+**NOT DONE:** final local/full/native gates; final-head Windows installed/populated
+qualification, automatic review/reconciliation and posted oversight PASS; merge.
+Require clean local == actual remote, required checks green and no unresolved
+threads/changes requested; merge with a merge commit and reviewed-tree equality.
+No installation/promotion or #278 work.

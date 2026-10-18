@@ -12,10 +12,11 @@ import unicodedata
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from itertools import chain
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from connect_automate import connect
@@ -1586,6 +1587,33 @@ class AutomationCalendarWrite:
     updated_at: str
 
 
+class AutomationCalendarWriteStateChanged(RuntimeError):
+    """A caller selected an admission whose run advanced before its handoff."""
+
+
+@dataclass(frozen=True)
+class AutomationCalendarWriteCancelled:
+    """The exact terminal admission, including replay after its current row is replaced."""
+
+    run: AutomationRun
+    outcome: dict[str, object]
+
+
+def calendar_write_outcome(
+    run: AutomationRun, write: AutomationCalendarWrite | sqlite3.Row,
+) -> dict[str, object]:
+    """Content-free projection for a current write or immutable cancellation event."""
+    values = asdict(write) if isinstance(write, AutomationCalendarWrite) else write
+    return {
+        "run_id": run.run_id,
+        "state_version": run.state_version,
+        "transaction_id": values["transaction_id"],
+        "status": values["status"],
+        "failure_code": values["failure_code"],
+        "graph_event_id": values["graph_event_id"],
+    }
+
+
 @dataclass(frozen=True)
 class AutomationCalendarWriteWork:
     run: AutomationRun
@@ -1838,12 +1866,201 @@ def _admit_scheduling_automation(
     )
 
 
+def _cancel_automation_source(
+    db: sqlite3.Connection,
+    row: sqlite3.Row | dict,
+    *,
+    updated_at: str,
+    cause: Literal["source_unavailable", "thread_unfollowed"],
+) -> bool:
+    """Atomically invalidate preparation and cancel only an unsubmitted admission."""
+    run_id = str(row["run_id"])
+    db.execute(
+        "DELETE FROM automation_extraction_payloads WHERE run_id = ?",
+        (run_id,),
+    )
+    db.execute(
+        "DELETE FROM automation_proposal_payloads WHERE run_id = ?",
+        (run_id,),
+    )
+    previous_state = str(row["state"])
+    if previous_state not in {
+        "detected",
+        "extracting",
+        "proposing",
+        "awaiting_confirmation",
+        "write_authorized",
+    }:
+        return False
+    previous_version = int(row["state_version"])
+    next_version = previous_version + 1
+    if previous_state == "write_authorized":
+        cancelled = db.execute(
+            """UPDATE automation_calendar_writes SET status = 'cancelled',
+                failure_code = ?, updated_at = ?
+            WHERE run_id = ? AND status = 'authorized'""",
+            (cause, updated_at, run_id),
+        )
+        if cancelled.rowcount != 1:
+            raise RuntimeError("Automation source cleanup lost its write-state race")
+    changed = db.execute(
+        """UPDATE automation_runs SET
+            state = 'source_unavailable', state_version = ?,
+            failure_code = 'source_unavailable', review_notified_at = NULL,
+            updated_at = ?
+        WHERE run_id = ? AND state = ? AND state_version = ?""",
+        (next_version, updated_at, run_id, previous_state, previous_version),
+    )
+    if changed.rowcount != 1:
+        raise RuntimeError("Automation source cleanup lost its expected-state race")
+    _append_automation_event(
+        db,
+        run_id=run_id,
+        sequence_no=next_version - 1,
+        previous_state=previous_state,
+        next_state="source_unavailable",
+        state_version=next_version,
+        automation_id=str(row["automation_id"]),
+        automation_version=int(row["automation_version"]),
+        extraction_schema_version=int(row["extraction_schema_version"]),
+        calendar_principal_key=str(row["calendar_principal_key"]),
+        transition_kind="source_unavailable",
+        failure_code=(cause if previous_state == "write_authorized" else "source_unavailable"),
+        created_at=updated_at,
+        payload_id=(
+            str(row["current_payload_id"]) if row["current_payload_id"] is not None else None
+        ),
+        payload_sha256=(
+            str(row["current_payload_sha256"])
+            if row["current_payload_sha256"] is not None
+            else None
+        ),
+        transaction_id=(str(row["transaction_id"]) if row["transaction_id"] is not None else None),
+    )
+    return True
+
+
+def _automation_run_for_message(db: sqlite3.Connection, message_id: str) -> sqlite3.Row | None:
+    record_eligible = removal.RECORD.available_sql("m") if removal.has_schema(db) else "1"
+    row = db.execute(
+        f"""SELECT r.* FROM automation_runs AS r
+        LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
+        JOIN logical_messages AS m
+          ON m.provider = r.provider
+         AND m.account_id = r.account_id
+         AND (
+             (i.mailbox_identity_key IS NOT NULL
+              AND m.mailbox_identity_key = i.mailbox_identity_key
+              AND message_source_key(
+                    m.provider, m.account_id, m.provider_message_id,
+                    m.mailbox_identity_key
+                  ) = r.source_message_key)
+             OR (i.mailbox_identity_key IS NULL
+                 AND m.mailbox_identity_key IS NULL
+                 AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id
+                     ) = r.source_message_key)
+         )
+        WHERE m.message_id = ? AND ({record_eligible})""",
+        (message_id,),
+    ).fetchone()
+    return row
+
+
+def _calendar_write_outcome_for_message(
+    db: sqlite3.Connection,
+    message_id: str,
+) -> dict[str, object] | None:
+    row = _automation_run_for_message(db, message_id)
+    if row is None:
+        return None
+    write = db.execute(
+        "SELECT * FROM automation_calendar_writes WHERE run_id=?",
+        (row["run_id"],),
+    ).fetchone()
+    if write is None:
+        return None
+    return calendar_write_outcome(_automation_run(row), _automation_calendar_write(write))
+
+
+def _calendar_proposal_generation(
+    db: sqlite3.Connection,
+    run_id: str,
+    *,
+    before_state_version: int | None = None,
+) -> int:
+    """Proposal generations survive payload cleanup in their immutable transitions."""
+    return int(
+        db.execute(
+            """SELECT COUNT(*) FROM automation_events WHERE run_id=?
+        AND previous_state='proposing' AND next_state IN ('awaiting_confirmation','manual_review')
+        AND (? IS NULL OR state_version<?)""",
+            (run_id, before_state_version, before_state_version),
+        ).fetchone()[0]
+    )
+
+
+def _cancelled_calendar_admission(
+    db: sqlite3.Connection,
+    row: sqlite3.Row,
+    confirmed_version: int,
+    *,
+    proposal_sha256: str | None = None,
+    proposal_version: int | None = None,
+) -> AutomationCalendarWriteCancelled | None:
+    # Immutable adjacent events prove this particular confirmed admission was
+    # cancelled before handoff, even after payload deletion or a fresh approval.
+    event = db.execute(
+        """SELECT c.transaction_id, c.failure_code, c.state_version, c.created_at,
+            'cancelled' AS status, NULL AS graph_event_id
+        FROM automation_events a JOIN automation_events c
+          ON c.run_id=a.run_id AND c.state_version=a.state_version+1
+         AND c.transaction_id=a.transaction_id
+        WHERE a.run_id=? AND a.state_version=? AND a.decision='confirmed'
+          AND a.previous_state='awaiting_confirmation' AND a.next_state='write_authorized'
+          AND a.transition_kind='write_authorized'
+          AND c.previous_state='write_authorized' AND c.next_state='source_unavailable'
+          AND c.transition_kind='source_unavailable'
+          AND c.failure_code IN ('source_unavailable','thread_unfollowed')
+          AND (? IS NULL OR a.payload_sha256=?)""",
+        (row["run_id"], confirmed_version, proposal_sha256, proposal_sha256),
+    ).fetchone()
+    if event is None:
+        return None
+    if proposal_version is not None and proposal_version != _calendar_proposal_generation(
+        db,
+        str(row["run_id"]),
+        before_state_version=confirmed_version,
+    ):
+        return None
+    current = db.execute(
+        "SELECT transaction_id,status,failure_code FROM automation_calendar_writes WHERE run_id=?",
+        (row["run_id"],),
+    ).fetchone()
+    if current is None or (
+        current["transaction_id"] == event["transaction_id"]
+        and (current["status"] != "cancelled" or current["failure_code"] != event["failure_code"])
+    ):
+        raise RuntimeError("Cancelled automation admission ledger is inconsistent")
+    run = replace(
+        _automation_run(row),
+        state="source_unavailable",
+        state_version=int(event["state_version"]),
+        failure_code="source_unavailable",
+        updated_at=str(event["created_at"]),
+    )
+    return AutomationCalendarWriteCancelled(run, calendar_write_outcome(run, event))
+
+
 def _mark_automation_sources_unavailable(
     db: sqlite3.Connection,
     message_ids: Sequence[str],
     *,
     updated_at: str,
+    cause: Literal["source_unavailable", "thread_unfollowed"],
 ) -> int:
+    if cause not in {"source_unavailable", "thread_unfollowed"}:
+        raise ValueError("Unknown automation source invalidation cause")
     if not message_ids:
         return 0
     for message_id in message_ids:
@@ -1883,74 +2100,7 @@ def _mark_automation_sources_unavailable(
             tuple(chunk),
         ).fetchall()
         for row in runs:
-            run_id = str(row["run_id"])
-            db.execute(
-                "DELETE FROM automation_extraction_payloads WHERE run_id = ?",
-                (run_id,),
-            )
-            db.execute(
-                "DELETE FROM automation_proposal_payloads WHERE run_id = ?",
-                (run_id,),
-            )
-            previous_state = str(row["state"])
-            if previous_state not in {
-                "detected",
-                "extracting",
-                "proposing",
-                "awaiting_confirmation",
-                "write_authorized",
-            }:
-                continue
-            previous_version = int(row["state_version"])
-            next_version = previous_version + 1
-            if previous_state == "write_authorized":
-                cancelled = db.execute(
-                    """UPDATE automation_calendar_writes SET status = 'cancelled',
-                        failure_code = 'source_unavailable', updated_at = ?
-                    WHERE run_id = ? AND status = 'authorized'""",
-                    (updated_at, run_id),
-                )
-                if cancelled.rowcount != 1:
-                    raise RuntimeError("Automation source cleanup lost its write-state race")
-            changed = db.execute(
-                """UPDATE automation_runs SET
-                    state = 'source_unavailable', state_version = ?,
-                    failure_code = 'source_unavailable', review_notified_at = NULL,
-                    updated_at = ?
-                WHERE run_id = ? AND state = ? AND state_version = ?""",
-                (next_version, updated_at, run_id, previous_state, previous_version),
-            )
-            if changed.rowcount != 1:
-                raise RuntimeError("Automation source cleanup lost its expected-state race")
-            transitioned += 1
-            _append_automation_event(
-                db,
-                run_id=run_id,
-                sequence_no=next_version - 1,
-                previous_state=previous_state,
-                next_state="source_unavailable",
-                state_version=next_version,
-                automation_id=str(row["automation_id"]),
-                automation_version=int(row["automation_version"]),
-                extraction_schema_version=int(row["extraction_schema_version"]),
-                calendar_principal_key=str(row["calendar_principal_key"]),
-                transition_kind="source_unavailable",
-                failure_code="source_unavailable",
-                created_at=updated_at,
-                payload_id=(
-                    str(row["current_payload_id"])
-                    if row["current_payload_id"] is not None
-                    else None
-                ),
-                payload_sha256=(
-                    str(row["current_payload_sha256"])
-                    if row["current_payload_sha256"] is not None
-                    else None
-                ),
-                transaction_id=(
-                    str(row["transaction_id"]) if row["transaction_id"] is not None else None
-                ),
-            )
+            transitioned += _cancel_automation_source(db, row, updated_at=updated_at, cause=cause)
     return transitioned
 
 
@@ -2927,6 +3077,27 @@ def _automation_source_available_sql(alias: str, *, eligibility) -> str:
                         source.provider_message_id)={alias}.source_message_key)
           ) AND NOT ({eligibility.available_sql("source")})
     )"""
+
+
+def _scheduling_preparation_available_sql(db: sqlite3.Connection, alias: str) -> str:
+    if not removal.has_schema(db):
+        return f"{alias}.state IN ('detected','extracting')"
+    return f"""({alias}.state IN ('detected','extracting') OR (
+        {alias}.state='source_unavailable'
+        AND EXISTS (SELECT 1 FROM automation_calendar_writes w
+                    WHERE w.run_id={alias}.run_id AND w.status='cancelled'
+                      AND w.failure_code='thread_unfollowed')
+        AND ({_automation_source_available_sql(alias, eligibility=removal.CONTENT)})
+        AND EXISTS (
+            SELECT 1 FROM logical_messages m
+            JOIN thread_follow f ON {_followed_message_sql("m")}
+            LEFT JOIN automation_run_source_identities i ON i.run_id={alias}.run_id
+            WHERE m.provider={alias}.provider AND m.account_id={alias}.account_id
+              AND m.mailbox_identity_key IS i.mailbox_identity_key
+              AND message_source_key(m.provider,m.account_id,m.provider_message_id,
+                                     m.mailbox_identity_key)={alias}.source_message_key
+        )
+    ))"""
 
 
 def _automation_source_available(db: sqlite3.Connection, run_id: str, *, eligibility) -> bool:
@@ -12096,7 +12267,7 @@ class Store:
                   ON a.provider = r.provider AND a.account_id = r.account_id
                 LEFT JOIN automation_extraction_payloads AS p
                   ON p.payload_id = r.current_payload_id
-                WHERE r.state IN ('detected', 'extracting')
+                WHERE {_scheduling_preparation_available_sql(db, "r")}
                   AND a.address IS NOT NULL
                   AND (
                       p.next_retry_at IS NULL
@@ -12425,11 +12596,17 @@ class Store:
             ):
                 raise RuntimeError("Automation proposal lost its expected-state race")
             prior_proposal = db.execute(
-                """SELECT COALESCE(MAX(proposal_version), 0) AS latest
-                FROM automation_proposal_payloads WHERE run_id = ?""",
-                (run_id,),
+                """SELECT MAX(
+                    COALESCE((SELECT MAX(proposal_version)
+                              FROM automation_proposal_payloads WHERE run_id=?),0),
+                    COALESCE((SELECT proposal_version
+                              FROM automation_calendar_writes WHERE run_id=?),0)
+                ) AS latest""",
+                (run_id, run_id),
             ).fetchone()
-            proposal_version = int(prior_proposal["latest"]) + 1
+            proposal_version = max(
+                int(prior_proposal["latest"]), _calendar_proposal_generation(db, run_id),
+            ) + 1
             proposal_document["principal_key"] = str(row["calendar_principal_key"])
             proposal_document["version"] = proposal_version
             proposal_json = json.dumps(
@@ -12517,10 +12694,12 @@ class Store:
         decision: str,
         write_authorized: bool = True,
         now: datetime | None = None,
-    ) -> AutomationRun:
+    ) -> AutomationRun | AutomationCalendarWriteCancelled:
         if decision not in {"confirm", "decline"}:
             raise ValueError("automation proposal decision is invalid")
-        if proposal_version < 1 or len(proposal_sha256) != 64:
+        if (type(expected_state_version) is not int or expected_state_version < 1
+            or type(proposal_version) is not int or proposal_version < 1
+            or len(proposal_sha256) != 64):
             raise ValueError("automation proposal identity is invalid")
         selected_now = now or datetime.now(UTC)
         if selected_now.tzinfo is None:
@@ -12534,7 +12713,18 @@ class Store:
                 WHERE run_id = ? AND proposal_version = ? AND proposal_sha256 = ?""",
                 (run_id, proposal_version, proposal_sha256),
             ).fetchone()
-            if row is None or proposal is None:
+            if row is None:
+                raise KeyError(run_id)
+            if decision == "confirm":
+                cancelled = _cancelled_calendar_admission(
+                    db, row, expected_state_version + 1, proposal_sha256=proposal_sha256,
+                    proposal_version=proposal_version,
+                )
+                if cancelled is not None:
+                    # The hash includes the monotonic proposal generation. Its
+                    # original confirmation also binds the exact expected version.
+                    return cancelled
+            if proposal is None:
                 raise KeyError(run_id)
             existing_write = db.execute(
                 "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
@@ -12544,8 +12734,13 @@ class Store:
                     int(existing_write["proposal_version"]) == proposal_version
                     and existing_write["proposal_sha256"] == proposal_sha256
                 ):
+                    if existing_write["status"] == "cancelled":
+                        raise RuntimeError(
+                            "Cancelled automation confirmation identity does not match"
+                        )
                     return _automation_run(row)
-                raise RuntimeError("Automation confirmation conflicts with its durable write")
+                if existing_write["status"] != "cancelled":
+                    raise RuntimeError("Automation confirmation conflicts with its durable write")
             if decision == "decline" and row["state"] == "declined":
                 return _automation_run(row)
             if (
@@ -12605,6 +12800,14 @@ class Store:
                     event_decision = "confirmed"
                     next_payload_id = str(proposal["payload_id"])
                     next_payload_sha256 = proposal_sha256
+                    if existing_write is not None:
+                        deleted = db.execute(
+                            """DELETE FROM automation_calendar_writes
+                            WHERE run_id=? AND status='cancelled'""",
+                            (run_id,),
+                        )
+                        if deleted.rowcount != 1:
+                            raise RuntimeError("Cancelled automation admission changed")
                     db.execute(
                         """INSERT INTO automation_calendar_writes(
                             run_id, transaction_id, proposal_version, proposal_sha256,
@@ -12743,7 +12946,9 @@ class Store:
         expected_state_version: int,
         *,
         now: datetime | None = None,
-    ) -> AutomationRun:
+    ) -> AutomationRun | AutomationCalendarWriteCancelled:
+        if type(expected_state_version) is not int or expected_state_version < 1:
+            raise ValueError("Automation write version is invalid")
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -12751,14 +12956,22 @@ class Store:
             write = db.execute(
                 "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
             ).fetchone()
-            if row is None or write is None:
+            if row is None:
+                raise KeyError(run_id)
+            cancelled = _cancelled_calendar_admission(db, row, expected_state_version)
+            if cancelled is not None:
+                return cancelled
+            if write is None:
                 raise KeyError(run_id)
             if (
                 row["state"] != "write_authorized"
                 or int(row["state_version"]) != expected_state_version
-                or write["status"] != "authorized"
             ):
-                raise RuntimeError("Automation write lost its expected-state race")
+                raise AutomationCalendarWriteStateChanged(
+                    "Automation write lost its expected-state race"
+                )
+            if write["status"] != "authorized":
+                raise RuntimeError("Automation write admission ledger is inconsistent")
             source_exists = db.execute(
                 """SELECT 1 FROM logical_messages AS m
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = ?
@@ -12796,10 +13009,14 @@ class Store:
             ).fetchone()
             next_version = expected_state_version + 1
             if source_exists is None or proposal_exists is None:
-                db.execute("DELETE FROM automation_extraction_payloads WHERE run_id = ?", (run_id,))
-                db.execute("DELETE FROM automation_proposal_payloads WHERE run_id = ?", (run_id,))
-                next_state = "source_unavailable"
-                failure_code = "source_unavailable"
+                _cancel_automation_source(
+                    db, dict(row, transaction_id=write["transaction_id"]),
+                    updated_at=stamp, cause="source_unavailable",
+                )
+                cancelled = _cancelled_calendar_admission(db, row, expected_state_version)
+                if cancelled is None:
+                    raise RuntimeError("Automation cancellation was not readable")
+                return cancelled
             else:
                 next_state = "writing"
                 failure_code = None
@@ -12995,11 +13212,17 @@ class Store:
             if row is None:
                 raise KeyError(run_id)
             if (
-                str(row["state"]) not in {"detected", "extracting"}
+                not db.execute(
+                    f"""SELECT 1 FROM automation_runs r WHERE r.run_id=?
+                    AND {_scheduling_preparation_available_sql(db, 'r')}""",
+                    (run_id,),
+                ).fetchone()
+                or type(expected_state_version) is not int
                 or int(row["state_version"]) != expected_state_version
             ):
                 raise RuntimeError("Automation extraction lost its expected-state race")
-            previous_source_hash = row["source_content_sha256"]
+            repreparing = row["state"] == "source_unavailable"
+            previous_source_hash = None if repreparing else row["source_content_sha256"]
             if previous_source_hash is not None and previous_source_hash != source_content_sha256:
                 raise AutomationSourceChanged("Automation source content changed after admission")
             payload_rows = db.execute(
@@ -13032,7 +13255,7 @@ class Store:
             attempt_no = len(payload_rows) + 1
             if attempt_no not in {1, 2}:
                 raise RuntimeError("Automation extraction retry budget is exhausted")
-            if row["extraction_context_at"] is not None and (
+            if not repreparing and row["extraction_context_at"] is not None and (
                 row["extraction_context_at"] != context_at
                 or row["extraction_timezone"] != timezone
                 or int(row["extraction_body_char_limit"]) != body_char_limit
@@ -13433,29 +13656,12 @@ class Store:
 
     def automation_run_for_message(self, message_id: str) -> AutomationRun | None:
         with self.connection() as db:
-            row = db.execute(
-                """SELECT r.* FROM automation_runs AS r
-                LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN logical_messages AS m
-                  ON m.provider = r.provider
-                 AND m.account_id = r.account_id
-                 AND (
-                     (i.mailbox_identity_key IS NOT NULL
-                      AND m.mailbox_identity_key = i.mailbox_identity_key
-                      AND message_source_key(
-                            m.provider, m.account_id, m.provider_message_id,
-                            m.mailbox_identity_key
-                          ) = r.source_message_key)
-                     OR (i.mailbox_identity_key IS NULL
-                         AND m.mailbox_identity_key IS NULL
-                         AND message_source_key(
-                                m.provider, m.account_id, m.provider_message_id
-                             ) = r.source_message_key)
-                 )
-                WHERE m.message_id = ?""",
-                (message_id,),
-            ).fetchone()
+            row = _automation_run_for_message(db, message_id)
         return _automation_run(row) if row is not None else None
+
+    def calendar_write_outcome_for_message(self, message_id: str) -> dict[str, object] | None:
+        with self.connection() as db:
+            return _calendar_write_outcome_for_message(db, message_id)
 
     def automation_run(self, run_id: str) -> AutomationRun | None:
         with self.connection() as db:
@@ -14430,6 +14636,7 @@ class Store:
             message_id = str(item["message_id"])
             item["attachments"] = attachments_by_message[message_id]
             item["calendar_proposal"] = proposal_by_message.get(message_id)
+            item["calendar_write_outcome"] = _calendar_write_outcome_for_message(db, message_id)
         return items
 
     def _purge_followed(self, retention_days, stamp, expired_units, parameters, polled_scope):
@@ -14509,7 +14716,7 @@ class Store:
                     if not current_rows or not set(current_rows) <= set(rows):
                         continue
                     reviews += _mark_automation_sources_unavailable(
-                        db, current_rows, updated_at=stamp.isoformat()
+                        db, current_rows, updated_at=stamp.isoformat(), cause="source_unavailable"
                     )
                     for offset in range(0, len(current), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
                         chunk = current[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
@@ -14592,6 +14799,7 @@ class Store:
                         db,
                         current_rows,
                         updated_at=stamp.isoformat(),
+                        cause="source_unavailable",
                     )
                     if current_expired:
                         current_placeholders = ", ".join("?" for _ in current_expired)

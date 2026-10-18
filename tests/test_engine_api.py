@@ -1865,6 +1865,12 @@ def test_calendar_proposal_decision_binds_message_and_exact_proposal(
                 failure_code=None,
             ),
             write=SimpleNamespace(graph_event_id="immutable-event-id"),
+            calendar_write_outcome={
+                "run_id": run_id, "state_version": 8,
+                "transaction_id": "6f352c00-bc6e-437a-b0b5-379e661b9420",
+                "status": "completed", "failure_code": None,
+                "graph_event_id": "immutable-event-id",
+            },
         )
 
     monkeypatch.setattr(engine_api, "decide_scheduling_proposal", decide)
@@ -1897,6 +1903,12 @@ def test_calendar_proposal_decision_binds_message_and_exact_proposal(
         "state_version": 8,
         "failure_code": None,
         "graph_event_id": "immutable-event-id",
+        "calendar_write_outcome": {
+            "run_id": run_id, "state_version": 8,
+            "transaction_id": "6f352c00-bc6e-437a-b0b5-379e661b9420",
+            "status": "completed", "failure_code": None,
+            "graph_event_id": "immutable-event-id",
+        },
     }
     assert calls == [
         {
@@ -8888,3 +8900,56 @@ def test_mail_account_list_reports_the_sent_scope(
     runtime.config.gmail_token_file.unlink()
     response = engine_api._response(request(config_path, "mail.accounts.list"))
     assert [a["sent_scope"] for a in response["data"]["accounts"]] == ["not_polled"]
+
+@pytest.mark.parametrize("held", [False, True])
+def test_calendar_cancelled_decision_and_locked_inbox_keep_only_bound_metadata(
+    tmp_path, monkeypatch, held
+):
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+    from test_service import config
+
+    from eom_email_watcher import service
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=held)
+    accept_calendar_unfollow(store, vendor)
+    cfg = config(tmp_path)
+    assert cfg.database_file == store.path
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(config=cfg, store=store))
+    monkeypatch.setattr(service, "feature_entitlements_active", lambda *features: True)
+    monkeypatch.setattr(
+        service,
+        "create_calendar_event",
+        lambda *args, **kwargs: pytest.fail("cancelled replay created an event"),
+    )
+    payload = dict(
+        decision="confirm",
+        message_id="local-scheduling",
+        run_id=authorized.run_id,
+        state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+    )
+    result = engine_api._calendar_automation_decide({"payload": payload})
+    expected = store.calendar_write_outcome_for_message("local-scheduling")
+    assert result["calendar_write_outcome"] == expected
+    assert result["state"] == "source_unavailable"
+    assert result["graph_event_id"] is None
+    assert set(expected) == {
+        "run_id",
+        "state_version",
+        "transaction_id",
+        "status",
+        "failure_code",
+        "graph_event_id",
+    }
+    assert expected["failure_code"] == "thread_unfollowed"
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    for _ in range(2):
+        rows = store.recent(100)
+        engine_api._hide_locked_automation_previews(rows)
+        row = next(row for row in rows if row["message_id"] == "local-scheduling")
+        assert row["calendar_proposal"] is None
+        assert row["calendar_write_outcome"] == expected
+    with pytest.raises(engine_api.ApiError) as error:
+        engine_api._calendar_automation_decide({"payload": dict(payload, message_id="foreign")})
+    assert error.value.code == "not_found"

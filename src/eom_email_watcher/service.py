@@ -31,6 +31,8 @@ from .db import (
     AdmissionProvenance,
     AnalyzedMessage,
     AutomationCalendarWrite,
+    AutomationCalendarWriteCancelled,
+    AutomationCalendarWriteStateChanged,
     AutomationExtractionPayload,
     AutomationProposalWork,
     AutomationRun,
@@ -43,6 +45,7 @@ from .db import (
     NotificationIntent,
     PendingMessage,
     Store,
+    calendar_write_outcome,
 )
 from .gmail import (
     GmailAuthorizationRejected,
@@ -347,6 +350,7 @@ class SchedulingWriteAccess:
 class SchedulingDecision:
     run: AutomationRun
     write: AutomationCalendarWrite | None
+    calendar_write_outcome: dict[str, object] | None = None
 
 
 def _scheduling_proposal_authorization(
@@ -1106,9 +1110,9 @@ def process_scheduling_writes(
                     current.state_version,
                     now=stamp,
                 )
-            except RuntimeError:
+            except AutomationCalendarWriteStateChanged:
                 continue
-            if writing.state == "source_unavailable":
+            if isinstance(writing, AutomationCalendarWriteCancelled):
                 processed += 1
                 review_required += 1
                 continue
@@ -1258,7 +1262,13 @@ def decide_scheduling_proposal(
         "decision": decision,
         "now": now,
     }
-    if decision == "confirm" and existing_write is None:
+    fresh_admission = existing_write is None or (
+        existing_write.status == "cancelled" and (
+            existing_write.proposal_version != proposal_version
+            or existing_write.proposal_sha256 != proposal_sha256
+        )
+    )
+    if decision == "confirm" and fresh_admission:
         try:
             updated = store.decide_automation_proposal(
                 run_id,
@@ -1290,12 +1300,17 @@ def decide_scheduling_proposal(
             expected_state_version,
             **decision_args,
         )
+    if isinstance(updated, AutomationCalendarWriteCancelled):
+        return SchedulingDecision(updated.run, None, updated.outcome)
     if decision == "confirm" and updated.state == "write_authorized":
         process_scheduling_writes(config, store, run_id=run_id, limit=1, now=now)
         updated = store.automation_run(run_id)
         if updated is None:
             raise RuntimeError("Scheduling automation disappeared after confirmation")
-    return SchedulingDecision(updated, store.automation_calendar_write(run_id))
+    write = store.automation_calendar_write(run_id)
+    return SchedulingDecision(
+        updated, write, calendar_write_outcome(updated, write) if write else None,
+    )
 
 
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
