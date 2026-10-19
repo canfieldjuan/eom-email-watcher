@@ -442,3 +442,34 @@ that new test assumption was rejected against the existing pending-only eligibil
 SQL and followed-adoption owner before correction. No pre-existing assertion changed. This assertion maps to the accepted contract’s metadata-versus-content
 boundary. No production eligibility predicate, guard, fixture policy or skip changes.
 The failed full run is preserved as failed qualification; all final gates remain.
+
+
+## Completed local qualification — external gates remain
+
+Tested commit: `c47510e654c3657ef017eada593ffc2c86d82be1`. The canonical full Python gate
+`uv run --locked pytest -x`, under umask 022 and fresh empty isolated XDG config/data
+with an external TMPDIR, completed: **4092 passed, 77 skipped, 2 deselected in 1663.74s (0:27:43)**.
+No new skips, collection exclusions, product predicates or test-oracle reductions.
+The required CI coverage job remains intact.
+
+Cause, before-image capture, typed begin replay and provider-owned writing
+omission mutations each failed at the declared behavior boundary. Exact database
+owner bytes were restored after each; the restored focused gate completed
+**17 passed, 280 deselected in 8.71s**.
+
+Native Rust at `9b6b7a09db9e50151c1a8fc2f12f80a03008d26d` completed
+**165 passed; 0 failed; 1 existing ignored**, with no src/desktop diff through the
+full-tested commit. Desktop **216 passed**, type/build, cargo format, Clippy and
+Ruff passed; rebuilt sidecar reported **packaged-engine-smoke: ok**. This section
+is qualification metadata only; runtime and test inputs are unchanged from the
+recorded tested commit.
+
+Durable evidence alias `EW291-LOCAL-QUALIFICATION`, SHA256
+`3f6fe94c42e4d87bfdfd7732ad2f6ce0b8023703da3ea8b4bc2ba0ee4e6aa401`. It indexes raw failed/passing runs, mutation failures, exact source freeze,
+changed-assertion inventory and file-by-file cold audit by alias and SHA256.
+
+**NOT DONE:** final published-head required CI including Windows installed/populated
+qualification, independent exact-head review and posted oversight PASS, review
+reconciliation and merge. Require zero unresolved threads/changes requested and
+clean local == actual remote; merge with a merge commit and reviewed-tree equality.
+No installation, promotion or #278 work.
