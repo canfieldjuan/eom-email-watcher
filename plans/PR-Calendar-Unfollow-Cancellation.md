@@ -559,3 +559,40 @@ selects the oldest admission with immutable run ID as tie-breaker. It never
 switches to a second copy when the chosen generation advances. The sibling
 multiple-alias regression also failed first, then checks stable selection and
 refusal of the non-owner. Ordinary canonical runs keep their existing precedence.
+
+
+## Review repair qualification
+
+Tested head: `c270960a2ff2d319b182e1bc69a840ffcbaea8f0`. Full
+`uv run --locked pytest -x`, umask 022, fresh isolated XDG config/data and
+external TMPDIR: **4105 passed, 77 skipped, 2 deselected in 1820.81s (0:30:20)**,
+exit 0. The pre-existing platform contracts and skip assertions are unchanged.
+The interrupted run on the earlier local repair is not qualification.
+
+The original Python failures were reproduced before repair; both alias-owner
+collision tests failed before consolidation. The manual-review omission mutant
+failed the formatter and production-card regressions. Restored owner regressions:
+**17 passed, 797 deselected**; broader adjacent lifecycle checks: **201 passed,
+954 deselected**. Existing assertions were preserved. The retained assertion map
+links every new assertion to the accepted replay, identity, consent, notification,
+CONTENT or fail-closed contract.
+
+Available native desktop gate at the tested head: **165 passed; 0 failed;
+1 existing ignored**. Desktop: **218 passed, 0 failed, 0 skipped**; type/build
+passed, with no desktop input diff through the tested head. Ruff and whitespace
+checks passed. Rebuilt Linux sidecar: **packaged-engine-smoke: ok**; its retained
+binary SHA256 is `c19d6638327d387059c954264e4061576c0219fe9ba9a4a668b21e64c8e538d4`.
+These native Linux results do not replace final published-head Windows proof.
+
+Evidence alias `EW291-REPAIR-QUALIFICATION`, SHA256
+`d8ab948ff7570999ec59b9bd4318df88d83cb56ba953bf58a1a0ec54670d64bd`, indexes
+raw failure/pass logs, exact source freeze, assertion mapping, cold audit and
+packaged-engine/native receipts. All frozen source hashes matched after the full
+run and the working tree was clean. This follow-up changes qualification metadata
+only; no runtime or test input changes.
+
+**NOT DONE:** final published-head CI and Windows installed/populated proof,
+independent exact-head review and posted oversight PASS, reconciliation and merge.
+Require zero unresolved review threads, no changes requested, clean local equal
+to actual remote, and merge-commit tree equality. The bodyless unapproved proposal
+policy is deferred in #292. No installation, promotion or #278 work.
