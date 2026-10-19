@@ -665,3 +665,53 @@ This commit records qualification metadata only, without runtime/test changes.
 **NOT DONE:** final published-head required CI and Windows installed/populated
 proof, independent exact-head review and posted oversight PASS, reconciliation
 and merge. No installation, promotion or #278 work; #292 remains separate.
+
+## Expiry and inbox review-round consolidation
+
+Exact published base `55fc0c78ff90952be4a6f8f2e8384d546d8636a8` had two
+blocking findings caused by the refollow path introduced in `55b05e0f`: a fresh
+proposal could outlive its reused run, and payload-less fresh `manual_review` or
+`ambiguous` could display the old cancelled admission. The third-round root note
+is PR comment `6259020953`. The pre-existing proposal issuance/decision rules
+consulted only proposal expiry while the pending-write selector consulted run
+expiry; the bound inbox outcome projection did not inspect current review state.
+
+`db._calendar_run_live_sql` now owns one run-lifetime condition consumed by
+`record_automation_proposal`, `decide_automation_proposal` and
+`pending_automation_calendar_writes`. Issuance caps a fresh proposal at run
+expiry, and confirmation refuses even a legacy uncapped proposal after run
+expiry through the existing `proposal_expired` path. The bound inbox projection
+suppresses the old cancellation for payload-less fresh review states, retaining
+the cancelled write and immutable replay. No renderer-specific override,
+schema/API change, new wording, timeout, skip or weakened assertion was added.
+
+Fail-first new regressions cover near-expiry refollow, a legacy uncapped stored
+proposal, at/past/invalid run expiry, and payload-less fresh review in both
+states. The first two probes failed at the deadline/consent assertions; the
+inbox variants failed at the projection assertion after correcting a test-only
+pre/post-cancellation comparison. An initial local repair added a computed
+column to a run row and broke old replay; the adjacent gate caught it, and the
+query owner was corrected without changing `_automation_run` or old assertions.
+The corrected calendar/scheduling adjacent gate, full Python under umask 022 in
+an isolated environment, Ruff, native fmt/Clippy/tests, desktop tests/build and
+rebuilt development packaged-engine smoke all passed on frozen runtime/test
+source. Durable evidence alias `EW291-EXPIRY-INBOX-REPAIR`, SHA256
+`2a5360a6ffe529d855711e15ee91174799e603a669f7436bd8956ddb7b55a73a`
+indexes raw gate logs, source hashes, fail-first classification and the diff.
+
+New assertion mapping to the accepted contract:
+- Fresh proposal cap, pre-deadline authorization/new transaction, and the
+  before/at-deadline selector checks prove normal expiry plus fresh consent.
+- At/past/invalid run expiry refusal, absent proposal and unchanged run prove
+  the existing expiry requirement without a partial admission.
+- Legacy uncapped confirmation's `proposal_expired` state, retained cancelled
+  transaction/cause and absent pending write prove fail-closed recovery without
+  silently losing a newly authorized event.
+- The old cancellation before refollow, fresh `manual_review`/`ambiguous` run,
+  absent proposal and absent stale outcome in both direct and inbox projections
+  prove truthful current status while preserving immutable old admission.
+
+The nonblocking generic source-loss replay mutant gap is issue #293. The
+pending-proposal policy is separate in #292. **NOT DONE:** this repair's published
+head CI/Windows installed and populated proof, independent exact-head review,
+thread reconciliation, merge. No installation or promotion.

@@ -8793,7 +8793,7 @@ def test_calendar_unfollow_cancellation_rolls_back_with_source_transaction(
 
 
 def refollowed_calendar_proposal_fixture(
-    tmp_path, *, held=False, cached=True, no_suggestions=False
+    tmp_path, *, held=False, cached=True, no_suggestions=False, run_expires_at=None
 ):
     from eom_email_watcher import body_state, removal, source_locks
 
@@ -8849,6 +8849,12 @@ def refollowed_calendar_proposal_fixture(
         violations=[],
         accepted_state="proposing",
     )
+    if run_expires_at is not None:
+        with store.connection() as db:
+            db.execute(
+                "UPDATE automation_runs SET expires_at=? WHERE run_id=?",
+                (run_expires_at, proposing.run_id),
+            )
     new_awaiting = store.record_automation_proposal(
         proposing.run_id,
         proposing.state_version,
@@ -8868,6 +8874,125 @@ def refollowed_calendar_proposal_fixture(
     assert fresh_proposal.proposal_sha256 != proposal.proposal_sha256
     assert store.pending_automation_calendar_writes() == []
     return store, original, awaiting, proposal, authorized, new_awaiting, fresh_proposal, proposing
+
+
+def test_refollowed_calendar_proposal_is_bounded_by_run_lifetime(tmp_path):
+    run_expiry = datetime(2026, 9, 7, 13, 2, tzinfo=UTC)
+    store, original, _, _, _, awaiting, fresh, proposing = (
+        refollowed_calendar_proposal_fixture(
+            tmp_path, run_expires_at=run_expiry.isoformat()
+        )
+    )
+    assert fresh.expires_at == run_expiry.isoformat()
+    authorized = store.decide_automation_proposal(
+        proposing.run_id, awaiting.state_version,
+        proposal_version=fresh.proposal_version,
+        proposal_sha256=fresh.proposal_sha256, decision="confirm",
+        now=datetime(2026, 9, 7, 13, 1, tzinfo=UTC),
+    )
+    assert authorized.state == "write_authorized"
+    assert (
+        store.automation_calendar_write(proposing.run_id).transaction_id
+        != original.transaction_id
+    )
+    assert [work.run.run_id for work in store.pending_automation_calendar_writes(
+        now=datetime(2026, 9, 7, 13, 1, tzinfo=UTC)
+    )] == [proposing.run_id]
+    assert store.pending_automation_calendar_writes(now=run_expiry) == []
+
+
+@pytest.mark.parametrize("run_expiry", [
+    "2026-09-07T13:00:00+00:00", "2026-09-07T12:59:00+00:00", "invalid",
+])
+def test_expired_calendar_run_cannot_issue_new_proposal(tmp_path, run_expiry):
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET expires_at=? WHERE run_id=?",
+            (run_expiry, proposing.run_id),
+        )
+    with pytest.raises(KeyError):
+        store.record_automation_proposal(
+            proposing.run_id, proposing.state_version,
+            extraction_payload_id=extraction.payload_id,
+            request_sha256="f" * 64, subject="Meeting request",
+            attendees=("jane@example.com",),
+            start="2026-09-08T10:00:00-05:00",
+            end="2026-09-08T10:30:00-05:00",
+            timezone="America/Chicago",
+            suggestion_reason="All attendees are available.", empty_reason=None,
+            observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+        )
+    assert store.automation_proposal(proposing.run_id) is None
+    assert store.automation_run(proposing.run_id).state == "proposing"
+
+
+def test_legacy_uncapped_refollow_proposal_cannot_authorize_expired_run(tmp_path):
+    run_expiry = datetime(2026, 9, 7, 13, 2, tzinfo=UTC)
+    store, original, _, _, _, awaiting, fresh, proposing = (
+        refollowed_calendar_proposal_fixture(
+            tmp_path, run_expires_at=run_expiry.isoformat()
+        )
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_proposal_payloads SET expires_at=? WHERE payload_id=?",
+            ("2026-09-07T13:15:00+00:00", fresh.payload_id),
+        )
+    result = store.decide_automation_proposal(
+        proposing.run_id, awaiting.state_version,
+        proposal_version=fresh.proposal_version,
+        proposal_sha256=fresh.proposal_sha256, decision="confirm",
+        now=datetime(2026, 9, 7, 13, 3, tzinfo=UTC),
+    )
+    assert (result.state, result.failure_code) == ("proposing", "proposal_expired")
+    retained = store.automation_calendar_write(proposing.run_id)
+    assert retained.transaction_id == original.transaction_id
+    assert (retained.status, retained.failure_code) == ("cancelled", "thread_unfollowed")
+    assert store.pending_automation_calendar_writes(now=run_expiry) == []
+
+
+@pytest.mark.parametrize("fresh_state", ["manual_review", "ambiguous"])
+def test_refollowed_payloadless_review_does_not_project_old_cancellation(tmp_path, fresh_state):
+    from eom_email_watcher import body_state, removal
+
+    store, vendor, _, _, authorized = calendar_unfollow_fixture(tmp_path, cached=False)
+    original = store.automation_calendar_write(authorized.run_id)
+    accept_calendar_unfollow(store, vendor)
+    assert store.calendar_write_outcome_for_message("local-scheduling")["status"] == "cancelled"
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    body_state.record(
+        store, "local-scheduling", ("Fresh request", 13),
+        fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    cancelled = store.automation_run(authorized.run_id)
+    fresh = store.reserve_automation_extraction(
+        authorized.run_id, cancelled.state_version,
+        source_content_sha256="c" * 64,
+        context_at="2026-09-07T09:00:00-05:00",
+        timezone="America/Chicago", body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(authorized.run_id)
+    result_json = b'{"intent":"new_meeting","proposed_times":[],"attendees":[]}'
+    current = store.record_automation_extraction(
+        authorized.run_id, extracting.state_version,
+        payload_id=fresh.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json, violations=[], accepted_state=fresh_state,
+    )
+    assert current.state == fresh_state
+    assert store.automation_proposal(current.run_id) is None
+    retained = store.automation_calendar_write(current.run_id)
+    assert retained.transaction_id == original.transaction_id
+    assert (retained.status, retained.failure_code) == ("cancelled", "thread_unfollowed")
+    assert store.calendar_write_outcome_for_message("local-scheduling") is None
+    inbox = next(item for item in store.recent(10) if item["message_id"] == "local-scheduling")
+    assert inbox["calendar_proposal"] is None
+    assert inbox["calendar_write_outcome"] is None
 
 
 @pytest.mark.parametrize("held, cached", [(False, True), (True, True), (False, False)])

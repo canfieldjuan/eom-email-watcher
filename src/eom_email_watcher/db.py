@@ -352,6 +352,11 @@ def _automation_expiry(observed_at: str, admitted_at: datetime) -> str:
     return (min(observed, admitted_at) + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
 
 
+def _calendar_run_live_sql(alias: str) -> str:
+    """One run-lifetime boundary for proposal issuance, consent and handoff."""
+    return f"aware_iso_epoch({alias}.expires_at) > ?"
+
+
 _CONNECT_JOBS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
     job_id TEXT PRIMARY KEY,
@@ -2025,7 +2030,8 @@ def _automation_run_for_message(
     calendar_join = ""
     if with_calendar_write:
         columns = (
-            "r.run_id,r.state_version,w.transaction_id,w.status,w.failure_code,w.graph_event_id"
+            "r.run_id,r.state,r.state_version,w.transaction_id,w.status,w.failure_code,"
+            "w.graph_event_id"
         )
         calendar_join = "JOIN automation_calendar_writes w ON w.run_id=r.run_id"
     row = db.execute(
@@ -2045,7 +2051,12 @@ def _calendar_write_outcome_for_message(
 ) -> dict[str, object] | None:
     # Resolve source/RECORD binding and both ledger rows in one SQLite snapshot.
     row = _automation_run_for_message(db, message_id, with_calendar_write=True)
-    return calendar_write_outcome(row, row) if row is not None else None
+    if row is None:
+        return None
+    if row["status"] == "cancelled" and row["state"] in {"manual_review", "ambiguous"}:
+        # A fresh payload-less review supersedes the prior cancelled admission.
+        return None
+    return calendar_write_outcome(row, row)
 
 
 def _calendar_proposal_generation(
@@ -12649,7 +12660,12 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if not _automation_source_available(db, run_id, eligibility=removal.CONTENT):
                 raise KeyError(run_id)
-            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
+            now_epoch = (stamp - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds()
+            row = db.execute(
+                f"SELECT r.* FROM automation_runs AS r WHERE r.run_id = ? "
+                f"AND ({_calendar_run_live_sql('r')})",
+                (run_id, now_epoch),
+            ).fetchone()
             extraction = db.execute(
                 """SELECT status FROM automation_extraction_payloads
                 WHERE payload_id = ? AND run_id = ?""",
@@ -12675,6 +12691,11 @@ class Store:
             proposal_version = max(
                 int(prior_proposal["latest"]), _calendar_proposal_generation(db, run_id),
             ) + 1
+            if expires_at is not None:
+                expires_at = min(
+                    datetime.fromisoformat(expires_at),
+                    datetime.fromisoformat(str(row["expires_at"])).astimezone(UTC),
+                ).isoformat()
             proposal_document["principal_key"] = str(row["calendar_principal_key"])
             proposal_document["version"] = proposal_version
             proposal_json = json.dumps(
@@ -12775,7 +12796,9 @@ class Store:
         stamp = selected_now.astimezone(UTC)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
             proposal = db.execute(
                 """SELECT * FROM automation_proposal_payloads
                 WHERE run_id = ? AND proposal_version = ? AND proposal_sha256 = ?""",
@@ -12844,7 +12867,13 @@ class Store:
                     expires_at = datetime.fromisoformat(str(expires_value)).astimezone(UTC)
                 except (OverflowError, ValueError) as exc:
                     raise RuntimeError("Stored automation proposal time is invalid") from exc
-                if stamp >= expires_at or stamp >= start_time:
+                now_epoch = (stamp - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds()
+                run_live = db.execute(
+                    f"SELECT 1 FROM automation_runs AS r WHERE r.run_id = ? "
+                    f"AND ({_calendar_run_live_sql('r')})",
+                    (run_id, now_epoch),
+                ).fetchone()
+                if run_live is None or stamp >= expires_at or stamp >= start_time:
                     extraction = db.execute(
                         """SELECT payload_id, result_sha256
                         FROM automation_extraction_payloads
@@ -12976,7 +13005,7 @@ class Store:
                 WHERE r.state IN ('write_authorized', 'writing', 'unresolved', 'reconciling')
                   AND (
                       r.state IN ('writing', 'reconciling')
-                      OR aware_iso_epoch(r.expires_at) > ?
+                      OR ({_calendar_run_live_sql('r')})
                   )
                 {run_filter}
                 ORDER BY r.updated_at, r.run_id LIMIT ?""",
