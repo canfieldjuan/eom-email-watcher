@@ -543,3 +543,19 @@ legacy test checks existing stale refusal with unchanged events/write and no
 provider call; frontend tests check both formatter surfaces and production-card
 wording/reason/no-button rendering. The fixture's no-suggestions option adds a
 sibling case; all prior assertions remain.
+
+A collision probe on local `bd039bad95bb706a89e4eee31a526f60351018ae`
+found the new alias fallback selected both a canonical run and a cancelled alias
+for the same logical unit. Stop that qualification (interrupted, not passed).
+Repair at `_scheduling_source_join_sql`: the canonical run retains ownership;
+the admitted alias fallback is available only when no bound canonical run exists.
+The same resolver controls selector/start/proposal/status, so no later queue
+filter compensates for duplicate admission. A fail-first regression proves one
+selected canonical run, refused alias reservation, unchanged canonical state and
+stable historical cancellation replay. This preserves existing D-identity rather
+than introducing a policy for multiple visible proposals.
+If multiple cancelled aliases exist without a canonical run, the same owner
+selects the oldest admission with immutable run ID as tie-breaker. It never
+switches to a second copy when the chosen generation advances. The sibling
+multiple-alias regression also failed first, then checks stable selection and
+refusal of the non-owner. Ordinary canonical runs keep their existing precedence.

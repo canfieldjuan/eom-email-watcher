@@ -9422,3 +9422,93 @@ def test_refollow_manual_review_resets_deliberate_cancellation_suppression(tmp_p
         authorized.run_id
     ]
     assert store.notification_intent_count() == len(store.notification_intents())
+
+
+
+def test_cancelled_alias_fallback_never_duplicates_an_existing_canonical_run(tmp_path):
+    from eom_email_watcher import removal
+
+    store, vendor, _, _, alias = calendar_unfollow_fixture(tmp_path, cached=False)
+    canonical = admitted_scheduling_run(
+        store, message_id="canonical", provider_message_id="canonical-provider"
+    )
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET logical_of='canonical' WHERE message_id='local-scheduling'")
+    accept_calendar_unfollow(store, vendor)
+    cancelled = store.automation_run(alias.run_id)
+    original = store.begin_automation_calendar_write(alias.run_id, alias.state_version)
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    assert [work.run.run_id for work in store.recoverable_automation_runs()] == [canonical.run_id]
+    with pytest.raises(RuntimeError, match="expected-state race"):
+        store.reserve_automation_extraction(
+            alias.run_id, cancelled.state_version, source_content_sha256="c" * 64,
+            context_at="2026-09-07T09:00:00-05:00", timezone="America/Chicago",
+            body_char_limit=20_000, organizer_address="owner@example.com",
+        )
+    assert store.automation_run_for_message("canonical").run_id == canonical.run_id
+    assert store.automation_run_for_message("local-scheduling") is None
+    assert store.begin_automation_calendar_write(alias.run_id, alias.state_version) == original
+    assert store.automation_run(canonical.run_id) == canonical
+
+
+
+def test_cancelled_aliases_have_one_stable_recovery_owner(tmp_path):
+    from eom_email_watcher import removal
+
+    store, vendor, _, proposal, first = calendar_unfollow_fixture(tmp_path, cached=False)
+    proposing, payload = proposing_scheduling_run(
+        store, message_id="second-copy", provider_message_id="second-provider"
+    )
+    awaiting = store.record_automation_proposal(
+        proposing.run_id, proposing.state_version, extraction_payload_id=payload.payload_id,
+        request_sha256="f" * 64, subject=proposal.subject, attendees=proposal.attendees,
+        start=proposal.start, end=proposal.end, timezone=proposal.timezone,
+        suggestion_reason=proposal.suggestion_reason, empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    second_proposal = store.automation_proposal(proposing.run_id)
+    second = store.decide_automation_proposal(
+        proposing.run_id, awaiting.state_version,
+        proposal_version=second_proposal.proposal_version,
+        proposal_sha256=second_proposal.proposal_sha256, decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    assert store.add_message(
+        message_id="canonical", provider=first.provider, account_id=first.account_id,
+        provider_message_id="canonical-provider", thread_id="canonical-thread",
+        sender="sender@example.com", sender_name=None, subject="Meeting",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET logical_of='canonical' "
+                   "WHERE message_id IN ('local-scheduling','second-copy')")
+    accept_calendar_unfollow(store, vendor)
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    selected = min((first, second), key=lambda run: (run.created_at, run.run_id))
+    other = second if selected.run_id == first.run_id else first
+    work = store.recoverable_automation_runs()
+    assert [item.run.run_id for item in work] == [selected.run_id]
+    assert store.automation_run_for_message("canonical").run_id == selected.run_id
+    store.reserve_automation_extraction(
+        selected.run_id, work[0].run.state_version, source_content_sha256="c" * 64,
+        context_at="2026-09-07T09:00:00-05:00", timezone="America/Chicago",
+        body_char_limit=20_000, organizer_address="owner@example.com",
+    )
+    # Selection cannot jump to the other cancelled copy as the chosen run advances.
+    assert [item.run.run_id for item in store.recoverable_automation_runs()] == [selected.run_id]
+    assert store.automation_run_for_message("canonical").run_id == selected.run_id
+    with pytest.raises(RuntimeError, match="expected-state race"):
+        store.reserve_automation_extraction(
+            other.run_id, store.automation_run(other.run_id).state_version,
+            source_content_sha256="c" * 64, context_at="2026-09-07T09:00:00-05:00",
+            timezone="America/Chicago", body_char_limit=20_000,
+            organizer_address="owner@example.com",
+        )

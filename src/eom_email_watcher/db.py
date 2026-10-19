@@ -1971,19 +1971,41 @@ def _scheduling_source_join_sql(run: str, identity: str, source: str, logical: s
     Ordinary duplicate runs remain suppressed. An already cancelled unfollow
     admission retains its explicit fresh-consent lifecycle after coalescing;
     immutable evidence keeps that identity usable after the current write changes.
+    The canonical run wins if present; otherwise the oldest admitted alias owns
+    recovery, with run_id as a stable tie-breaker independent of mutable state.
     """
     return f"""JOIN messages {source}
         ON {_automation_message_binding_sql(run, identity, source)}
         JOIN logical_messages {logical}
           ON {logical}.message_id=COALESCE({source}.logical_of,{source}.message_id)
-         AND ({source}.logical_of IS NULL OR EXISTS (
-             SELECT 1 FROM automation_events lineage
-             WHERE lineage.run_id={run}.run_id
-               AND lineage.previous_state='write_authorized'
-               AND lineage.next_state='source_unavailable'
-               AND lineage.transition_kind='source_unavailable'
-               AND lineage.failure_code='thread_unfollowed'
-               AND lineage.transaction_id IS NOT NULL
+         AND ({source}.logical_of IS NULL OR (
+             NOT EXISTS (
+                 SELECT 1 FROM automation_runs canonical_run
+                 LEFT JOIN automation_run_source_identities canonical_identity
+                   ON canonical_identity.run_id=canonical_run.run_id
+                 WHERE {_automation_message_binding_sql(
+                     "canonical_run", "canonical_identity", logical
+                 )}
+             )
+             AND {run}.run_id=(
+                 SELECT candidate.run_id FROM automation_runs candidate
+                 LEFT JOIN automation_run_source_identities candidate_identity
+                   ON candidate_identity.run_id=candidate.run_id
+                 JOIN messages candidate_source ON {_automation_message_binding_sql(
+                     "candidate", "candidate_identity", "candidate_source"
+                 )}
+                 WHERE candidate_source.logical_of={logical}.message_id
+                   AND EXISTS (
+                       SELECT 1 FROM automation_events lineage
+                       WHERE lineage.run_id=candidate.run_id
+                         AND lineage.previous_state='write_authorized'
+                         AND lineage.next_state='source_unavailable'
+                         AND lineage.transition_kind='source_unavailable'
+                         AND lineage.failure_code='thread_unfollowed'
+                         AND lineage.transaction_id IS NOT NULL
+                   )
+                 ORDER BY candidate.created_at,candidate.run_id LIMIT 1
+             )
          ))"""
 
 
