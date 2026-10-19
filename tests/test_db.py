@@ -9033,6 +9033,84 @@ def test_second_pending_unfollow_does_not_borrow_old_cancelled_write(tmp_path):
     assert store.automation_proposal(awaiting.run_id) is None
 
 
+def test_retained_body_unfollow_does_not_attach_old_write_to_pending_event(
+    tmp_path, monkeypatch
+):
+    # Isolate the retained-body removal path from the independent calendar
+    # before-image path; both normally participate in this derived transaction.
+    store, _, _, _, _, awaiting, _, _ = (
+        refollowed_calendar_proposal_fixture(tmp_path, cached=True)
+    )
+    old_write = store.automation_calendar_write(awaiting.run_id)
+    assert old_write is not None and old_write.status == "cancelled"
+    vendor = store.vendor_for_address("sender@example.com")
+    assert vendor is not None
+    old_events = store.automation_events(awaiting.run_id)
+    with store.connection() as db:
+        old_receipts = db.execute(
+            "SELECT COUNT(*) FROM message_removal_requests WHERE kind='unfollow'"
+        ).fetchone()[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(db_module, "_capture_followed_calendar_sql", lambda scopes: "")
+        accept_calendar_unfollow(store, vendor["vendor_id"])
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM message_removal_requests WHERE kind='unfollow'"
+        ).fetchone()[0] == old_receipts + 1
+    event = store.automation_events(awaiting.run_id)[-1]
+    assert len(store.automation_events(awaiting.run_id)) == len(old_events) + 1
+    assert (event.previous_state, event.failure_code, event.transaction_id) == (
+        "awaiting_confirmation", "thread_unfollowed", None,
+    )
+    assert store.automation_calendar_write(awaiting.run_id) == old_write
+    assert store.automation_proposal(awaiting.run_id) is None
+
+
+def test_generic_loss_after_refollow_does_not_reuse_old_unfollow_lineage(tmp_path):
+    from eom_email_watcher import body_state, removal
+
+    store, _, _, _, _, awaiting, _, _ = (
+        refollowed_calendar_proposal_fixture(tmp_path, cached=True)
+    )
+    old_write = store.automation_calendar_write(awaiting.run_id)
+    assert old_write is not None and old_write.status == "cancelled"
+    with store.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db_module._mark_automation_sources_unavailable(
+            db, ["local-scheduling"],
+            updated_at="2026-09-07T13:10:00+00:00", cause="source_unavailable",
+        )
+    assert changed == 1
+    lost = store.automation_run(awaiting.run_id)
+    assert (lost.state, store.automation_events(awaiting.run_id)[-1].failure_code) == (
+        "source_unavailable", "source_unavailable",
+    )
+    vendor = store.vendor_for_address("sender@example.com")
+    assert vendor is not None
+    accept_calendar_unfollow(store, vendor["vendor_id"])
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor["vendor_id"], "sender@example.com", operation=operation)
+    body_state.record(
+        store, "local-scheduling", ("Returned request", 16),
+        fetched_at=datetime(2026, 9, 7, 13, 15, tzinfo=UTC),
+    )
+    with store.connection() as db:
+        assert db_module._automation_source_available(
+            db, awaiting.run_id, eligibility=removal.CONTENT
+        )
+        assert db.execute("SELECT 1 FROM thread_follow WHERE followed=1").fetchone()
+    assert store.automation_calendar_write(awaiting.run_id) == old_write
+    assert store.automation_events(awaiting.run_id)[-1].failure_code == "source_unavailable"
+    assert store.recoverable_automation_runs() == []
+    with pytest.raises(RuntimeError, match="Automation extraction lost its expected-state race"):
+        store.reserve_automation_extraction(
+            awaiting.run_id, lost.state_version,
+            source_content_sha256="d" * 64,
+            context_at="2026-09-07T09:15:00-05:00", timezone="America/Chicago",
+            body_char_limit=20_000, organizer_address="owner@example.com",
+        )
+
+
 @pytest.mark.parametrize("held", [False, True])
 def test_accepted_unfollow_preserves_calendar_cancellation_cause(tmp_path, held):
     store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=held)
