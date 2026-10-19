@@ -123,15 +123,40 @@ guide the reproduction; neither proves the new behavior at this base.
 
 ## Implementation summary
 
-Not started. This first commit is documentation only.
+Implementation in progress on the accepted contract. The before-image capture
+and its consumer now use one pending-admission predicate; the cancellation
+owner records a typed cause for all accepted-unfollow transitions. Fresh
+preparation and alias recovery consume the immutable cause event. Qualification,
+exact-head review and merge remain pending.
+
+### Assertion mapping for the implementation round
+
+All new assertions in the named test are covered by its mapped contract clause:
+
+| Test in `tests/test_db.py` | Accepted clause and asserted behavior |
+| --- | --- |
+| `test_pending_calendar_unfollow_revokes_proposal_at_origin` | Capture, transition and consumers: with or without retained body, terminal run, absent payload/write, typed cause, refused stale confirmation. |
+| `test_calendar_review_state_unfollow_suppresses_review_at_origin` | Transition and consumers: review-state invalidation, suppressed review intent, typed cause, no write. |
+| `test_pending_calendar_preparation_unfollow_has_typed_event_without_write` | Capture and transition: detected, extracting and proposing all terminate with typed event and no transaction. |
+| `test_pending_calendar_refollow_requires_fresh_proposal_and_confirmation` | Re-follow: existing CONTENT gate, monotonic proposal, refused old identity, fresh authorization required. |
+| `test_pending_calendar_confirmation_and_unfollow_commit_orders` | Commit ordering: both guarded transaction orders and their distinct durable outcomes, with no pending write after unfollow. |
+| `test_pending_calendar_unfollow_rolls_back_with_follow_mutation` | Commit ordering and transition: injected failure rolls back follow removal, run, proposal and event together. |
+| `test_generic_source_loss_does_not_recast_calendar_review_as_unfollow` | Transition: generic source loss keeps its review-state behavior and does not forge an unfollow cause. |
+| `test_pending_calendar_unfollow_alias_recovery_has_one_owner` | Capture and re-follow: physical alias binding, canonical precedence and one recovery owner. |
+| `test_second_pending_unfollow_does_not_borrow_old_cancelled_write` | Transition: a later pending generation gets no transaction identity or new write row. |
+| `test_cancelled_alias_fallback_never_duplicates_an_existing_canonical_run` | Capture and re-follow: the prior `canonical == detected` assertion was replaced with an exact terminal-state/version/typed-cause assertion because the accepted contract revokes that pending canonical run. The existing single-owner and alias refusal assertions remain. |
 
 ## Cold diff audit
 
-Before publication, confirm the only diff is this contract and that no test,
-runtime or existing contract file changed. Code review will compare the later
-implementation against each requirement above.
+The implementation round changes this contract, the database origin and its
+real-store regression tests. It changes no schema, native DTO, provider call,
+UI, dependency or generated file. The full Python run under `umask 022` exited
+successfully; its private raw log is held as alias `full-python.log`, SHA-256
+`cfbefed75080482f88a2e94e641e719f8a0f701f479fef1c742dc560fe2f6b6b`.
+The Windows-only platform contracts were excluded on this Linux host; exact-head
+native proof and independent review are still gates.
 
 ## Gap audit
 
-**NOT DONE:** operator contract acceptance, fail-first reproduction,
-implementation, regression proof, qualification, exact-head review and merge.
+**NOT DONE:** full local qualification, grouped implementation push, exact-head
+CI and Windows proof, independent review and merge.

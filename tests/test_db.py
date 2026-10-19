@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -8652,6 +8653,386 @@ def accept_calendar_unfollow(store, vendor):
     assert change.removed
 
 
+def pending_calendar_unfollow_fixture(tmp_path, *, cached):
+    from eom_email_watcher import body_state
+
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Scheduling sender")
+    store.add_vendor_address(vendor, "sender@example.com")
+    proposing, extraction = proposing_scheduling_run(store)
+    if cached:
+        body_state.record(
+            store,
+            "local-scheduling",
+            ("Can we meet?", 12),
+            fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+        )
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="f" * 64,
+        subject="Meeting request",
+        attendees=(),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="The organizer is available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    return store, vendor, awaiting, proposal
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_pending_calendar_unfollow_revokes_proposal_at_origin(tmp_path, cached):
+    store, vendor, awaiting, proposal = pending_calendar_unfollow_fixture(
+        tmp_path, cached=cached
+    )
+    assert store.automation_calendar_write(awaiting.run_id) is None
+    accept_calendar_unfollow(store, vendor)
+    run = store.automation_run(awaiting.run_id)
+    assert run is not None and run.state == "source_unavailable"
+    assert store.automation_proposal(awaiting.run_id) is None
+    assert store.automation_calendar_write(awaiting.run_id) is None
+    assert store.automation_events(awaiting.run_id)[-1].failure_code == "thread_unfollowed"
+    with pytest.raises((KeyError, RuntimeError)):
+        store.decide_automation_proposal(
+            awaiting.run_id,
+            awaiting.state_version,
+            proposal_version=proposal.proposal_version,
+            proposal_sha256=proposal.proposal_sha256,
+            decision="confirm",
+            now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+        )
+    assert store.automation_calendar_write(awaiting.run_id) is None
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize(
+    ("review_state", "failure_code"),
+    [("manual_review", "reschedule_not_supported"),
+     ("ambiguous", "ambiguous_extraction")],
+)
+def test_calendar_review_state_unfollow_suppresses_review_at_origin(
+    tmp_path, cached, review_state, failure_code
+):
+    from eom_email_watcher import body_state
+
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Scheduling sender")
+    store.add_vendor_address(vendor, "sender@example.com")
+    detected = admitted_scheduling_run(store)
+    if cached:
+        body_state.record(
+            store, "local-scheduling", ("Can we meet?", 12),
+            fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+        )
+    payload = store.reserve_automation_extraction(
+        detected.run_id, detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago", body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    result_json = b'{"intent":"new_meeting"}'
+    review = store.record_automation_extraction(
+        detected.run_id, extracting.state_version,
+        payload_id=payload.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json, violations=[],
+        accepted_state=review_state, accepted_code=failure_code,
+    )
+    assert review.review_notified_at is None
+    accept_calendar_unfollow(store, vendor)
+    run = store.automation_run(review.run_id)
+    assert run is not None and run.state == "source_unavailable"
+    assert run.review_notified_at is not None
+    assert store.automation_events(review.run_id)[-1].failure_code == "thread_unfollowed"
+    assert store.automation_calendar_write(review.run_id) is None
+    assert all(
+        intent.subject_id != review.run_id
+        for intent in store.notification_intents(kind="automation_review")
+    )
+
+
+@pytest.mark.parametrize("state", ["detected", "extracting", "proposing"])
+def test_pending_calendar_preparation_unfollow_has_typed_event_without_write(tmp_path, state):
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Scheduling sender")
+    store.add_vendor_address(vendor, "sender@example.com")
+    detected = admitted_scheduling_run(store)
+    run = detected
+    if state != "detected":
+        payload = store.reserve_automation_extraction(
+            detected.run_id, detected.state_version,
+            source_content_sha256="b" * 64,
+            context_at="2026-09-07T08:00:00-05:00", timezone="America/Chicago",
+            body_char_limit=20_000, organizer_address="owner@example.com",
+        )
+        run = store.automation_run(detected.run_id)
+        if state == "proposing":
+            result_json = b'{"intent":"new_meeting"}'
+            run = store.record_automation_extraction(
+                detected.run_id, run.state_version, payload_id=payload.payload_id,
+                result_sha256=hashlib.sha256(result_json).hexdigest(),
+                result_json=result_json, violations=[], accepted_state="proposing",
+            )
+    assert run is not None and run.state == state
+    accept_calendar_unfollow(store, vendor)
+    cancelled = store.automation_run(run.run_id)
+    assert cancelled is not None and cancelled.state == "source_unavailable"
+    assert store.automation_calendar_write(run.run_id) is None
+    assert store.automation_proposal(run.run_id) is None
+    event = store.automation_events(run.run_id)[-1]
+    assert (event.previous_state, event.failure_code, event.transaction_id) == (
+        state, "thread_unfollowed", None,
+    )
+
+
+def test_pending_calendar_refollow_requires_fresh_proposal_and_confirmation(tmp_path):
+    from eom_email_watcher import body_state, removal
+
+    store, vendor, awaiting, old = pending_calendar_unfollow_fixture(tmp_path, cached=False)
+    accept_calendar_unfollow(store, vendor)
+    cancelled = store.automation_run(awaiting.run_id)
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    body_state.record(
+        store, "local-scheduling", ("Fresh request", 13),
+        fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    assert [work.run.run_id for work in store.recoverable_automation_runs()] == [awaiting.run_id]
+    payload = store.reserve_automation_extraction(
+        awaiting.run_id, cancelled.state_version,
+        source_content_sha256="c" * 64,
+        context_at="2026-09-07T09:00:00-05:00", timezone="America/Chicago",
+        body_char_limit=20_000, organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(awaiting.run_id)
+    result_json = b'{"intent":"new_meeting"}'
+    proposing = store.record_automation_extraction(
+        awaiting.run_id, extracting.state_version, payload_id=payload.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json, violations=[], accepted_state="proposing",
+    )
+    fresh_run = store.record_automation_proposal(
+        awaiting.run_id, proposing.state_version,
+        extraction_payload_id=payload.payload_id, request_sha256="f" * 64,
+        subject="Meeting request", attendees=(), start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00", timezone="America/Chicago",
+        suggestion_reason="The organizer is available.", empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    fresh = store.automation_proposal(awaiting.run_id)
+    assert fresh.proposal_version > old.proposal_version
+    assert fresh.proposal_sha256 != old.proposal_sha256
+    with pytest.raises((KeyError, RuntimeError)):
+        store.decide_automation_proposal(
+            awaiting.run_id, awaiting.state_version,
+            proposal_version=old.proposal_version, proposal_sha256=old.proposal_sha256,
+            decision="confirm", now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+        )
+    with pytest.raises(PermissionError, match="Calendar write authorization is required"):
+        store.decide_automation_proposal(
+            awaiting.run_id, fresh_run.state_version,
+            proposal_version=fresh.proposal_version, proposal_sha256=fresh.proposal_sha256,
+            decision="confirm", write_authorized=False,
+            now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+        )
+    assert store.automation_calendar_write(awaiting.run_id) is None
+    authorized = store.decide_automation_proposal(
+        awaiting.run_id, fresh_run.state_version,
+        proposal_version=fresh.proposal_version, proposal_sha256=fresh.proposal_sha256,
+        decision="confirm", now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    assert authorized.state == "write_authorized"
+    assert store.automation_calendar_write(awaiting.run_id).status == "authorized"
+
+
+@pytest.mark.parametrize("confirm_first", [False, True])
+def test_pending_calendar_confirmation_and_unfollow_commit_orders(
+    tmp_path, monkeypatch, confirm_first
+):
+    store, vendor, awaiting, proposal = pending_calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    reached_before_commit = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    append = db_module._append_automation_event
+    first_state = "write_authorized" if confirm_first else "source_unavailable"
+
+    def hold_first_transition(db, **kwargs):
+        append(db, **kwargs)
+        if kwargs["next_state"] == first_state:
+            reached_before_commit.set()
+            assert release_first.wait(timeout=10), "first transaction barrier timed out"
+
+    def confirm():
+        return store.decide_automation_proposal(
+            awaiting.run_id, awaiting.state_version,
+            proposal_version=proposal.proposal_version,
+            proposal_sha256=proposal.proposal_sha256,
+            decision="confirm", now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+        )
+
+    def unfollow():
+        accept_calendar_unfollow(store, vendor)
+
+    def second_action(action):
+        second_started.set()
+        return action()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db_module, "_append_automation_event", hold_first_transition)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(confirm if confirm_first else unfollow)
+            try:
+                assert reached_before_commit.wait(timeout=10)
+                second = executor.submit(
+                    second_action, unfollow if confirm_first else confirm
+                )
+                assert second_started.wait(timeout=10)
+                assert not second.done()
+            finally:
+                release_first.set()
+            first_result = first.result(timeout=10)
+            if confirm_first:
+                assert first_result.state == "write_authorized"
+                second.result(timeout=10)
+            else:
+                with pytest.raises(KeyError):
+                    second.result(timeout=10)
+    run = store.automation_run(awaiting.run_id)
+    assert run is not None and run.state == "source_unavailable"
+    assert store.automation_proposal(awaiting.run_id) is None
+    write = store.automation_calendar_write(awaiting.run_id)
+    if confirm_first:
+        assert write is not None and write.status == "cancelled"
+        assert write.failure_code == "thread_unfollowed"
+    else:
+        assert write is None
+    assert store.pending_automation_calendar_writes() == []
+
+
+def test_pending_calendar_unfollow_rolls_back_with_follow_mutation(tmp_path, monkeypatch):
+    store, vendor, awaiting, proposal = pending_calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    before = store.automation_events(awaiting.run_id)
+    append = db_module._append_automation_event
+
+    def fail_cancellation(db, **kwargs):
+        if kwargs["next_state"] == "source_unavailable":
+            raise RuntimeError("injected pending cancellation rollback")
+        return append(db, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db_module, "_append_automation_event", fail_cancellation)
+        with pytest.raises(RuntimeError, match="injected pending cancellation rollback"):
+            accept_calendar_unfollow(store, vendor)
+    assert store.automation_run(awaiting.run_id) == awaiting
+    assert store.automation_proposal(awaiting.run_id) == proposal
+    assert store.automation_events(awaiting.run_id) == before
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM vendor_addresses WHERE address='sender@example.com'"
+        ).fetchone()
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_run(awaiting.run_id).state == "source_unavailable"
+
+
+def test_generic_source_loss_does_not_recast_calendar_review_as_unfollow(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    admitted = admitted_scheduling_run(store)
+    payload = store.reserve_automation_extraction(
+        admitted.run_id, admitted.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00", timezone="America/Chicago",
+        body_char_limit=20_000, organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(admitted.run_id)
+    result_json = b'{"intent":"new_meeting"}'
+    review = store.record_automation_extraction(
+        admitted.run_id, extracting.state_version, payload_id=payload.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json, violations=[], accepted_state="manual_review",
+        accepted_code="reschedule_not_supported",
+    )
+    events = store.automation_events(admitted.run_id)
+    with store.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db_module._mark_automation_sources_unavailable(
+            db, ["local-scheduling"],
+            updated_at="2026-09-07T13:00:00+00:00", cause="source_unavailable",
+        )
+    assert changed == 0
+    assert store.automation_run(admitted.run_id) == review
+    assert store.automation_events(admitted.run_id) == events
+
+
+@pytest.mark.parametrize("canonical_run", [False, True])
+def test_pending_calendar_unfollow_alias_recovery_has_one_owner(tmp_path, canonical_run):
+    from eom_email_watcher import body_state, removal
+
+    store, vendor, awaiting, _ = pending_calendar_unfollow_fixture(tmp_path, cached=False)
+    source = store.message_source("local-scheduling")
+    canonical = None
+    if canonical_run:
+        canonical = admitted_scheduling_run(
+            store, message_id="canonical", provider_message_id="canonical-provider"
+        )
+    else:
+        assert store.add_message(
+            message_id="canonical", provider=source.provider, account_id=source.account_id,
+            provider_message_id="canonical-provider", thread_id="canonical-thread",
+            sender="sender@example.com", sender_name=None, subject="Meeting",
+            received_at="2026-09-07T12:00:00+00:00",
+        )
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET logical_of='canonical' WHERE message_id='local-scheduling'")
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_run(awaiting.run_id).state == "source_unavailable"
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    body_state.record(
+        store, "canonical", ("Fresh request", 13),
+        fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    recovered = [work.run.run_id for work in store.recoverable_automation_runs()]
+    assert recovered == ([canonical.run_id] if canonical is not None else [awaiting.run_id])
+
+
+def test_second_pending_unfollow_does_not_borrow_old_cancelled_write(tmp_path):
+    store, old_write, _, _, _, awaiting, _, proposing = (
+        refollowed_calendar_proposal_fixture(tmp_path, cached=False)
+    )
+    vendor = store.vendor_for_address("sender@example.com")
+    assert vendor is not None
+    accept_calendar_unfollow(store, vendor["vendor_id"])
+    run = store.automation_run(proposing.run_id)
+    event = store.automation_events(proposing.run_id)[-1]
+    write = store.automation_calendar_write(proposing.run_id)
+    assert run is not None and run.state == "source_unavailable"
+    assert event.previous_state == "awaiting_confirmation"
+    assert event.failure_code == "thread_unfollowed"
+    assert event.transaction_id is None
+    assert write.transaction_id == old_write.transaction_id
+    assert (write.status, write.failure_code) == ("cancelled", "thread_unfollowed")
+    assert store.automation_proposal(awaiting.run_id) is None
+
+
 @pytest.mark.parametrize("held", [False, True])
 def test_accepted_unfollow_preserves_calendar_cancellation_cause(tmp_path, held):
     store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=held)
@@ -9577,7 +9958,10 @@ def test_cancelled_alias_fallback_never_duplicates_an_existing_canonical_run(tmp
     assert store.automation_run_for_message("canonical").run_id == canonical.run_id
     assert store.automation_run_for_message("local-scheduling") is None
     assert store.begin_automation_calendar_write(alias.run_id, alias.state_version) == original
-    assert store.automation_run(canonical.run_id) == canonical
+    canonical_after = store.automation_run(canonical.run_id)
+    assert canonical_after.state == "source_unavailable"
+    assert canonical_after.state_version == canonical.state_version + 1
+    assert store.automation_events(canonical.run_id)[-1].failure_code == "thread_unfollowed"
 
 
 
