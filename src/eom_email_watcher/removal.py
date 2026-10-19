@@ -464,7 +464,10 @@ def _accept_in_transaction(db, key, kind, parameters, message_ids, *, now, autho
             "ON i.intent_id=t.intent_id WHERE i.request_id=?", (key,),
         )
     ]
-    _mark_automation_sources_unavailable(db, selected, updated_at=stamp)
+    _mark_automation_sources_unavailable(
+        db, selected, updated_at=stamp,
+        cause="thread_unfollowed" if kind == "unfollow" else "source_unavailable",
+    )
     return outcome(db, key, kind=kind, fingerprint=fingerprint), True
 
 

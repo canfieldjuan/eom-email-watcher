@@ -1865,6 +1865,12 @@ def test_calendar_proposal_decision_binds_message_and_exact_proposal(
                 failure_code=None,
             ),
             write=SimpleNamespace(graph_event_id="immutable-event-id"),
+            calendar_write_outcome={
+                "run_id": run_id, "state_version": 8,
+                "transaction_id": "6f352c00-bc6e-437a-b0b5-379e661b9420",
+                "status": "completed", "failure_code": None,
+                "graph_event_id": "immutable-event-id",
+            },
         )
 
     monkeypatch.setattr(engine_api, "decide_scheduling_proposal", decide)
@@ -1897,6 +1903,12 @@ def test_calendar_proposal_decision_binds_message_and_exact_proposal(
         "state_version": 8,
         "failure_code": None,
         "graph_event_id": "immutable-event-id",
+        "calendar_write_outcome": {
+            "run_id": run_id, "state_version": 8,
+            "transaction_id": "6f352c00-bc6e-437a-b0b5-379e661b9420",
+            "status": "completed", "failure_code": None,
+            "graph_event_id": "immutable-event-id",
+        },
     }
     assert calls == [
         {
@@ -8888,3 +8900,113 @@ def test_mail_account_list_reports_the_sent_scope(
     runtime.config.gmail_token_file.unlink()
     response = engine_api._response(request(config_path, "mail.accounts.list"))
     assert [a["sent_scope"] for a in response["data"]["accounts"]] == ["not_polled"]
+
+@pytest.mark.parametrize("held", [False, True])
+def test_calendar_cancelled_decision_and_locked_inbox_keep_only_bound_metadata(
+    tmp_path, monkeypatch, held
+):
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+    from test_service import config
+
+    from eom_email_watcher import service
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=held)
+    accept_calendar_unfollow(store, vendor)
+    cfg = config(tmp_path)
+    assert cfg.database_file == store.path
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(config=cfg, store=store))
+    monkeypatch.setattr(service, "feature_entitlements_active", lambda *features: True)
+    monkeypatch.setattr(
+        service,
+        "create_calendar_event",
+        lambda *args, **kwargs: pytest.fail("cancelled replay created an event"),
+    )
+    payload = dict(
+        decision="confirm",
+        message_id="local-scheduling",
+        run_id=authorized.run_id,
+        state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+    )
+    result = engine_api._calendar_automation_decide({"payload": payload})
+    expected = store.calendar_write_outcome_for_message("local-scheduling")
+    assert result["calendar_write_outcome"] == expected
+    assert result["state"] == "source_unavailable"
+    assert result["graph_event_id"] is None
+    assert set(expected) == {
+        "run_id",
+        "state_version",
+        "transaction_id",
+        "status",
+        "failure_code",
+        "graph_event_id",
+    }
+    assert expected["failure_code"] == "thread_unfollowed"
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    for _ in range(2):
+        rows = store.recent(100)
+        engine_api._hide_locked_automation_previews(rows)
+        row = next(row for row in rows if row["message_id"] == "local-scheduling")
+        assert row["calendar_proposal"] is None
+        assert row["calendar_write_outcome"] == expected
+    with pytest.raises(engine_api.ApiError) as error:
+        engine_api._calendar_automation_decide({"payload": dict(payload, message_id="foreign")})
+    assert error.value.code == "not_found"
+
+
+
+def test_legacy_begin_cleanup_refuses_inconsistent_admission_as_stale(tmp_path, monkeypatch):
+    from test_db import calendar_unfollow_fixture
+    from test_service import config
+
+    from eom_email_watcher import db as database
+    from eom_email_watcher import service
+
+    store, _, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, cached=False)
+    write = store.automation_calendar_write(authorized.run_id)
+    # Pre-PR begin_automation_calendar_write at main 9fc701e removed payloads,
+    # advanced the run, and recorded this event while leaving the write authorized.
+    stamp = "2026-09-07T13:06:00+00:00"
+    with store.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM automation_proposal_payloads WHERE run_id=?", (authorized.run_id,))
+        db.execute(
+            "DELETE FROM automation_extraction_payloads WHERE run_id=?", (authorized.run_id,)
+        )
+        db.execute(
+            """UPDATE automation_runs SET state='source_unavailable', state_version=?,
+                failure_code='source_unavailable', review_notified_at=NULL, updated_at=?
+            WHERE run_id=?""",
+            (authorized.state_version + 1, stamp, authorized.run_id),
+        )
+        database._append_automation_event(
+            db, run_id=authorized.run_id, sequence_no=authorized.state_version,
+            previous_state="write_authorized", next_state="source_unavailable",
+            state_version=authorized.state_version + 1, automation_id=authorized.automation_id,
+            automation_version=authorized.automation_version,
+            extraction_schema_version=authorized.extraction_schema_version,
+            calendar_principal_key=authorized.calendar_principal_key,
+            transition_kind="source_unavailable", failure_code="source_unavailable",
+            created_at=stamp, transaction_id=write.transaction_id,
+        )
+    with pytest.raises(RuntimeError, match="ledger is inconsistent"):
+        store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    cfg = config(tmp_path)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(config=cfg, store=store))
+    monkeypatch.setattr(service, "feature_entitlements_active", lambda *features: True)
+    monkeypatch.setattr(service, "create_calendar_event", lambda *args, **kwargs: pytest.fail(
+        "an inconsistent legacy admission must never create an event"
+    ))
+    before = store.automation_events(authorized.run_id)
+    with pytest.raises(engine_api.ApiError) as error:
+        engine_api._calendar_automation_decide({"payload": {
+            "decision": "confirm", "message_id": "local-scheduling",
+            "run_id": authorized.run_id, "state_version": awaiting.state_version,
+            "proposal_version": proposal.proposal_version,
+            "proposal_sha256": proposal.proposal_sha256,
+        }})
+    assert error.value.code == "stale_proposal"
+    assert store.automation_calendar_write(authorized.run_id) == write
+    assert store.automation_events(authorized.run_id) == before
+    assert store.pending_automation_calendar_writes() == []

@@ -1831,6 +1831,7 @@ def test_source_cleanup_cancels_authorized_write_before_submission(tmp_path: Pat
     write = store.automation_calendar_write(proposing.run_id)
     assert run is not None and run.state == "source_unavailable"
     assert write is not None and write.status == "cancelled"
+    assert write.failure_code == "source_unavailable"
     assert store.automation_proposal(proposing.run_id) is None
 
 
@@ -8596,3 +8597,1043 @@ def test_a_newer_copy_keeps_a_logical_message_within_the_cutoff_for_every_reader
         [root], cutoff=later - timedelta(days=30), now=later
     ) == frozenset()
     assert store.purge(30, now=later) == 1
+
+def calendar_unfollow_fixture(tmp_path, *, held=False, cached=True, message_id="local-scheduling"):
+    from eom_email_watcher import body_state
+
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    vendor = store.create_vendor("Scheduling sender")
+    store.add_vendor_address(vendor, "sender@example.com")
+    proposing, extraction = proposing_scheduling_run(store, message_id=message_id)
+    if cached:
+        body_state.record(
+            store,
+            message_id,
+            ("Can we meet?", 12),
+            fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+        )
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="f" * 64,
+        subject="Meeting request",
+        attendees=(),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="The organizer is available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    authorized = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    if held:
+        from test_deferred_removal import retain_legacy_aliases
+
+        retain_legacy_aliases(store, message_id)
+    return store, vendor, awaiting, proposal, authorized
+
+
+def accept_calendar_unfollow(store, vendor):
+    from eom_email_watcher import removal
+
+    with removal.operation_scope(store.path) as operation:
+        change = store.remove_vendor_address(vendor, "sender@example.com", operation=operation)
+    assert change.removed
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_accepted_unfollow_preserves_calendar_cancellation_cause(tmp_path, held):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=held)
+    original = store.automation_calendar_write(authorized.run_id)
+    assert original is not None and original.status == "authorized"
+    accept_calendar_unfollow(store, vendor)
+    write = store.automation_calendar_write(authorized.run_id)
+    run = store.automation_run(authorized.run_id)
+    assert run is not None and run.state == "source_unavailable"
+    assert write is not None and write.status == "cancelled"
+    assert write.transaction_id == original.transaction_id
+    assert write.failure_code == "thread_unfollowed"
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_cancelled_calendar_admission_replays_without_payload(tmp_path, held):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=held)
+    original = store.automation_calendar_write(authorized.run_id)
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_proposal(authorized.run_id) is None
+    for _ in range(2):
+        store = Store(store.path)  # Lost reply/restart uses only the durable ledger.
+        result = store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+        assert isinstance(result, db_module.AutomationCalendarWriteCancelled)
+        assert result.outcome == {
+            "run_id": authorized.run_id,
+            "state_version": authorized.state_version + 1,
+            "transaction_id": original.transaction_id,
+            "status": "cancelled",
+            "failure_code": "thread_unfollowed",
+            "graph_event_id": None,
+        }
+        replay = store.decide_automation_proposal(
+            authorized.run_id,
+            awaiting.state_version,
+            proposal_version=proposal.proposal_version,
+            proposal_sha256=proposal.proposal_sha256,
+            decision="confirm",
+        )
+        assert replay == result
+        assert store.pending_automation_calendar_writes() == []
+    events = store.automation_events(authorized.run_id)
+    assert len(events) == authorized.state_version + 1
+    assert events[-1].failure_code == "thread_unfollowed"
+    assert events[-1].transaction_id == original.transaction_id
+    outcome = store.calendar_write_outcome_for_message("local-scheduling")
+    assert outcome == result.outcome
+    inbox = next(item for item in store.recent(100) if item["message_id"] == "local-scheduling")
+    assert inbox["calendar_write_outcome"] == outcome
+    assert inbox["calendar_proposal"] is None
+    with pytest.raises(RuntimeError, match="expected-state race"):
+        store.begin_automation_calendar_write(authorized.run_id, authorized.state_version + 1)
+    with pytest.raises(KeyError):
+        store.begin_automation_calendar_write(str(uuid.uuid4()), authorized.state_version)
+    for invalid in (False, 0, ""):
+        with pytest.raises(ValueError):
+            store.begin_automation_calendar_write(authorized.run_id, invalid)
+    with pytest.raises(KeyError):
+        # A mismatched confirmation cannot replay without its removed payload.
+        store.decide_automation_proposal(
+            authorized.run_id,
+            awaiting.state_version + 1,
+            proposal_version=proposal.proposal_version,
+            proposal_sha256=proposal.proposal_sha256,
+            decision="confirm",
+        )
+
+
+@pytest.mark.parametrize("state", ["writing", "unresolved", "reconciling", "completed"])
+def test_unfollow_after_calendar_handoff_preserves_provider_identity(tmp_path, state):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    writing = store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    current = writing
+    if state in {"unresolved", "reconciling"}:
+        current = store.transition_automation_calendar_write(
+            current.run_id,
+            current.state_version,
+            next_state="unresolved",
+            failure_code="write_outcome_unknown",
+        )
+        if state == "reconciling":
+            current = store.transition_automation_calendar_write(
+                current.run_id, current.state_version, next_state="reconciling"
+            )
+    elif state == "completed":
+        current = store.transition_automation_calendar_write(
+            current.run_id, current.state_version, next_state="completed", graph_event_id="event-1"
+        )
+    original = store.automation_calendar_write(authorized.run_id)
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_calendar_write(authorized.run_id) == original
+    assert store.automation_run(current.run_id) == current
+    assert store.automation_proposal(current.run_id) is None
+    outcome = store.calendar_write_outcome_for_message("local-scheduling")
+    assert outcome["status"] == state
+    assert outcome["transaction_id"] == original.transaction_id
+    assert outcome["graph_event_id"] == ("event-1" if state == "completed" else None)
+    if state == "writing":
+        completed = store.transition_automation_calendar_write(
+            writing.run_id,
+            writing.state_version,
+            next_state="completed",
+            graph_event_id="after-unfollow",
+        )
+        assert completed.state == "completed"
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_calendar_unfollow_cancellation_rolls_back_with_source_transaction(
+    tmp_path, monkeypatch, cached
+):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=cached
+    )
+    original = store.automation_calendar_write(authorized.run_id)
+    events = store.automation_events(authorized.run_id)
+    append = db_module._append_automation_event
+
+    def fail_cancellation(db, **kwargs):
+        if kwargs["next_state"] == "source_unavailable":
+            raise RuntimeError("injected cancellation rollback")
+        return append(db, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db_module, "_append_automation_event", fail_cancellation)
+        with pytest.raises(RuntimeError, match="injected cancellation rollback"):
+            accept_calendar_unfollow(store, vendor)
+    assert store.automation_calendar_write(authorized.run_id) == original
+    assert store.automation_run(authorized.run_id) == authorized
+    assert store.automation_events(authorized.run_id) == events
+    assert store.automation_proposal(authorized.run_id) == proposal
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM vendor_addresses WHERE address='sender@example.com'"
+        ).fetchone()
+        assert not db.execute("SELECT 1 FROM message_removal_requests").fetchone()
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_calendar_write(authorized.run_id).status == "cancelled"
+
+
+def refollowed_calendar_proposal_fixture(
+    tmp_path, *, held=False, cached=True, no_suggestions=False, run_expires_at=None
+):
+    from eom_email_watcher import body_state, removal, source_locks
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, held=held, cached=cached
+    )
+    original = store.automation_calendar_write(authorized.run_id)
+    accept_calendar_unfollow(store, vendor)
+    assert not store.recoverable_automation_runs()
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    cancelled_run = store.automation_run(authorized.run_id)
+    if held:
+        assert not store.recoverable_automation_runs()
+        with pytest.raises(KeyError):
+            store.reserve_automation_extraction(
+                authorized.run_id,
+                cancelled_run.state_version,
+                source_content_sha256="c" * 64,
+                context_at="2026-09-07T09:00:00-05:00",
+                timezone="America/Chicago",
+                body_char_limit=20_000,
+                organizer_address="owner@example.com",
+            )
+        source_locks.qualify_protocol(store, fresh=False)
+        source_locks.qualify_protocol(store, fresh=False)
+    body_state.record(
+        store,
+        "local-scheduling",
+        ("Fresh request", 13),
+        fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    assert [work.run.run_id for work in store.recoverable_automation_runs()] == [authorized.run_id]
+    fresh = store.reserve_automation_extraction(
+        authorized.run_id,
+        cancelled_run.state_version,
+        source_content_sha256="c" * 64,
+        context_at="2026-09-07T09:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(authorized.run_id)
+    result_json = json.dumps(
+        {"intent": "new_meeting", "proposed_times": [], "attendees": []}
+    ).encode()
+    proposing = store.record_automation_extraction(
+        authorized.run_id,
+        extracting.state_version,
+        payload_id=fresh.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json,
+        violations=[],
+        accepted_state="proposing",
+    )
+    if run_expires_at is not None:
+        with store.connection() as db:
+            db.execute(
+                "UPDATE automation_runs SET expires_at=? WHERE run_id=?",
+                (run_expires_at, proposing.run_id),
+            )
+    new_awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=fresh.payload_id,
+        request_sha256="f" * 64,
+        subject=proposal.subject,
+        attendees=proposal.attendees,
+        start=None if no_suggestions else proposal.start,
+        end=None if no_suggestions else proposal.end,
+        timezone=None if no_suggestions else proposal.timezone,
+        suggestion_reason=None if no_suggestions else proposal.suggestion_reason,
+        empty_reason="No available meeting time." if no_suggestions else None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    fresh_proposal = store.automation_proposal(proposing.run_id)
+    assert fresh_proposal.proposal_version > proposal.proposal_version
+    assert fresh_proposal.proposal_sha256 != proposal.proposal_sha256
+    assert store.pending_automation_calendar_writes() == []
+    return store, original, awaiting, proposal, authorized, new_awaiting, fresh_proposal, proposing
+
+
+def test_refollowed_calendar_proposal_is_bounded_by_run_lifetime(tmp_path):
+    run_expiry = datetime(2026, 9, 7, 13, 2, tzinfo=UTC)
+    store, original, _, _, _, awaiting, fresh, proposing = (
+        refollowed_calendar_proposal_fixture(
+            tmp_path, run_expires_at=run_expiry.isoformat()
+        )
+    )
+    assert fresh.expires_at == run_expiry.isoformat()
+    authorized = store.decide_automation_proposal(
+        proposing.run_id, awaiting.state_version,
+        proposal_version=fresh.proposal_version,
+        proposal_sha256=fresh.proposal_sha256, decision="confirm",
+        now=datetime(2026, 9, 7, 13, 1, tzinfo=UTC),
+    )
+    assert authorized.state == "write_authorized"
+    assert (
+        store.automation_calendar_write(proposing.run_id).transaction_id
+        != original.transaction_id
+    )
+    assert [work.run.run_id for work in store.pending_automation_calendar_writes(
+        now=datetime(2026, 9, 7, 13, 1, tzinfo=UTC)
+    )] == [proposing.run_id]
+    assert store.pending_automation_calendar_writes(now=run_expiry) == []
+
+
+@pytest.mark.parametrize("run_expiry", [
+    "2026-09-07T13:00:00+00:00", "2026-09-07T12:59:00+00:00", "invalid",
+])
+def test_expired_calendar_run_cannot_issue_new_proposal(tmp_path, run_expiry):
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET expires_at=? WHERE run_id=?",
+            (run_expiry, proposing.run_id),
+        )
+    with pytest.raises(KeyError):
+        store.record_automation_proposal(
+            proposing.run_id, proposing.state_version,
+            extraction_payload_id=extraction.payload_id,
+            request_sha256="f" * 64, subject="Meeting request",
+            attendees=("jane@example.com",),
+            start="2026-09-08T10:00:00-05:00",
+            end="2026-09-08T10:30:00-05:00",
+            timezone="America/Chicago",
+            suggestion_reason="All attendees are available.", empty_reason=None,
+            observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+        )
+    assert store.automation_proposal(proposing.run_id) is None
+    assert store.automation_run(proposing.run_id).state == "proposing"
+
+
+def test_legacy_uncapped_refollow_proposal_cannot_authorize_expired_run(tmp_path):
+    run_expiry = datetime(2026, 9, 7, 13, 2, tzinfo=UTC)
+    store, original, _, _, _, awaiting, fresh, proposing = (
+        refollowed_calendar_proposal_fixture(
+            tmp_path, run_expires_at=run_expiry.isoformat()
+        )
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_proposal_payloads SET expires_at=? WHERE payload_id=?",
+            ("2026-09-07T13:15:00+00:00", fresh.payload_id),
+        )
+    result = store.decide_automation_proposal(
+        proposing.run_id, awaiting.state_version,
+        proposal_version=fresh.proposal_version,
+        proposal_sha256=fresh.proposal_sha256, decision="confirm",
+        now=datetime(2026, 9, 7, 13, 3, tzinfo=UTC),
+    )
+    assert (result.state, result.failure_code) == ("proposing", "proposal_expired")
+    retained = store.automation_calendar_write(proposing.run_id)
+    assert retained.transaction_id == original.transaction_id
+    assert (retained.status, retained.failure_code) == ("cancelled", "thread_unfollowed")
+    assert store.pending_automation_calendar_writes(now=run_expiry) == []
+
+
+@pytest.mark.parametrize("fresh_state", ["manual_review", "ambiguous"])
+def test_refollowed_payloadless_review_does_not_project_old_cancellation(tmp_path, fresh_state):
+    from eom_email_watcher import body_state, removal
+
+    store, vendor, _, _, authorized = calendar_unfollow_fixture(tmp_path, cached=False)
+    original = store.automation_calendar_write(authorized.run_id)
+    accept_calendar_unfollow(store, vendor)
+    assert store.calendar_write_outcome_for_message("local-scheduling")["status"] == "cancelled"
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    body_state.record(
+        store, "local-scheduling", ("Fresh request", 13),
+        fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    cancelled = store.automation_run(authorized.run_id)
+    fresh = store.reserve_automation_extraction(
+        authorized.run_id, cancelled.state_version,
+        source_content_sha256="c" * 64,
+        context_at="2026-09-07T09:00:00-05:00",
+        timezone="America/Chicago", body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(authorized.run_id)
+    result_json = b'{"intent":"new_meeting","proposed_times":[],"attendees":[]}'
+    current = store.record_automation_extraction(
+        authorized.run_id, extracting.state_version,
+        payload_id=fresh.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json, violations=[], accepted_state=fresh_state,
+    )
+    assert current.state == fresh_state
+    assert store.automation_proposal(current.run_id) is None
+    retained = store.automation_calendar_write(current.run_id)
+    assert retained.transaction_id == original.transaction_id
+    assert (retained.status, retained.failure_code) == ("cancelled", "thread_unfollowed")
+    assert store.calendar_write_outcome_for_message("local-scheduling") is None
+    inbox = next(item for item in store.recent(10) if item["message_id"] == "local-scheduling")
+    assert inbox["calendar_proposal"] is None
+    assert inbox["calendar_write_outcome"] is None
+
+
+@pytest.mark.parametrize("held, cached", [(False, True), (True, True), (False, False)])
+def test_refollow_requires_new_calendar_proposal_consent_and_transaction(tmp_path, held, cached):
+    (store, original, awaiting, proposal, authorized, new_awaiting, fresh_proposal, proposing) = (
+        refollowed_calendar_proposal_fixture(tmp_path, held=held, cached=cached)
+    )
+    with pytest.raises(PermissionError, match="Calendar write authorization is required"):
+        store.decide_automation_proposal(
+            proposing.run_id,
+            new_awaiting.state_version,
+            proposal_version=fresh_proposal.proposal_version,
+            proposal_sha256=fresh_proposal.proposal_sha256,
+            decision="confirm",
+            write_authorized=False,
+            now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+        )
+    assert (
+        store.automation_calendar_write(proposing.run_id).transaction_id == original.transaction_id
+    )
+    new_authorized = store.decide_automation_proposal(
+        proposing.run_id,
+        new_awaiting.state_version,
+        proposal_version=fresh_proposal.proposal_version,
+        proposal_sha256=fresh_proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    new_write = store.automation_calendar_write(proposing.run_id)
+    assert new_write.transaction_id != original.transaction_id
+    assert new_authorized.state_version > authorized.state_version
+    # Old starts and confirmations return the old terminal identity, never the new admission.
+    old_start = store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    old_confirm = store.decide_automation_proposal(
+        authorized.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+    )
+    assert old_start == old_confirm
+    assert old_start.outcome["transaction_id"] == original.transaction_id
+    assert store.automation_calendar_write(proposing.run_id) == new_write
+    assert store.automation_run(proposing.run_id) == new_authorized
+    assert [
+        event.transaction_id
+        for event in store.automation_events(proposing.run_id)
+        if event.failure_code == "thread_unfollowed"
+    ] == [original.transaction_id]
+    writing = store.begin_automation_calendar_write(proposing.run_id, new_authorized.state_version)
+    assert writing.state == "writing"
+    assert (
+        store.automation_calendar_write(proposing.run_id).transaction_id == new_write.transaction_id
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement", ["provider", "account_id", "mailbox_identity_key", "provider_message_id"]
+)
+def test_calendar_outcome_never_follows_reused_local_message_id(tmp_path, replacement):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    accept_calendar_unfollow(store, vendor)
+    assert local_removal(store, "delete_message", "local-scheduling")
+    values = dict(
+        message_id="local-scheduling",
+        thread_id=None,
+        provider=authorized.provider,
+        account_id=authorized.account_id,
+        provider_message_id="provider-scheduling",
+        sender="sender@example.com",
+        sender_name="Sender",
+        subject="Replacement",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    values[replacement] = {
+        "provider": "gmail",
+        "account_id": "different-account",
+        "mailbox_identity_key": "d" * 64,
+        "provider_message_id": "other-message",
+    }[replacement]
+    if replacement == "account_id":
+        store.register_mail_account(
+            authorized.provider,
+            "different-account",
+            display_name="Other account",
+            address="other-owner@example.com",
+        )
+    if replacement == "mailbox_identity_key":
+        store.reconcile_mailbox_identity(
+            authorized.provider,
+            authorized.account_id,
+            "d" * 64,
+            legacy_status="replacement",
+            preserve_cursor=True,
+        )
+    assert store.add_message(**values)
+    assert store.automation_run_for_message("local-scheduling") is None
+    assert store.calendar_write_outcome_for_message("local-scheduling") is None
+    item = next(item for item in store.recent(10) if item["message_id"] == "local-scheduling")
+    assert item["calendar_write_outcome"] is None
+    assert store.automation_calendar_write(authorized.run_id).status == "cancelled"
+
+
+def test_calendar_begin_missing_payload_uses_shared_generic_cancellation(tmp_path):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    with store.connection() as db:
+        db.execute("DELETE FROM automation_proposal_payloads WHERE run_id=?", (authorized.run_id,))
+    result = store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    assert isinstance(result, db_module.AutomationCalendarWriteCancelled)
+    assert result.outcome["failure_code"] == "source_unavailable"
+    assert store.automation_calendar_write(authorized.run_id).status == "cancelled"
+    assert store.pending_automation_calendar_writes() == []
+
+
+def test_cancelled_calendar_replay_refuses_inconsistent_current_admission(tmp_path):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    accept_calendar_unfollow(store, vendor)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_calendar_writes SET status='authorized' WHERE run_id=?",
+            (authorized.run_id,),
+        )
+    with pytest.raises(RuntimeError, match="ledger is inconsistent"):
+        store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+
+
+@pytest.mark.parametrize("version", [False, 0, "", 2**63])
+def test_calendar_cancelled_replay_never_accepts_invalid_proposal_version(tmp_path, version):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    accept_calendar_unfollow(store, vendor)
+    expected = ValueError if type(version) is not int or version < 1 else OverflowError
+    with pytest.raises(expected):
+        store.decide_automation_proposal(
+            authorized.run_id,
+            awaiting.state_version,
+            proposal_version=version,
+            proposal_sha256=proposal.proposal_sha256,
+            decision="confirm",
+        )
+
+@pytest.mark.parametrize("reader", ["projection", "inbox"])
+def test_calendar_outcome_reads_run_and_write_from_one_snapshot(tmp_path, monkeypatch, reader):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    bound_read = db_module._automation_run_for_message
+    advanced = False
+
+    def handoff_after_bound_read(db, message_id, **kwargs):
+        nonlocal advanced
+        row = bound_read(db, message_id, **kwargs)
+        if message_id == "local-scheduling" and not advanced:
+            advanced = True
+            store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+        return row
+
+    monkeypatch.setattr(db_module, "_automation_run_for_message", handoff_after_bound_read)
+    if reader == "projection":
+        result = store.calendar_write_outcome_for_message("local-scheduling")
+    else:
+        result = next(
+            item for item in store.recent(10) if item["message_id"] == "local-scheduling"
+        )["calendar_write_outcome"]
+    assert advanced
+    assert store.automation_run(authorized.run_id).state == "writing"
+    # The controlled handoff commits after the projection's bound read. That
+    # snapshot must stay entirely authorized, not borrow the newer write status.
+    assert result["state_version"] == authorized.state_version
+    assert result["status"] == "authorized"
+
+
+def test_bodyless_approved_calendar_unfollow_cancels_without_removal_receipt(tmp_path):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    selected = store.pending_automation_calendar_writes(now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC))
+    assert [work.run.run_id for work in selected] == [authorized.run_id]
+    original = store.automation_calendar_write(authorized.run_id)
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_bodies").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM message_body_unavailable").fetchone()[0] == 0
+    accept_calendar_unfollow(store, vendor)
+    write = store.automation_calendar_write(authorized.run_id)
+    assert write.status == "cancelled"
+    assert write.failure_code == "thread_unfollowed"
+    assert write.transaction_id == original.transaction_id
+    assert store.automation_proposal(authorized.run_id) is None
+    assert (
+        store.pending_automation_calendar_writes(now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC)) == []
+    )
+    replay = Store(store.path).begin_automation_calendar_write(
+        selected[0].run.run_id, selected[0].run.state_version
+    )
+    assert isinstance(replay, db_module.AutomationCalendarWriteCancelled)
+    assert replay.outcome["failure_code"] == "thread_unfollowed"
+    with store.connection() as db:
+        for table in (
+            "message_removal_requests",
+            "message_removal_intents",
+            "message_removal_targets",
+        ):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_bodyless_calendar_follow_loss_requires_guarded_transaction(tmp_path):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    with (
+        pytest.raises(RuntimeError, match="guarded write transaction"),
+        store.connection() as db,
+    ):
+        db.execute("DELETE FROM vendor_addresses WHERE vendor_id=?", (vendor,))
+    assert store.automation_run(authorized.run_id) == authorized
+    assert store.automation_proposal(authorized.run_id) == proposal
+    assert store.automation_calendar_write(authorized.run_id).status == "authorized"
+
+
+@pytest.mark.parametrize("aliases", [False, True])
+@pytest.mark.parametrize("retained", ["none", "marker", "body"])
+def test_calendar_capture_preserves_body_removal_target_selection(tmp_path, aliases, retained):
+    from test_deferred_removal import retain_legacy_aliases
+
+    from eom_email_watcher import body_state
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=retained == "body"
+    )
+    if retained == "marker":
+        body_state.record(
+            store,
+            "local-scheduling",
+            None,
+            fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+            reason="source_gone",
+        )
+    if aliases:
+        retain_legacy_aliases(store, "local-scheduling")
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_calendar_write(authorized.run_id).failure_code == "thread_unfollowed"
+    with store.connection() as db:
+        expected = int(retained != "none")
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == expected
+        assert db.execute("SELECT COUNT(*) FROM message_removal_intents").fetchone()[0] == expected
+        assert db.execute("SELECT COUNT(*) FROM message_removal_targets").fetchone()[0] == (
+            (33 if aliases else 1) * expected
+        )
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.parametrize("state", ["writing", "unresolved", "reconciling", "completed"])
+def test_bodyless_unfollow_after_handoff_preserves_recovery(tmp_path, state):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    current = store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    if state in {"unresolved", "reconciling"}:
+        current = store.transition_automation_calendar_write(
+            current.run_id,
+            current.state_version,
+            next_state="unresolved",
+            failure_code="write_outcome_unknown",
+        )
+        if state == "reconciling":
+            current = store.transition_automation_calendar_write(
+                current.run_id, current.state_version, next_state="reconciling"
+            )
+    elif state == "completed":
+        current = store.transition_automation_calendar_write(
+            current.run_id, current.state_version, next_state="completed", graph_event_id="event-1"
+        )
+    before = store.automation_calendar_write(authorized.run_id)
+    events = store.automation_events(authorized.run_id)
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_run(current.run_id) == current
+    assert store.automation_calendar_write(current.run_id) == before
+    assert store.automation_events(current.run_id) == events
+    assert store.automation_proposal(current.run_id) == proposal
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("prior_schema", [35, 36])
+def test_calendar_capture_survives_authentic_upgrade_and_rebuild(
+    tmp_path, monkeypatch, prior_schema
+):
+    from eom_email_watcher import thread_migration
+
+    with monkeypatch.context() as prior:
+        prior.setattr(db_module, "SCHEMA_VERSION", prior_schema)
+        store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+            tmp_path, cached=False
+        )
+        with store.connection() as db:
+            assert db.execute("PRAGMA user_version").fetchone()[0] == prior_schema
+            if prior_schema == 35:
+                assert not db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='message_removal_targets'"
+                ).fetchone()
+    store.initialize()
+    with thread_migration.upgrade_owner(store.path) as owner, owner.transaction(store) as db:
+        db.execute("UPDATE mail_accounts SET active=active")
+        evidence = [tuple(row) for row in db.execute("SELECT * FROM derived_previous_followed")]
+        assert evidence == [("local-scheduling", authorized.run_id)]
+        during = set()
+
+        def observe(sql):
+            if sql == "DROP TABLE messages":
+                during.add(
+                    tuple(
+                        tuple(row)
+                        for row in db.execute(
+                            "SELECT name FROM sqlite_temp_master "
+                            "WHERE type='trigger' AND name GLOB 'derived_*'"
+                        )
+                    )
+                )
+
+        db.set_trace_callback(observe)
+        thread_migration.rebuild_messages(db)
+        db.set_trace_callback(None)
+        assert during == {()}
+        assert [
+            tuple(row) for row in db.execute("SELECT * FROM derived_previous_followed")
+        ] == evidence
+        db_module._recompute_derived(db, db_module.DERIVED_INPUT_TABLES)
+        thread_migration.check_database(db)
+    assert store.automation_run(authorized.run_id) == authorized
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_calendar_write(authorized.run_id).failure_code == "thread_unfollowed"
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 0
+
+
+def test_calendar_alias_move_uses_logical_follow_owner(tmp_path):
+    from eom_email_watcher import removal
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    source = store.message_source("local-scheduling")
+    assert store.add_message(
+        message_id="canonical",
+        provider=source.provider,
+        account_id=source.account_id,
+        provider_message_id="canonical-provider",
+        thread_id="canonical-thread",
+        sender="sender@example.com",
+        sender_name=None,
+        subject="Meeting",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET logical_of='canonical' WHERE message_id='local-scheduling'")
+    # Its physical thread disappeared, but its logical unit is still followed.
+    assert store.automation_run(authorized.run_id) == authorized
+    assert store.automation_calendar_write(authorized.run_id).status == "authorized"
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_calendar_write(authorized.run_id).failure_code == "thread_unfollowed"
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_removal_requests").fetchone()[0] == 0
+
+
+def test_bodyless_calendar_cancellation_preserves_same_source_connect_job(tmp_path):
+    from test_deferred_removal import connect_source_job
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=False, message_id="m"
+    )
+    selected, created = connect_source_job(store)
+    job = store.connect_job(created.job_id)
+    dispatch = store.connect_dispatch(created.job_id)
+    assert job is not None and dispatch.source_available
+    accept_calendar_unfollow(store, vendor)
+    assert store.automation_calendar_write(authorized.run_id).failure_code == "thread_unfollowed"
+    assert store.connect_job(created.job_id) == job
+    assert store.connect_dispatch(created.job_id) == dispatch
+
+
+def test_never_followed_calendar_initial_admission_remains_available(tmp_path):
+    from eom_email_watcher import removal
+
+    store = Store(tmp_path / "never-followed.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    before = store.automation_extraction_payloads(proposing.run_id)
+    assert [payload.payload_id for payload in before] == [extraction.payload_id]
+    # An unrelated input mutation is not a follow-loss before-image.
+    vendor = store.create_vendor("Unrelated")
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "unrelated@example.net", operation=operation)
+    assert store.automation_run(proposing.run_id) == proposing
+    assert store.automation_extraction_payloads(proposing.run_id) == before
+
+
+
+def test_cancelled_calendar_replay_excludes_new_generation_material(tmp_path):
+    (store, original, awaiting, proposal, authorized, new_awaiting, fresh_proposal, _) = (
+        refollowed_calendar_proposal_fixture(tmp_path, cached=False)
+    )
+    def replay():
+        started = store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+        confirmed = store.decide_automation_proposal(
+            authorized.run_id, awaiting.state_version,
+            proposal_version=proposal.proposal_version,
+            proposal_sha256=proposal.proposal_sha256, decision="confirm",
+        )
+        assert started == confirmed
+        return started
+
+    before = replay()
+    event = next(e for e in store.automation_events(authorized.run_id)
+                 if e.failure_code == "thread_unfollowed")
+    assert before.outcome["transaction_id"] == original.transaction_id
+    assert before.run.current_payload_id == event.payload_id
+    assert before.run.current_payload_sha256 == event.payload_sha256
+    # The immutable ledger cannot reconstruct extraction context. Do not borrow
+    # source hashes, context, or notification state from the current generation.
+    assert before.run.source_content_sha256 is None
+    assert before.run.extraction_context_at is None
+    assert before.run.extraction_timezone is None
+    assert before.run.extraction_body_char_limit is None
+    assert before.run.review_notified_at == event.created_at
+    current = store.decide_automation_proposal(
+        authorized.run_id, new_awaiting.state_version,
+        proposal_version=fresh_proposal.proposal_version,
+        proposal_sha256=fresh_proposal.proposal_sha256, decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    store.begin_automation_calendar_write(current.run_id, current.state_version)
+    assert replay() == before
+    assert store.automation_calendar_write(current.run_id).transaction_id != original.transaction_id
+
+
+@pytest.mark.parametrize("reader", ["selector", "reserve"])
+@pytest.mark.parametrize("held", [False, True])
+def test_cancelled_alias_refollow_reaches_fresh_calendar_handoff(tmp_path, reader, held):
+    from eom_email_watcher import removal, source_locks
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=held, held=held
+    )
+    source = store.message_source("local-scheduling")
+    assert store.add_message(
+        message_id="canonical", provider=source.provider, account_id=source.account_id,
+        provider_message_id="canonical-provider", thread_id="canonical-thread",
+        sender="sender@example.com", sender_name=None, subject="Meeting",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET logical_of='canonical' WHERE message_id='local-scheduling'")
+    accept_calendar_unfollow(store, vendor)
+    old_write = store.automation_calendar_write(authorized.run_id)
+    cancelled_run = store.automation_run(authorized.run_id)
+    assert store.recoverable_automation_runs() == []
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    if held:
+        assert store.recoverable_automation_runs() == []
+        with pytest.raises(KeyError):
+            store.reserve_automation_extraction(
+                authorized.run_id, cancelled_run.state_version,
+                source_content_sha256="c" * 64, context_at="2026-09-07T09:00:00-05:00",
+                timezone="America/Chicago", body_char_limit=20_000,
+                organizer_address="owner@example.com",
+            )
+        source_locks.qualify_protocol(store, fresh=False)
+        source_locks.qualify_protocol(store, fresh=False)
+    if reader == "selector":
+        work = store.recoverable_automation_runs()
+        assert [w.run.run_id for w in work] == [authorized.run_id]
+        assert work[0].provider_message_id == source.provider_message_id
+    payload = store.reserve_automation_extraction(
+        authorized.run_id, cancelled_run.state_version,
+        source_content_sha256="c" * 64, context_at="2026-09-07T09:00:00-05:00",
+        timezone="America/Chicago", body_char_limit=20_000, organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(authorized.run_id)
+    result = b'{"intent":"new_meeting","proposed_times":[],"attendees":[]}'
+    proposing = store.record_automation_extraction(
+        authorized.run_id, extracting.state_version, payload_id=payload.payload_id,
+        result_sha256=hashlib.sha256(result).hexdigest(), result_json=result,
+        violations=[], accepted_state="proposing",
+    )
+    assert [w.run.run_id for w in store.proposable_automation_runs()] == [authorized.run_id]
+    fresh_awaiting = store.record_automation_proposal(
+        proposing.run_id, proposing.state_version, extraction_payload_id=payload.payload_id,
+        request_sha256="f" * 64, subject=proposal.subject, attendees=proposal.attendees,
+        start=proposal.start, end=proposal.end, timezone=proposal.timezone,
+        suggestion_reason=proposal.suggestion_reason, empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    fresh = store.automation_proposal_for_message("canonical")
+    assert fresh is not None and fresh.proposal_version > proposal.proposal_version
+    item = next(i for i in store.recent(10) if i["message_id"] == "canonical")
+    assert item["calendar_proposal"]["proposal_sha256"] == fresh.proposal_sha256
+    new = store.decide_automation_proposal(
+        authorized.run_id, fresh_awaiting.state_version,
+        proposal_version=fresh.proposal_version, proposal_sha256=fresh.proposal_sha256,
+        decision="confirm", now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    assert store.automation_calendar_write(new.run_id).transaction_id != old_write.transaction_id
+    writing = store.begin_automation_calendar_write(new.run_id, new.state_version)
+    assert writing.state == "writing"
+    assert store.calendar_write_outcome_for_message("canonical")["status"] == "writing"
+
+
+@pytest.mark.parametrize("cached,held", [(False, False), (True, False), (True, True)])
+def test_deliberate_calendar_unfollow_suppresses_review_at_transition(tmp_path, cached, held):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=cached, held=held
+    )
+    accept_calendar_unfollow(store, vendor)
+    run = store.automation_run(authorized.run_id)
+    assert run.review_notified_at == run.updated_at
+    assert store.notification_intents(kind="automation_review") == []
+    assert store.notification_intent_count() == len(store.notification_intents())
+    restarted = Store(store.path)
+    assert restarted.notification_intents(kind="automation_review") == []
+
+
+def test_generic_calendar_loss_still_requests_review(tmp_path):
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    with store.connection() as db:
+        db.execute("DELETE FROM automation_proposal_payloads WHERE run_id=?", (authorized.run_id,))
+    store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    assert store.automation_run(authorized.run_id).review_notified_at is None
+    assert [i.subject_id for i in store.notification_intents(kind="automation_review")] == [
+        authorized.run_id
+    ]
+    assert store.notification_intent_count() == len(store.notification_intents())
+
+
+def test_refollow_manual_review_resets_deliberate_cancellation_suppression(tmp_path):
+    store, _, _, _, authorized, manual, fresh, _ = refollowed_calendar_proposal_fixture(
+        tmp_path, cached=False, no_suggestions=True
+    )
+    assert manual.state == "manual_review"
+    assert manual.review_notified_at is None
+    assert fresh.status == "no_suggestions"
+    assert [i.subject_id for i in store.notification_intents(kind="automation_review")] == [
+        authorized.run_id
+    ]
+    assert store.notification_intent_count() == len(store.notification_intents())
+
+
+
+def test_cancelled_alias_fallback_never_duplicates_an_existing_canonical_run(tmp_path):
+    from eom_email_watcher import removal
+
+    store, vendor, _, _, alias = calendar_unfollow_fixture(tmp_path, cached=False)
+    canonical = admitted_scheduling_run(
+        store, message_id="canonical", provider_message_id="canonical-provider"
+    )
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET logical_of='canonical' WHERE message_id='local-scheduling'")
+    accept_calendar_unfollow(store, vendor)
+    cancelled = store.automation_run(alias.run_id)
+    original = store.begin_automation_calendar_write(alias.run_id, alias.state_version)
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    assert [work.run.run_id for work in store.recoverable_automation_runs()] == [canonical.run_id]
+    with pytest.raises(RuntimeError, match="expected-state race"):
+        store.reserve_automation_extraction(
+            alias.run_id, cancelled.state_version, source_content_sha256="c" * 64,
+            context_at="2026-09-07T09:00:00-05:00", timezone="America/Chicago",
+            body_char_limit=20_000, organizer_address="owner@example.com",
+        )
+    assert store.automation_run_for_message("canonical").run_id == canonical.run_id
+    assert store.automation_run_for_message("local-scheduling") is None
+    assert store.begin_automation_calendar_write(alias.run_id, alias.state_version) == original
+    assert store.automation_run(canonical.run_id) == canonical
+
+
+
+def test_cancelled_aliases_have_one_stable_recovery_owner(tmp_path):
+    from eom_email_watcher import removal
+
+    store, vendor, _, proposal, first = calendar_unfollow_fixture(tmp_path, cached=False)
+    proposing, payload = proposing_scheduling_run(
+        store, message_id="second-copy", provider_message_id="second-provider"
+    )
+    awaiting = store.record_automation_proposal(
+        proposing.run_id, proposing.state_version, extraction_payload_id=payload.payload_id,
+        request_sha256="f" * 64, subject=proposal.subject, attendees=proposal.attendees,
+        start=proposal.start, end=proposal.end, timezone=proposal.timezone,
+        suggestion_reason=proposal.suggestion_reason, empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    second_proposal = store.automation_proposal(proposing.run_id)
+    second = store.decide_automation_proposal(
+        proposing.run_id, awaiting.state_version,
+        proposal_version=second_proposal.proposal_version,
+        proposal_sha256=second_proposal.proposal_sha256, decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    assert store.add_message(
+        message_id="canonical", provider=first.provider, account_id=first.account_id,
+        provider_message_id="canonical-provider", thread_id="canonical-thread",
+        sender="sender@example.com", sender_name=None, subject="Meeting",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    with (
+        removal.operation_scope(store.path) as operation,
+        store.derived_connection(operation) as db,
+    ):
+        db.execute("UPDATE messages SET logical_of='canonical' "
+                   "WHERE message_id IN ('local-scheduling','second-copy')")
+    accept_calendar_unfollow(store, vendor)
+    with removal.operation_scope(store.path) as operation:
+        store.add_vendor_address(vendor, "sender@example.com", operation=operation)
+    selected = min((first, second), key=lambda run: (run.created_at, run.run_id))
+    other = second if selected.run_id == first.run_id else first
+    work = store.recoverable_automation_runs()
+    assert [item.run.run_id for item in work] == [selected.run_id]
+    assert store.automation_run_for_message("canonical").run_id == selected.run_id
+    store.reserve_automation_extraction(
+        selected.run_id, work[0].run.state_version, source_content_sha256="c" * 64,
+        context_at="2026-09-07T09:00:00-05:00", timezone="America/Chicago",
+        body_char_limit=20_000, organizer_address="owner@example.com",
+    )
+    # Selection cannot jump to the other cancelled copy as the chosen run advances.
+    assert [item.run.run_id for item in store.recoverable_automation_runs()] == [selected.run_id]
+    assert store.automation_run_for_message("canonical").run_id == selected.run_id
+    with pytest.raises(RuntimeError, match="expected-state race"):
+        store.reserve_automation_extraction(
+            other.run_id, store.automation_run(other.run_id).state_version,
+            source_content_sha256="c" * 64, context_at="2026-09-07T09:00:00-05:00",
+            timezone="America/Chicago", body_char_limit=20_000,
+            organizer_address="owner@example.com",
+        )

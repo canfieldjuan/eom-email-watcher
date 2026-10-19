@@ -1096,7 +1096,19 @@ pub struct CalendarProposalPreview {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CalendarWriteOutcome {
+    pub run_id: String,
+    pub state_version: i64,
+    pub transaction_id: String,
+    pub status: String,
+    pub failure_code: Option<String>,
+    pub graph_event_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CalendarDecisionResult {
+    #[serde(default)]
+    pub calendar_write_outcome: Option<CalendarWriteOutcome>,
     pub run_id: String,
     pub state: String,
     pub state_version: i64,
@@ -1208,6 +1220,8 @@ pub struct InboxItem {
     pub attachments: Vec<InboxAttachment>,
     #[serde(default)]
     pub calendar_proposal: Option<CalendarProposalPreview>,
+    #[serde(default)]
+    pub calendar_write_outcome: Option<CalendarWriteOutcome>,
     #[serde(default)]
     pub admission: Option<InboxAdmission>,
 }
@@ -3786,6 +3800,81 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
             proposal.account_address.as_deref(),
             Some("owner@example.com")
         );
+    }
+
+    #[test]
+    fn calendar_write_outcome_survives_inbox_without_proposal() {
+        for status in [
+            "authorized",
+            "writing",
+            "unresolved",
+            "reconciling",
+            "completed",
+            "failed",
+            "cancelled",
+        ] {
+            let outcome = json!({
+                "run_id": "11111111-1111-4111-8111-111111111111", "state_version": 6,
+                "transaction_id": "22222222-2222-4222-8222-222222222222",
+                "status": status,
+                "failure_code": if status == "cancelled" { Some("thread_unfollowed") } else { None },
+                "graph_event_id": if status == "completed" { Some("created-event") } else { None }
+            });
+            let item: InboxItem = serde_json::from_value(json!({
+                "message_id": "message-1", "received_at": "2026-09-07T12:00:00+00:00",
+                "sender": "sender@example.com", "subject": "Meeting request",
+                "status": "analyzed", "attempts": 0,
+                "calendar_proposal": null, "calendar_write_outcome": outcome.clone()
+            }))
+            .expect("deserialize retained-header calendar outcome");
+            let forwarded = serde_json::to_value(item).expect("serialize inbox for webview");
+            assert_eq!(
+                forwarded["calendar_write_outcome"], outcome,
+                "Native inbox transport discarded calendar status after payload cleanup"
+            );
+            assert!(forwarded["calendar_proposal"].is_null());
+        }
+    }
+
+    #[test]
+    fn calendar_write_outcome_survives_decision_roundtrip() {
+        let outcome = json!({
+            "run_id": "11111111-1111-4111-8111-111111111111", "state_version": 6,
+            "transaction_id": "22222222-2222-4222-8222-222222222222",
+            "status": "cancelled", "failure_code": "thread_unfollowed", "graph_event_id": null
+        });
+        let decision: CalendarDecisionResult = serde_json::from_value(json!({
+            "run_id": "11111111-1111-4111-8111-111111111111", "state": "source_unavailable",
+            "state_version": 6, "failure_code": "source_unavailable", "graph_event_id": null,
+            "calendar_write_outcome": outcome.clone()
+        }))
+        .expect("deserialize cancelled calendar decision");
+        let forwarded =
+            serde_json::to_value(decision).expect("serialize calendar decision for webview");
+        assert_eq!(
+            forwarded["calendar_write_outcome"], outcome,
+            "Native decision transport discarded the typed cancellation outcome"
+        );
+    }
+
+    #[test]
+    fn calendar_write_outcome_allows_legacy_absence_but_refuses_partial_identity() {
+        let legacy = json!({
+            "run_id": "11111111-1111-4111-8111-111111111111", "state": "declined",
+            "state_version": 6, "failure_code": null, "graph_event_id": null
+        });
+        let decision: CalendarDecisionResult = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(decision.calendar_write_outcome.is_none());
+        for invalid in [
+            json!({"status": "cancelled"}),
+            json!(false),
+            json!(""),
+            json!([]),
+        ] {
+            let mut mixed = legacy.clone();
+            mixed["calendar_write_outcome"] = invalid;
+            assert!(serde_json::from_value::<CalendarDecisionResult>(mixed).is_err());
+        }
     }
 
     #[test]

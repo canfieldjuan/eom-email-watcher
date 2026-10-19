@@ -254,6 +254,28 @@ This schema-36 contract for issue #260 replaces the schema-35 refusal in #255. P
 - **Public outcome.** The API carries a `deferred` outcome, the counts of completed and pending targets, and the persisted intent identity whenever any requested target remains. It never maps a held target to `not_found` or reports the request cleared. The desktop says "Deletion pending until the local upgrade completes" and reports the completed and pending counts separately for partial completion; its status readers retain that pending state across restart and show completion only after the persisted intent settles. Delete and clear keep their completed behavior when nothing is held. Body state reads show the pending removal for an unfollowed target instead of rendering its retained bytes.
 - **Verification.** An unqualified 33-row logical unit reports deferred and retains its intent and bytes; a smaller non-held unit is removed immediately. A fail-first acceptance test proves the logical-target barrier while the bytes remain, including a prevented fetch and recapture. Qualification completes the held deletion and removes its body. A restart between acceptance and qualification preserves the request and still completes it once, with truthful partial and terminal outcomes through the API and desktop. The same owner covers delete, clear-history and unfollow.
 
+### Calendar cancellation after accepted unfollow
+
+The operator accepted issue #290's policy and the contract in
+`plans/PR-Calendar-Unfollow-Cancellation.md`: **Cancel cleanly**. Accepted unfollow
+cancels an approved calendar admission only before its durable `writing` handoff,
+inside the source-invalidation transaction. The existing write ledger records
+`cancelled` / `thread_unfollowed`; its run retains `source_unavailable` and the
+immutable event retains the cancelled transaction identity. The desktop says
+**“Not added: you unfollowed this thread”**, including after proposal cleanup.
+Other source loss keeps its generic meaning.
+
+Writing, uncertain, reconciling and completed admissions keep their existing
+principal, interval, transaction, recovery and retention semantics. Recovery looks
+up the original transaction and never submits a replacement or automatically
+deletes an event. Re-follow only permits fresh preparation after shared CONTENT
+eligibility returns. A fresh proposal generation and explicit new approval create
+a new transaction; old confirmations/starts only replay the old terminal outcome.
+The content-free, source-bound `calendar_write_outcome` projection survives payload
+cleanup and remains readable under the existing history entitlement policy.
+This policy uses schema 36 and the existing decision endpoint; it creates no new
+notification or content channel. #278 and installation/promotion remain separate.
+
 ### D-claims: claims and comparability
 
 - **Source.** Each inbound message with a vendor, in a followed thread, is offered to the extraction task. The source text is computed as follows:

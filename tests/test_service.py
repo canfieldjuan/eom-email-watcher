@@ -6614,3 +6614,257 @@ def test_real_history_observation_controls_source_confirmation(
     assert [row["recorded_at"] is not None for row in rows] == (
         [latest not in {"partial", "truncated"}] * len(rows)
     )
+
+@pytest.mark.parametrize("held", [False, True])
+def test_selected_calendar_worker_consumes_unfollow_cancellation(tmp_path, monkeypatch, held):
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=held)
+    cfg = config(tmp_path)
+
+    def authorize_after_selection(*args, **kwargs):
+        accept_calendar_unfollow(store, vendor)
+        return ProposalAuthorization()
+
+    monkeypatch.setattr(
+        service_module, "_scheduling_write_authorization", authorize_after_selection
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_calendar_event",
+        lambda *args, **kwargs: pytest.fail("cancelled admission reached provider create"),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "find_calendar_event_by_transaction",
+        lambda *args, **kwargs: pytest.fail("unsubmitted cancellation reached lookup"),
+    )
+    outcome = process_scheduling_writes(cfg, store, now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC))
+    assert outcome.processed == 1
+    assert outcome.review_required == 0
+    assert store.notification_intents(kind="automation_review") == []
+    assert store.automation_calendar_write(authorized.run_id).status == "cancelled"
+    assert store.automation_calendar_write(authorized.run_id).submitted_at is None
+    monkeypatch.setattr(service_module, "feature_entitlements_active", lambda *features: True)
+    replay = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=authorized.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 7, tzinfo=UTC),
+    )
+    assert replay.calendar_write_outcome["failure_code"] == "thread_unfollowed"
+    assert replay.run.state == "source_unavailable"
+    assert replay.write is None
+
+
+@pytest.mark.parametrize("state", ["writing", "unresolved", "reconciling"])
+@pytest.mark.parametrize("lookup", ["found", "absent", "transport_error"])
+def test_unfollowed_calendar_write_uses_only_original_transaction_lookup(
+    tmp_path, monkeypatch, state, lookup
+):
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    current = store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    if state in {"unresolved", "reconciling"}:
+        current = store.transition_automation_calendar_write(
+            current.run_id,
+            current.state_version,
+            next_state="unresolved",
+            failure_code="write_outcome_unknown",
+        )
+    if state == "reconciling":
+        store.transition_automation_calendar_write(
+            current.run_id, current.state_version, next_state="reconciling"
+        )
+    write = store.automation_calendar_write(authorized.run_id)
+    accept_calendar_unfollow(store, vendor)
+    cfg = config(tmp_path)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_calendar_event",
+        lambda *args, **kwargs: pytest.fail("recovery attempted another create"),
+    )
+    calls = []
+
+    def find(_authorization, **kwargs):
+        calls.append(kwargs)
+        if lookup == "transport_error":
+            raise Microsoft365Error("lookup unavailable")
+        return (
+            CalendarWriteResult("existing-event", write.transaction_id)
+            if lookup == "found"
+            else None
+        )
+
+    monkeypatch.setattr(service_module, "find_calendar_event_by_transaction", find)
+    for _ in range(2 if state in {"writing", "reconciling"} else 1):
+        process_scheduling_writes(cfg, store, now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC))
+    result = store.automation_calendar_write(authorized.run_id)
+    assert result.transaction_id == write.transaction_id
+    assert result.calendar_principal_key == write.calendar_principal_key
+    assert result.start == write.start and result.end == write.end
+    assert result.status == ("completed" if lookup == "found" else "unresolved")
+    assert result.graph_event_id == ("existing-event" if lookup == "found" else None)
+    assert len(calls) == 1
+    assert calls[0]["transaction_id"] == write.transaction_id
+    assert store.automation_proposal(authorized.run_id) is None
+    assert store.calendar_write_outcome_for_message("local-scheduling")["status"] == result.status
+
+
+def test_refollowed_calendar_requires_fresh_write_authorization_before_new_transaction(
+    tmp_path, monkeypatch
+):
+    from test_db import refollowed_calendar_proposal_fixture
+
+    (store, original, awaiting, old_proposal, authorized, fresh_awaiting, proposal, proposing) = (
+        refollowed_calendar_proposal_fixture(tmp_path)
+    )
+    cfg = config(tmp_path)
+    monkeypatch.setattr(service_module, "feature_entitlements_active", lambda *features: True)
+    accesses = []
+
+    def no_write_access(*args, **kwargs):
+        accesses.append(kwargs)
+        return None
+
+    monkeypatch.setattr(service_module, "_scheduling_write_authorization", no_write_access)
+    arguments = dict(
+        run_id=proposing.run_id,
+        expected_state_version=fresh_awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    before = store.automation_calendar_write(proposing.run_id)
+    assert before.status == "cancelled" and before.transaction_id == original.transaction_id
+    with pytest.raises(PermissionError, match="write permission is unavailable"):
+        decide_scheduling_proposal(cfg, store, **arguments)
+    assert len(accesses) == 1
+    assert store.automation_calendar_write(proposing.run_id) == before
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    creates = []
+
+    def create(_authorization, *, transaction_id, **kwargs):
+        creates.append(transaction_id)
+        return CalendarWriteResult("fresh-event", transaction_id)
+
+    monkeypatch.setattr(service_module, "create_calendar_event", create)
+    result = decide_scheduling_proposal(cfg, store, **arguments)
+    assert result.run.state == "completed"
+    assert creates == [result.write.transaction_id]
+    assert result.write.transaction_id != original.transaction_id
+    replay = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=authorized.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=old_proposal.proposal_version,
+        proposal_sha256=old_proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 7, tzinfo=UTC),
+    )
+    assert replay.calendar_write_outcome["transaction_id"] == original.transaction_id
+    assert replay.calendar_write_outcome["status"] == "cancelled"
+    assert creates == [result.write.transaction_id]
+
+def test_calendar_worker_does_not_swallow_admission_invariant_failure(tmp_path, monkeypatch):
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+
+    def corrupt_after_selection(*args, **kwargs):
+        accept_calendar_unfollow(store, vendor)
+        with store.connection() as db:
+            db.execute(
+                "UPDATE automation_calendar_writes SET status='authorized' WHERE run_id=?",
+                (authorized.run_id,),
+            )
+        return ProposalAuthorization()
+
+    monkeypatch.setattr(service_module, "_scheduling_write_authorization", corrupt_after_selection)
+    monkeypatch.setattr(
+        service_module,
+        "create_calendar_event",
+        lambda *args, **kwargs: pytest.fail("inconsistent admission reached create"),
+    )
+    with pytest.raises(RuntimeError, match="ledger is inconsistent"):
+        process_scheduling_writes(
+            config(tmp_path), store, now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC)
+        )
+
+
+@pytest.mark.parametrize("cause", ["thread_unfollowed", "source_unavailable"])
+@pytest.mark.parametrize("entrypoint", ["worker", "watcher"])
+def test_selected_calendar_cancellation_review_matches_persisted_cause(
+    tmp_path, monkeypatch, cause, entrypoint
+):
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+
+    store, vendor, _awaiting, _proposal, authorized = calendar_unfollow_fixture(
+        tmp_path, cached=False
+    )
+    cfg = replace(config(tmp_path), senders=())
+    stamp = datetime(2026, 9, 7, 13, 6, tzinfo=UTC)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: stamp)
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
+    )
+
+    def authorize_after_selection(*args, **kwargs):
+        if cause == "thread_unfollowed":
+            accept_calendar_unfollow(store, vendor)
+        else:
+            # Existing generic source-loss path: the admitted payload disappeared.
+            with store.connection() as db:
+                db.execute(
+                    "DELETE FROM automation_proposal_payloads WHERE run_id=?", (authorized.run_id,)
+                )
+        return ProposalAuthorization()
+
+    monkeypatch.setattr(
+        service_module, "_scheduling_write_authorization", authorize_after_selection
+    )
+    monkeypatch.setattr(
+        service_module, "create_calendar_event",
+        lambda *args, **kwargs: pytest.fail("cancelled admission reached provider create"),
+    )
+    monkeypatch.setattr(
+        service_module, "find_calendar_event_by_transaction",
+        lambda *args, **kwargs: pytest.fail("unsubmitted cancellation reached lookup"),
+    )
+    if entrypoint == "worker":
+        outcome = process_scheduling_writes(cfg, store, now=stamp)
+        processed, reviews = outcome.processed, outcome.review_required
+    else:
+        outcome = run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=False)
+        processed, reviews = outcome["automation_processed"], outcome["automation_review_required"]
+    assert processed == 1
+    write = store.automation_calendar_write(authorized.run_id)
+    assert write.status == "cancelled"
+    assert write.failure_code == cause
+    assert write.submitted_at is None
+    expected_reviews = int(cause == "source_unavailable")
+    assert reviews == expected_reviews
+    intents = store.notification_intents(kind="automation_review")
+    assert [intent.subject_id for intent in intents] == (
+        [authorized.run_id] if expected_reviews else []
+    )
+    assert store.notification_intent_count() == len(store.notification_intents())
+    assert (store.automation_run(authorized.run_id).review_notified_at is None) == bool(
+        expected_reviews
+    )

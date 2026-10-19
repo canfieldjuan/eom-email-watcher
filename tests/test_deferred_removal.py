@@ -5180,6 +5180,8 @@ def test_eligibility_callers_cannot_default_or_downgrade_content():
             "record_reconcile_headers",
             "_insert_message_in_transaction",
             "record_message_location",
+            # Accepted calendar contract: retained metadata/replay, never content admission.
+            "_automation_run_for_message",
         },
     }
     record_starts = {("service", "_capture_ids"), ("reconcile", "fetch")}
@@ -5367,3 +5369,43 @@ def test_scheduling_selection_does_not_reselect_held_unfollow(tmp_path, monkeypa
         )
     assert [work.run.run_id for work in selected(limit=1)] == [eligible.run_id]
     assert store.automation_run(blocked.run_id) == state
+
+
+def test_held_calendar_record_projection_does_not_admit_content(tmp_path):
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, held=True)
+    assert store.source_start("local-scheduling", eligibility=removal.CONTENT)
+    accept_calendar_unfollow(store, vendor)
+    outcome = store.calendar_write_outcome_for_message("local-scheduling")
+    assert set(outcome) == {
+        "run_id", "state_version", "transaction_id", "status", "failure_code", "graph_event_id"
+    }
+    assert outcome["run_id"] == authorized.run_id
+    assert outcome["failure_code"] == "thread_unfollowed"
+    assert store.source_start("local-scheduling", eligibility=removal.RECORD)
+    assert not store.source_start("local-scheduling", eligibility=removal.CONTENT)
+    with pytest.raises(KeyError):
+        store.message_source("local-scheduling")
+    assert store.automation_proposal(authorized.run_id) is None
+    with store.connection() as db:
+        assert db.execute("SELECT text FROM message_bodies").fetchone()[0] == "Can we meet?"
+
+
+def test_completed_calendar_metadata_cannot_repopulate_unfollowed_body(tmp_path):
+    from datetime import UTC, datetime
+
+    from test_db import accept_calendar_unfollow, calendar_unfollow_fixture
+
+    store, vendor, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path)
+    accept_calendar_unfollow(store, vendor)
+    outcome = store.calendar_write_outcome_for_message("local-scheduling")
+    assert outcome["run_id"] == authorized.run_id
+    assert outcome["failure_code"] == "thread_unfollowed"
+    assert store.automation_proposal(authorized.run_id) is None
+    body_state.record(store, "local-scheduling", ("must not return", 15),
+                      fetched_at=datetime(2026, 9, 7, 13, tzinfo=UTC))
+    with store.connection() as db:
+        assert db.execute("SELECT followed FROM thread_follow").fetchone()[0] == 0
+        assert not db.execute("SELECT 1 FROM message_bodies").fetchone()
+        assert not db.execute("SELECT 1 FROM message_body_unavailable").fetchone()

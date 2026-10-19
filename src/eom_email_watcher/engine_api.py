@@ -2732,6 +2732,7 @@ def _calendar_automation_decide(request: dict[str, object]) -> dict[str, object]
             "state_version": outcome.run.state_version,
             "failure_code": outcome.run.failure_code,
             "graph_event_id": (outcome.write.graph_event_id if outcome.write is not None else None),
+            "calendar_write_outcome": outcome.calendar_write_outcome,
         }
 
 
