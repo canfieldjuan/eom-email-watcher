@@ -8953,3 +8953,60 @@ def test_calendar_cancelled_decision_and_locked_inbox_keep_only_bound_metadata(
     with pytest.raises(engine_api.ApiError) as error:
         engine_api._calendar_automation_decide({"payload": dict(payload, message_id="foreign")})
     assert error.value.code == "not_found"
+
+
+
+def test_legacy_begin_cleanup_refuses_inconsistent_admission_as_stale(tmp_path, monkeypatch):
+    from test_db import calendar_unfollow_fixture
+    from test_service import config
+
+    from eom_email_watcher import db as database
+    from eom_email_watcher import service
+
+    store, _, awaiting, proposal, authorized = calendar_unfollow_fixture(tmp_path, cached=False)
+    write = store.automation_calendar_write(authorized.run_id)
+    # Pre-PR begin_automation_calendar_write at main 9fc701e removed payloads,
+    # advanced the run, and recorded this event while leaving the write authorized.
+    stamp = "2026-09-07T13:06:00+00:00"
+    with store.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM automation_proposal_payloads WHERE run_id=?", (authorized.run_id,))
+        db.execute(
+            "DELETE FROM automation_extraction_payloads WHERE run_id=?", (authorized.run_id,)
+        )
+        db.execute(
+            """UPDATE automation_runs SET state='source_unavailable', state_version=?,
+                failure_code='source_unavailable', review_notified_at=NULL, updated_at=?
+            WHERE run_id=?""",
+            (authorized.state_version + 1, stamp, authorized.run_id),
+        )
+        database._append_automation_event(
+            db, run_id=authorized.run_id, sequence_no=authorized.state_version,
+            previous_state="write_authorized", next_state="source_unavailable",
+            state_version=authorized.state_version + 1, automation_id=authorized.automation_id,
+            automation_version=authorized.automation_version,
+            extraction_schema_version=authorized.extraction_schema_version,
+            calendar_principal_key=authorized.calendar_principal_key,
+            transition_kind="source_unavailable", failure_code="source_unavailable",
+            created_at=stamp, transaction_id=write.transaction_id,
+        )
+    with pytest.raises(RuntimeError, match="ledger is inconsistent"):
+        store.begin_automation_calendar_write(authorized.run_id, authorized.state_version)
+    cfg = config(tmp_path)
+    monkeypatch.setattr(engine_api, "_runtime", lambda _: SimpleNamespace(config=cfg, store=store))
+    monkeypatch.setattr(service, "feature_entitlements_active", lambda *features: True)
+    monkeypatch.setattr(service, "create_calendar_event", lambda *args, **kwargs: pytest.fail(
+        "an inconsistent legacy admission must never create an event"
+    ))
+    before = store.automation_events(authorized.run_id)
+    with pytest.raises(engine_api.ApiError) as error:
+        engine_api._calendar_automation_decide({"payload": {
+            "decision": "confirm", "message_id": "local-scheduling",
+            "run_id": authorized.run_id, "state_version": awaiting.state_version,
+            "proposal_version": proposal.proposal_version,
+            "proposal_sha256": proposal.proposal_sha256,
+        }})
+    assert error.value.code == "stale_proposal"
+    assert store.automation_calendar_write(authorized.run_id) == write
+    assert store.automation_events(authorized.run_id) == before
+    assert store.pending_automation_calendar_writes() == []

@@ -13,9 +13,9 @@ export function calendarOutcomeNotice(
   state?: string,
 ): { text: string; kind: "success" | "warning" | "error" } {
   // A fresh proposal can coexist with the previous terminal current-write row.
-  // Its own pending/declined copy must not describe that previous admission.
+  // Its own fresh-proposal copy must not describe that previous admission.
   if (outcome?.status === "cancelled" &&
-      (state === "awaiting_confirmation" || state === "declined")) {
+      (state === "awaiting_confirmation" || state === "declined" || state === "manual_review")) {
     outcome = null;
   }
   if (outcome?.status === "cancelled") {

@@ -473,3 +473,73 @@ qualification, independent exact-head review and posted oversight PASS, review
 reconciliation and merge. Require zero unresolved threads/changes requested and
 clean local == actual remote; merge with a merge commit and reviewed-tree equality.
 No installation, promotion or #278 work.
+
+
+## Published-head review repair round
+
+Root cause: my `55b05e0f` introduced four incomplete invariants: historical
+cancellation replay copied mutable generation fields (`_cancelled_calendar_admission`,
+`db.py:2054`); refollow preparation bound a canonical row directly to a physical
+source key (`_scheduling_preparation_available_sql`, `db.py:3086`); the shared
+notice owner omitted fresh `manual_review` (`calendarOutcome.ts:18`); and
+`_cancel_automation_source` cleared notification acknowledgement for deliberate
+unfollow (`db.py:1911`). Each is reproduced before production edits.
+
+Required change surface: reconstruct a stable content-free historical run from
+immutable cancellation/authorization evidence, leaving unavailable extraction
+context absent; resolve physical admission identity before canonical logical
+follow, preserving ordinary initial duplicate suppression and routing the fresh
+proposal/confirmation/start/status readers through that binding; preserve local-only
+cancellation by recording notification suppression at the transition owner; include
+fresh manual review in the one notice formatter. Test replay before and after new
+preparation/consent, alias refollow through real write handoff, ordinary duplicate
+controls, bodyless/completed/held notification selection and counts, generic loss
+and fresh manual-review notification reset, and both formatter surfaces.
+
+Explicit non-scope: no schema/API/dependency/workflow/harness changes, no provider
+retry or consent changes, no body eligibility bypass, no install/promotion or #278.
+These repairs implement the already accepted policy. Independent exact-head review
+and Windows qualification remain required; technical repairs remain owned here.
+
+Verification: declared fail-first tests at the published head, isolated/adjacent
+Python and desktop tests, lint/type/build, full local Python under umask 022 and
+isolated repo environment before the single grouped repair push. Existing tests
+and assertions stay intact. Map new assertions to the accepted replay, canonical
+source identity, local status, fresh consent and existing notification contracts.
+
+
+Oversight follow-ups on the same published head:
+- Snapshot scope: only the source/RECORD binding and run/write outcome share one
+  SQLite statement. The proposal payload and outcome are separate autocommit reads;
+  this PR does not claim an atomic whole-card proposal/outcome snapshot. Refresh
+  fencing and typed confirmation identity still reject stale user actions.
+- Invariant failures intentionally abort the current calendar-write batch and
+  surface an error. The accepted contract prohibits swallowing genuine ledger
+  errors. A persistently inconsistent row requires origin diagnosis; continuing
+  silently past it is not authorized. The real worker invariant regression stays.
+- RECORD admission at `_automation_run_for_message` also gates the existing API
+  decision binding, not only inbox status. A removed record returns `not_found`;
+  CONTENT gating and fresh write authorization remain separate requirements.
+- Legacy begin-time cleanup on main `9fc701e` could leave a source-unavailable run
+  plus an authorized write and an immutable generic-loss event. This inconsistent
+  admission remains fail-closed: store replay raises its ledger error, the existing
+  API maps it to `stale_proposal`, no provider call/event mutation occurs. A runtime
+  regression captures the exact old transition shape; no silent repair or invented
+  cancellation result is added.
+- A bodyless still-unapproved proposal is outside the accepted authorized-admission
+  capture amendment. Record and defer that asymmetry for an operator policy
+  decision. No production change in this repair extends the capture to it.
+- Execute the production manual-review proposal-card segment, proving its shared
+  formatter receives the new state, displays existing no-event wording, retains
+  the empty-result reason and creates no stale confirmation controls.
+
+Deferred policy tracked in #292. New assertion mapping: historical replay checks
+old payload/event identity, absent unrecorded context and unchanged replay after
+fresh approval; alias lifecycle checks shared CONTENT denial before cleanup,
+physical source fetch identity, canonical proposal/status visibility and a new
+transaction reaching writing; notification tests check suppression at the
+transition plus preserved generic and new manual-review delivery/count behavior;
+legacy test checks existing stale refusal with unchanged events/write and no
+provider call; frontend tests check both formatter surfaces and production-card
+wording/reason/no-button rendering. The fixture's no-suggestions option adds a
+sibling case; all prior assertions remain.

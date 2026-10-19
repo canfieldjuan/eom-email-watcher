@@ -1908,10 +1908,17 @@ def _cancel_automation_source(
     changed = db.execute(
         """UPDATE automation_runs SET
             state = 'source_unavailable', state_version = ?,
-            failure_code = 'source_unavailable', review_notified_at = NULL,
+            failure_code = 'source_unavailable', review_notified_at = ?,
             updated_at = ?
         WHERE run_id = ? AND state = ? AND state_version = ?""",
-        (next_version, updated_at, run_id, previous_state, previous_version),
+        (
+            next_version,
+            updated_at if cause == "thread_unfollowed" else None,
+            updated_at,
+            run_id,
+            previous_state,
+            previous_version,
+        ),
     )
     if changed.rowcount != 1:
         raise RuntimeError("Automation source cleanup lost its expected-state race")
@@ -1958,6 +1965,28 @@ def _automation_message_binding_sql(run: str, identity: str, message: str) -> st
         )"""
 
 
+def _scheduling_source_join_sql(run: str, identity: str, source: str, logical: str) -> str:
+    """Resolve the physical admission before its current logical owner.
+
+    Ordinary duplicate runs remain suppressed. An already cancelled unfollow
+    admission retains its explicit fresh-consent lifecycle after coalescing;
+    immutable evidence keeps that identity usable after the current write changes.
+    """
+    return f"""JOIN messages {source}
+        ON {_automation_message_binding_sql(run, identity, source)}
+        JOIN logical_messages {logical}
+          ON {logical}.message_id=COALESCE({source}.logical_of,{source}.message_id)
+         AND ({source}.logical_of IS NULL OR EXISTS (
+             SELECT 1 FROM automation_events lineage
+             WHERE lineage.run_id={run}.run_id
+               AND lineage.previous_state='write_authorized'
+               AND lineage.next_state='source_unavailable'
+               AND lineage.transition_kind='source_unavailable'
+               AND lineage.failure_code='thread_unfollowed'
+               AND lineage.transaction_id IS NOT NULL
+         ))"""
+
+
 def _automation_run_for_message(
     db: sqlite3.Connection,
     message_id: str,
@@ -1976,7 +2005,7 @@ def _automation_run_for_message(
         f"""SELECT {columns} FROM automation_runs AS r
         {calendar_join}
         LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-        JOIN logical_messages AS m ON {_automation_message_binding_sql("r", "i", "m")}
+        {_scheduling_source_join_sql("r", "i", "source", "m")}
         WHERE m.message_id = ? AND ({record_eligible})""",
         (message_id,),
     ).fetchone()
@@ -2021,6 +2050,8 @@ def _cancelled_calendar_admission(
     # cancelled before handoff, even after payload deletion or a fresh approval.
     event = db.execute(
         """SELECT c.transaction_id, c.failure_code, c.state_version, c.created_at,
+            c.automation_id, c.automation_version, c.extraction_schema_version,
+            c.calendar_principal_key, c.payload_id, c.payload_sha256,
             'cancelled' AS status, NULL AS graph_event_id
         FROM automation_events a JOIN automation_events c
           ON c.run_id=a.run_id AND c.state_version=a.state_version+1
@@ -2056,6 +2087,21 @@ def _cancelled_calendar_admission(
         state="source_unavailable",
         state_version=int(event["state_version"]),
         failure_code="source_unavailable",
+        automation_id=str(event["automation_id"]),
+        automation_version=int(event["automation_version"]),
+        extraction_schema_version=int(event["extraction_schema_version"]),
+        calendar_principal_key=str(event["calendar_principal_key"]),
+        # No immutable extraction context was retained after content cleanup.
+        # A replay is a terminal historical projection, never current consent.
+        source_content_sha256=None,
+        extraction_context_at=None,
+        extraction_timezone=None,
+        extraction_body_char_limit=None,
+        current_payload_id=event["payload_id"],
+        current_payload_sha256=event["payload_sha256"],
+        review_notified_at=(
+            str(event["created_at"]) if event["failure_code"] == "thread_unfollowed" else None
+        ),
         updated_at=str(event["created_at"]),
     )
     return AutomationCalendarWriteCancelled(run, calendar_write_outcome(run, event))
@@ -3083,13 +3129,11 @@ def _scheduling_preparation_available_sql(db: sqlite3.Connection, alias: str) ->
                       AND w.failure_code='thread_unfollowed')
         AND ({_automation_source_available_sql(alias, eligibility=removal.CONTENT)})
         AND EXISTS (
-            SELECT 1 FROM logical_messages m
+            SELECT 1 FROM automation_runs followed_run
+            LEFT JOIN automation_run_source_identities i ON i.run_id=followed_run.run_id
+            {_scheduling_source_join_sql("followed_run", "i", "source", "m")}
             JOIN thread_follow f ON {_followed_message_sql("m")}
-            LEFT JOIN automation_run_source_identities i ON i.run_id={alias}.run_id
-            WHERE m.provider={alias}.provider AND m.account_id={alias}.account_id
-              AND m.mailbox_identity_key IS i.mailbox_identity_key
-              AND message_source_key(m.provider,m.account_id,m.provider_message_id,
-                                     m.mailbox_identity_key)={alias}.source_message_key
+            WHERE followed_run.run_id={alias}.run_id
         )
     ))"""
 
@@ -12286,22 +12330,7 @@ class Store:
                     i.mailbox_identity_key AS source_mailbox_identity_key
                 FROM automation_runs AS r
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN logical_messages AS m
-                  ON m.provider = r.provider
-                 AND m.account_id = r.account_id
-                 AND (
-                     (i.mailbox_identity_key IS NOT NULL
-                      AND m.mailbox_identity_key = i.mailbox_identity_key
-                      AND message_source_key(
-                            m.provider, m.account_id, m.provider_message_id,
-                            m.mailbox_identity_key
-                          ) = r.source_message_key)
-                     OR (i.mailbox_identity_key IS NULL
-                         AND m.mailbox_identity_key IS NULL
-                         AND message_source_key(
-                                m.provider, m.account_id, m.provider_message_id
-                             ) = r.source_message_key)
-                 )
+                {_scheduling_source_join_sql("r", "i", "m", "logical_source")}
                 JOIN mail_accounts AS a
                   ON a.provider = r.provider AND a.account_id = r.account_id
                 LEFT JOIN automation_extraction_payloads AS p
@@ -12384,22 +12413,7 @@ class Store:
                     p.created_at AS extraction_created_at, p.completed_at
                 FROM automation_runs AS r
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN logical_messages AS m
-                  ON m.provider = r.provider
-                 AND m.account_id = r.account_id
-                 AND (
-                     (i.mailbox_identity_key IS NOT NULL
-                      AND m.mailbox_identity_key = i.mailbox_identity_key
-                      AND message_source_key(
-                            m.provider, m.account_id, m.provider_message_id,
-                            m.mailbox_identity_key
-                          ) = r.source_message_key)
-                     OR (i.mailbox_identity_key IS NULL
-                         AND m.mailbox_identity_key IS NULL
-                         AND message_source_key(
-                                m.provider, m.account_id, m.provider_message_id
-                             ) = r.source_message_key)
-                 )
+                {_scheduling_source_join_sql("r", "i", "m", "logical_source")}
                 JOIN mail_accounts AS a
                   ON a.provider = r.provider AND a.account_id = r.account_id
                 JOIN automation_extraction_payloads AS p
@@ -12479,29 +12493,15 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if not removal.CONTENT.message_available(db, message_id):
                 return None
+            run = _automation_run_for_message(db, message_id)
+            if run is None or not _automation_source_available(
+                db, str(run["run_id"]), eligibility=removal.CONTENT
+            ):
+                return None
             row = db.execute(
-                """SELECT p.* FROM automation_proposal_payloads AS p
-                JOIN automation_runs AS r
-                  ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
-                LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN logical_messages AS m
-                  ON m.provider = r.provider
-                 AND m.account_id = r.account_id
-                 AND (
-                     (i.mailbox_identity_key IS NOT NULL
-                      AND m.mailbox_identity_key = i.mailbox_identity_key
-                      AND message_source_key(
-                            m.provider, m.account_id, m.provider_message_id,
-                            m.mailbox_identity_key
-                          ) = r.source_message_key)
-                     OR (i.mailbox_identity_key IS NULL
-                         AND m.mailbox_identity_key IS NULL
-                         AND message_source_key(
-                                m.provider, m.account_id, m.provider_message_id
-                             ) = r.source_message_key)
-                 )
-                WHERE m.message_id = ?""",
-                (message_id,),
+                """SELECT * FROM automation_proposal_payloads
+                WHERE run_id=? AND payload_id=?""",
+                (run["run_id"], run["current_payload_id"]),
             ).fetchone()
         return _automation_proposal_payload(row) if row is not None else None
 
@@ -13012,28 +13012,11 @@ class Store:
             if write["status"] != "authorized":
                 raise RuntimeError("Automation write admission ledger is inconsistent")
             source_exists = db.execute(
-                """SELECT 1 FROM logical_messages AS m
-                LEFT JOIN automation_run_source_identities AS i ON i.run_id = ?
-                WHERE m.provider = ? AND m.account_id = ? AND (
-                    (i.mailbox_identity_key IS NOT NULL
-                     AND m.mailbox_identity_key = i.mailbox_identity_key
-                     AND message_source_key(
-                            m.provider, m.account_id, m.provider_message_id,
-                            m.mailbox_identity_key
-                         ) = ?)
-                    OR (i.mailbox_identity_key IS NULL
-                        AND m.mailbox_identity_key IS NULL
-                        AND message_source_key(
-                               m.provider, m.account_id, m.provider_message_id
-                            ) = ?)
-                )""",
-                (
-                    run_id,
-                    row["provider"],
-                    row["account_id"],
-                    row["source_message_key"],
-                    row["source_message_key"],
-                ),
+                f"""SELECT 1 FROM automation_runs r
+                LEFT JOIN automation_run_source_identities i ON i.run_id=r.run_id
+                {_scheduling_source_join_sql("r", "i", "source", "m")}
+                WHERE r.run_id=?""",
+                (run_id,),
             ).fetchone()
             proposal_exists = db.execute(
                 """SELECT 1 FROM automation_proposal_payloads
@@ -14501,22 +14484,7 @@ class Store:
               ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
             LEFT JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
             LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-            JOIN messages AS m
-              ON m.provider = r.provider
-             AND m.account_id = r.account_id
-             AND (
-                 (i.mailbox_identity_key IS NOT NULL
-                  AND m.mailbox_identity_key = i.mailbox_identity_key
-                  AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id,
-                        m.mailbox_identity_key
-                      ) = r.source_message_key)
-                 OR (i.mailbox_identity_key IS NULL
-                     AND m.mailbox_identity_key IS NULL
-                     AND message_source_key(
-                            m.provider, m.account_id, m.provider_message_id
-                         ) = r.source_message_key)
-             )
+            {_scheduling_source_join_sql("r", "i", "source", "m")}
             JOIN mail_accounts AS a
               ON a.provider = r.provider AND a.account_id = r.account_id
             WHERE m.message_id IN ({placeholders})

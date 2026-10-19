@@ -153,3 +153,46 @@ test("fresh proposal decisions retain their wording over an older cancelled admi
   assert.equal(calendarOutcomeNotice(cancelled, "proposal", "awaiting_confirmation").text,
     "No calendar event has been created.");
 });
+
+
+test("fresh manual-review proposal never reuses previous unfollow wording", () => {
+  for (const surface of ["proposal", "decision"] as const) {
+    assert.deepEqual(calendarOutcomeNotice(cancelled, surface, "manual_review"),
+      calendarOutcomeNotice(null, surface, "manual_review"));
+    assert.equal(calendarOutcomeNotice(cancelled, surface, "source_unavailable").text,
+      "Not added: you unfollowed this thread");
+  }
+});
+
+
+test("production manual-review card uses fresh proposal wording and offers no old confirmation", () => {
+  const start = source.indexOf("let calendarProposal: HTMLElement | null = null;");
+  const end = source.indexOf('const attachments = document.createElement("ul");', start);
+  assert.ok(start >= 0 && end > start);
+  const segment = stripTypeScriptTypes(source.slice(start, end) +
+    'if (calendarProposal) card.append(calendarProposal);');
+  const nodes: any[] = [];
+  const card = { children: [] as any[], append(node: any) { this.children.push(node); } };
+  runInNewContext(segment, {
+    card, renderStartedAt: Date.now(), nextProposalExpiry: null, calendarOutcomeNotice,
+    item: { calendar_write_outcome: cancelled, calendar_proposal: {
+      state: "manual_review", status: "no_suggestions", subject: "Synthetic meeting",
+      attendees: [], start: null, end: null, timezone: null, expires_at: null,
+      empty_reason: "No available meeting time.", account_id: "synthetic-account",
+      account_display_name: "Synthetic owner", account_address: "owner@example.com",
+    } },
+    document: { createElement(tag: string) {
+      const node = { tag, textContent: "", className: "", dataset: {}, children: [] as any[],
+        set innerHTML(_value: string) { assert.fail("calendar text must be rendered literally"); },
+        setAttribute() {}, append(...children: any[]) { this.children.push(...children); } };
+      nodes.push(node);
+      return node;
+    } },
+  });
+  assert.equal(card.children.length, 1);
+  assert.equal(nodes.find(node => node.className === "calendar-proposal-note")?.textContent,
+    "No calendar event has been created.");
+  assert.equal(nodes.some(node => node.textContent === "No available meeting time."), true);
+  assert.equal(nodes.some(node => node.textContent === "Not added: you unfollowed this thread"), false);
+  assert.equal(nodes.filter(node => node.tag === "button").length, 0);
+});
