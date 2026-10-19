@@ -60,13 +60,25 @@ accurate replay and eligibility; it must not fabricate a calendar write.
   create a fake write outcome, or add new user-facing wording. Review-state
   notifications are suppressed at the origin for both initial and refollowed
   generations. Existing approved-write wording stays as in #291.
+- **Commit ordering:** `Store.decide_automation_proposal` and the accepted
+  unfollow through `Store.derived_connection(operation)` are serialized by
+  their SQLite `BEGIN IMMEDIATE` write transactions. The latter transaction
+  is owned by `removal._RuntimeAcceptance.transaction` under
+  `removal.operation_scope`; the operation guard alone is not the race oracle.
+  If confirmation commits first, it durably authorizes the write and the
+  subsequent unfollow applies #291's authorized-write cancellation. If
+  unfollow commits first, it removes the proposal and advances the run; a
+  later confirmation is refused as stale and never saves `write_authorized`.
+  Neither order creates a provider call in the acceptance transaction.
 - **Tests:** use the real store, follow mutation and removal operation scope
   in `tests/test_db.py`, with adjacent deferred-removal/service tests where
   needed. Cover bodyless and retained-body pending proposals, earlier
   preparation states, both review states, guarded transaction refusal,
   rollback, source/alias binding, stale confirmation, re-follow/fresh consent,
-  generic source loss, and writing/uncertain/completed controls. Each changed
-  assertion must map to the accepted behavior here; retain old assertions.
+  generic source loss, writing/uncertain/completed controls, and both
+  confirmation/unfollow commit orders using deterministic barriers rather
+  than sleeps. Each changed assertion must map to the accepted behavior here;
+  retain old assertions.
 
 ### Explicit non-scope
 
@@ -92,8 +104,9 @@ guide the reproduction; neither proves the new behavior at this base.
    existing synthetic fixtures. Record the before result outside the worktree.
 2. Add fail-first real-store regressions that fail at the policy assertion,
    with boundary controls for missing/mixed bindings, cached/held/no-body
-   source, run state, re-follow, old versions, and generic loss. Identify each
-   introducing commit and owning function before production edits.
+   source, run state, re-follow, old versions, generic loss, and the two
+   serialized commit orders. Identify each introducing commit and owning
+   function before production edits.
 3. Fix at the before-image/cause/transition owners. If fresh preparation needs
    a reader change, use the existing shared scheduling eligibility owner and
    its persisted event signal. Prove isolated and original cases pass; use an
@@ -104,7 +117,9 @@ guide the reproduction; neither proves the new behavior at this base.
    Keep raw logs, assertion mapping and source hashes in durable evidence
    outside the worktree. Required final-head CI, native Windows installed and
    populated qualification, exact-head independent review and zero unresolved
-   threads gate merge. No installation or promotion.
+   threads gate merge. Keep the implementation round at about 1,000 changed
+   lines or fewer including tests; split before pushing if it would exceed
+   that limit. No installation or promotion.
 
 ## Implementation summary
 
