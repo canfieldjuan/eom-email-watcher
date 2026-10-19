@@ -1,0 +1,122 @@
+# Pending calendar work after deliberate unfollow — contract for #292
+
+Status: **contract only; implementation requires operator acceptance of this document**.
+Base: merged #291 at `b8258b6de14ebc4438d4aec0c6317edc013843ac`.
+Decision: [issue #292](https://github.com/canfieldjuan/eom-email-watcher/issues/292#issuecomment-6258924816).
+This is one concern in a separate PR. The first commit changes this document only.
+
+## Contract
+
+### Root cause
+
+`src/eom_email_watcher/db.py:6000` `_capture_followed_calendar_sql`, introduced by
+`9b6b7a09db9e50151c1a8fc2f12f80a03008d26d`, captures only a bound run in
+`write_authorized` with an `authorized` calendar write. The guarded derived
+unfollow consumer at `db.py:6254` therefore sees no bodyless run that is still
+`detected`, `extracting`, `proposing`, or `awaiting_confirmation`. With no retained
+body, the body-removal acceptance path has no target either. A deliberate unfollow
+can leave the proposal and its confirmation action live. This is the policy gap
+recorded with a synthetic reproduction in issue #292; that issue's evidence is
+historical, not a passing or failing test of this PR.
+
+The shared transition at `db.py:1881` already invalidates preparation and
+prevents an unsubmitted authorized write. It currently returns before advancing
+`manual_review` and `ambiguous` runs, which can leave a review intent after
+deliberate unfollow. Its event carries the typed `thread_unfollowed` cause only
+for an approved write. A pre-write cancellation needs that durable cause for
+accurate replay and eligibility; it must not fabricate a calendar write.
+
+### Required change surface
+
+- **Before-image and cause owner:** capture every physically bound, previously
+  followed scheduling run with cancellable preparation or an unsubmitted
+  authorized write before follow inputs change, whether a body is retained or
+  not. Consume that evidence only when its logical source has actually lost
+  follow in the same guarded transaction. Use one shared pre-send eligibility
+  definition for capture and consumption, preserving the physical source and
+  canonical logical binding from #291. A missing or mismatched source must
+  never cancel another run. The body-bearing removal path and bodyless path
+  must converge on one cancellation owner and one typed cause.
+- **Transition:** on accepted `thread_unfollowed`, remove current proposal and
+  extraction payloads, advance cancellable pre-write preparation and review
+  states to terminal `source_unavailable`, record the typed cause in the
+  immutable event, and suppress the deliberate-unfollow review notification.
+  A pre-write run has no calendar transaction or cancelled-write row. An
+  `authorized` write keeps #291's exact cancellation, transaction identity,
+  replay and existing notice. Generic `source_unavailable` still requests
+  review. Already writing, unresolved, reconciling, completed,
+  failed or user-declined work is not recast as a pending cancellation.
+- **Re-follow:** old proposal identity/version and stale confirmation cannot
+  authorize a write. If the same bound source becomes followed again and
+  satisfies the existing CONTENT, principal, run-lifetime and retention rules,
+  the existing scheduling preparation owner may issue a fresh proposal with
+  monotonic identity/version and requires new confirmation. This explicit
+  recovery uses the recorded unfollow lineage; it does not impose a new
+  follow requirement on ordinary initial proposals. Alias/canonical recovery
+  remains single-owner and must not create duplicate preparation.
+- **Consumers:** pending-work, confirmation, direct/inbox and notification
+  readers consume the resulting run/payload/event state. They do not infer
+  unfollow from missing content, filter a still-live proposal downstream,
+  create a fake write outcome, or add new user-facing wording. Review-state
+  notifications are suppressed at the origin for both initial and refollowed
+  generations. Existing approved-write wording stays as in #291.
+- **Tests:** use the real store, follow mutation and removal operation scope
+  in `tests/test_db.py`, with adjacent deferred-removal/service tests where
+  needed. Cover bodyless and retained-body pending proposals, earlier
+  preparation states, both review states, guarded transaction refusal,
+  rollback, source/alias binding, stale confirmation, re-follow/fresh consent,
+  generic source loss, and writing/uncertain/completed controls. Each changed
+  assertion must map to the accepted behavior here; retain old assertions.
+
+### Explicit non-scope
+
+No schema or migration, public API or native DTO, entitlement, provider retry,
+calendar create/lookup/delete, UI copy, notification transport, initial
+proposal admission policy, timeout, dependency, generated-file or harness
+change. Do not delete an event already handed to the provider or relax CONTENT
+and held-removal eligibility. Do not fold the generic-source-loss replay-test
+gap tracked in #293 into this PR. Any need to change product behavior or these
+boundaries requires a contract amendment before code.
+
+### Assumptions and blockers
+
+The direct “Let’s start” after the #292 policy explanation authorizes this
+contract-first round. Code remains held until the operator accepts this exact
+contract. The issue's old synthetic observation and #291's passing controls
+guide the reproduction; neither proves the new behavior at this base.
+
+### Verification plan
+
+1. Freeze the exact main base and reproduce the bodyless pending-proposal
+   survival, retained-body comparison and review-state notification with
+   existing synthetic fixtures. Record the before result outside the worktree.
+2. Add fail-first real-store regressions that fail at the policy assertion,
+   with boundary controls for missing/mixed bindings, cached/held/no-body
+   source, run state, re-follow, old versions, and generic loss. Identify each
+   introducing commit and owning function before production edits.
+3. Fix at the before-image/cause/transition owners. If fresh preparation needs
+   a reader change, use the existing shared scheduling eligibility owner and
+   its persisted event signal. Prove isolated and original cases pass; use an
+   omission mutation to show tests fail without the origin fix.
+4. Run focused and adjacent tests, Ruff and diff checks, then the full local
+   Python suite under `umask 022` in isolated XDG/TMP directories before the
+   grouped implementation push. Classify each new failure before editing.
+   Keep raw logs, assertion mapping and source hashes in durable evidence
+   outside the worktree. Required final-head CI, native Windows installed and
+   populated qualification, exact-head independent review and zero unresolved
+   threads gate merge. No installation or promotion.
+
+## Implementation summary
+
+Not started. This first commit is documentation only.
+
+## Cold diff audit
+
+Before publication, confirm the only diff is this contract and that no test,
+runtime or existing contract file changed. Code review will compare the later
+implementation against each requirement above.
+
+## Gap audit
+
+**NOT DONE:** operator contract acceptance, fail-first reproduction,
+implementation, regression proof, qualification, exact-head review and merge.
