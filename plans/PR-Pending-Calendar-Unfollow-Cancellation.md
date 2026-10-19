@@ -1,9 +1,22 @@
 # Pending calendar work after deliberate unfollow — contract for #292
 
-Status: **contract only; implementation requires operator acceptance of this document**.
+Status: **accepted by Juan; implementation pushed; qualification and review pending**.
+Juan replied verbatim **"I accept"** in the coding chat on 2026-10-19 at
+15:10:56 UTC, accepting the revised contract at
+`bc3cf9761e33bd75f2e22888a03d1dfba4cdf5be`. The implementation was
+pushed at `d893138304482205f85ef2f48cb3db7ebffb2132`.
 Base: merged #291 at `b8258b6de14ebc4438d4aec0c6317edc013843ac`.
 Decision: [issue #292](https://github.com/canfieldjuan/eom-email-watcher/issues/292#issuecomment-6258924816).
-This is one concern in a separate PR. The first commit changes this document only.
+This is one concern in a separate PR.
+
+## Revision log
+
+- `bc3cf9761e33bd75f2e22888a03d1dfba4cdf5be`: revised docs-only
+  contract, including the two transaction commit orders and serializing owner.
+- 2026-10-19 15:10:56 UTC: Juan's direct "I accept" accepted that exact
+  contract head in this coding chat; code work then began within its scope.
+- `d893138304482205f85ef2f48cb3db7ebffb2132`: implementation round
+  pushed after fail-first and local gates. Exact-head external gates remain.
 
 ## Contract
 
@@ -92,10 +105,11 @@ boundaries requires a contract amendment before code.
 
 ### Assumptions and blockers
 
-The direct “Let’s start” after the #292 policy explanation authorizes this
-contract-first round. Code remains held until the operator accepts this exact
-contract. The issue's old synthetic observation and #291's passing controls
-guide the reproduction; neither proves the new behavior at this base.
+The direct “Let’s start” after the #292 policy explanation authorized the
+contract-first round. Juan then directly accepted the revised contract head as
+recorded in the status and revision log. The issue's old synthetic observation
+and #291's passing controls guided reproduction; the fail-first tests and local
+qualification for this implementation are recorded below.
 
 ### Verification plan
 
