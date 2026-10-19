@@ -9891,6 +9891,39 @@ def test_cancelled_calendar_replay_excludes_new_generation_material(tmp_path):
     assert store.automation_calendar_write(current.run_id).transaction_id != original.transaction_id
 
 
+def test_generic_calendar_cancellation_replay_keeps_review_eligible(tmp_path):
+    store, _, _, _, authorized = calendar_unfollow_fixture(tmp_path, cached=False)
+    with store.connection() as db:
+        db.execute(
+            "DELETE FROM automation_proposal_payloads WHERE run_id=?",
+            (authorized.run_id,),
+        )
+
+    cancelled = store.begin_automation_calendar_write(
+        authorized.run_id, authorized.state_version
+    )
+    assert isinstance(cancelled, db_module.AutomationCalendarWriteCancelled)
+    event = store.automation_events(authorized.run_id)[-1]
+    assert (event.failure_code, cancelled.outcome["failure_code"]) == (
+        "source_unavailable", "source_unavailable",
+    )
+    assert store.automation_run(authorized.run_id).review_notified_at is None
+    assert cancelled.run.review_notified_at is None
+    assert [intent.subject_id for intent in store.notification_intents(
+        kind="automation_review"
+    )] == [authorized.run_id]
+
+    restarted = Store(store.path)
+    replay = restarted.begin_automation_calendar_write(
+        authorized.run_id, authorized.state_version
+    )
+    assert replay == cancelled
+    assert replay.run.review_notified_at is None
+    assert [intent.subject_id for intent in restarted.notification_intents(
+        kind="automation_review"
+    )] == [authorized.run_id]
+
+
 @pytest.mark.parametrize("reader", ["selector", "reserve"])
 @pytest.mark.parametrize("held", [False, True])
 def test_cancelled_alias_refollow_reaches_fresh_calendar_handoff(tmp_path, reader, held):
