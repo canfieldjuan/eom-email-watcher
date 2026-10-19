@@ -1591,6 +1591,11 @@ class AutomationCalendarWriteStateChanged(RuntimeError):
     """A caller selected an admission whose run advanced before its handoff."""
 
 
+def automation_source_loss_requires_review(cause: object) -> bool:
+    """Only an explicitly persisted deliberate unfollow suppresses review."""
+    return cause != "thread_unfollowed"
+
+
 @dataclass(frozen=True)
 class AutomationCalendarWriteCancelled:
     """The exact terminal admission, including replay after its current row is replaced."""
@@ -1913,7 +1918,7 @@ def _cancel_automation_source(
         WHERE run_id = ? AND state = ? AND state_version = ?""",
         (
             next_version,
-            updated_at if cause == "thread_unfollowed" else None,
+            None if automation_source_loss_requires_review(cause) else updated_at,
             updated_at,
             run_id,
             previous_state,
@@ -2122,7 +2127,9 @@ def _cancelled_calendar_admission(
         current_payload_id=event["payload_id"],
         current_payload_sha256=event["payload_sha256"],
         review_notified_at=(
-            str(event["created_at"]) if event["failure_code"] == "thread_unfollowed" else None
+            None
+            if automation_source_loss_requires_review(event["failure_code"])
+            else str(event["created_at"])
         ),
         updated_at=str(event["created_at"]),
     )

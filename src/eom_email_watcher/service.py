@@ -45,6 +45,7 @@ from .db import (
     NotificationIntent,
     PendingMessage,
     Store,
+    automation_source_loss_requires_review,
     calendar_write_outcome,
 )
 from .gmail import (
@@ -1114,7 +1115,9 @@ def process_scheduling_writes(
                 continue
             if isinstance(writing, AutomationCalendarWriteCancelled):
                 processed += 1
-                review_required += 1
+                review_required += int(
+                    automation_source_loss_requires_review(writing.outcome["failure_code"])
+                )
                 continue
             proposal = work.proposal
             if proposal is None:

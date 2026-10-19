@@ -596,3 +596,39 @@ independent exact-head review and posted oversight PASS, reconciliation and merg
 Require zero unresolved review threads, no changes requested, clean local equal
 to actual remote, and merge-commit tree equality. The bodyless unapproved proposal
 policy is deferred in #292. No installation, promotion or #278 work.
+
+
+## Review-count consistency consolidation
+
+New finding on `2bedd7327d9d93eaf3f59ff582f541e12245abe3`: the selected-then-unfollowed
+worker returns a terminal cancellation but counts it as requiring review. The
+counter line itself predates this PR (`b49c165fff0afce46460dae9980c9588c58344e2`);
+my `55b05e0fa4177b8d6eade61054a489cc6017f350` changed the branch at
+`service.py:1115` to consume typed deliberate cancellations without updating that
+accounting. My later `bd039bad95bb706a89e4eee31a526f60351018ae` notification fix
+covered only the transition and replay readers. The invariant is one concept:
+an explicitly recorded deliberate unfollow needs no review; generic source loss
+still needs review.
+
+Consolidate this decision in `automation_source_loss_requires_review`, next to
+the database cancellation result. Transition notification disposition, historical
+replay disposition and worker accounting all consume the same predicate. The
+worker reads the cause in the persisted cancellation outcome, never the generic
+run-level source-unavailable label. Notification list/count readers continue to
+consume the existing persisted acknowledgement marker; no downstream filter or
+SQL copy of the cause rule. Existing purge counters describe generic expiration
+only, and other scheduling review counters describe independent extraction,
+proposal, identity or validation failures; their behavior stays intact.
+
+Fail-first proof on the published runtime: **4 failed, 2 passed, 186 deselected**.
+The worker and public watcher paths both reported a review for deliberate unfollow;
+generic-loss controls passed. New assertions cover cached and held cancellation,
+bodyless cancellation, the canonical public check, no provider create/lookup,
+terminal write/cause, review-intent/count consistency and acknowledgement state.
+All map to the accepted local-only cancellation and preserved generic-review
+contracts; old assertions are preserved. A cause-check omission mutant failed
+**8 tests**, including the transition, replay and counter consumers. Exact source
+bytes restored. Full Python under umask 022 and available native qualification
+remain required before the grouped consolidation push; final-head Windows and
+independent review gates remain. No schema/API, product policy, install/promotion
+or #278 changes.
