@@ -632,3 +632,36 @@ bytes restored. Full Python under umask 022 and available native qualification
 remain required before the grouped consolidation push; final-head Windows and
 independent review gates remain. No schema/API, product policy, install/promotion
 or #278 changes.
+
+
+## Review-count consolidation qualification
+
+Tested head: `83c6e5e0cb0ae71a98aa2ab30042d1f33c9a0c70`. The required full
+`uv run --locked pytest -x` gate, umask 022 and fresh isolated XDG/TMP directories,
+completed **4109 passed, 77 skipped, 2 deselected in 1042.72s (0:17:22)**, exit 0.
+Available native Rust: **165 passed, 0 failed, 1 existing ignored**; rebuilt engine:
+**packaged-engine-smoke: ok**. Ruff and whitespace checks passed. Desktop inputs
+are unchanged from the prior qualified publication, whose receipt is retained;
+no duplicate local UI run. Final published-head CI still exercises desktop/Windows.
+
+The first full attempt timed out at the unchanged 120-second child deadline in
+`test_real_followed_purge_large_unit_under_service_file_limit[False]`. The same
+isolated case also timed out on the published baseline. Retained fixtures show
+watermark setup had not finished and contained no automation runs. Oversight
+reported concurrent heavy builds/suites and then stopped that work. With source,
+assertions and deadline unchanged, the isolated current case passed in **85.25
+seconds**, followed by the successful full rerun above. Shared-host contention
+is supported by this comparison; other sessions were not controlled. All failed
+attempts, fixture observations and start/end host-load receipts are retained.
+No production, test, timeout, skip or assertion change was made for this failure.
+
+Evidence alias `EW291-REVIEW-COUNT-QUALIFICATION`, SHA256
+`131122e48f0ee5afc0f3330c50eb2cafd5e15134f27f59c2f2e21bb3ff402222`, indexes
+the original fail-first, corrected/adjacent gates, cause-check omission, source
+freeze, assertion map, cold audit, native/sidecar and timeout-classification proof.
+All frozen source hashes matched after the full run and the tree was clean.
+This commit records qualification metadata only, without runtime/test changes.
+
+**NOT DONE:** final published-head required CI and Windows installed/populated
+proof, independent exact-head review and posted oversight PASS, reconciliation
+and merge. No installation, promotion or #278 work; #292 remains separate.
