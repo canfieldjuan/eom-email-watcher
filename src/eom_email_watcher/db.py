@@ -1878,6 +1878,12 @@ def _admit_scheduling_automation(
     )
 
 
+_CALENDAR_PENDING_STATES = frozenset({
+    "detected", "extracting", "proposing", "awaiting_confirmation",
+})
+_CALENDAR_REVIEW_STATES = frozenset({"manual_review", "ambiguous"})
+
+
 def _cancel_automation_source(
     db: sqlite3.Connection,
     row: sqlite3.Row | dict,
@@ -1896,13 +1902,8 @@ def _cancel_automation_source(
         (run_id,),
     )
     previous_state = str(row["state"])
-    if previous_state not in {
-        "detected",
-        "extracting",
-        "proposing",
-        "awaiting_confirmation",
-        "write_authorized",
-    }:
+    if (previous_state not in _CALENDAR_PENDING_STATES | {"write_authorized"}
+        and not (cause == "thread_unfollowed" and previous_state in _CALENDAR_REVIEW_STATES)):
         return False
     previous_version = int(row["state_version"])
     next_version = previous_version + 1
@@ -1944,7 +1945,7 @@ def _cancel_automation_source(
         extraction_schema_version=int(row["extraction_schema_version"]),
         calendar_principal_key=str(row["calendar_principal_key"]),
         transition_kind="source_unavailable",
-        failure_code=(cause if previous_state == "write_authorized" else "source_unavailable"),
+        failure_code=cause,
         created_at=updated_at,
         payload_id=(
             str(row["current_payload_id"]) if row["current_payload_id"] is not None else None
@@ -1954,7 +1955,11 @@ def _cancel_automation_source(
             if row["current_payload_sha256"] is not None
             else None
         ),
-        transaction_id=(str(row["transaction_id"]) if row["transaction_id"] is not None else None),
+        transaction_id=(
+            str(row["transaction_id"])
+            if previous_state == "write_authorized" and row["transaction_id"] is not None
+            else None
+        ),
     )
     return True
 
@@ -1975,12 +1980,29 @@ def _automation_message_binding_sql(run: str, identity: str, message: str) -> st
         )"""
 
 
+def _calendar_unfollow_lineage_sql(event: str) -> str:
+    """The durable cause shared by alias recovery and fresh preparation."""
+    return f"""{event}.next_state='source_unavailable'
+        AND {event}.transition_kind='source_unavailable'
+        AND {event}.failure_code='thread_unfollowed'"""
+
+
+def _calendar_unfollow_candidate_sql(run: str, write: str) -> str:
+    """Only a still-pending admission or an authorized write can be revoked."""
+    pending = ",".join(
+        f"'{state}'" for state in sorted(_CALENDAR_PENDING_STATES | _CALENDAR_REVIEW_STATES)
+    )
+    return f"""({run}.state IN (
+        {pending}
+    ) OR ({run}.state='write_authorized' AND {write}.status='authorized'))"""
+
+
 def _scheduling_source_join_sql(run: str, identity: str, source: str, logical: str) -> str:
     """Resolve the physical admission before its current logical owner.
 
-    Ordinary duplicate runs remain suppressed. An already cancelled unfollow
+    Ordinary duplicate runs remain suppressed. An unfollowed
     admission retains its explicit fresh-consent lifecycle after coalescing;
-    immutable evidence keeps that identity usable after the current write changes.
+    immutable evidence keeps that identity usable after its current state changes.
     The canonical run wins if present; otherwise the oldest admitted alias owns
     recovery, with run_id as a stable tie-breaker independent of mutable state.
     """
@@ -2008,11 +2030,7 @@ def _scheduling_source_join_sql(run: str, identity: str, source: str, logical: s
                    AND EXISTS (
                        SELECT 1 FROM automation_events lineage
                        WHERE lineage.run_id=candidate.run_id
-                         AND lineage.previous_state='write_authorized'
-                         AND lineage.next_state='source_unavailable'
-                         AND lineage.transition_kind='source_unavailable'
-                         AND lineage.failure_code='thread_unfollowed'
-                         AND lineage.transaction_id IS NOT NULL
+                         AND {_calendar_unfollow_lineage_sql('lineage')}
                    )
                  ORDER BY candidate.created_at,candidate.run_id LIMIT 1
              )
@@ -3164,9 +3182,10 @@ def _scheduling_preparation_available_sql(db: sqlite3.Connection, alias: str) ->
         return f"{alias}.state IN ('detected','extracting')"
     return f"""({alias}.state IN ('detected','extracting') OR (
         {alias}.state='source_unavailable'
-        AND EXISTS (SELECT 1 FROM automation_calendar_writes w
-                    WHERE w.run_id={alias}.run_id AND w.status='cancelled'
-                      AND w.failure_code='thread_unfollowed')
+        AND EXISTS (SELECT 1 FROM automation_events unfollow
+                    WHERE unfollow.run_id={alias}.run_id
+                      AND unfollow.state_version={alias}.state_version
+                      AND {_calendar_unfollow_lineage_sql('unfollow')})
         AND ({_automation_source_available_sql(alias, eligibility=removal.CONTENT)})
         AND EXISTS (
             SELECT 1 FROM automation_runs followed_run
@@ -5998,19 +6017,19 @@ def _capture_followed_content_sql(scopes: str | None) -> str:
 
 
 def _capture_followed_calendar_sql(scopes: str | None) -> str:
-    """Retain approved, bound admissions before a follow input can change."""
+    """Retain pending or approved, bound admissions before a follow input changes."""
     condition = "1" if scopes is None else (
         f"EXISTS (SELECT 1 FROM ({scopes}) scope "
         f"WHERE {_derived_scope_match_sql('m', 'scope')})"
     )
     return f"""INSERT OR IGNORE INTO derived_previous_followed(message_id,calendar_run_id)
         SELECT source.message_id,r.run_id FROM automation_runs r
-        JOIN automation_calendar_writes w ON w.run_id=r.run_id AND w.status='authorized'
+        LEFT JOIN automation_calendar_writes w ON w.run_id=r.run_id
         LEFT JOIN automation_run_source_identities i ON i.run_id=r.run_id
         JOIN messages source ON {_automation_message_binding_sql("r", "i", "source")}
         JOIN messages m ON m.message_id=COALESCE(source.logical_of,source.message_id)
         JOIN thread_follow f ON {_followed_message_sql("m")}
-        WHERE r.state='write_authorized' AND {condition};"""
+        WHERE {_calendar_unfollow_candidate_sql('r', 'w')} AND {condition};"""
 
 
 def _track_derived_rows(db: sqlite3.Connection) -> None:
@@ -6249,11 +6268,12 @@ def _recompute_derived(db: sqlite3.Connection, changed: frozenset[str]) -> None:
     if tracked and removal.has_schema(db):
         # Consume the admission before-image here, before physical body cleanup.
         # This does not fabricate body-removal evidence or invalidate Connect.
-        admissions = db.execute(f"""SELECT DISTINCT r.*,w.transaction_id
+        admissions = db.execute(f"""SELECT DISTINCT r.*,
+            CASE WHEN r.state='write_authorized' THEN w.transaction_id END AS transaction_id
             FROM derived_previous_followed prior
             JOIN automation_runs r ON r.run_id=prior.calendar_run_id
-            JOIN automation_calendar_writes w ON w.run_id=r.run_id AND w.status='authorized'
-            WHERE r.state='write_authorized' AND NOT EXISTS (
+            LEFT JOIN automation_calendar_writes w ON w.run_id=r.run_id
+            WHERE {_calendar_unfollow_candidate_sql('r', 'w')} AND NOT EXISTS (
                 SELECT 1 FROM messages source
                 JOIN messages m ON m.message_id=COALESCE(source.logical_of,source.message_id)
                 JOIN thread_follow f ON {_followed_message_sql("m")}
