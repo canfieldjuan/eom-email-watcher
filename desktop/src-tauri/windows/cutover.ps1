@@ -368,7 +368,8 @@ function Installed-Processes {
             } catch {
                 $script:targetProcess = $process.ProcessId
                 $script:targetImage = $process.Name
-                throw ("Cannot establish the identity of a running Email Watcher process pid=$($process.ProcessId) image=$($process.Name): " + $_.Exception.Message)
+                $message = "Cannot establish the identity of a running Email Watcher process pid=$($process.ProcessId) image=$($process.Name)"
+                throw [InvalidOperationException]::new($message, $_.Exception)
             } finally {
                 if ($live) { $live.Dispose() }
             }

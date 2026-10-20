@@ -414,7 +414,8 @@ $assignments=@($ast.FindAll({param($n)
     $n.Left.Extent.Text -eq '$handle' -and
     ($n.Right.Extent.Text -match 'Open-CutoverProcessHandle|\$(live|installer)\.Handle')
 },$true))
-if ($assignments.Count -ne 2) { throw 'Process handle readers changed without this proof' }
+# Restore, process enumeration, and process stop all use the same getter owner.
+if ($assignments.Count -ne 3) { throw 'Process handle readers changed without this proof' }
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;

@@ -263,7 +263,9 @@ $script:items=@([pscustomobject]@{Name='owned.exe';ExecutablePath=$null;ProcessI
 $script:lookup='gone'
 if (@(Installed-Processes).Count) { throw 'Exited process blocked cutover' }
 $script:blocked=[pscustomobject]@{HasExited=$false}
-$script:blocked | Add-Member ScriptMethod get_Handle { throw 'public inaccessible handle' }
+$script:blocked | Add-Member ScriptMethod get_Handle {
+    throw [ComponentModel.Win32Exception]::new(5)
+}
 $script:blocked | Add-Member ScriptMethod Dispose { }
 $script:items=@([pscustomobject]@{Name='owned.exe';ExecutablePath=$null;ProcessId=98762})
 $script:lookup='blocked'
@@ -276,9 +278,12 @@ try { Installed-Processes | Out-Null } catch { $refusal=$_ }
 if (!$refusal -or $refusal.Exception.Message -notmatch '98762.*owned\.exe') {
     throw 'Live unreadable identity did not refuse with PID and name'
 }
+if ($refusal.Exception.GetBaseException().NativeErrorCode -ne 5) {
+    throw 'Live unreadable identity lost its native refusal code'
+}
 $diagnostic=@(Write-CutoverFailure $refusal 'process') -join "`n"
-if ($diagnostic -notmatch 'failure-stage=process-stop process=98762 .*image=owned\.exe') {
-    throw 'Cutover failure line omitted PID or image name'
+if ($diagnostic -notmatch 'failure-stage=process-stop process=98762 code=5 .*image=owned\.exe') {
+    throw 'Cutover failure line omitted PID, image name, or native code'
 }
 $real=Microsoft.PowerShell.Management\Get-Process -Id $PID
 try {
