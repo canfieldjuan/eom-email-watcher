@@ -9,11 +9,13 @@ $ErrorActionPreference = 'Stop'
 $stage = 'initialization'
 $operation = 'phase-entry'
 $targetProcess = 0
+$targetImage = ''
 function Write-CutoverFailure($record, [string]$context) {
     $failure = $record.Exception
     $base = $failure.GetBaseException()
     $code = if ($base -is [ComponentModel.Win32Exception]) { $base.NativeErrorCode } else { '' }
-    Write-Output ("Cutover failure-stage=$stage process=$targetProcess code=$code context=$context operation=$operation")
+    $image = if ($targetImage) { ' image=' + $targetImage } else { '' }
+    Write-Output ("Cutover failure-stage=$stage process=$targetProcess code=$code context=$context operation=$operation$image")
     while ($failure) {
         Write-Output ("Cutover exception type=" + $failure.GetType().FullName +
             " HResult=" + $failure.HResult + " message=" + $failure.Message)
@@ -342,10 +344,37 @@ function Installed-Processes {
     foreach ($process in Get-CimInstance Win32_Process) {
         if ($process.ProcessId -eq $InstallerPid) { continue }
         $path = Resolve-ExecutablePath $process.ExecutablePath ('process ' + $process.ProcessId)
-        if (Is-InstalledPath $path) { Assert-OwnedImage $path; $process }
-        elseif (!$process.ExecutablePath -and $identityNames.Contains($process.Name)) {
-            throw 'Cannot establish the identity of a running Email Watcher process'
+        if (!$process.ExecutablePath -and $identityNames.Contains($process.Name)) {
+            $live = $null
+            try {
+                $gone = $false
+                try { $live = Get-Process -Id $process.ProcessId -ErrorAction Stop }
+                catch {
+                    if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound) {
+                        $gone = $true
+                    } else { throw }
+                }
+                if ($gone -or !$live) { continue }
+                try {
+                    $handle = Open-CutoverProcessHandle $live
+                    $path = Resolve-ExecutablePath ([CutoverProcess]::Image($handle)) ('process ' + $process.ProcessId)
+                    if (!$path) { throw 'The live process image path is empty' }
+                } catch {
+                    $gone = $false
+                    try { $gone = [bool]$live.HasExited } catch {}
+                    if (!$gone) { throw }
+                }
+                if ($gone) { continue }
+            } catch {
+                $script:targetProcess = $process.ProcessId
+                $script:targetImage = $process.Name
+                $message = "Cannot establish the identity of a running Email Watcher process pid=$($process.ProcessId) image=$($process.Name)"
+                throw [InvalidOperationException]::new($message, $_.Exception)
+            } finally {
+                if ($live) { $live.Dispose() }
+            }
         }
+        if (Is-InstalledPath $path) { Assert-OwnedImage $path; $process }
     }
 }
 if ($Phase -eq 'Pre') {

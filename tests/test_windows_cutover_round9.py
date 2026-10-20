@@ -208,10 +208,6 @@ if (!$ownedPrograms.Contains($retired)) { throw 'Retry lost authenticated prior 
 function Get-CimInstance { param($ClassName); $script:items }
 $script:items=@([pscustomobject]@{Name='uninstall.exe';ExecutablePath=$null;ProcessId=98761})
 if (@(Installed-Processes).Count) { throw 'Generic inaccessible image attributed' }
-$script:items=@([pscustomobject]@{Name='new-app.exe';ExecutablePath=$null;ProcessId=98762})
-$refused=$false
-try { Installed-Processes } catch { $refused=$true }
-if (!$refused) { throw 'Inaccessible application identity ignored' }
 $script:items=@([pscustomobject]@{
     Name='new-resource-helper.exe';ExecutablePath=(Join-Path $root 'new-resource-helper.exe');
     ProcessId=98763
@@ -236,6 +232,103 @@ if (@(Installed-Processes).Count -ne 1) { throw 'Shipped full-path helper reject
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "CATALOG_RETRY_IDENTITY_PASS" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native path-less CIM process race")
+def test_native_pathless_identity_rechecks_process_liveness(tmp_path):
+    import subprocess
+
+    root = tmp_path / "installation"
+    root.mkdir()
+    catalog = tmp_path / "package.txt"
+    catalog.write_text(
+        "EW-PACKAGE-FILES-V1\nowned.exe\nEW-APP-IMAGE|owned.exe\n", encoding="utf-16"
+    )
+    code = r"""
+$ErrorActionPreference='Stop'
+$source=Get-Content -LiteralPath $env:EW_SCRIPT -Raw
+$limit=$source.IndexOf('if ($Phase -eq ''Pre'')')
+. ([scriptblock]::Create($source.Substring(0,$limit))) -Phase Pre `
+    -InstallRoot $env:EW_ROOT -ProgramCatalog $env:EW_CATALOG
+$ownedPrograms=Load-OwnedPrograms
+function Get-CimInstance { param($ClassName); $script:items }
+function Get-Process {
+    param($Id, $ErrorAction)
+    if ($script:lookup -eq 'real') {
+        return Microsoft.PowerShell.Management\Get-Process -Id $Id -ErrorAction Stop
+    }
+    if ($script:lookup -eq 'blocked') { return $script:blocked }
+}
+$script:items=@([pscustomobject]@{Name='owned.exe';ExecutablePath=$null;ProcessId=98761})
+$script:lookup='gone'
+if (@(Installed-Processes).Count) { throw 'Exited process blocked cutover' }
+$script:blocked=[pscustomobject]@{HasExited=$false}
+$script:blocked | Add-Member ScriptMethod get_Handle {
+    throw [ComponentModel.Win32Exception]::new(5)
+}
+$script:blocked | Add-Member ScriptMethod Dispose { }
+$script:items=@([pscustomobject]@{Name='owned.exe';ExecutablePath=$null;ProcessId=98762})
+$script:lookup='blocked'
+$script:blocked.HasExited=$true
+if (@(Installed-Processes).Count) { throw 'Process exit during handle lookup blocked cutover' }
+$script:blocked.HasExited=$false
+$stage='process-stop'
+$refusal=$null
+try { Installed-Processes | Out-Null } catch { $refusal=$_ }
+if (!$refusal -or $refusal.Exception.Message -notmatch '98762.*owned\.exe') {
+    throw 'Live unreadable identity did not refuse with PID and name'
+}
+if ($refusal.Exception.GetBaseException().NativeErrorCode -ne 5) {
+    throw 'Live unreadable identity lost its native refusal code'
+}
+$diagnostic=@(Write-CutoverFailure $refusal 'process') -join "`n"
+if ($diagnostic -notmatch 'failure-stage=process-stop process=98762 code=5 .*image=owned\.exe') {
+    throw 'Cutover failure line omitted PID, image name, or native code'
+}
+$real=Microsoft.PowerShell.Management\Get-Process -Id $PID
+try {
+    $image=[CutoverProcess]::Image((Open-CutoverProcessHandle $real))
+    $root=[IO.Path]::GetDirectoryName($image)
+    $prefix=$root.TrimEnd('\')+'\'
+    $ownedPrograms=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $ownedPrograms.Add($image) | Out-Null
+    $identityNames=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $identityNames.Add([IO.Path]::GetFileName($image)) | Out-Null
+    $script:items=@(
+        [pscustomobject]@{
+            Name=[IO.Path]::GetFileName($image);ExecutablePath=$null;ProcessId=2147483647
+        },
+        [pscustomobject]@{
+            Name=[IO.Path]::GetFileName($image);ExecutablePath=$null;ProcessId=$PID
+        }
+    )
+    $script:lookup='real'
+    if (@(Installed-Processes).Count -ne 1) { throw 'Mixed process identities misclassified' }
+    $ownedPrograms.Clear()
+    $refusal=$null
+    try { Installed-Processes | Out-Null } catch { $refusal=$_ }
+    if (!$refusal -or $refusal.Exception.Message -notmatch 'Unknown installation image: ') {
+        throw 'Recovered unknown image bypassed package ownership'
+    }
+} finally { $real.Dispose() }
+'PATHLESS_IDENTITY_RECHECK_PASS'
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", code],
+        env=powershell_environment(
+            dict(
+                os.environ,
+                EW_SCRIPT=str(ROOT / "desktop/src-tauri/windows/cutover.ps1"),
+                EW_ROOT=str(root),
+                EW_CATALOG=str(catalog),
+            )
+        ),
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PATHLESS_IDENTITY_RECHECK_PASS" in result.stdout.splitlines()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native unhandled phase failure exit/diagnostics")
