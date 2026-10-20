@@ -267,6 +267,9 @@ $script:blocked | Add-Member ScriptMethod get_Handle { throw 'public inaccessibl
 $script:blocked | Add-Member ScriptMethod Dispose { }
 $script:items=@([pscustomobject]@{Name='owned.exe';ExecutablePath=$null;ProcessId=98762})
 $script:lookup='blocked'
+$script:blocked.HasExited=$true
+if (@(Installed-Processes).Count) { throw 'Process exit during handle lookup blocked cutover' }
+$script:blocked.HasExited=$false
 $stage='process-stop'
 $refusal=$null
 try { Installed-Processes | Out-Null } catch { $refusal=$_ }
@@ -286,11 +289,16 @@ try {
     $ownedPrograms.Add($image) | Out-Null
     $identityNames=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $identityNames.Add([IO.Path]::GetFileName($image)) | Out-Null
-    $script:items=@([pscustomobject]@{
-        Name=[IO.Path]::GetFileName($image);ExecutablePath=$null;ProcessId=$PID
-    })
+    $script:items=@(
+        [pscustomobject]@{
+            Name=[IO.Path]::GetFileName($image);ExecutablePath=$null;ProcessId=2147483647
+        },
+        [pscustomobject]@{
+            Name=[IO.Path]::GetFileName($image);ExecutablePath=$null;ProcessId=$PID
+        }
+    )
     $script:lookup='real'
-    if (@(Installed-Processes).Count -ne 1) { throw 'Live owned image was not recovered' }
+    if (@(Installed-Processes).Count -ne 1) { throw 'Mixed process identities misclassified' }
     $ownedPrograms.Clear()
     $refusal=$null
     try { Installed-Processes | Out-Null } catch { $refusal=$_ }
