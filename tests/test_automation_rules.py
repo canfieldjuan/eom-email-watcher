@@ -503,6 +503,28 @@ def test_rule_cas_noop_and_atomic_analysis_create_one_durable_fire(tmp_path: Pat
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 0
 
 
+def test_deletion_retains_recorded_fire_but_stops_new_analysis_matches(tmp_path: Path) -> None:
+    store = initialized_store(tmp_path)
+    rule = store.put_automation_rule(rule_definition())
+    add_invoice_message(store, "message-1")
+    store.mark_analyzed(
+        "message-1", analysis(), mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+        body_chars=None, body_source_chars=None,
+    )
+    old_fires = store.automation_fires_for_message("message-1")
+    assert len(old_fires) == 1
+    assert old_fires[0].rule_id == rule.summary.rule_id
+
+    assert store.delete_automation_rule(rule.summary.rule_id, rule.summary.version) == 2
+    add_invoice_message(store, "message-2")
+    store.mark_analyzed(
+        "message-2", analysis(), mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+        body_chars=None, body_source_chars=None,
+    )
+    assert store.automation_fires_for_message("message-2") == []
+    assert store.automation_fires_for_message("message-1") == old_fires
+
+
 def test_empty_root_part_id_creates_a_source_verified_fire_and_attempt(tmp_path: Path) -> None:
     store = initialized_store(tmp_path)
     created = store.put_automation_rule(rule_definition())

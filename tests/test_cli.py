@@ -273,6 +273,36 @@ def test_recent_uses_entitlement_gated_engine_projection(
     ]
 
 
+def test_rule_delete_cli_forwards_loaded_version_and_prints_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    rule_id = "22222222-2222-4222-8222-222222222222"
+    calls: list[dict[str, object]] = []
+
+    def dispatch(request: dict[str, object]) -> dict[str, object]:
+        calls.append(request)
+        return {"rule_id": rule_id, "version": 8, "deleted": True}
+
+    monkeypatch.setattr(engine_api, "dispatch", dispatch)
+    with pytest.raises(SystemExit) as exited:
+        cli.main([
+            "--config", str(config_path), "rule-delete", rule_id,
+            "--expected-version", "7",
+        ])
+
+    assert exited.value.code == 0
+    assert calls == [{
+        "protocol": 1,
+        "operation": "automation.rules.delete",
+        "config_path": str(config_path),
+        "payload": {"rule_id": rule_id, "expected_version": 7},
+    }]
+    assert json.loads(capsys.readouterr().out) == {
+        "rule_id": rule_id, "version": 8, "deleted": True,
+    }
+
+
 def _check_config(tmp_path: Path) -> SimpleNamespace:
     state = tmp_path / "state"
     state.mkdir()

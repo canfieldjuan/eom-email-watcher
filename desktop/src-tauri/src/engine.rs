@@ -1144,6 +1144,13 @@ pub struct AutomationRuleResult {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutomationRuleDeleted {
+    pub rule_id: String,
+    pub version: i64,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AutomationRules {
     pub revision: i64,
     pub rules: Vec<AutomationRuleSummary>,
@@ -1950,6 +1957,21 @@ impl Engine {
         self.request(
             "automation.rules.set_enabled",
             json!({"rule_id": rule_id, "expected_version": expected_version, "enabled": enabled}),
+        )
+    }
+
+    pub fn delete_automation_rule(
+        &self,
+        rule_id: String,
+        expected_version: i64,
+    ) -> Result<AutomationRuleDeleted, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "automation.rules.delete",
+            json!({"rule_id": rule_id, "expected_version": expected_version}),
         )
     }
 
@@ -5378,11 +5400,13 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
             "automation.rules.prepare",
             "automation.rules.put_watched",
             "automation.rules.set_enabled",
+            "automation.rules.delete",
         ] {
             let data = match operation {
                 "connect.catalog" => json!({"items":[],"diagnostic":null}),
                 "automation.rules.list" => json!({"revision":8,"rules":[summary]}),
                 "automation.rules.prepare" => json!({"definition":definition}),
+                "automation.rules.delete" => json!({"rule_id":"rule-a","version":8,"deleted":true}),
                 _ => json!({"rule":rule}),
             };
             fs::write(
@@ -5447,7 +5471,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
                     );
                     json!({"definition":definition,"rule_id":"rule-a","expected_version":7})
                 }
-                _ => {
+                "automation.rules.set_enabled" => {
                     assert!(
                         !engine
                             .set_automation_rule_enabled("rule-a".into(), 7, false)
@@ -5458,6 +5482,18 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
                     );
                     json!({"rule_id":"rule-a","expected_version":7,"enabled":false})
                 }
+                "automation.rules.delete" => {
+                    assert_eq!(
+                        engine.delete_automation_rule("rule-a".into(), 7).unwrap(),
+                        AutomationRuleDeleted {
+                            rule_id: "rule-a".into(),
+                            version: 8,
+                            deleted: true
+                        }
+                    );
+                    json!({"rule_id":"rule-a","expected_version":7})
+                }
+                _ => unreachable!(),
             };
             let request: Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
             assert_eq!(request["operation"], operation);

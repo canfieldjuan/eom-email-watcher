@@ -18,17 +18,136 @@ const source = readFileSync(new URL("../src/coiSetup.ts", import.meta.url), "utf
 const compiled = stripTypeScriptTypes(source).replace(/import[\s\S]*?from "[^"\n]+";/g, "")
   .replace("export function mountCoiSetup", "exports.mountCoiSetup = function mountCoiSetup");
 
-function mount(invoke: (command: string, args?: any) => Promise<any>) {
+function mount(invoke: (command: string, args?: any) => Promise<any>, confirm = () => true) {
   const elements = new Map<string, ReturnType<typeof element>>();
   const root = { set innerHTML(html: string) {
     for (const [match] of html.matchAll(/data-(?:field|action)="[^"]+"/g)) elements.set(`[${match}]`, element());
     elements.set("fieldset", element()); elements.set("form", element());
   }, querySelector(selector: string) { return elements.get(selector) ?? null; } };
   const exports: any = {};
-  runInNewContext(compiled, { exports, ...rules, document: { createElement: element } });
+  runInNewContext(compiled, { exports, ...rules, document: { createElement: element }, window: { confirm } });
   const mounted = exports.mountCoiSetup(root, invoke, String);
   return { elements, mounted };
 }
+
+test("a selected uneditable rule can be confirmed and deleted through the mounted controls", async () => {
+  const ruleId = "22222222-2222-4222-8222-222222222222";
+  const rule = { summary: { rule_id: ruleId, version: 7, enabled: false, system: false,
+    valid: false, name: null, invalid_reason: "stored definition unavailable" },
+    definition: null, selection: null };
+  let deleted = false;
+  let allow = false;
+  const confirmations: string[] = [];
+  const calls: Array<{ command: string; args?: any }> = [];
+  const invoke = async (command: string, args?: any) => {
+    calls.push({ command, args });
+    switch (command) {
+      case "mail_accounts_list": return { accounts: [] };
+      case "watchlist_list": return [];
+      case "connect_catalog": return { items: [], diagnostic: null };
+      case "automation_rules_list": return { revision: deleted ? 2 : 1, rules: deleted ? [] : [rule.summary] };
+      case "connect_entitlement_status": return { automations_active: false };
+      case "automation_rules_get": return { rule };
+      case "automation_rules_delete":
+        assert.equal(args.ruleId, ruleId);
+        assert.equal(args.expectedVersion, 7);
+        deleted = true;
+        return { rule_id: ruleId, version: 8, deleted: true };
+      default: throw new Error(command);
+    }
+  };
+  const { elements, mounted } = mount(invoke, (text) => { confirmations.push(text); return allow; });
+  elements.get('[data-field="saved"]')!.value = ruleId;
+  await mounted.refresh();
+  assert.equal(elements.get("fieldset")!.disabled, true);
+  const deleteButton = elements.get('[data-action="delete"]');
+  assert.ok(deleteButton, "Delete rule control is missing");
+  assert.equal(deleteButton.disabled, false);
+  deleteButton.listeners.get("click")!();
+  assert.equal(deleted, false, "cancel must not send a deletion");
+  allow = true;
+  deleteButton.listeners.get("click")!();
+  for (let tick = 0; tick < 10; tick++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deleted, true);
+  assert.ok(confirmations.every((text) => text.includes(ruleId) && text.includes("already recorded")));
+  assert.equal(elements.get('[data-field="saved"]')!.value, "");
+  assert.match(elements.get('[data-field="status"]')!.textContent, /deleted/i);
+});
+
+test("delete refuses unsafe versions and system rules before invoking the engine", async () => {
+  for (const [version, system] of [[0, false], [Number.MAX_SAFE_INTEGER + 1, false], [1, true]] as const) {
+    const ruleId = "22222222-2222-4222-8222-222222222222";
+    const rule = { summary: { rule_id: ruleId, version, system, enabled: false,
+      valid: false, name: null, invalid_reason: "stored definition unavailable" }, definition: null };
+    const calls: string[] = [];
+    const invoke = async (command: string) => {
+      calls.push(command);
+      switch (command) {
+        case "mail_accounts_list": return { accounts: [] };
+        case "watchlist_list": return [];
+        case "connect_catalog": return { items: [], diagnostic: null };
+        case "automation_rules_list": return { revision: 1, rules: [rule.summary] };
+        case "connect_entitlement_status": return { automations_active: false };
+        case "automation_rules_get": return { rule };
+        default: throw new Error(command);
+      }
+    };
+    const { elements, mounted } = mount(invoke);
+    elements.get('[data-field="saved"]')!.value = ruleId;
+    await mounted.refresh();
+    const button = elements.get('[data-action="delete"]')!;
+    assert.equal(button.hidden, system);
+    assert.equal(button.disabled, true);
+    button.listeners.get("click")!();
+    assert.equal(calls.includes("automation_rules_delete"), false);
+  }
+});
+
+test("delete refusal requires refresh and a known receipt survives a failed reload", async () => {
+  for (const outcome of ["stale_rule", "system_rule_protected", "not_found", "mailbox_busy", "reload_failed"]) {
+    const ruleId = "22222222-2222-4222-8222-222222222222";
+    const rule = { summary: { rule_id: ruleId, version: 7, system: false, enabled: false,
+      valid: true, name: "Saved", invalid_reason: null }, definition: null };
+    let calls = 0;
+    let reload = false;
+    const invoke = async (command: string) => {
+      switch (command) {
+        case "mail_accounts_list":
+          if (reload) throw new Error("catalog unavailable");
+          return { accounts: [] };
+        case "watchlist_list": return [];
+        case "connect_catalog": return { items: [], diagnostic: null };
+        case "automation_rules_list": return { revision: 1, rules: [rule.summary] };
+        case "connect_entitlement_status": return { automations_active: false };
+        case "automation_rules_get": return { rule };
+        case "automation_rules_delete":
+          calls++;
+          if (outcome === "reload_failed") {
+            reload = true;
+            return { rule_id: ruleId, version: 8, deleted: true };
+          }
+          throw { code: outcome, message: "Engine refused deletion" };
+        default: throw new Error(command);
+      }
+    };
+    const { elements, mounted } = mount(invoke, () => true);
+    elements.get('[data-field="saved"]')!.value = ruleId;
+    await mounted.refresh();
+    const button = elements.get('[data-action="delete"]')!;
+    button.listeners.get("click")!();
+    for (let tick = 0; tick < 10; tick++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 1);
+    assert.equal(button.disabled, true, "a rejected or uncertain mutation needs fresh state");
+    const status = elements.get('[data-field="status"]')!.textContent;
+    if (outcome === "reload_failed") assert.match(status, /deletion committed, but the list could not refresh/i);
+    else {
+      assert.ok(status.includes(outcome), `missing engine refusal ${outcome}: ${status}`);
+      assert.doesNotMatch(status, /deletion committed/i);
+    }
+    button.listeners.get("click")!();
+    assert.equal(calls, 1, "refresh-required state must block another mutation");
+  }
+});
 
 test("saved rule review renders the frozen selection even when not editable", async () => {
   const selection = { protocol_version: 2, acknowledged_manifest_features: ["fixed-parameters-v1"],
