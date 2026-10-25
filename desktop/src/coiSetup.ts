@@ -223,6 +223,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
       if (receipt.rule_id !== ruleId || receipt.deleted !== true || !Number.isSafeInteger(receipt.version)
         || receipt.version <= version) throw new Error("Delete receipt did not identify the committed rule. Refresh saved rules.");
       committed = true;
+      reset();
       await loadSources("");
     }, true);
     renderState();

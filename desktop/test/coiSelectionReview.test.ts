@@ -149,6 +149,57 @@ test("delete refusal requires refresh and a known receipt survives a failed relo
   }
 });
 
+test("a committed delete clears selection before a failed reload so the next refresh recovers", async () => {
+  const ruleId = "22222222-2222-4222-8222-222222222222";
+  const rule = { summary: { rule_id: ruleId, version: 7, system: false, enabled: false,
+    valid: true, name: "Saved", invalid_reason: null }, definition: null };
+  const provider = { protocol_version: 2,
+    provider: { app_id: "certificate-provider", name: "Certificate provider", version: "1.0", instance_id: "saved" },
+    capability: { id: "certificate.extract", version: "1.0", effects: { external: false },
+      accepts: [{ media_type: "application/pdf", max_bytes: 1024 }],
+      produces: ["application/vnd.local-connect.certificate+json"], parameters: [] } };
+  let deleted = false;
+  let failNextSourceRead = false;
+  let getCallsAfterDelete = 0;
+  const invoke = async (command: string) => {
+    switch (command) {
+      case "mail_accounts_list":
+        if (failNextSourceRead) {
+          failNextSourceRead = false;
+          throw new Error("source temporarily unavailable");
+        }
+        return { accounts: [] };
+      case "watchlist_list": return [];
+      case "connect_catalog": return { items: [provider], diagnostic: null };
+      case "automation_rules_list": return { revision: deleted ? 2 : 1, rules: deleted ? [] : [rule.summary] };
+      case "connect_entitlement_status": return { automations_active: false };
+      case "automation_rules_get":
+        if (deleted) {
+          getCallsAfterDelete++;
+          throw { code: "not_found", message: "Deleted rule was requested again" };
+        }
+        return { rule };
+      case "automation_rules_delete":
+        deleted = true;
+        failNextSourceRead = true;
+        return { rule_id: ruleId, version: 8, deleted: true };
+      default: throw new Error(command);
+    }
+  };
+  const { elements, mounted } = mount(invoke);
+  elements.get('[data-field="saved"]')!.value = ruleId;
+  await mounted.refresh();
+  elements.get('[data-action="delete"]')!.listeners.get("click")!();
+  for (let tick = 0; tick < 10; tick++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deleted, true);
+  assert.match(elements.get('[data-field="status"]')!.textContent, /deletion committed, but the list could not refresh/i);
+  await mounted.refresh();
+  assert.equal(getCallsAfterDelete, 0, "recovery must not fetch the tombstoned rule");
+  assert.equal(elements.get('[data-field="saved"]')!.value, "");
+  assert.equal(elements.get('[data-action="new"]')!.disabled, false);
+  assert.match(elements.get('[data-field="status"]')!.textContent, /refreshed/i);
+});
+
 test("saved rule review renders the frozen selection even when not editable", async () => {
   const selection = { protocol_version: 2, acknowledged_manifest_features: ["fixed-parameters-v1"],
     provider: { app_id: "fixture", name: "Fixture", version: "1.0", instance_id: "saved" },
