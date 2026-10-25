@@ -8112,6 +8112,30 @@ def test_automation_rule_lock_contention_is_retryable_mailbox_busy(
     }
 
 
+def test_rule_delete_during_held_check_refuses_without_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    created = runtime.store.put_automation_rule(_automation_definition())
+    identity = {"rule_id": created.summary.rule_id, "expected_version": created.summary.version}
+    lock_path = engine_api._production_check_lock_path(runtime.config)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+
+    with engine_api.operation_lock(lock_path, "held check pass"):
+        response = engine_api._response(request(
+            config_path, "automation.rules.delete", identity,
+        ))
+
+    assert response["error"] == {
+        "code": "mailbox_busy",
+        "message": "Another mailbox operation is already running",
+        "retryable": True,
+    }
+    assert runtime.store.automation_rule(created.summary.rule_id).summary.version == 1
+
+
 def test_automation_rule_mutation_rejects_unsupported_lock_before_runtime_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
