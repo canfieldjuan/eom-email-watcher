@@ -460,12 +460,12 @@ provider identity cannot currently be obtained. List is summary-only so the
 maximum rule count cannot create a response containing every maximum-sized
 definition.
 
-### Proposed operator deletion reachability — issue #297
+### Operator deletion reachability — issue #297
 
-**Status: proposed contract only.** The existing engine and Store own deletion;
-this amendment requires operator-facing reachability without changing their
-authority or the rule lifecycle above. Implementation starts only after the
-operator accepts this amendment.
+**Status: accepted by Juan on 2026-10-24.** The existing engine and Store own
+deletion; this amendment requires operator-facing reachability without
+changing their authority or the rule lifecycle above. Implementation follows
+in a later commit under this contract.
 
 **Root cause.** `automation.rules.delete` and its transactional tombstone already
 exist, but the desktop command bridge, COI setup, and CLI expose no delete
@@ -1018,7 +1018,7 @@ Rule deletion does not rewrite already committed fires.
   binding, failed closed on ambiguous overlapping recovery, and separated
   transient mailbox-identity lookup failures from invalid rule definitions.
 - **Amendment (2026-10-10, proposed with #231):** added the per-attachment `attachment.document_class` condition (`equals`, `in` up to six) over attachment inspection's closed class set. A class check is committed in `mark_analyzed` and counted toward the fire limit, never decided there, and resolves in the pump, the one other place fires are created. `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules) owns that timing, so an email's category can never stop classification.
-- **Operator deletion reachability (2026-10-24, proposed for #297):** adds
+- **Operator deletion reachability (2026-10-24, accepted for #297):** adds
   desktop and CLI access to the existing versioned delete owner, with truthful
-  refusal, refresh, and installed-action proof. No backend lifecycle change is
-  accepted by this proposal.
+  refusal, refresh, and installed-action proof. This acceptance does not change
+  the backend lifecycle.
