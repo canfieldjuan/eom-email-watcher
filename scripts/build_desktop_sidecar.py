@@ -311,6 +311,8 @@ def _package_sidecar(
         str(build_directory / "spec"),
         "--collect-all",
         "tzdata",
+        "--collect-data",
+        "connect_automate",
     ]
 
     with ExitStack() as stack:
