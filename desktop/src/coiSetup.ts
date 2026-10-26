@@ -1,4 +1,5 @@
 import type { ConnectCapabilities, ConnectCapability } from "./connectTypes";
+import { confirmAction } from "./confirmation";
 import {
   CoiRequestGate, coiControlState, coiDefinition, editableCoiFields, isCoiProvider, providerKey,
   type CoiFields, type RuleDetail, type RuleList, type RuleResult,
@@ -214,9 +215,10 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
       message("This saved rule version cannot be represented exactly. Refresh rules before deleting.", true);
       return;
     }
-    if (!window.confirm(`Delete rule "${ruleName || ruleId}"? This stops new matches, but already recorded work remains.`)) return;
     let committed = false;
     const request = gate.run(async () => {
+      if (!(await confirmAction(`Delete rule "${ruleName || ruleId}"? This stops new matches, but already recorded work remains.`, "Delete rule"))) return false;
+      gate.needsRefresh = true;
       const receipt = await invoke<{ rule_id: string; version: number; deleted: boolean }>("automation_rules_delete", {
         ruleId, expectedVersion: version,
       });
@@ -225,9 +227,10 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
       committed = true;
       reset();
       await loadSources("");
-    }, true);
+      return true;
+    });
     renderState();
-    void request.then(() => message("Rule deleted. Already recorded work remains."), (error) => {
+    void request.then((deleted) => message(deleted ? "Rule deleted. Already recorded work remains." : "Rule deletion cancelled."), (error) => {
       const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
         ? `${error.code}: ` : "";
       message(committed

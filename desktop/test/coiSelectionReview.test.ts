@@ -18,14 +18,14 @@ const source = readFileSync(new URL("../src/coiSetup.ts", import.meta.url), "utf
 const compiled = stripTypeScriptTypes(source).replace(/import[\s\S]*?from "[^"\n]+";/g, "")
   .replace("export function mountCoiSetup", "exports.mountCoiSetup = function mountCoiSetup");
 
-function mount(invoke: (command: string, args?: any) => Promise<any>, confirm = () => true) {
+function mount(invoke: (command: string, args?: any) => Promise<any>, confirm: (text: string) => boolean | Promise<boolean> = () => true) {
   const elements = new Map<string, ReturnType<typeof element>>();
   const root = { set innerHTML(html: string) {
     for (const [match] of html.matchAll(/data-(?:field|action)="[^"]+"/g)) elements.set(`[${match}]`, element());
     elements.set("fieldset", element()); elements.set("form", element());
   }, querySelector(selector: string) { return elements.get(selector) ?? null; } };
   const exports: any = {};
-  runInNewContext(compiled, { exports, ...rules, document: { createElement: element }, window: { confirm } });
+  runInNewContext(compiled, { exports, ...rules, confirmAction: confirm, document: { createElement: element }, window: { confirm } });
   const mounted = exports.mountCoiSetup(root, invoke, String);
   return { elements, mounted };
 }
@@ -65,6 +65,7 @@ test("a selected uneditable rule can be confirmed and deleted through the mounte
   assert.equal(deleteButton.disabled, false);
   deleteButton.listeners.get("click")!();
   assert.equal(deleted, false, "cancel must not send a deletion");
+  for (let tick = 0; tick < 10; tick++) await new Promise((resolve) => setImmediate(resolve));
   allow = true;
   deleteButton.listeners.get("click")!();
   for (let tick = 0; tick < 10; tick++) await new Promise((resolve) => setImmediate(resolve));
@@ -302,5 +303,51 @@ test("required fixed COI parameters survive provider listing and the live pre-sa
     assert.ok(catalogs >= 2, "live pre-save catalog must be checked");
     assert.equal(calls.includes("automation_rules_put"), liveState === "fixed", `live ${liveState} must use the eligibility owner`);
     if (liveState !== "fixed") assert.match(elements.get('[data-field="status"]')!.textContent, /provider is unavailable/);
+  }
+});
+
+
+test("rule deletion waits for an explicit asynchronous confirmation and fences repeated clicks", async () => {
+  for (const approved of [false, true]) {
+    const ruleId = "22222222-2222-4222-8222-222222222222";
+    const rule = { summary: { rule_id: ruleId, version: 7, enabled: true, system: false,
+      valid: true, name: "Saved" }, definition: null };
+    let release!: (approved: boolean) => void;
+    let dialogs = 0;
+    let deletes = 0;
+    const invoke = async (command: string) => {
+      switch (command) {
+        case "mail_accounts_list": return { accounts: [] };
+        case "watchlist_list": return [];
+        case "connect_catalog": return { items: [] };
+        case "automation_rules_list": return { rules: deletes ? [] : [rule.summary], revision: 1 };
+        case "connect_entitlement_status": return { automations_active: true };
+        case "automation_rules_get": return { rule };
+        case "automation_rules_delete": deletes++; return { rule_id: ruleId, version: 8, deleted: true };
+        default: throw new Error(command);
+      }
+    };
+    const { elements, mounted } = mount(invoke, () => {
+      dialogs++;
+      return new Promise<boolean>((resolve) => { release = resolve; });
+    });
+    elements.get('[data-field="saved"]')!.value = ruleId;
+    await mounted.refresh();
+    const button = elements.get('[data-action="delete"]')!;
+    button.listeners.get("click")!();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(deletes, 0, "unanswered confirmation must not delete the rule");
+    assert.equal(button.disabled, true);
+    button.listeners.get("click")!();
+    await mounted.refresh();
+    assert.equal(dialogs, 1, "pending confirmation must own the request gate");
+    release(approved);
+    for (let tick = 0; tick < 10; tick++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(deletes, approved ? 1 : 0);
+    if (!approved) {
+      assert.equal(elements.get('[data-field="saved"]')!.value, ruleId);
+      assert.equal(button.disabled, false, "cancel should allow a fresh attempt without refresh");
+      assert.match(elements.get('[data-field="status"]')!.textContent, /cancel/i);
+    }
   }
 });

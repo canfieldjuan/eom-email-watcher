@@ -24,7 +24,7 @@ test("vendor removal handlers display the saved notice or their ordinary success
       await runInNewContext(`(async () => { ${handler}; await ${name}(); })()`, {
         vendorId: acme.vendor_id, vendorName: acme.display_name, address: "billing@acme.com",
         unwatch: false, unwatchAddresses: false, addressCount: 2,
-        vendorsBusy: () => false, window: { confirm: () => true },
+        vendorsBusy: () => false, confirmAction: async () => true,
         removeAddressConfirmText: () => "confirm", deleteVendorConfirmText: () => "confirm",
         invoke: async () => ({ ...acme, notice: held ? notice : null }),
         vendorOperation: async (_pending: string, operation: () => Promise<string>) => { shown = await operation(); },

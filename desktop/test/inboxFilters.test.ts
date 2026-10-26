@@ -125,7 +125,7 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
       let inboxClearInFlight = false, inboxRequestGeneration = 0, inboxReloadAfterMutation = false;
       const inboxLoadMore = { hidden: false }, inboxStatus = { textContent: "", dataset: {} };
       const renders = [], cleared = [];
-      const window = { confirm: () => true }, inboxMutationInFlight = () => false;
+      const confirmAction = async () => true, inboxMutationInFlight = () => false;
       const setInboxControlsBusy = () => {}, resumeInboxReloadAfterMutation = () => {};
       const clearMessageOwnedUiState = id => cleared.push(id ?? "all");
       const renderInbox = items => renders.push({ ids: items.map(item => item.message_id),
@@ -178,7 +178,7 @@ test("Delete handler clears only its accepted cached item and always reloads the
       const expandedInboxMessages = new Set(["selected", "other"]), inboxDeletionsInFlight = new Set();
       let inboxRequestGeneration = 0, inboxReloadAfterMutation = false, calls = 0;
       const inboxStatus = { textContent: "", dataset: {} }, cleared = [];
-      const window = { confirm: () => true }, inboxMutationInFlight = () => false;
+      const confirmAction = async () => true, inboxMutationInFlight = () => false;
       const setInboxControlsBusy = () => {}, renderInbox = () => {}, resumeInboxReloadAfterMutation = () => {};
       const clearMessageOwnedUiState = id => cleared.push(id);
       const inboxRemovalClient = { delete: async id => {

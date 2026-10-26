@@ -483,7 +483,10 @@ control surface.
   A busy or refresh-required view cannot submit a deletion.
 - Before sending a request, the desktop confirms the selected rule's name (or
   its rule ID when unnamed) and explains that deletion stops new matches but
-  does not remove already recorded work. Cancel sends no request. Confirm sends
+  does not remove already recorded work. The shared native confirmation owner
+  awaits the dialog result; an unanswered, cancelled, dismissed, or failed dialog
+  sends no request. The rule request gate stays busy during confirmation and
+  permits a fresh attempt after cancellation. Confirm sends
   the loaded `rule_id` and exact `version` through a registered Tauri command
   and the existing engine operation. It never looks up a newer version and
   silently retries a stale request.

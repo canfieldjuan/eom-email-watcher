@@ -1,3 +1,4 @@
+import { confirmAction } from "./confirmation";
 import { calendarOutcomeNotice, latestCalendarOutcome, type CalendarWriteOutcome } from "./calendarOutcome";
 import { inboxAdmissionLabel, type InboxAdmissionKind } from "./inboxAdmission";
 import { activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult } from "./connectIdentity";
@@ -1860,7 +1861,7 @@ function renderInbox(items: InboxItem[]): void {
               ? `Recheck the expired proposal “${proposal.subject}” before creating it? If Email Watcher still considers it valid, this confirmation will create the event on ${proposal.account_address || proposal.account_display_name}; otherwise it will refresh the proposal without creating an event.${invitationWarning}`
               : `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationWarning}`;
             if (
-              !window.confirm(confirmationMessage)
+              !await confirmAction(confirmationMessage)
             ) {
               return;
             }
@@ -2064,7 +2065,7 @@ function renderInbox(items: InboxItem[]): void {
             capability.capability.effects.external ||
             capability.capability.effects.confirmation_required;
           const confirmed = requiresConfirmation
-            ? window.confirm(
+            ? await confirmAction(
                 `${capability.capability.action.label}\n${capability.capability.action.description}\n\nContinue with ${capability.provider.name}?`,
               )
             : false;
@@ -2201,7 +2202,7 @@ function renderInbox(items: InboxItem[]): void {
           if (automationDecisionsInFlight.has(fire.fire_id)) return;
           if (
             decision === "confirmed" &&
-            !window.confirm(
+            !await confirmAction(
               `Confirm automation rule ${fire.rule_id} for "${attachment.filename}"? This authorizes its prepared action and may change data in another app.`,
             )
           ) return;
@@ -2621,11 +2622,11 @@ function setInboxControlsBusy(busy: boolean): void {
 
 async function deleteInboxItem(item: InboxItem): Promise<void> {
   if (inboxMutationInFlight()) return;
-  const confirmed = window.confirm(
+  const confirmed = await confirmAction(
     `Delete "${item.subject}" from Email Watcher's local history? ` +
       "Its local analysis, attachment metadata, notifications, and capability results will be removed. The source email will stay in your mailbox.",
   );
-  if (!confirmed) return;
+  if (!confirmed || inboxMutationInFlight()) return;
 
   inboxDeletionsInFlight.add(item.message_id);
   inboxRequestGeneration += 1;
@@ -2656,10 +2657,10 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
 
 async function clearInboxHistory(): Promise<void> {
   if (inboxMutationInFlight()) return;
-  const confirmed = window.confirm(
+  const confirmed = await confirmAction(
     "Clear all local Email Watcher history? This removes local analyses, attachment metadata, notifications, and capability results. Source email will stay in your mailbox.",
   );
-  if (!confirmed) return;
+  if (!confirmed || inboxMutationInFlight()) return;
 
   inboxClearInFlight = true;
   inboxRequestGeneration += 1;
@@ -3600,10 +3601,10 @@ async function reconnectMailAccount(account: MailAccountStatus): Promise<void> {
 
 async function disconnectMailAccount(account: MailAccountStatus): Promise<void> {
   if (mailOperationInFlight) return;
-  const confirmed = window.confirm(
+  const confirmed = await confirmAction(
     `Disconnect ${account.address || account.display_name}? Local history remains available and source email is not changed.`,
   );
-  if (!confirmed) return;
+  if (!confirmed || mailOperationInFlight) return;
   invalidateGmailLabelState(null);
   closeMailServerForm();
   try {
@@ -3987,13 +3988,14 @@ async function mutateCalendarConsent(
   if (!definition) return;
   if (
     action === "disconnect" &&
-    !window.confirm(
+    !await confirmAction(
       `Remove ${definition.actionLabel} from ${account.address || account.display_name}? This removes only that calendar permission; mailbox reading remains connected.`,
     )
   ) {
     return;
   }
 
+  if (calendarConsentOperationInFlight !== null) return;
   calendarConsentOperationInFlight = `${account.account_id}:${profile}:${action}`;
   setCalendarConsentButtonsBusy();
   calendarConsentStatus.textContent =
@@ -4941,7 +4943,7 @@ async function removeVendorAddress(
   address: string,
   unwatch: boolean,
 ): Promise<void> {
-  if (vendorsBusy() || !window.confirm(removeAddressConfirmText(vendorName, address, unwatch))) {
+  if (vendorsBusy() || !await confirmAction(removeAddressConfirmText(vendorName, address, unwatch))) {
     return;
   }
   await vendorOperation(`Removing ${address}…`, async () => {
@@ -4958,7 +4960,7 @@ async function deleteVendor(
 ): Promise<void> {
   if (
     vendorsBusy()
-    || !window.confirm(deleteVendorConfirmText(vendorName, addressCount, unwatchAddresses))
+    || !await confirmAction(deleteVendorConfirmText(vendorName, addressCount, unwatchAddresses))
   ) {
     return;
   }
