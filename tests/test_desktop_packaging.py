@@ -134,6 +134,54 @@ ADMISSION_TOKEN = {
 }
 
 
+@pytest.mark.parametrize("change", [None, "missing", "changed"])
+def test_package_smoke_verifies_real_archive_sdk_data(tmp_path, change):
+    from PyInstaller.archive.writers import CArchiveWriter
+    from PyInstaller.utils.hooks import collect_data_files
+
+    entries = []
+    for source, destination in collect_data_files("connect_automate"):
+        name = Path(source).name
+        if name == "README.md":
+            if change == "missing":
+                continue
+            if change == "changed":
+                altered = tmp_path / name
+                altered.write_bytes(b"not the pinned policy")
+                source = str(altered)
+        entries.append(((Path(destination) / name).as_posix(), source, True, "x"))
+    binary = tmp_path / "engine.pkg"
+    CArchiveWriter(str(binary), entries, "python313.dll")
+    if change is None:
+        smoke_packaged_engine.verify_bundled_connect_data(binary)
+    else:
+        with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError,
+                           match="Packaged Connect data missing or changed"):
+            smoke_packaged_engine.verify_bundled_connect_data(binary)
+
+
+def test_smoke_cli_checks_archive_before_running_engine(tmp_path, monkeypatch):
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"placeholder")
+    calls = []
+    monkeypatch.setattr(smoke_packaged_engine.sys, "argv", [
+        "smoke", str(binary), "--expected-entitlement-state", "missing",
+    ])
+
+    def reject(path):
+        assert path == binary.resolve()
+        calls.append("archive")
+        raise smoke_packaged_engine.PackagedEngineSmokeError("missing policy")
+
+    monkeypatch.setattr(smoke_packaged_engine, "verify_bundled_connect_data", reject)
+    monkeypatch.setattr(smoke_packaged_engine, "smoke_packaged_engine",
+                        lambda *args: calls.append("engine"))
+    with pytest.raises(SystemExit) as exc:
+        smoke_packaged_engine.main()
+    assert exc.value.code == 2
+    assert calls == ["archive"]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows stat and lock semantics")
 def test_windows_first_run_initialization_loads_in_packaged_smoke_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1142,7 +1190,10 @@ def test_qualification_reuses_release_packaging_owner(tmp_path, monkeypatch):
         k: v for k, v in snapshots[1][1].items() if k != key
     }
     assert calls[1][:2] == calls[3][:2]
-    assert calls[1][3:] == calls[3][3:]  # Same smoke contract, distinct binary outputs.
+    # Shared smoke contract plus real catalog acceptance under fixture authority.
+    assert calls[3][3:] == calls[1][3:] + [
+        "--catalog-entitlement", str(test_ring.parent / "fixture-entitlement.json"),
+    ]
     with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="labelled qualification"):
         qualification.build_test_sidecar(release_ring)
     with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="non-production"):

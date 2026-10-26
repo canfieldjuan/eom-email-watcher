@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -33,6 +34,22 @@ PUBLIC_FAILURE_CODES = frozenset(
 
 class PackagedEngineSmokeError(RuntimeError):
     pass
+
+
+def verify_bundled_connect_data(binary: Path) -> None:
+    """Check every SDK resource against the pinned distribution, even unlicensed."""
+    from PyInstaller.utils.hooks import collect_data_files
+    from windows_cutover_parity import sidecar_manifest
+
+    manifest = sidecar_manifest(binary)
+    resources = collect_data_files("connect_automate")
+    if not resources:
+        raise PackagedEngineSmokeError("Pinned Connect SDK has no runtime data to verify")
+    for source, destination in resources:
+        name = (Path(destination) / Path(source).name).as_posix()
+        expected = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+        if manifest.get(name, {}).get("sha256") != expected:
+            raise PackagedEngineSmokeError(f"Packaged Connect data missing or changed: {name}")
 
 
 def _public_failure_code(output: str, operation: str) -> str | None:
@@ -153,6 +170,7 @@ def smoke_packaged_engine(
     binary: Path,
     expected_entitlement_state: str,
     expected_mail_providers: tuple[str, ...] = (),
+    catalog_entitlement: Path | None = None,
 ) -> None:
     if not binary.is_file():
         raise PackagedEngineSmokeError("Packaged engine is not a regular file")
@@ -290,12 +308,39 @@ def smoke_packaged_engine(
 
         _cli_read(isolated_binary, config_path, environment)
 
+        if catalog_entitlement is not None:
+            from windows_cutover_fixture import reference_provider
+
+            environment["XDG_RUNTIME_DIR"] = str(private_root)
+            _request(
+                isolated_binary, config_path=config_path,
+                operation="connect.entitlement.install",
+                payload={"source_path": str(catalog_entitlement.resolve())},
+                working_directory=temporary, environment=environment,
+            )
+            with reference_provider(private_root, manifest_freshness=True) as (provider, _, _):
+                catalog = _request(
+                    isolated_binary, config_path=config_path, operation="connect.catalog",
+                    payload=None, working_directory=temporary, environment=environment,
+                )
+                items = catalog["data"].get("items", [])
+                if not items or any(
+                    item.get("provider", {}).get("instance_id") != provider.instance_id
+                    for item in items
+                ):
+                    raise PackagedEngineSmokeError("Packaged catalog did not admit the fixture")
+                print("packaged-catalog-smoke: ok")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Smoke-test one packaged Email Watcher engine binary."
     )
     parser.add_argument("engine_binary", type=Path)
+    parser.add_argument(
+        "--catalog-entitlement", type=Path,
+        help="Signed qualification licence for isolated native catalog acceptance.",
+    )
     parser.add_argument(
         "--expected-entitlement-state",
         required=True,
@@ -311,10 +356,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     try:
+        verify_bundled_connect_data(args.engine_binary.resolve())
         smoke_packaged_engine(
             args.engine_binary.resolve(),
             args.expected_entitlement_state,
             tuple(args.expected_mail_provider),
+            args.catalog_entitlement,
         )
     except PackagedEngineSmokeError as exc:
         print(str(exc), file=sys.stderr)

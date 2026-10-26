@@ -309,11 +309,16 @@ class MailFixture:
 
 
 @contextmanager
-def reference_provider(private: Path):
+def reference_provider(private: Path, *, manifest_freshness: bool = False):
     """Reuse the proven provider protocol with native private Windows storage."""
     posted, release = threading.Event(), threading.Event()
 
     class PausedHandler(_Handler):
+        def end_headers(self):
+            if manifest_freshness:
+                self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+
         def _json(self, status, value):
             # Store completed real job first; pause the authoritative POST reply.
             if self.command == "POST" and status == 200:
