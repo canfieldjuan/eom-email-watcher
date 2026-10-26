@@ -18,6 +18,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
         <label>Saved rule<select data-field="saved"><option value="">New rule</option></select></label>
         <button type="button" data-action="refresh">Refresh rules and providers</button>
         <button type="button" data-action="new">New rule</button>
+        <button type="button" data-action="delete" hidden>Delete rule</button>
       </div>
       <p data-field="status" role="status" aria-live="polite">Open Expiry Ledger to load setup.</p>
       <p data-field="locked" hidden><span class="capability-locked">Automations locked</span> <button type="button" data-action="view-connect">View Connect</button></p>
@@ -60,6 +61,7 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
   const toggle = get<HTMLButtonElement>('[data-action="toggle"]');
   const refreshButton = get<HTMLButtonElement>('[data-action="refresh"]');
   const newButton = get<HTMLButtonElement>('[data-action="new"]');
+  const deleteButton = get<HTMLButtonElement>('[data-action="delete"]');
   const gate = new CoiRequestGate();
   let accounts: Account[] = [];
   let senders: Sender[] = [];
@@ -108,6 +110,9 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     fieldset.disabled = gate.busy || !loaded || !editable || gate.needsRefresh;
     saved.disabled = gate.busy || !loaded;
     newButton.disabled = gate.busy || !loaded || gate.needsRefresh;
+    deleteButton.hidden = current === null || current.summary.system;
+    deleteButton.disabled = gate.busy || !loaded || gate.needsRefresh || !current || current.summary.system
+      || !Number.isSafeInteger(current.summary.version) || current.summary.version <= 0;
     refreshButton.disabled = gate.busy;
     const choice = selected();
     const controls = coiControlState(automationsActive === true, current?.summary ?? null);
@@ -202,6 +207,34 @@ export function mountCoiSetup(root: HTMLElement, invoke: Invoke, errorMessage: (
     void refresh();
   });
   newButton.addEventListener("click", () => { if (!gate.busy && !gate.needsRefresh) { reset(); message("Configure a new COI rule."); } });
+  deleteButton.addEventListener("click", () => {
+    if (!current || current.summary.system || !loaded || gate.busy || gate.needsRefresh) return;
+    const { rule_id: ruleId, version, name: ruleName } = current.summary;
+    if (!Number.isSafeInteger(version) || version <= 0) {
+      message("This saved rule version cannot be represented exactly. Refresh rules before deleting.", true);
+      return;
+    }
+    if (!window.confirm(`Delete rule "${ruleName || ruleId}"? This stops new matches, but already recorded work remains.`)) return;
+    let committed = false;
+    const request = gate.run(async () => {
+      const receipt = await invoke<{ rule_id: string; version: number; deleted: boolean }>("automation_rules_delete", {
+        ruleId, expectedVersion: version,
+      });
+      if (receipt.rule_id !== ruleId || receipt.deleted !== true || !Number.isSafeInteger(receipt.version)
+        || receipt.version <= version) throw new Error("Delete receipt did not identify the committed rule. Refresh saved rules.");
+      committed = true;
+      reset();
+      await loadSources("");
+    }, true);
+    renderState();
+    void request.then(() => message("Rule deleted. Already recorded work remains."), (error) => {
+      const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+        ? `${error.code}: ` : "";
+      message(committed
+        ? `Rule deletion committed, but the list could not refresh: ${errorMessage(error)} Refresh saved rules before continuing.`
+        : `${code}${errorMessage(error)} Refresh saved rules before continuing; deletion may not have committed.`, true);
+    }).finally(renderState);
+  });
   refreshButton.addEventListener("click", () => void refresh());
   get<HTMLButtonElement>('[data-action="view-connect"]').addEventListener("click", () => onViewConnect?.());
   get<HTMLFormElement>("form").addEventListener("input", renderState);

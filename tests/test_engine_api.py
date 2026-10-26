@@ -20,7 +20,12 @@ from eom_email_watcher import engine_api
 from eom_email_watcher import gmail as gmail_module
 from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import config_admission_snapshot, load_config
-from eom_email_watcher.db import AdmissionProvenance, GmailLabelStoreError, Store
+from eom_email_watcher.db import (
+    AdmissionProvenance,
+    AutomationRuleNotFound,
+    GmailLabelStoreError,
+    Store,
+)
 from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
     GmailError,
@@ -8013,6 +8018,49 @@ def test_automation_rule_operations_expose_one_cas_lifecycle(
     assert missing["error"]["code"] == "not_found"
 
 
+def test_rule_delete_cli_commits_through_engine_and_reports_stale_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from eom_email_watcher import cli
+
+    _install_rule_catalog(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    created = runtime.store.put_automation_rule(_automation_definition())
+    rule_id = created.summary.rule_id
+    runtime.store.set_automation_rule_enabled(rule_id, 1, False)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+
+    @contextmanager
+    def available_lock(path: Path, busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api.removal, "connect_operation_lock", available_lock)
+    with pytest.raises(SystemExit) as stale:
+        cli.main(["--config", str(config_path), "rule-delete", rule_id,
+                  "--expected-version", "1"])
+    assert stale.value.code == 2
+    assert "stale_rule:" in capsys.readouterr().err
+    assert runtime.store.automation_rule(rule_id) is not None
+
+    with pytest.raises(SystemExit) as result:
+        cli.main(["--config", str(config_path), "rule-delete", rule_id,
+                  "--expected-version", "2"])
+    assert result.value.code == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "rule_id": rule_id, "version": 3, "deleted": True,
+    }
+    with pytest.raises(AutomationRuleNotFound):
+        runtime.store.automation_rule(rule_id)
+
+    with pytest.raises(SystemExit) as missing:
+        cli.main(["--config", str(config_path), "rule-delete", rule_id,
+                  "--expected-version", "2"])
+    assert missing.value.code == 2
+    assert "not_found:" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("expected_version", [True, 0, -1, 2**63, "1", None])
 def test_automation_rule_mutation_rejects_non_strict_versions(
     tmp_path: Path,
@@ -8062,6 +8110,30 @@ def test_automation_rule_lock_contention_is_retryable_mailbox_busy(
         "message": "Another mailbox operation is already running",
         "retryable": True,
     }
+
+
+def test_rule_delete_during_held_check_refuses_without_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    created = runtime.store.put_automation_rule(_automation_definition())
+    identity = {"rule_id": created.summary.rule_id, "expected_version": created.summary.version}
+    lock_path = engine_api._production_check_lock_path(runtime.config)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+
+    with engine_api.operation_lock(lock_path, "held check pass"):
+        response = engine_api._response(request(
+            config_path, "automation.rules.delete", identity,
+        ))
+
+    assert response["error"] == {
+        "code": "mailbox_busy",
+        "message": "Another mailbox operation is already running",
+        "retryable": True,
+    }
+    assert runtime.store.automation_rule(created.summary.rule_id).summary.version == 1
 
 
 def test_automation_rule_mutation_rejects_unsupported_lock_before_runtime_access(

@@ -460,6 +460,75 @@ provider identity cannot currently be obtained. List is summary-only so the
 maximum rule count cannot create a response containing every maximum-sized
 definition.
 
+### Operator deletion reachability — issue #297
+
+**Status: accepted by Juan on 2026-10-24.** The existing engine and Store own
+deletion; this amendment requires operator-facing reachability without
+changing their authority or the rule lifecycle above. Implementation follows
+in a later commit under this contract.
+
+**Root cause.** `automation.rules.delete` and its transactional tombstone already
+exist, but the desktop command bridge, COI setup, and CLI expose no delete
+action. A person can pause a rule but cannot remove it through either supported
+control surface.
+
+**Required behavior and change surface.**
+
+- Desktop COI setup offers **Delete rule** for a loaded non-system saved rule.
+  The action is separate from the editable COI form: a user-owned invalid or
+  otherwise uneditable rule remains deletable. Deletion also remains available
+  when the Automations entitlement is inactive, as the engine already permits
+  cleanup then. The loaded version must be a positive JavaScript safe integer;
+  the UI refuses an unrepresentable version instead of sending a rounded one.
+  A busy or refresh-required view cannot submit a deletion.
+- Before sending a request, the desktop confirms the selected rule's name (or
+  its rule ID when unnamed) and explains that deletion stops new matches but
+  does not remove already recorded work. Cancel sends no request. Confirm sends
+  the loaded `rule_id` and exact `version` through a registered Tauri command
+  and the existing engine operation. It never looks up a newer version and
+  silently retries a stale request.
+- The Tauri bridge forwards `{rule_id, expected_version}` and returns the
+  existing `{rule_id, version, deleted: true}` tombstone receipt. The Rust
+  mailbox-operation gate and admitted-host check used by adjacent rule
+  mutations remain in force; the Python engine's operation lock and Store
+  transaction remain authoritative.
+- On a committed desktop receipt, refresh the live rule list, clear the
+  deleted selection, and report success. If that refresh fails after a known
+  receipt, report that deletion committed but the list could not refresh;
+  require refresh before another mutation. On `stale_rule`,
+  `system_rule_protected`, `not_found`, `mailbox_busy`, or an uncertain error,
+  show the engine refusal and require a fresh rule snapshot before another
+  mutation. No error path claims deletion succeeded. System rules are not
+  offered in the ordinary picker; engine protection still applies to races
+  and direct callers.
+- The CLI adds one explicit `eom-mail-watch rule-delete RULE_ID
+  --expected-version VERSION` command. It forwards both supplied values to
+  `automation.rules.delete`, prints the engine tombstone receipt on success,
+  and exits nonzero with the engine code and message on refusal. It does not
+  infer a current version or bypass the engine through direct Store access.
+
+**Explicit non-scope.** Do not change the delete operation, Store tombstone,
+rule schema, mailbox/Connect contracts, entitlement policy, lock ownership,
+evaluation, dispatch, queued work, or historical versions. Do not add bulk
+deletion, undo, a new rule browser, dependency updates, or shared SDK edits.
+The desktop command registration change is limited to this Watcher command and
+must be sequenced with any concurrent owner of that file.
+
+**Verification and acceptance.** A failing-before behavioral test must show
+the missing desktop or CLI path; implementation then proves confirmation
+cancel, persisted deletion through each entry point, no new matching after
+deletion, and retention of already recorded fires. Exercise stale, system,
+missing, malformed identity/version, lock-busy, invalid/uneditable-rule, and
+inactive-entitlement boundaries at their owning layers. Rust bridge tests pin
+the exact operation/payload/receipt; desktop tests exercise the mounted
+controls and refresh/error state; CLI tests exercise its command and real
+engine/Store result. Run adjacent Python, desktop, Rust, lint/type/build,
+and native Windows packaging checks. Installed acceptance must demonstrate a
+supported user action reaching the persisted rule state on each platform
+claimed; a green source test alone is not an installed proof. Record the
+resulting evidence on issue #297 before calling the slice adopted or
+installed-verified.
+
 A definition is parsed and canonically serialized inside `Store.put_rule`.
 After strict validation, all defaulted members are materialized and the canonical
 Pydantic object is dumped in JSON mode. Canonical bytes are UTF-8 encoding of
@@ -949,3 +1018,7 @@ Rule deletion does not rewrite already committed fires.
   binding, failed closed on ambiguous overlapping recovery, and separated
   transient mailbox-identity lookup failures from invalid rule definitions.
 - **Amendment (2026-10-10, proposed with #231):** added the per-attachment `attachment.document_class` condition (`equals`, `in` up to six) over attachment inspection's closed class set. A class check is committed in `mark_analyzed` and counted toward the fire limit, never decided there, and resolves in the pump, the one other place fires are created. `docs/ATTACHMENT_INSPECTION_CONTRACT.md` (I-rules) owns that timing, so an email's category can never stop classification.
+- **Operator deletion reachability (2026-10-24, accepted for #297):** adds
+  desktop and CLI access to the existing versioned delete owner, with truthful
+  refusal, refresh, and installed-action proof. This acceptance does not change
+  the backend lifecycle.

@@ -44,6 +44,9 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor", help="Check local configuration and dependencies")
     recent = commands.add_parser("recent", help="Show recent watched-message results")
     recent.add_argument("--limit", type=int, default=20)
+    rule_delete = commands.add_parser("rule-delete", help="Delete one saved automation rule")
+    rule_delete.add_argument("rule_id")
+    rule_delete.add_argument("--expected-version", type=int, required=True)
     requeue_analysis = commands.add_parser(
         "requeue-analysis", help="Retry one permanently paused message analysis"
     )
@@ -328,6 +331,22 @@ def _recent(config_path: Path, limit: int) -> int:
     return 0
 
 
+def _rule_delete(config_path: Path, rule_id: str, expected_version: int) -> int:
+    from .engine_api import ApiError, dispatch
+
+    try:
+        receipt = dispatch({
+            "protocol": 1,
+            "operation": "automation.rules.delete",
+            "config_path": str(config_path),
+            "payload": {"rule_id": rule_id, "expected_version": expected_version},
+        })
+    except ApiError as exc:
+        raise RuntimeError(f"{exc.code}: {exc}") from exc
+    print(json.dumps(receipt, indent=2))
+    return 0
+
+
 def _requeue_analysis(config_path: Path, message_id: str) -> int:
     _config, store, _model = _runtime(config_path)
     try:
@@ -368,6 +387,8 @@ def main(argv: list[str] | None = None) -> None:
                 )
             elif args.command == "requeue-analysis":
                 code = _requeue_analysis(args.config, args.message_id)
+            elif args.command == "rule-delete":
+                code = _rule_delete(args.config, args.rule_id, args.expected_version)
             else:
                 code = _recent(args.config, args.limit)
         except (
