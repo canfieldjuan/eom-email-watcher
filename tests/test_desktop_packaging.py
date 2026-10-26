@@ -4,6 +4,7 @@ import base64
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -131,6 +132,54 @@ ADMISSION_TOKEN = {
     "revision": f"sha256:{'a' * 64}",
     "identity": f"sha256:{'b' * 64}",
 }
+
+
+@pytest.mark.parametrize("change", [None, "missing", "changed"])
+def test_package_smoke_verifies_real_archive_sdk_data(tmp_path, change):
+    from PyInstaller.archive.writers import CArchiveWriter
+    from PyInstaller.utils.hooks import collect_data_files
+
+    entries = []
+    for source, destination in collect_data_files("connect_automate"):
+        name = Path(source).name
+        if name == "README.md":
+            if change == "missing":
+                continue
+            if change == "changed":
+                altered = tmp_path / name
+                altered.write_bytes(b"not the pinned policy")
+                source = str(altered)
+        entries.append(((Path(destination) / name).as_posix(), source, True, "x"))
+    binary = tmp_path / "engine.pkg"
+    CArchiveWriter(str(binary), entries, "python313.dll")
+    if change is None:
+        smoke_packaged_engine.verify_bundled_connect_data(binary)
+    else:
+        with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError,
+                           match="Packaged Connect data missing or changed"):
+            smoke_packaged_engine.verify_bundled_connect_data(binary)
+
+
+def test_smoke_cli_checks_archive_before_running_engine(tmp_path, monkeypatch):
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"placeholder")
+    calls = []
+    monkeypatch.setattr(smoke_packaged_engine.sys, "argv", [
+        "smoke", str(binary), "--expected-entitlement-state", "missing",
+    ])
+
+    def reject(path):
+        assert path == binary.resolve()
+        calls.append("archive")
+        raise smoke_packaged_engine.PackagedEngineSmokeError("missing policy")
+
+    monkeypatch.setattr(smoke_packaged_engine, "verify_bundled_connect_data", reject)
+    monkeypatch.setattr(smoke_packaged_engine, "smoke_packaged_engine",
+                        lambda *args: calls.append("engine"))
+    with pytest.raises(SystemExit) as exc:
+        smoke_packaged_engine.main()
+    assert exc.value.code == 2
+    assert calls == ["archive"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows stat and lock semantics")
@@ -989,6 +1038,38 @@ def _configure_fake_sidecar_build(
     return calls, staged_files
 
 
+def test_packaged_connect_policy_reads_collected_runtime_data(tmp_path, monkeypatch):
+    from connect_automate import _manifest_policy
+    from PyInstaller.utils.hooks import collect_data_files
+
+    calls, _ = _configure_fake_sidecar_build(tmp_path, monkeypatch)
+    build_desktop_sidecar.build_sidecar()
+    arguments = calls[0]
+    # Apply the real collector requested by the packaging owner, then execute
+    # the SDK reader from a relocated bundle with no source-tree data fallback.
+    bundle = tmp_path / "bundle"
+    module_path = bundle / "connect_automate" / "_manifest_policy.py"
+    module_path.parent.mkdir(parents=True)
+    shutil.copyfile(_manifest_policy.__file__, module_path)
+    for index, argument in enumerate(arguments):
+        if argument == "--collect-data":
+            for source, destination in collect_data_files(arguments[index + 1]):
+                target = bundle / destination / Path(source).name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+    spec = importlib.util.spec_from_file_location("packaged_policy", module_path)
+    assert spec is not None and spec.loader is not None
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+
+    assert policy.freshness_fields({
+        "cache-control": "no-store", "vary": "Local-Connect-Manifest-Features",
+    }) == ([], {"no-store"}, {"local-connect-manifest-features"})
+    assert policy.freshness_fields({"cache-control": "no-store=1"})[0] == [
+        "malformed recognized cache directive"
+    ]
+
+
 def test_development_build_remains_credential_free(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1109,7 +1190,10 @@ def test_qualification_reuses_release_packaging_owner(tmp_path, monkeypatch):
         k: v for k, v in snapshots[1][1].items() if k != key
     }
     assert calls[1][:2] == calls[3][:2]
-    assert calls[1][3:] == calls[3][3:]  # Same smoke contract, distinct binary outputs.
+    # Shared smoke contract plus real catalog acceptance under fixture authority.
+    assert calls[3][3:] == calls[1][3:] + [
+        "--catalog-entitlement", str(test_ring.parent / "fixture-entitlement.json"),
+    ]
     with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="labelled qualification"):
         qualification.build_test_sidecar(release_ring)
     with pytest.raises(build_desktop_sidecar.SidecarBuildError, match="non-production"):

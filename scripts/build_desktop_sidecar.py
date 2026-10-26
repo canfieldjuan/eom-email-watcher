@@ -274,6 +274,7 @@ def _package_sidecar(
     *,
     build_directory: Path | None = None,
     output_directory: Path | None = None,
+    catalog_entitlement: Path | None = None,
 ) -> Path:
     """One packaging owner; callers supply already validated authority bytes.
 
@@ -311,6 +312,8 @@ def _package_sidecar(
         str(build_directory / "spec"),
         "--collect-all",
         "tzdata",
+        "--collect-data",
+        "connect_automate",
     ]
 
     with ExitStack() as stack:
@@ -398,6 +401,8 @@ def _package_sidecar(
     ]
     for provider in expected_mail_providers:
         smoke_arguments.extend(["--expected-mail-provider", provider])
+    if catalog_entitlement is not None:
+        smoke_arguments.extend(["--catalog-entitlement", str(catalog_entitlement)])
     subprocess.run(
         smoke_arguments,
         check=True,

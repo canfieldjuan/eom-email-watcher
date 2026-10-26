@@ -36,6 +36,7 @@ def build_test_sidecar(keyring: Path) -> Path:
         content,
         build_directory=keyring.parent / "qualification-build",
         output_directory=keyring.parent / "qualification-binaries",
+        catalog_entitlement=keyring.parent / "fixture-entitlement.json",
     )
 
 
