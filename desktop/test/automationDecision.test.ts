@@ -95,7 +95,7 @@ test("decision refresh requires its own committed inbox projection", async () =>
     ui.indexOf("const refreshDecisionInbox = async"),
     ui.indexOf("const decide = async (decision: \"confirmed\""),
   );
-  const loadInbox = ui.slice(ui.indexOf("async function loadInbox("), ui.indexOf("async function refreshLoadedInboxSpan("));
+  const loadInbox = ui.slice(ui.indexOf("async function loadInboxPage("), ui.indexOf("async function runInboxRefresh("));
   const commitPoint = loadInbox.indexOf("inboxItems = page.items");
   assert.notEqual(commitPoint, -1);
   const renderPoint = loadInbox.indexOf("renderInbox(inboxItems);", commitPoint);
@@ -126,7 +126,7 @@ test("refresh fences require a later full committed query", () => {
 test("rerendered decision controls stay blocked until a later query commits", async () => {
   const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const panel = ui.slice(ui.indexOf("for (const fire of attachment.automation_fires ?? [])"), ui.indexOf("attachments.append(row);"));
-  const loadInbox = ui.slice(ui.indexOf("async function loadInbox("), ui.indexOf("async function refreshLoadedInboxSpan("));
+  const loadInbox = ui.slice(ui.indexOf("async function loadInboxPage("), ui.indexOf("async function runInboxRefresh("));
   assert.match(ui, /const automationDecisionRefreshRequired = new Map<string, number>\(\)/);
   assert.match(panel, /automationDecisionsInFlight\.has\(fire\.fire_id\)[\s\S]*?confirm\.disabled = true;[\s\S]*?decline\.disabled = true;/);
   assert.match(panel, /automationDecisionRefreshRequired\.has\(fire\.fire_id\)[\s\S]*?showRefreshRetry\(\)/);

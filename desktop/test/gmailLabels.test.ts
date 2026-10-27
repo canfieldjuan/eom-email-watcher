@@ -1,3 +1,4 @@
+import { stripTypeScriptTypes } from "node:module";
 import { mailboxPendingMessage } from "../src/mailboxProgress.ts";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -34,40 +35,15 @@ type MailboxMutationHarness = {
 };
 
 function mailboxMutationHarness(): MailboxMutationHarness {
-  const match = source.match(
-    /let mailboxOperationRevision = 0;([\s\S]*?)\n\nfunction errorMessage/,
-  );
-  assert.ok(match);
-  const executable = match[1]
-    .replace(
-      /function observeMailboxOperationRevision\(revision: unknown\): boolean/,
-      "function observeMailboxOperationRevision(revision)",
-    )
-    .replace(
-      /function scheduledCheckEventIsCurrent\(event: ScheduledCheckEvent\): boolean/,
-      "function scheduledCheckEventIsCurrent(event)",
-    )
-    .replace(
-      /function observeMailboxOperationRevisionFromError\(error: unknown\): boolean/,
-      "function observeMailboxOperationRevisionFromError(error)",
-    )
-    .replace(
-      /function currentMailboxEffectScope\(\): MailboxEffectScope \| null/,
-      "function currentMailboxEffectScope()",
-    )
-    .replace(
-      /function mailboxEffectScopeIsCurrent\(scope: MailboxEffectScope \| null\): boolean/,
-      "function mailboxEffectScopeIsCurrent(scope)",
-    )
-    .replace(
-      /function mailboxEffectRequestIsCurrent\(\s*requestGeneration: number,\s*currentGeneration: number,\s*scope: MailboxEffectScope \| null,\s*\): boolean/,
-      "function mailboxEffectRequestIsCurrent(requestGeneration, currentGeneration, scope)",
-    )
-    .replace(/\(error as \{ mailbox_operation_revision\?: unknown \}\)/g, "error")
-    .replace(
-      /async function runMailAccountMutation<T extends \{ mailbox_operation_revision: number \}>\(\s*operation: \(\) => Promise<T>,\s*\): Promise<T>/,
-      "async function runMailAccountMutation(operation)",
-    );
+  const state = source.slice(source.indexOf("let mailboxOperationRevision = 0;"), source.indexOf("const inboxReload ="));
+  const names = ["observeMailboxOperationRevision", "scheduledCheckEventIsCurrent",
+    "observeMailboxOperationRevisionFromError", "currentMailboxEffectScope",
+    "mailboxEffectScopeIsCurrent", "mailboxEffectRequestIsCurrent", "runMailAccountMutation"];
+  const executable = stripTypeScriptTypes(state + names.map(name => {
+    const match = source.match(new RegExp("^(?:async )?function " + name + "(?:<[^\\n]+>)?\\([\\s\\S]*?^\\}", "m"));
+    assert.ok(match, name);
+    return match[0];
+  }).join("\n"));
   return Function(
     `let healthRequestGeneration = 0;
      let inboxRequestGeneration = 0;
@@ -75,7 +51,8 @@ function mailboxMutationHarness(): MailboxMutationHarness {
      const checkNow = { disabled: false };
      function inboxMutationInFlight() { return false; }
      function setInboxControlsBusy(_busy) {}
-     let mailboxOperationRevision = 0;${executable}
+     function wakeInboxReload() {}
+     ${executable}
      return {
        run: runMailAccountMutation,
        observe: observeMailboxOperationRevision,
@@ -504,7 +481,7 @@ test("accepted scheduled inbox and health effects are invalidated across overlap
 
 test("scheduled inbox and health consumers retain their effect scope through cleanup", () => {
   const inbox = source.match(
-    /async function loadInbox\(\s*append = false,\s*effectScope: MailboxEffectScope \| null = null,\s*\): Promise<boolean> \{([\s\S]*?)\n\}\n\nasync function refreshLoadedInboxSpan/,
+    /async function loadInboxPage\(\s*append = false,\s*effectScope: MailboxEffectScope \| null = null,\s*\): Promise<boolean> \{([\s\S]*?)\n\}\n\nasync function runInboxRefresh/,
   );
   assert.ok(inbox);
   assert.match(inbox[1], /mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)/);
