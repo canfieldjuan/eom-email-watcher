@@ -8,7 +8,7 @@ const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
 const names = ['observeMailboxOperationRevision', 'observeMailboxOperationRevisionFromError',
   'mailboxEffectScopeIsCurrent', 'mailboxEffectRequestIsCurrent', 'runMailAccountMutation',
   'selectInboxSender', 'queryFromInboxControls', 'commitInboxQueryFromControls', 'clearInboxPageForAccountChange', 'reconcileInboxAccountScope', 'inboxMutationInFlight',
-  'deleteInboxItem', 'clearInboxHistory', 'inboxReloadBlocked', 'wakeInboxReload', 'runInboxRefresh', 'loadInboxPage', 'loadInbox', 'refreshLoadedInboxSpan', 'renderHealth', 'startConfiguredDesktop', 'renderConfigAdmissionState'];
+  'deleteInboxItem', 'clearInboxHistory', 'inboxReloadBlocked', 'wakeInboxReload', 'runInboxRefresh', 'loadInboxPage', 'loadInbox', 'refreshLoadedInboxSpan', 'scheduleConnectQueueRefresh', 'renderHealth', 'startConfiguredDesktop', 'renderConfigAdmissionState'];
 const code = names.map(name => {
   const match = source.match(new RegExp('^(?:async )?function '+name+'(?:<[^\\n]+>)?\\([\\s\\S]*?^\\}', 'm'));
   assert.ok(match, name);
@@ -22,6 +22,7 @@ function harness() {
   const context = vm.createContext({
     inboxItems: [{message_id:'old-row'}], inboxNextCursor: 'page-two',
     activeInboxQuery: {provider:'imap',account_id:'old',sender:null,limit:25},
+    inboxItemsEpoch:0, connectQueueRefresh:null, connectQueueRefreshAgain:false,
     activeInboxAccountSelection: 'active', inboxQueryEpoch: 0, inboxRequestGeneration: 0,
     inboxPageState:'loaded', inboxPageStateGeneration:0, inboxCapabilityUnavailableCount:0,
     expandedInboxMessages:new Set(), inboxDeletionsInFlight:new Set(), inboxClearInFlight:false,
@@ -360,4 +361,47 @@ test('R1/R2: filter-only Apply replaces the blocked span and records pending',as
   hold.resolve({mailbox_operation_revision:2});await operation;await tick();
   assert.equal(calls.length,1);assert.equal(calls[0].keyword,'new filter');
   assert.equal(calls[0].cursor,null);assert.equal(c.inboxItems.length,25);
+});
+
+test('R2 review: active span survives a first-page request arriving during its transport',async()=>{
+  const {c,calls}=harness();c.inboxItems=Array(50).fill({message_id:'retained'});
+  const hold=deferred();const query=c.invoke;
+  c.invoke=async(operation,args)=>{
+    const result=await query(operation,args);
+    if(calls.length===1)await hold.promise;
+    return result;
+  };
+  const span=c.refreshLoadedInboxSpan();await tick();
+  assert.equal(calls.length,1);
+  assert.equal(await c.loadInbox(),false);
+  hold.resolve();await span;await tick();
+  assert.equal(calls.length,4,'both the active and queued refresh must restore the span');
+  assert.equal(c.inboxItems.length,50,'queued first request must not shrink the active span');
+});
+
+test('R3 review: blocked scope clear survives a later scoped request becoming stale',async()=>{
+  for(const independent of [false,true]) {
+    const {c,calls}=harness();c.inboxClearInFlight=true;
+    if(independent)c.selectInboxSender('new@example.test');
+    assert.equal(await c.loadInbox(false,{mutation_epoch:0,mailbox_operation_revision:1}),false);
+    c.mailboxOperationRevision=2;c.inboxClearInFlight=false;c.wakeInboxReload();await tick();
+    assert.equal(calls.length,independent?1:0,'independent obligation must not inherit the later effect scope');
+    if(independent){assert.equal(c.inboxPageState,'loaded');assert.equal(calls[0].sender,'new@example.test');}
+  }
+});
+
+test('R2 review: queue refresh after filter Apply never captures retained old-query count',async()=>{
+  const {c,calls}=harness();c.inboxItems=Array(50).fill({message_id:'old-query'});
+  const hold=deferred();const operation=c.runMailAccountMutation(()=>hold.promise);
+  c.inboxKeywordInput.value='new query';c.commitInboxQueryFromControls();
+  c.scheduleConnectQueueRefresh();await tick();assert.equal(calls.length,0);
+  hold.resolve({mailbox_operation_revision:2});await operation;await tick();
+  assert.equal(calls.length,1,'new query must not inherit the old-query span');
+  assert.equal(calls[0].keyword,'new query');assert.equal(calls[0].cursor,null);
+  assert.equal(c.inboxItems.length,25);
+  assert.equal(await c.loadInbox(true),true);
+  assert.equal(c.inboxItems.length,50);
+  c.scheduleConnectQueueRefresh();await tick();
+  assert.equal(calls.length,4,'a subsequent span must use newly committed current-query rows');
+  assert.equal(c.inboxItems.length,50);
 });

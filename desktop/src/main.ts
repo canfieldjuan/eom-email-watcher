@@ -1029,6 +1029,7 @@ let inboxPageStateGeneration = 0;
 let inboxSenderNavigationError: string | null = null;
 const expandedInboxMessages = new Set<string>();
 let inboxItems: InboxItem[] = [];
+let inboxItemsEpoch: number | null = null;
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
 let inboxProposalExpiryTimer: number | null = null;
@@ -2779,6 +2780,7 @@ async function loadInboxPage(
     attachmentCapabilityDiagnostics.clear();
     inboxCapabilityUnavailableCount = 0;
     inboxItems = page.items;
+    inboxItemsEpoch = inboxQueryEpoch;
     inboxPageState = "loaded";
   } else {
     const known = new Set(inboxItems.map((item) => item.message_id));
@@ -2843,7 +2845,11 @@ async function loadInbox(
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {
-  await inboxReload.request({ kind: "span", target: inboxItems.length });
+  // Retained rows may still belong to the previous filter while its replacement loads.
+  const intent: InboxRefreshIntent = inboxItemsEpoch === inboxQueryEpoch
+    ? { kind: "span", target: inboxItems.length }
+    : { kind: "first" };
+  await inboxReload.request(intent);
 }
 
 function scheduleConnectQueueRefresh(): void {
