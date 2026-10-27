@@ -2272,6 +2272,7 @@ class Watcher:
         reconcile_vendor_snapshot=None,
         sent_scope: str | None = None,
         polling_complete: bool = False,
+        mailbox_poll_state: str = "unknown",
     ) -> dict[str, int | bool | str]:
         if not dry_run and reconcile_allowed:
             from .reconcile import run
@@ -2310,6 +2311,7 @@ class Watcher:
             "fallback_notified": fallback,
             "purged": purged,
             "stale_cursor_recovered": recovered,
+            "mailbox_poll_state": "unknown" if dry_run else mailbox_poll_state,
         }
         if recovery_incomplete:
             result["incomplete"] = True
@@ -2560,7 +2562,7 @@ class Watcher:
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             )
-        sent_added, sent_complete = self._poll_sent_folder(
+        sent_added, sent_complete, sent_poll_state = self._poll_sent_folder(
             mailbox_identity_key=mailbox_identity_key,
             label_selectors=label_selectors,
             gated_allowed=gated_allowed,
@@ -2589,6 +2591,11 @@ class Watcher:
             reconcile_label_selectors=label_selectors,
                     reconcile_vendor_snapshot=vendor_snapshot,
             polling_complete=sent_complete and changes.drained and not recovery_incomplete,
+            mailbox_poll_state=(
+                "unknown" if recovered or recovery_incomplete or sent_poll_state == "unknown"
+                else "pending" if not changes.drained or sent_poll_state == "pending"
+                else "drained"
+            ),
             recovery_incomplete=recovery_incomplete,
             recovery_reason=recovery_reason,
         )
@@ -2888,7 +2895,7 @@ class Watcher:
         sent_scope: str | None,
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool, str]:
         """Poll the Sent folder this check's _settle_sent found available (D-scope).
 
         Gmail's one mailbox-wide cursor already carries SENT events, so only the other
@@ -2896,9 +2903,11 @@ class Watcher:
         previews the Inbox: it reads, and moves no cursor.
         """
         if SENT_LOCATION not in folders or self.mailbox.provider == "gmail":
-            return 0, True
+            return 0, True, "drained"
         if sent_scope != SENT_SCOPE_AVAILABLE:
-            return 0, sent_scope == SENT_SCOPE_UNAVAILABLE
+            if sent_scope == SENT_SCOPE_UNAVAILABLE:
+                return 0, True, "drained"
+            return 0, False, "unknown"
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
         folder_scope = {
@@ -2911,12 +2920,14 @@ class Watcher:
         if state is None:
             # No position yet: a dry run records none, and _settle_sent retries one
             # it could not read on the next check.
-            return 0, False
+            return 0, False, "unknown"
         # A Sent folder error never stops the Inbox check; the next check retries.
+        recovered = False
         try:
             try:
                 changes = self.gateway.sent_changes_since(state[0])
             except StaleMailboxCursor as exc:
+                recovered = True
                 # Like the Inbox: recover the interval since the last success first.
                 logger.warning("Sent folder cursor expired (%s); recovering the gap", exc)
                 if not dry_run:
@@ -2941,7 +2952,8 @@ class Watcher:
             )
             if not dry_run:
                 self.store.set_folder_state(changes.cursor, at=checked_at, **folder_scope)
-            return added, changes.drained
+            poll_state = "unknown" if recovered else "drained" if changes.drained else "pending"
+            return added, changes.drained, poll_state
         except MailboxError as exc:
             logger.warning("Sent folder poll failed; the Inbox check is unaffected: %s", exc)
             self._record_sent_poll_outcome(
@@ -2950,7 +2962,7 @@ class Watcher:
                 dry_run=dry_run,
                 checked_at=checked_at,
             )
-            return 0, False
+            return 0, False, "unknown"
 
     def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender

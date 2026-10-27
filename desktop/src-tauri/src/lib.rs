@@ -328,7 +328,7 @@ impl ConfigInitializationIntent {
             && settings.local_model.model == self.model_name.trim()
             && settings.local_model.editable
             && settings.notifications_enabled
-            && settings.poll_interval_minutes == 120
+            && settings.poll_interval_minutes == 5
             && settings.retention_days == 180
             && desktop_initialization_receipt == Some(self.desktop_initialization_receipt.as_str());
         if matches {
@@ -1530,7 +1530,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         Ok(())
     }
 
-    fn polling_status(&self) -> Result<PollingStatus, EngineError> {
+    fn polling_scheduler(&self) -> Result<PollScheduler, EngineError> {
         let inner = self.inner.lock().map_err(|_| {
             EngineError::host("host_error", "Configuration admission coordinator stopped")
         })?;
@@ -1540,7 +1540,10 @@ impl AdmissionCoordinator<AdmissionWorkers> {
                 "Watcher configuration is not admitted",
             )
         })?;
-        Ok(workers.scheduler.status())
+        Ok(workers.scheduler.clone())
+    }
+    fn polling_status(&self) -> Result<PollingStatus, EngineError> {
+        Ok(self.polling_scheduler()?.status())
     }
 }
 
@@ -2388,10 +2391,12 @@ async fn watcher_check(
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<DesktopCheckResult, EngineError> {
     let _admission_permit = admission.require_admitted()?;
+    let scheduler = admission.polling_scheduler()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let outcome = delivery.check_and_deliver(&engine)?;
+        scheduler.observe_manual_check(&outcome.check, outcome.delivery.failed);
         Ok(DesktopCheckResult {
             check: outcome.check,
             delivered_notifications: outcome.delivery.delivered,
@@ -3006,7 +3011,7 @@ esac"#,
                 model: model.into(),
             },
             notifications_enabled: true,
-            poll_interval_minutes: 120,
+            poll_interval_minutes: 5,
             polling_supported: true,
             retention_days: 180,
             timezone: timezone.into(),

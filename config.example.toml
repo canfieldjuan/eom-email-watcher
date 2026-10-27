@@ -1,7 +1,7 @@
 timezone = "America/Chicago"
 body_char_limit = 20000
 retention_days = 180
-poll_interval_minutes = 120
+poll_interval_minutes = 5
 # Database and credential/token paths default to Email Watcher's runtime state
 # directory: $STATE_DIRECTORY for systemd, otherwise
 # $XDG_STATE_HOME/eom-email-watcher, otherwise ~/.local/state/eom-email-watcher.

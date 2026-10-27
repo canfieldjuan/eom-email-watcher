@@ -236,6 +236,12 @@ address that is not watched returns `not_found`, and malformed payload values re
 pending-notification counting continue so removing the final sender cannot strand prior state.
 Adding the first sender activates later Gmail checks.
 
+Active check results may include `mailbox_poll_state`: `pending`, `drained` or `unknown`.
+It is a provider observation, not a backlog count. Missing or unrecognized values are unknown.
+Preview and recovery cannot request faster scheduling. The service owns aggregation and the
+scheduler owns deadlines, including manual results; see [C1–C5](../plans/PR-Poll-Backlog-145.md#accepted-behavior-acceptance-clauses)
+for the canonical backlog, error, notification and compatibility rules.
+
 Vendor operations implement [D-vendor](THREAD_VIEW_CONTRACT.md#d-vendor-vendors-and-vendor_ofaddress)
 and [D-ops](THREAD_VIEW_CONTRACT.md#d-ops-operation-classes-and-gating) of the thread-view
 contract, which owns their rules: operation classes, the watchlist link, removal effects, and the

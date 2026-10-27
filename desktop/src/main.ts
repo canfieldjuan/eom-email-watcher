@@ -1,3 +1,4 @@
+import { mailboxPendingMessage } from "./mailboxProgress";
 import { confirmAction } from "./confirmation";
 import { calendarOutcomeNotice, latestCalendarOutcome, type CalendarWriteOutcome } from "./calendarOutcome";
 import { inboxAdmissionLabel, type InboxAdmissionKind } from "./inboxAdmission";
@@ -443,6 +444,7 @@ interface GmailRecoveryStatus {
 }
 
 interface CheckResult extends GmailRecoveryStatus {
+  mailbox_poll_state?: string;
   active: boolean;
   reason?: string;
   discovered: number;
@@ -457,6 +459,7 @@ interface CheckResult extends GmailRecoveryStatus {
 }
 
 interface ScheduledCheckEvent extends GmailRecoveryStatus {
+  mailbox_poll_state?: string;
   mailbox_operation_revision?: number;
   status: "complete" | "delivery_failed" | "check_failed" | "recovery_pending" | "inactive";
   failed_notifications: number;
@@ -4227,7 +4230,10 @@ function checkResultMessage(result: CheckResult): string {
   if (!result.active) {
     return `Add a watched sender or Gmail label before running a check.${deliveryMessage}${failureMessage}${queueMessage}`;
   }
-  const summary = `Check complete: ${result.discovered} found, ${result.summarized} analyzed.`;
+  const progress = mailboxPendingMessage(result.mailbox_poll_state);
+  const summary = progress !== null
+    ? `${progress} ${result.discovered} found, ${result.summarized} analyzed.`
+    : `Check complete: ${result.discovered} found, ${result.summarized} analyzed.`;
   return `${summary}${deliveryMessage}${failureMessage}${queueMessage}`;
 }
 
@@ -5068,11 +5074,11 @@ void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
     } else if (inactiveMessage !== null) {
       void loadHealth(`Automatic check paused: ${inactiveMessage}`, "error", effectScope);
     } else if (event.payload.status === "complete") {
-      void loadHealth("Automatic check complete.", "success", effectScope);
+      void loadHealth(mailboxPendingMessage(event.payload.mailbox_poll_state) ?? "Automatic check complete.", "success", effectScope);
     } else if (event.payload.status === "delivery_failed") {
       const count = event.payload.failed_notifications;
       void loadHealth(
-        `Automatic check complete, but ${count} notification${count === 1 ? "" : "s"} remain queued.`,
+        `${mailboxPendingMessage(event.payload.mailbox_poll_state) ?? "Automatic check complete, but"} ${count} notification${count === 1 ? "" : "s"} remain queued.`,
         "error",
         effectScope,
       );

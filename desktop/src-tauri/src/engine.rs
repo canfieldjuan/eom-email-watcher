@@ -1505,6 +1505,8 @@ pub struct NotificationHealth {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CheckResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_poll_state: Option<String>,
     pub active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -6724,7 +6726,7 @@ with open(sys.argv[1],'a') as output: output.write(json.dumps(payload)+'\n')
                         model: "local-model".into(),
                     },
                     notifications_enabled: true,
-                    poll_interval_minutes: 120,
+                    poll_interval_minutes: 5,
                     polling_supported: true,
                     retention_days: 180,
                     timezone: "UTC".into(),
@@ -7002,7 +7004,7 @@ timezone = "UTC"
                     model: "local-model".into(),
                 },
                 notifications_enabled: true,
-                poll_interval_minutes: 120,
+                poll_interval_minutes: 5,
                 polling_supported: true,
                 retention_days: 180,
                 timezone: "UTC".into(),
@@ -7068,6 +7070,7 @@ timezone = "UTC"
         assert_eq!(
             engine.check().expect("inactive check without Gmail"),
             CheckResult {
+                mailbox_poll_state: None,
                 active: false,
                 reason: None,
                 discovered: 0,

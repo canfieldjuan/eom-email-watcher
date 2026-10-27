@@ -31,7 +31,7 @@ from . import private_storage
 from .text import utf8_size, within_utf8_bytes
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
-DEFAULT_POLL_INTERVAL_MINUTES = 120
+DEFAULT_POLL_INTERVAL_MINUTES = 5
 DEFAULT_RETENTION_DAYS = 180
 MIN_RETENTION_DAYS = 1
 MAX_RETENTION_DAYS = 3650

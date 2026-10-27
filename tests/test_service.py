@@ -6868,3 +6868,107 @@ def test_selected_calendar_cancellation_review_matches_persisted_cause(
     assert (store.automation_run(authorized.run_id).review_notified_at is None) == bool(
         expected_reviews
     )
+
+
+@pytest.mark.parametrize("total", [200, 201, 401])
+def test_mailbox_poll_state_real_gmail_bounded_batches(tmp_path, monkeypatch, total):
+    """C1/C4: preserve the contract's real paging/service/store reproduction."""
+    from test_gmail import FakeHistoryService, history_response
+
+    from eom_email_watcher.gmail import GmailGateway
+
+    class Boundary(FakeGmail):
+        def __init__(self):
+            super().__init__()
+            self.real = GmailGateway(FakeHistoryService(history_response(total)))
+            self.batches = []
+
+        def changes_since(self, cursor):
+            changes = self.real.changes_since(cursor)
+            self.batches.append(changes)
+            return changes
+
+        def metadata(self, mid, **kwargs):
+            return replace(
+                super().metadata(mid), received_at=datetime.now(UTC).isoformat(),
+                sender=(
+                    "trusted@example.com" if mid == f"message-{total - 1}"
+                    else "stranger@example.com"
+                ),
+            )
+
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("12345", datetime.now(UTC))
+    gateway = Boundary()
+    results = []
+    for _ in range((total + 199) // 200):
+        # A fresh owner resumes the durable cursor between checks.
+        results.append(Watcher(cfg, store, gateway, FakeModel()).check(
+            deliver_notifications=False, _gated_allowed=False,
+        ))
+    assert [r.get("mailbox_poll_state") for r in results] == [
+        "pending" for _ in results[:-1]
+    ] + ["drained"]
+    assert sum(r["discovered"] for r in results) == 1
+    assert sum(len(c.message_ids) for c in gateway.batches) == total
+    assert len(gateway.batches) == len(results)
+
+
+@pytest.mark.parametrize("sent_error", [False, True])
+def test_mailbox_poll_state_sent_error_dominates_pending(tmp_path, monkeypatch, sent_error):
+    """C1/C5: a Sent error must never look like successful backlog."""
+    cfg, store, account_id, credential, identity, cursor = _imap_sent_scaffold(tmp_path)
+    gateway = SentPollingGateway(credential, identity, cursor, fail_sent=sent_error)
+    _active_entitlement(monkeypatch)
+    gateway.changes_since = lambda _: MailboxChanges((), cursor, drained=False)
+    result = Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()).check()
+    assert result.get("mailbox_poll_state") == ("unknown" if sent_error else "pending")
+    assert gateway.sent_calls.count(("changes", gateway.sent_cursor)) == 1
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("ids", [(), ("blocked", "blocked")])
+def test_mailbox_poll_state_uses_provider_not_counts(tmp_path, dry_run, ids):
+    """C1: empty/duplicate batches can still have a provider continuation."""
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    store.reconcile_mailbox_identity(
+        "gmail", "gmail-default", TEST_MAILBOX_IDENTITY_KEY, preserve_cursor=True,
+    )
+    gateway = FakeGmail()
+    gateway.changes_since = lambda _: MailboxChanges(ids, "200", drained=False)
+    before = store.state()
+    result = Watcher(cfg, store, gateway, FakeModel()).check(dry_run=dry_run)
+    assert result["mailbox_poll_state"] == ("unknown" if dry_run else "pending")
+    if dry_run:
+        assert store.state() == before
+
+
+def test_mailbox_poll_state_failed_capture_preserves_cursor_and_retry(tmp_path):
+    """C5: fail at the capture boundary, then resume the same bounded batch."""
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    gateway = FakeGmail()
+    gateway.changes_since = lambda _: MailboxChanges(("allowed",), "200", drained=False)
+    metadata = gateway.metadata
+
+    def fail(mid, **kwargs):
+        raise MailboxError("synthetic capture failure")
+
+    gateway.metadata = fail
+    before = store.state()
+    with pytest.raises(MailboxError, match="synthetic capture failure"):
+        Watcher(cfg, store, gateway, FakeModel()).check()
+    assert store.state() == before
+    gateway.metadata = metadata
+    result = Watcher(cfg, store, gateway, FakeModel()).check()
+    assert result["mailbox_poll_state"] == "pending"
+    assert result["discovered"] == 1
+    again = Watcher(cfg, store, gateway, FakeModel()).check()
+    assert again["discovered"] == 0

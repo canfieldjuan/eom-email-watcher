@@ -1,3 +1,4 @@
+import { mailboxPendingMessage } from "../src/mailboxProgress.ts";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { webcrypto } from "node:crypto";
@@ -783,10 +784,11 @@ test("check status keeps Gmail recovery visible until catch-up finishes", () => 
   );
   assert.ok(functionSource);
   const checkResultMessage = Function(
+    "mailboxPendingMessage",
     `function recoveryStatusMessage(result, progress) {${recoveryFunctionSource[1]}\n}
      function inactiveCheckMessage(reason) {${inactiveFunctionSource[1]}\n}
      return function checkResultMessage(result) {${functionSource[1]}\n}`,
-  )() as (result: Record<string, unknown>) => string;
+  )(mailboxPendingMessage) as (result: Record<string, unknown>) => string;
   const baseline = {
     active: true,
     discovered: 2,
@@ -800,6 +802,11 @@ test("check status keeps Gmail recovery visible until catch-up finishes", () => 
     remaining_notifications: 0,
   };
 
+  assert.match(checkResultMessage({ ...baseline, mailbox_poll_state: "pending", failed_notifications: 1 }), /more mailbox changes remain/);
+  assert.match(checkResultMessage({ ...baseline, mailbox_poll_state: "pending", failed_notifications: 1 }), /1 delivery attempt failed\./);
+  for (const mailbox_poll_state of [undefined, "unknown", "drained", "invalid"]) {
+    assert.doesNotMatch(checkResultMessage({ ...baseline, mailbox_poll_state }), /more mailbox changes remain|caught up/);
+  }
   const collecting = checkResultMessage({
     ...baseline,
     recovery_pending: true,
@@ -1284,4 +1291,33 @@ test("label-only polling claim requires active selector, zero senders, and runni
     assert.match(state.message, reason);
     assert.doesNotMatch(state.message, /Label-only automatic polling is active/);
   }
+});
+
+
+test("scheduled backlog messages preserve delivery errors and stale-event exclusion", () => {
+  const match = source.match(/void listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*?)\n\}\);/);
+  assert.ok(match);
+  const run = Function("event", "configurationReady", "scheduledCheckEventIsCurrent",
+    "currentMailboxEffectScope", "loadInbox", "healthView", "recoveryStatusMessage",
+    "inactiveCheckMessage", "loadHealth", "mailboxPendingMessage", "scheduledCheckFailureMessage",
+    match[1]);
+  const messages: string[] = [];
+  const invoke = (payload: Record<string, unknown>, current = true) => run(
+    { payload }, true, () => current, () => ({}), () => {}, { hidden: false },
+    () => payload.recovery_pending ? "Recovery pending" : null,
+    () => "Inactive", (message: string) => messages.push(message), mailboxPendingMessage,
+    () => "Provider failed",
+  );
+  invoke({ status: "complete", mailbox_poll_state: "pending" });
+  assert.equal(messages.pop(), mailboxPendingMessage("pending"));
+  invoke({ status: "delivery_failed", mailbox_poll_state: "pending", failed_notifications: 2 });
+  assert.match(messages.pop()!, /more mailbox changes remain.*2 notifications remain queued/);
+  for (const state of [undefined, "unknown", "drained", "invalid"]) {
+    invoke({ status: "complete", mailbox_poll_state: state });
+    assert.doesNotMatch(messages.pop()!, /more mailbox changes remain|caught up/);
+  }
+  invoke({ status: "check_failed", mailbox_poll_state: "pending" });
+  assert.equal(messages.pop(), "Provider failed");
+  invoke({ status: "complete", mailbox_poll_state: "pending" }, false);
+  assert.equal(messages.length, 0);
 });

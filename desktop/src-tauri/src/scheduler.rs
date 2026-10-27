@@ -34,6 +34,8 @@ struct ScheduledCheckEvent {
     status: ScheduledCheckStatus,
     failed_notifications: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    mailbox_poll_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_pending: Option<bool>,
@@ -133,21 +135,6 @@ impl WorkerGate {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         state.activated && !state.stopped && !self.cancellation.is_cancelled()
-    }
-
-    fn wait_for(&self, duration: Duration) -> bool {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped || self.cancellation.is_cancelled() {
-            return false;
-        }
-        let (state, _) = self
-            .changed
-            .wait_timeout(state, duration)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !state.stopped && !self.cancellation.is_cancelled()
     }
 }
 
@@ -422,6 +409,10 @@ impl ScheduledCheckEvent {
                 ScheduledCheckStatus::DeliveryFailed
             },
             failed_notifications,
+            mailbox_poll_state: check
+                .active
+                .then(|| check.mailbox_poll_state.clone())
+                .flatten(),
             reason: check.reason.clone(),
             recovery_pending: recovery_pending.then_some(true),
             recovery_state: recovery_pending
@@ -443,6 +434,7 @@ impl ScheduledCheckEvent {
             mailbox_operation_revision: error.mailbox_operation_revision,
             status: ScheduledCheckStatus::CheckFailed,
             failed_notifications: 0,
+            mailbox_poll_state: None,
             reason: None,
             recovery_pending: None,
             recovery_state: None,
@@ -466,8 +458,32 @@ pub struct PollScheduler {
     enabled: bool,
     interval_minutes: u64,
     next_check_unix_ms: Arc<AtomicU64>,
+    manual_progress: Arc<Mutex<ManualProgress>>,
     gate: Arc<WorkerGate>,
     worker: OwnedWorker,
+}
+
+// This owner serializes manual observations with scheduled completion. A manual
+// deadline recorded after a scheduled check started cannot be overwritten by it.
+#[derive(Default)]
+struct ManualProgress {
+    revision: u64,
+    deadline: Option<u64>,
+}
+
+fn pending_poll(event: &ScheduledCheckEvent) -> bool {
+    matches!(
+        event.status,
+        ScheduledCheckStatus::Complete | ScheduledCheckStatus::DeliveryFailed
+    ) && event.mailbox_poll_state.as_deref() == Some("pending")
+}
+
+fn poll_delay(interval: u64, event: &ScheduledCheckEvent) -> u64 {
+    if pending_poll(event) {
+        interval.min(5)
+    } else {
+        interval
+    }
 }
 
 fn next_check_unix_ms(now: SystemTime, interval_minutes: u64) -> u64 {
@@ -487,20 +503,24 @@ fn sleep_slice(deadline_unix_ms: u64, now_unix_ms: u64) -> Option<Duration> {
     Some(Duration::from_millis(remaining_ms).min(MAX_SLEEP_SLICE))
 }
 
-fn wait_until(gate: &WorkerGate, deadline_unix_ms: u64) -> bool {
+fn wait_until(gate: &WorkerGate, deadline: &AtomicU64) -> bool {
+    // The same gate lock covers the deadline read and wait registration; the
+    // notifier takes it after updating the deadline, so wakeups cannot be lost.
+    let mut state = gate
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
-        let now_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        let Some(duration) = sleep_slice(deadline_unix_ms, now_unix_ms) else {
-            return !gate.is_stopped();
-        };
-        if !gate.wait_for(duration) {
+        if state.stopped || gate.cancellation.is_cancelled() {
             return false;
         }
+        let Some(duration) = sleep_slice(deadline.load(Ordering::Relaxed), unix_ms_now()) else {
+            return true;
+        };
+        (state, _) = gate
+            .changed
+            .wait_timeout(state, duration)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -518,6 +538,7 @@ impl PollScheduler {
         Self {
             enabled,
             interval_minutes,
+            manual_progress: Arc::new(Mutex::new(ManualProgress::default())),
             next_check_unix_ms: Arc::new(AtomicU64::new(if enabled {
                 next_check_unix_ms(SystemTime::now(), interval_minutes)
             } else {
@@ -535,6 +556,61 @@ impl PollScheduler {
             interval_minutes: self.interval_minutes,
             next_check_unix_ms: (next_check_unix_ms != 0).then_some(next_check_unix_ms),
         }
+    }
+
+    fn check_started(&self) -> u64 {
+        let mut progress = self
+            .manual_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.deadline = None;
+        progress.revision
+    }
+
+    fn check_finished(&self, started: u64, event: &ScheduledCheckEvent, now: SystemTime) {
+        let progress = self
+            .manual_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut deadline = next_check_unix_ms(now, poll_delay(self.interval_minutes, event));
+        if progress.revision != started
+            && let Some(manual) = progress.deadline
+        {
+            deadline = deadline.min(manual);
+        }
+        self.next_check_unix_ms.store(deadline, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_manual_check(&self, check: &CheckResult, failed: u64) {
+        self.observe_manual_at(check, failed, SystemTime::now());
+    }
+
+    fn observe_manual_at(&self, check: &CheckResult, failed: u64, now: SystemTime) {
+        let event = ScheduledCheckEvent::from_check(check, failed, 0);
+        if !self.enabled || !check.active || self.gate.is_stopped() || !pending_poll(&event) {
+            return;
+        }
+        let deadline = next_check_unix_ms(now, poll_delay(self.interval_minutes, &event));
+        {
+            let mut progress = self
+                .manual_progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            progress.revision = progress.revision.wrapping_add(1);
+            progress.deadline = Some(
+                progress
+                    .deadline
+                    .map_or(deadline, |earlier| earlier.min(deadline)),
+            );
+            self.next_check_unix_ms
+                .fetch_min(deadline, Ordering::Relaxed);
+        }
+        let _state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.gate.changed.notify_all();
     }
 
     pub fn stage(
@@ -556,10 +632,8 @@ impl PollScheduler {
             if !scheduler.gate.wait_for_activation() {
                 return;
             }
-            while wait_until(
-                &scheduler.gate,
-                scheduler.next_check_unix_ms.load(Ordering::Relaxed),
-            ) {
+            while wait_until(&scheduler.gate, &scheduler.next_check_unix_ms) {
+                let started = scheduler.check_started();
                 let event = match delivery.check_and_deliver_with_cancellation(
                     &engine,
                     SCHEDULED_ENGINE_TIMEOUT,
@@ -587,10 +661,7 @@ impl PollScheduler {
                     }
                 };
                 connect_queue.wake();
-                scheduler.next_check_unix_ms.store(
-                    next_check_unix_ms(SystemTime::now(), scheduler.interval_minutes),
-                    Ordering::Relaxed,
-                );
+                scheduler.check_finished(started, &event, SystemTime::now());
                 if app.emit(SCHEDULED_CHECK_EVENT, event).is_err() {
                     eprintln!("scheduled watcher check could not refresh the desktop window");
                 }
@@ -714,6 +785,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
         recovery_next_retry_at: Option<&str>,
     ) -> CheckResult {
         CheckResult {
+            mailbox_poll_state: None,
             active: true,
             reason: None,
             discovered: 2,
@@ -729,6 +801,158 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
             recovery_failure_code: recovery_failure_code.map(str::to_owned),
             recovery_next_retry_at: recovery_next_retry_at.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn pending_poll_observation_survives_delivery_failure() {
+        let mut value = serde_json::to_value(check_result_with_recovery(None, None, None)).unwrap();
+        value["mailbox_poll_state"] = serde_json::json!("pending");
+        let check: CheckResult = serde_json::from_value(value).unwrap();
+        let event = ScheduledCheckEvent::from_check(&check, 1, 7);
+        assert_eq!(event.status, ScheduledCheckStatus::DeliveryFailed);
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["mailbox_poll_state"],
+            "pending"
+        );
+    }
+
+    fn pending_check() -> CheckResult {
+        let mut check = check_result_with_recovery(None, None, None);
+        check.mailbox_poll_state = Some("pending".into());
+        check
+    }
+
+    #[test]
+    fn backlog_delay_boundaries_and_failure_twins() {
+        let now = UNIX_EPOCH + Duration::from_secs(1000);
+        for interval in [1, 5, 120, 1440] {
+            let scheduler = PollScheduler::new(interval, true);
+            for failed in [0, 1] {
+                let event = ScheduledCheckEvent::from_check(&pending_check(), failed, 0);
+                let started = scheduler.check_started();
+                scheduler.check_finished(started, &event, now);
+                assert_eq!(
+                    scheduler.status().next_check_unix_ms,
+                    Some(next_check_unix_ms(now, interval.min(5)))
+                );
+            }
+            for state in [None, Some("unknown"), Some("drained"), Some("invalid")] {
+                let mut check = pending_check();
+                check.mailbox_poll_state = state.map(str::to_owned);
+                let event = ScheduledCheckEvent::from_check(&check, 0, 0);
+                scheduler.check_finished(scheduler.check_started(), &event, now);
+                assert_eq!(
+                    scheduler.status().next_check_unix_ms,
+                    Some(next_check_unix_ms(now, interval))
+                );
+            }
+            let mut check = pending_check();
+            check.active = false;
+            for event in [
+                ScheduledCheckEvent::from_check(&check, 0, 0),
+                ScheduledCheckEvent::check_failed(&EngineError::host("test", "test")),
+                ScheduledCheckEvent::from_check(
+                    &check_result_with_recovery(Some("collecting"), None, None),
+                    0,
+                    0,
+                ),
+            ] {
+                scheduler.check_finished(scheduler.check_started(), &event, now);
+                assert_eq!(
+                    scheduler.status().next_check_unix_ms,
+                    Some(next_check_unix_ms(now, interval))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manual_pending_only_pulls_earlier_and_does_not_enable_or_revive() {
+        let now = UNIX_EPOCH + Duration::from_secs(1000);
+        let scheduler = PollScheduler::new(120, true);
+        scheduler
+            .next_check_unix_ms
+            .store(next_check_unix_ms(now, 120), Ordering::Relaxed);
+        scheduler.observe_manual_at(&pending_check(), 1, now);
+        assert_eq!(
+            scheduler.status().next_check_unix_ms,
+            Some(next_check_unix_ms(now, 5))
+        );
+        scheduler
+            .next_check_unix_ms
+            .store(next_check_unix_ms(now, 1), Ordering::Relaxed);
+        scheduler.observe_manual_at(&pending_check(), 0, now);
+        assert_eq!(
+            scheduler.status().next_check_unix_ms,
+            Some(next_check_unix_ms(now, 1))
+        );
+        for state in [None, Some("unknown"), Some("drained"), Some("invalid")] {
+            let mut check = pending_check();
+            check.mailbox_poll_state = state.map(str::to_owned);
+            scheduler.observe_manual_at(&check, 0, UNIX_EPOCH);
+            assert_eq!(
+                scheduler.status().next_check_unix_ms,
+                Some(next_check_unix_ms(now, 1))
+            );
+        }
+        scheduler.signal_stop();
+        scheduler.observe_manual_at(&pending_check(), 0, UNIX_EPOCH);
+        assert_eq!(
+            scheduler.status().next_check_unix_ms,
+            Some(next_check_unix_ms(now, 1))
+        );
+        let disabled = PollScheduler::new(120, false);
+        disabled.observe_manual_at(&pending_check(), 0, now);
+        assert_eq!(disabled.status().next_check_unix_ms, None);
+    }
+
+    #[test]
+    fn scheduled_completion_preserves_racing_manual_deadline_in_both_orders() {
+        let now = UNIX_EPOCH + Duration::from_secs(1000);
+        let event =
+            ScheduledCheckEvent::from_check(&check_result_with_recovery(None, None, None), 0, 0);
+        for manual_first in [true, false] {
+            let scheduler = PollScheduler::new(120, true);
+            // Simulate the expired staged deadline while a scheduled check is in flight.
+            scheduler.next_check_unix_ms.store(1, Ordering::Relaxed);
+            let started = scheduler.check_started();
+            if manual_first {
+                scheduler.observe_manual_at(&pending_check(), 0, now);
+                scheduler.observe_manual_at(&pending_check(), 0, now + Duration::from_secs(1));
+                scheduler.check_finished(started, &event, now + Duration::from_secs(2));
+            } else {
+                scheduler.check_finished(started, &event, now);
+                scheduler.observe_manual_at(&pending_check(), 0, now);
+            }
+            assert_eq!(
+                scheduler.status().next_check_unix_ms,
+                Some(next_check_unix_ms(now, 5))
+            );
+            // The next completed check may report drained and return to idle cadence.
+            scheduler.check_finished(scheduler.check_started(), &event, now);
+            assert_eq!(
+                scheduler.status().next_check_unix_ms,
+                Some(next_check_unix_ms(now, 120))
+            );
+        }
+    }
+
+    #[test]
+    fn sleeping_worker_observes_manual_deadline_and_stop() {
+        let scheduler = PollScheduler::new(120, true);
+        let worker = scheduler.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            tx.send(wait_until(&worker.gate, &worker.next_check_unix_ms))
+                .unwrap()
+        });
+        // A deterministic past completion creates an already-due catch-up deadline.
+        // This covers notification before or after the waiter registers.
+        scheduler.observe_manual_at(&pending_check(), 0, UNIX_EPOCH);
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        handle.join().unwrap();
+        scheduler.signal_stop();
+        assert!(!wait_until(&scheduler.gate, &scheduler.next_check_unix_ms));
     }
 
     #[test]
@@ -770,6 +994,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
                 mailbox_operation_revision: Some(7),
                 status: ScheduledCheckStatus::DeliveryFailed,
                 failed_notifications: 2,
+                mailbox_poll_state: None,
                 reason: None,
                 recovery_pending: None,
                 recovery_state: None,
@@ -785,6 +1010,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
                 mailbox_operation_revision: Some(7),
                 status: ScheduledCheckStatus::Complete,
                 failed_notifications: 0,
+                mailbox_poll_state: None,
                 reason: None,
                 recovery_pending: None,
                 recovery_state: None,
