@@ -2384,6 +2384,22 @@ async fn settings_update(
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
+// One owner for manual completion: successful mailbox progress survives delivery
+// failures, while an engine failure returns before any scheduler observation.
+fn run_manual_check(
+    scheduler: &PollScheduler,
+    check_and_deliver: impl FnOnce() -> Result<delivery::CoordinatedCheck, EngineError>,
+) -> Result<DesktopCheckResult, EngineError> {
+    let outcome = check_and_deliver()?;
+    scheduler.observe_manual_check(&outcome.check, outcome.delivery.failed);
+    Ok(DesktopCheckResult {
+        check: outcome.check,
+        delivered_notifications: outcome.delivery.delivered,
+        failed_notifications: outcome.delivery.failed,
+        remaining_notifications: outcome.delivery.remaining,
+    })
+}
+
 #[tauri::command]
 async fn watcher_check(
     engine: State<'_, Engine>,
@@ -2395,14 +2411,7 @@ async fn watcher_check(
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let outcome = delivery.check_and_deliver(&engine)?;
-        scheduler.observe_manual_check(&outcome.check, outcome.delivery.failed);
-        Ok(DesktopCheckResult {
-            check: outcome.check,
-            delivered_notifications: outcome.delivery.delivered,
-            failed_notifications: outcome.delivery.failed,
-            remaining_notifications: outcome.delivery.remaining,
-        })
+        run_manual_check(&scheduler, || delivery.check_and_deliver(&engine))
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"));
@@ -2732,6 +2741,76 @@ mod tests {
     use std::thread;
     #[cfg(unix)]
     use std::time::Instant;
+
+    #[test]
+    fn manual_check_completion_forwards_progress_and_preserves_delivery_counts() {
+        use std::cell::Cell;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        for state in [None, Some("pending"), Some("unknown"), Some("drained")] {
+            for failed in [0, 1] {
+                let scheduler = PollScheduler::new(120, true);
+                let staged = scheduler.status().next_check_unix_ms;
+                let calls = Cell::new(0);
+                let check: CheckResult = serde_json::from_value(serde_json::json!({
+                    "active": true, "discovered": 2, "summarized": 1,
+                    "fallback_notified": 0, "purged": 0,
+                    "stale_cursor_recovered": false, "pending_notifications": 3,
+                    "automation_processed": 0, "automation_review_required": 0,
+                    "mailbox_poll_state": state
+                }))
+                .unwrap();
+                let expected_check = serde_json::to_value(&check).unwrap();
+                let before = now_ms();
+                let result = run_manual_check(&scheduler, || {
+                    calls.set(calls.get() + 1);
+                    Ok(delivery::CoordinatedCheck {
+                        check,
+                        delivery: delivery::DeliveryOutcome {
+                            delivered: 2,
+                            failed,
+                            remaining: 3,
+                        },
+                        mailbox_operation_revision: 7,
+                    })
+                })
+                .unwrap();
+                let after = now_ms();
+                assert_eq!(calls.get(), 1);
+                assert_eq!(serde_json::to_value(&result.check).unwrap(), expected_check);
+                assert_eq!(result.delivered_notifications, 2);
+                assert_eq!(result.failed_notifications, failed);
+                assert_eq!(result.remaining_notifications, 3);
+                let deadline = scheduler.status().next_check_unix_ms.unwrap();
+                if state == Some("pending") {
+                    assert!((before + 300_000..=after + 300_000).contains(&deadline));
+                    assert!(Some(deadline) < staged);
+                } else {
+                    assert_eq!(Some(deadline), staged);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_check_completion_error_preserves_deadline_and_error() {
+        let scheduler = PollScheduler::new(120, true);
+        let staged = scheduler.status().next_check_unix_ms;
+        let error = run_manual_check(&scheduler, || {
+            Err(EngineError::host("poll_failed", "Mailbox check failed"))
+        })
+        .err()
+        .expect("engine failure must propagate");
+        assert_eq!(error.code, "poll_failed");
+        assert_eq!(error.message, "Mailbox check failed");
+        assert_eq!(scheduler.status().next_check_unix_ms, staged);
+    }
 
     #[cfg(unix)]
     fn wait_for_process_id(path: &Path) -> i32 {

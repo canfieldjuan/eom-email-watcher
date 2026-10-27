@@ -65,6 +65,8 @@ pub struct ConnectQueueScheduler {
 
 #[derive(Default)]
 struct WorkerGateState {
+    #[cfg(test)]
+    wait_registered: Option<Sender<()>>,
     activated: bool,
     stopped: bool,
 }
@@ -517,6 +519,12 @@ fn wait_until(gate: &WorkerGate, deadline: &AtomicU64) -> bool {
         let Some(duration) = sleep_slice(deadline.load(Ordering::Relaxed), unix_ms_now()) else {
             return true;
         };
+        #[cfg(test)]
+        if let Some(registered) = state.wait_registered.take() {
+            // Sent under the gate lock: the observer cannot notify until this
+            // waiter atomically releases that lock in wait_timeout below.
+            let _ = registered.send(());
+        }
         (state, _) = gate
             .changed
             .wait_timeout(state, duration)
@@ -889,12 +897,24 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
         for state in [None, Some("unknown"), Some("drained"), Some("invalid")] {
             let mut check = pending_check();
             check.mailbox_poll_state = state.map(str::to_owned);
+            // Both the idle and accelerated mutant deadlines would be earlier.
+            // A rejected observation must leave this later staged deadline alone.
+            let staged = next_check_unix_ms(now, 1440);
+            scheduler
+                .next_check_unix_ms
+                .store(staged, Ordering::Relaxed);
             scheduler.observe_manual_at(&check, 0, UNIX_EPOCH);
+            assert_eq!(scheduler.status().next_check_unix_ms, Some(staged));
+            // Positive twin: the same clock/deadline must admit real pending work.
+            scheduler.observe_manual_at(&pending_check(), 0, UNIX_EPOCH);
             assert_eq!(
                 scheduler.status().next_check_unix_ms,
-                Some(next_check_unix_ms(now, 1))
+                Some(next_check_unix_ms(UNIX_EPOCH, 5))
             );
         }
+        scheduler
+            .next_check_unix_ms
+            .store(next_check_unix_ms(now, 1), Ordering::Relaxed);
         scheduler.signal_stop();
         scheduler.observe_manual_at(&pending_check(), 0, UNIX_EPOCH);
         assert_eq!(
@@ -953,6 +973,32 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
         handle.join().unwrap();
         scheduler.signal_stop();
         assert!(!wait_until(&scheduler.gate, &scheduler.next_check_unix_ms));
+    }
+
+    #[test]
+    fn registered_waiter_is_notified_before_sleep_slice() {
+        let scheduler = PollScheduler::new(120, true);
+        let (registered_tx, registered_rx) = mpsc::channel();
+        scheduler.gate.state.lock().unwrap().wait_registered = Some(registered_tx);
+        let worker = scheduler.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = tx.send(wait_until(&worker.gate, &worker.next_check_unix_ms));
+        });
+        let registered = registered_rx.recv_timeout(Duration::from_secs(2));
+        if registered.is_ok() {
+            scheduler.observe_manual_at(&pending_check(), 0, UNIX_EPOCH);
+        }
+        let woke = rx.recv_timeout(Duration::from_secs(2));
+        // Always release and join, including when the notification mutant fails.
+        scheduler.signal_stop();
+        handle.join().unwrap();
+        assert!(registered.is_ok(), "worker did not reach wait registration");
+        assert_eq!(
+            woke,
+            Ok(true),
+            "manual notification did not wake registered waiter"
+        );
     }
 
     #[test]
