@@ -5,9 +5,16 @@ the useful watchlist path, and a live Health view. Health can inspect mail accou
 database, and notification readiness, then run one production-safe `Check now` through the existing
 versioned Python engine contract. The host drains a bounded batch of durable notification intents
 through Tauri's native notification plugin on startup and after `Check now`. On compatible hosts, a
-single-instance process also polls automatically using `poll_interval_minutes` (120 minutes by
-default) and publishes the next scheduled check in Health. Polling remains disabled when production
+single-instance process also polls automatically using `poll_interval_minutes` (five minutes for
+new/missing config) and publishes the next scheduled check in Health. Polling remains disabled when
+production
 locking or host-owned notification delivery is unsupported by the current configuration.
+Existing saved intervals are preserved, including the former initialized 120-minute value.
+Successful checks with confirmed mailbox backlog use an earlier follow-up deadline; manual
+checks can bring that deadline forward. The complete cadence, error and compatibility rules
+are owned by the [accepted polling contract](../plans/PR-Poll-Backlog-145.md#accepted-behavior-acceptance-clauses).
+The shipped Linux timer is separate from desktop settings; existing installed units change only
+through reviewed unit adoption. Processing, jitter and downtime prevent a hard latency promise.
 Closing the main window hides it while the host keeps automatic polling and notification delivery
 alive. The system-tray menu restores the window or explicitly quits the host. An opt-in Settings
 control registers the installed application to start after login; that launch stays hidden in the

@@ -237,18 +237,49 @@ source evidence alone cannot certify Windows or customer-account latency.
 
 ## Implementation summary / cold diff audit
 
-This contract PR changes only this document. No runtime or test code changed;
-all synthetic reproduction artifacts are retained outside the worktree.
-Cold audit must show this contract alone. After acceptance, every changed
-assertion maps to C1–C5; no weakened assertions, skips or downstream workarounds.
+The separate implementation preserves C1–C5 above. No schema, provider cap,
+provider request path or installed setting changed.
+
+- C1/C5: `service.py` carries the Sent observation separately from the existing
+  retention boolean; `_check_active` aggregates it with Inbox observations and
+  `_finish_active_result` reports unknown for preview/recovery. No cursor logic
+  changed. No downstream inference from message counts or cursor syntax remains.
+- C2: `scheduler.rs` owns `poll_delay`, manual deadline observations and scheduled
+  completion. A mutex serializes deadline writes with manual revision tracking;
+  the existing gate condition variable wakes a waiter without a lost wake-up.
+  Removed the superseded fixed-deadline wait helper. Existing delivery exclusion
+  still serializes manual/scheduled mailbox work; no new worker or polling loop.
+- C1/C2/C4: `engine.rs` carries an optional state, `lib.rs` forwards manual success
+  to the admitted scheduler, and `main.ts` uses `mailboxProgress.ts` for shared
+  wording after existing recovery/inactive/current-account gates. `delivery.rs`
+  changes only an existing test struct literal for the optional field.
+- C3: Python/example defaults and the shipped timer change; Rust initialization
+  receipt verification remains an exact comparison. Saved values are untouched.
+- API and desktop docs link to the canonical clauses rather than redefining them.
+
+Changed-assertion mapping:
+
+| Test owner / assertions | Contract |
+|---|---|
+| Service `mailbox_poll_state` tests: real Gmail bounded batches and fresh-owner resume, one watched admission, one batch/check; Sent error dominates pending and Sent still gets one turn; empty/duplicate IDs; preview leaves cursor unchanged; failed capture preserves cursor, retry admits once | C1, C4, C5 |
+| Scheduler pending transport through delivery failure; configured/pending cadence at interval boundaries and unknown/legacy/inactive/recovery/error twins | C1, C2, C5 |
+| Scheduler manual earlier-only, disabled/stopped controls, both completion orders, repeated observations, return to idle, real sleeping worker wake/stop | C2 |
+| Config initialization/missing-value assertions updated to the accepted default; saved values including old initialization unchanged; false/empty settings rejected | C3 |
+| Rust real-engine initialization/settings expectations and strict receipt fixtures updated; legacy result literals explicitly lack the optional state | C1, C3 |
+| Existing desktop rendering tests extended with manual/scheduled pending and delivery details, unknown/legacy controls and stale-account event exclusion | C4 |
+
+Fail-first probes observed absent service outcomes and absent Rust event state;
+initialization returned the old default. A mutation restoring configured cadence
+made the held-clock deadline regression fail. The mutation was removed afterward.
+Local verification and failure classifications are retained with the implementation
+review packet; no passing claim is made for an unrun platform qualification.
 
 ## Gap audit
 
-**NOT DONE:** baseline reproduced; contract review passed and operator acceptance
-is recorded above. Implementation, regression changes and native qualification
-remain for the separate implementation PR. Keep #145 open until its accepted
-target and platform evidence are met; sustained overload remains bounded and
-visible; it is not eliminated for arbitrary input rates.
+**NOT DONE:** implementation and local regressions are prepared. Exact-head CI,
+independent review, and native installed action/latency qualification remain.
+Keep #145 open until its accepted target and platform evidence are met. No live
+settings, installation or promotion is authorized by this implementation PR.
 
 ## Durable evidence (SHA-256 aliases)
 

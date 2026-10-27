@@ -1543,7 +1543,7 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
 
     settings = engine_api._response(request(config_path, "settings.get"))
     assert settings["ok"] is True
-    assert settings["data"]["poll_interval_minutes"] == 120
+    assert settings["data"]["poll_interval_minutes"] == 5
     assert settings["data"]["polling_supported"] is True
     encoded = json.dumps(settings)
     assert "model_api_token_file" not in encoded

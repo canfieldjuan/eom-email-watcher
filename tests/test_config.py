@@ -464,6 +464,7 @@ def test_first_run_initialization_creates_private_zero_sender_config(
     assert config.model_name == "local-model"
     assert config.model_require_auth is False
     assert config.notifications_enabled is True
+    assert config.poll_interval_minutes == 5
     assert config.senders == ()
     if os.name == "nt":
         from connect_automate.connect_windows import validate_private_regular_file
@@ -1332,6 +1333,8 @@ def test_settings_update_accepts_boundary_values(
         ({}, "At least one"),
         ({"unknown": 1}, "Unsupported settings"),
         ({"poll_interval_minutes": True}, "must be an integer"),
+        ({"poll_interval_minutes": False}, "must be an integer"),
+        ({"poll_interval_minutes": ""}, "must be an integer"),
         ({"poll_interval_minutes": 0}, "between 1 and 1440"),
         ({"poll_interval_minutes": 1441}, "between 1 and 1440"),
         ({"retention_days": False}, "must be an integer"),
@@ -1569,7 +1572,7 @@ def _apply_config_mutation(path: Path, mutation: str) -> None:
 def _assert_config_mutation_state(path: Path, mutation: str, *, applied: bool) -> None:
     loaded = load_config(path)
     if mutation == "settings":
-        assert loaded.poll_interval_minutes == (45 if applied else 120)
+        assert loaded.poll_interval_minutes == (45 if applied else 5)
     elif mutation == "add":
         assert ("new@example.com" in loaded.allowlist) is applied
     else:
@@ -1934,3 +1937,25 @@ def test_remove_senders_unwatches_several_in_one_write_and_skips_unwatched(
     assert remove_senders(path, ["missing@acme.com"]) == []
     assert len(writes) == 1
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("minutes", [1, 5, 120, 1440])
+def test_poll_default_change_preserves_saved_interval(tmp_path, minutes):
+    path = tmp_path / "config.toml"
+    write_config(path, extra=f"poll_interval_minutes = {minutes}")
+    before = path.read_bytes()
+    assert load_config(path).poll_interval_minutes == minutes
+    assert path.read_bytes() == before
+
+
+def test_poll_default_change_preserves_old_initialization(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    with monkeypatch.context() as old:
+        old.setattr(config_module, "DEFAULT_POLL_INTERVAL_MINUTES", 120)
+        initialize_config(
+            path, timezone="UTC", model_base_url="http://localhost:8080/v1",
+            model_name="local-model",
+        )
+    before = path.read_bytes()
+    assert load_config(path).poll_interval_minutes == 120
+    assert path.read_bytes() == before

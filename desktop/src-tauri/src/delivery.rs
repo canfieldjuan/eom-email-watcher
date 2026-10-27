@@ -899,6 +899,7 @@ mod tests {
                 return Err(EngineError::host("gmail_error", "simulated check failure"));
             }
             Ok(CheckResult {
+                mailbox_poll_state: None,
                 active: true,
                 reason: None,
                 discovered: 0,
