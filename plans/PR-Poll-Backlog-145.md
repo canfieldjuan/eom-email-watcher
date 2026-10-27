@@ -1,8 +1,14 @@
 # #145 — bounded mailbox backlog progress and polling cadence
 
-Status: **PROPOSED — contract only; no implementation authorized.**
-Operator chose “145 next”. #203 remains queued. Oversight contract review and
-Juan's explicit acceptance are required before implementation.
+Status: **ACCEPTED CONTRACT — implementation remains separate.**
+Operator acceptance of C1–C5 at `85dc3f3` was relayed verbatim by oversight
+on 2026-10-27: Juan said “accept all three”; the relay explicitly identifies
+this #145 contract as one of those three (mailbox receipt `8ca31e7e`).
+Oversight CONTRACT PASS: review `5661592417` at the accepted head.
+Merge this contract-only PR after its exact-head CI and review gates hold;
+then implement C1–C5 in a separate PR based on the merged contract, beginning
+with fail-first regression tests. No live settings changes, installation or
+promotion. #203 remains queued.
 
 ## Root cause and measured inventory
 
@@ -51,7 +57,7 @@ batch's persisted cursor unchanged, and the next successful check admits the
 remaining watched message. Sustained 250 new IDs per check leaves measured
 backlogs 50/100/150: no finite bound promises to outrun arbitrary arrivals.
 
-## Proposed behavior (acceptance clauses)
+## Accepted behavior (acceptance clauses)
 
 **C1 — one truthful owner.** Add optional `mailbox_poll_state` to check results:
 `drained`, `pending`, or `unknown`. The service derives it from successful
@@ -231,17 +237,16 @@ source evidence alone cannot certify Windows or customer-account latency.
 
 ## Implementation summary / cold diff audit
 
-This proposal changes only this document. No runtime or test code changed;
+This contract PR changes only this document. No runtime or test code changed;
 all synthetic reproduction artifacts are retained outside the worktree.
 Cold audit must show this contract alone. After acceptance, every changed
 assertion maps to C1–C5; no weakened assertions, skips or downstream workarounds.
 
 ## Gap audit
 
-**NOT DONE:** baseline reproduced; implementation, regression changes, native
-qualification, oversight contract review and operator acceptance remain.
-The five-minute cadence/status wording is a proposed product decision, not an
-operator acceptance inferred from “145 next”. Keep #145 open until its accepted
+**NOT DONE:** baseline reproduced; contract review passed and operator acceptance
+is recorded above. Implementation, regression changes and native qualification
+remain for the separate implementation PR. Keep #145 open until its accepted
 target and platform evidence are met; sustained overload remains bounded and
 visible; it is not eliminated for arbitrary input rates.
 
