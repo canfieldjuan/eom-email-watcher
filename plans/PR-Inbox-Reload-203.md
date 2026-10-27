@@ -1,6 +1,19 @@
 # Inbox refresh ownership — #203
 
-Status: proposed contract only. No implementation, installation or live setting change.
+Status: accepted contract only. No implementation, installation or live setting change.
+
+## Operator acceptance
+
+Juan accepted the reviewed contract at `79fc04089275fba19fd5b402ce10ca3921ad3b76`:
+“Accept inbox reload plan” (verbatim decision relayed by oversight, mailbox
+`19d15c28`, 2026-10-27). In this coding chat Juan also wrote, verbatim,
+“Contract excepted”, interpreted as acceptance consistent with that explicit relay.
+Oversight CONTRACT PASS and the Codex clean review apply to the accepted text.
+
+Record acceptance here, merge this PR as contract-only after exact-head CI and
+review gates, then implement R1–R4 in a separate PR on the merged contract,
+starting with fail-first regressions. No backend, polling, settings or install changes.
+
 Base: `9e33e809719c719fff14169180d8b09b7c3924e7`.
 
 ## Root cause
@@ -158,18 +171,19 @@ its direct wiring/tests; stop for a revised contract if more is required.
 
 ## Implementation summary
 
-Contract only. Production and test files are unchanged.
+Contract and acceptance record only. Production and test files are unchanged.
 
 ## Cold diff audit
 
-Only this plan is added. It narrows the historical issue using current owner
+Only this plan and its acceptance record are added. It narrows the historical issue using current owner
 reproduction, identifies the introducing commits, and defines one owner and
 regression/commit requirements without changing runtime behavior.
 
 ## Gap audit
 
-NOT DONE — proposed contract awaits oversight review and operator acceptance.
-Implementation, regressions and native/UI qualification have not been performed.
+NOT DONE — the contract has oversight review and operator acceptance. Exact-head
+CI/review reconciliation and contract-only merge remain. Implementation follows
+in a separate PR; regressions and native/UI qualification have not been performed.
 
 ## Evidence aliases (SHA-256)
 
