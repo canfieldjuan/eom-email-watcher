@@ -77,24 +77,53 @@ transaction, repeated engine-call loop, extra threads or parallel provider
 reads. Each next check reloads config/admission and mailbox identity normally.
 The single scheduler delay owner implements this rule; no UI-owned retry rule.
 
-A drained, unknown, inactive, failed or recovery-pending outcome uses the
-existing configured/recovery behavior. Restarts retain existing durable
-cursors; volatile pending status is not falsely reconstructed from cursor
-syntax. The first post-restart check retains configured startup timing.
-Manual checks stay one check; they do not launch a hidden background loop.
+A `CheckFailed` outcome keeps the existing configured cadence. A
+`DeliveryFailed` outcome with successful mailbox state pending uses the
+pending cadence: notification transport failure does not undo mailbox progress.
+Queued notifications retain their existing retry path. Drained, unknown,
+inactive and recovery-pending outcomes keep existing configured/recovery behavior.
+
+Manual checks remain single checks, but a successful manual check observing
+pending reports that observation to the same scheduler deadline owner. It may
+only pull an enabled scheduler's staged deadline earlier, to
+`min(staged_deadline, completion + min(configured_interval, 5 minutes))`.
+It never postpones an earlier deadline, enables a disabled scheduler, starts a
+second worker or launches a loop. The waiting worker must observe the earlier
+deadline. Deadline updates and check admission preserve existing mailbox-operation
+exclusion: manual and scheduled checks cannot execute concurrently. The owner
+must not lose an earlier manual deadline in a racing scheduled completion.
+A manual CheckFailed, unknown, inactive, drained or recovery-pending result
+leaves the staged deadline unchanged. A manual DeliveryFailed with successful
+pending mailbox work may pull it earlier under the same formula. The UI never
+writes or computes scheduler deadlines.
+
+Restarts retain existing durable cursors; volatile pending status is not falsely
+reconstructed from cursor syntax. The first post-restart check retains configured
+startup timing.
 
 **C3 — initial latency and compatibility.** Propose a 5-minute default for
 new/missing config and the example config. Change the shipped Linux timer to
 5 minutes while retaining boot delay, jitter and its deployment/locking gates.
-Explicit saved intervals are preserved. Existing customized/installed units
-are not rewritten by this PR; normal reviewed cutover adopts the new template.
-Desktop and headless cadence remain separately reported: the static systemd
-timer does not pretend to read the GUI interval. A retained old timer can
-still poll slowly until explicitly upgraded. No live settings changes now.
+All saved intervals are preserved, including values written by initialization.
+`initialize_config` (`config.py:4022`) explicitly persists the default, so existing
+desktop installs normally retain a saved 120-minute idle interval. Do not guess
+whether a saved value was initialized or deliberately chosen. Their idle
+first-arrival latency changes only when the owner edits that setting; pending
+catch-up is the only immediate cadence improvement from this implementation.
+
+Existing customized/installed units are not rewritten by this PR; headless idle
+latency changes only through reviewed unit adoption. The CLI never reads the
+poll interval for scheduling. Desktop and headless cadence remain separately
+reported: the static systemd timer does not read the GUI interval. A retained old
+timer still polls slowly until explicitly upgraded. No live settings changes now.
 
 Qualification target: on an active qualified host with no provider errors,
 zero backlog, and bounded fixture processing, a new message is admitted by
-the next configured/default check. For the 401-ID fixture, eventual admission
+the next configured/default check. Existing desktop installations retain their
+saved idle interval (normally 120 minutes) until the owner changes it; existing
+headless installations retain their old cadence until reviewed unit adoption.
+The new default must not be presented as improving their idle first-arrival
+latency automatically. For the 401-ID fixture, eventual admission
 must use three bounded checks with at most 5 minutes scheduled waiting between
 successes, including when the saved idle setting is 120 minutes. Initial
 arrival-to-check delay, processing, jitter, lock contention and downtime are
@@ -152,6 +181,8 @@ or account limitations remain explicit qualification limits.
 - `desktop/src-tauri/src/lib.rs`: initialization receipt verification currently
   compares the poll interval to 120 (:331); update that strict expected default
   with the Python default and its initialization tests, never relax verification.
+  Forward successful manual check observations to the scheduler's single deadline
+  owner; do not duplicate the scheduling rule in the command or frontend.
 - `desktop/src-tauri/src/engine.rs`, `scheduler.rs`, `desktop/src/main.ts`:
   optional result transport, one scheduler delay rule, truthful status rendering.
 - Existing Python service/config/API/CLI tests, Rust scheduler/transport tests,
@@ -173,10 +204,17 @@ source evidence alone cannot certify Windows or customer-account latency.
 - C1: 200/201/401 real-adapter twins; empty/duplicate IDs, pending/true-drained,
   missing field and unknown state; Sent failure dominates faster scheduling.
 - C2: held clock proves delay min(config,5) only for successful pending; exact
-  configured cadence for other outcomes; repeat/check/stop races, cancellation,
+  configured cadence for CheckFailed and non-pending outcomes; DeliveryFailed
+  plus pending keeps catch-up. Manual pending during a staged wait pulls only
+  earlier (including a preexisting earlier deadline); a manual attempt during an
+  in-flight scheduled check obeys exclusion. Race scheduled completion against
+  manual admission, and verify no earlier deadline is overwritten, no disabled
+  scheduler is enabled, and the sleeping worker notices the new deadline.
+  Repeat/check/stop races, cancellation,
   idle intervals 1/5/120/1440, settings rejection of 0/false/empty/out-of-range;
   no lock held during the wait; restart resumes saved cursor without duplicates.
-- C3: actual default config and shipped timer, explicit saved 120 unchanged;
+- C3: actual default config and shipped timer; both initialization-written and
+  user-chosen saved 120 stay unchanged, with no automatic idle-latency claim;
   measured first arrival and burst latency with processing/jitter separated.
 - C4: Sent/notifications/pending work each get a turn during continuous Inbox
   arrivals; mounted manual/scheduled messages retain errors and do not claim
