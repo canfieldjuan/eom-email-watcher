@@ -77,7 +77,7 @@ test("queue progress refreshes the full loaded inbox span", async () => {
 
   assert.match(
     source,
-    /while \(inboxItems\.length < loadedCount && inboxNextCursor\) \{\s+if \(!await loadInbox\(true\) \|\| epoch !== inboxQueryEpoch\) return;/,
+    /while \(inboxItems\.length < intent.target && inboxNextCursor\) \{\s+if \(!await loadInboxPage\(true, effectScope\) \|\| !current\(\)\) return false;/,
   );
   assert.match(
     source,

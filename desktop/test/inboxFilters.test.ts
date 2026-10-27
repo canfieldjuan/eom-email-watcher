@@ -58,15 +58,16 @@ test("sender selection clears the scope before requesting its first page", () =>
   assert.ok(selection, "sender selection handler exists");
   assert.match(selection, /activeInboxQuery = \{ \.\.\.activeInboxQuery, sender \}/);
   assert.doesNotMatch(selection, /sender_query/);
-  assert.ok(selection.indexOf("clearInboxPageForAccountChange(") < selection.indexOf("void loadInbox()"));
+  assert.match(selection, /clearInboxPageForAccountChange\(/);
+  assert.doesNotMatch(selection, /void loadInbox|inboxReloadAfterMutation/);
   const clear = source.match(/function clearInboxPageForAccountChange[\s\S]*?\n\}/)![0];
   assert.match(clear, /inboxRequestGeneration \+= 1/);
   assert.match(clear, /inboxQueryEpoch \+= 1/);
   assert.match(clear, /inboxItems = \[\]/);
   assert.match(clear, /inboxNextCursor = null/);
   assert.match(clear, /inboxLoadMore.hidden = true/);
-  assert.match(clear, /renderInbox\(inboxItems\)/);
-  const load = source.match(/async function loadInbox\([\s\S]*?\n\}/)![0];
+  assert.match(clear, /renderInbox\(inboxItems\)[\s\S]*void loadInbox\(\)/);
+  const load = source.match(/async function loadInboxPage\([\s\S]*?\n\}/)![0];
   assert.match(load, /query: \{ \.\.\.activeInboxQuery, cursor \}/);
   assert.match(load, /if \(!mailboxEffectRequestIsCurrent[^\n]+[\s\S]*?return false/);
   const failure = load.slice(load.indexOf("} catch (error)"), load.indexOf("if (!append) {\n    attachmentCapabilities"));
@@ -74,7 +75,7 @@ test("sender selection clears the scope before requesting its first page", () =>
   assert.doesNotMatch(failure, /inboxItems =/);
 });
 
-const inboxLoad = source.match(/async function loadInbox\([\s\S]*?\n\}/)![0];
+const inboxLoad = source.match(/async function loadInboxPage\([\s\S]*?\n\}/)![0];
 
 test("inbox page state starts loading and scope clearing records pending before rendering", () => {
   assert.ok(source.includes('let inboxPageState: "pending" | "loading" | "loaded" | "failed" = "loading";'), "page state must start loading");
@@ -83,7 +84,7 @@ test("inbox page state starts loading and scope clearing records pending before 
 });
 
 test("inbox first-page loading follows unchanged guards and owns its generation before requesting", () => {
-  assert.match(inboxLoad, /if \(!mailboxEffectScopeIsCurrent\(effectScope\)\) return false;\s+if \(inboxMutationInFlight\(\)\) return false;\s+if \(append && !inboxNextCursor\) return false;\s+const generation = \+\+inboxRequestGeneration;/);
+  assert.match(inboxLoad, /if \(!mailboxEffectScopeIsCurrent\(effectScope\)\) return false;\s+if \(inboxReloadBlocked\(\)\) return false;\s+if \(append && !inboxNextCursor\) return false;\s+const generation = \+\+inboxRequestGeneration;/);
   assert.doesNotMatch(inboxLoad, /inboxReloadAfterMutation/);
   const beforeRequest = inboxLoad.slice(inboxLoad.indexOf("const generation"), inboxLoad.indexOf("page = await"));
   assert.match(beforeRequest, /if \(!append\) \{\s+inboxPageState = "loading";\s+inboxPageStateGeneration = generation;\s+if \(inboxItems.length === 0\) renderInbox\(inboxItems\);\s+\}/, "first-page request must own loading and render an empty list");
@@ -122,11 +123,11 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
       let inboxItems = [{ message_id: "held" }, { message_id: "deleted" }];
       const expandedInboxMessages = new Set(["held", "deleted"]);
       let inboxPageState = "failed", inboxNextCursor = "next", inboxCapabilityUnavailableCount = 3;
-      let inboxClearInFlight = false, inboxRequestGeneration = 0, inboxReloadAfterMutation = false;
+      let inboxClearInFlight = false, inboxRequestGeneration = 0, reloads = 0;
       const inboxLoadMore = { hidden: false }, inboxStatus = { textContent: "", dataset: {} };
       const renders = [], cleared = [];
       const confirmAction = async () => true, inboxMutationInFlight = () => false;
-      const setInboxControlsBusy = () => {}, resumeInboxReloadAfterMutation = () => {};
+      const setInboxControlsBusy = () => {}, wakeInboxReload = () => {}, loadInbox = () => { reloads++; };
       const clearMessageOwnedUiState = id => cleared.push(id ?? "all");
       const renderInbox = items => renders.push({ ids: items.map(item => item.message_id),
         state: inboxPageState, expanded: [...expandedInboxMessages] });
@@ -137,7 +138,7 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
       ${handler}
       await clearInboxHistory();
       return JSON.stringify({ renders, cleared, inboxNextCursor, inboxCapabilityUnavailableCount,
-        inboxLoadMore, inboxStatus, inboxClearInFlight, inboxReloadAfterMutation });
+        inboxLoadMore, inboxStatus, inboxClearInFlight, reloads });
     })()`, { result, outcome, inboxClearView, errorMessage: (error: { message: string }) => error.message }));
     const completed = outcome === "completed";
     for (const render of observed.renders.slice(1)) {
@@ -153,7 +154,7 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
     assert.equal(observed.inboxStatus.dataset.kind,
       completed ? "success" : outcome === "deferred" ? "pending" : outcome === "error" ? "error" : undefined);
     assert.equal(observed.inboxClearInFlight, false);
-    assert.equal(observed.inboxReloadAfterMutation, true);
+    assert.equal(observed.reloads, 1);
     if (completed) assert.match(observed.inboxStatus.textContent, /^Cleared 2 local messages\./);
     else if (outcome === "deferred") {
       assert.ok(observed.inboxStatus.textContent.includes(pending));
@@ -176,10 +177,10 @@ test("Delete handler clears only its accepted cached item and always reloads the
       const item = { message_id: "selected", subject: "Selected message" };
       let inboxItems = [item, { message_id: "other", subject: "Other message" }];
       const expandedInboxMessages = new Set(["selected", "other"]), inboxDeletionsInFlight = new Set();
-      let inboxRequestGeneration = 0, inboxReloadAfterMutation = false, calls = 0;
+      let inboxRequestGeneration = 0, reloads = 0, calls = 0;
       const inboxStatus = { textContent: "", dataset: {} }, cleared = [];
       const confirmAction = async () => true, inboxMutationInFlight = () => false;
-      const setInboxControlsBusy = () => {}, renderInbox = () => {}, resumeInboxReloadAfterMutation = () => {};
+      const setInboxControlsBusy = () => {}, renderInbox = () => {}, wakeInboxReload = () => {}, loadInbox = () => { reloads++; };
       const clearMessageOwnedUiState = id => cleared.push(id);
       const inboxRemovalClient = { delete: async id => {
         calls++; if (id !== "selected") throw Error("Wrong item");
@@ -189,14 +190,14 @@ test("Delete handler clears only its accepted cached item and always reloads the
       ${handler}
       await deleteInboxItem(item);
       return JSON.stringify({ ids: inboxItems.map(item => item.message_id), expanded: [...expandedInboxMessages],
-        inflight: [...inboxDeletionsInFlight], inboxReloadAfterMutation, inboxStatus, cleared, calls });
+        inflight: [...inboxDeletionsInFlight], reloads, inboxStatus, cleared, calls });
     })()`, { result, outcome, inboxRemovalStatus, errorMessage: (error: { message: string }) => error.message }));
     assert.deepEqual(observed.ids, accepted ? ["other"] : ["selected", "other"]);
     assert.deepEqual(observed.expanded, observed.ids);
     assert.deepEqual(observed.cleared, accepted ? ["selected"] : []);
     assert.deepEqual(observed.inflight, []);
     assert.equal(observed.calls, 1);
-    assert.equal(observed.inboxReloadAfterMutation, true);
+    assert.equal(observed.reloads, 1);
     assert.equal(observed.inboxStatus.dataset.kind,
       outcome === "completed" ? "success" : outcome === "deferred" ? "pending" : outcome === "error" ? "error" : undefined);
     if (outcome === "completed") assert.equal(observed.inboxStatus.textContent,
@@ -212,21 +213,15 @@ test("inbox empty text checks pending loading and failed before existing query t
   assert.match(empty, /\? inboxSenderEmptyText\(activeInboxQuery, activeInboxAccountSelection\)\s+: filtered\s+\? "No watched messages match these filters\."\s+: "No watched messages yet\. Add a sender or Gmail label, then run the watcher\.";/);
 });
 
-test("sender selection defers reload until the final inbox mutation finishes", () => {
-  const selection = source.match(/function selectInboxSender\([\s\S]*?\n\}/)![0];
-  assert.match(
-    selection,
-    /if \(inboxMutationInFlight\(\)\) \{\s+inboxReloadAfterMutation = true;\s+\} else \{\s+void loadInbox\(\);\s+\}/,
-    "sender selection must defer its reload while a mutation is in flight",
-  );
-  assert.match(source, /let inboxReloadAfterMutation = false;/);
-  const resume = source.match(/function resumeInboxReloadAfterMutation\([\s\S]*?\n\}/)![0];
-  assert.match(resume, /if \(inboxMutationInFlight\(\) \|\| !inboxReloadAfterMutation\) return;/);
-  assert.match(resume, /inboxReloadAfterMutation = false;\s+void loadInbox\(\);/);
-  const deletion = source.match(/async function deleteInboxItem\([\s\S]*?\n\}/)![0];
-  const clearing = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
-  assert.match(deletion, /finally \{\s+inboxDeletionsInFlight.delete\(item.message_id\);\s+inboxReloadAfterMutation = true;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
-  assert.match(clearing, /finally \{\s+inboxClearInFlight = false;\s+inboxReloadAfterMutation = true;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
+// R1's held-operation matrix in inboxReload.test.ts executes these handlers.
+test("sender and removal completion share the refresh owner", () => {
+  const selection = source.match(/function selectInboxSender[\s\S]*?\n\}/)![0];
+  assert.match(selection, /clearInboxPageForAccountChange/);
+  assert.doesNotMatch(source, /inboxReloadAfterMutation|resumeInboxReloadAfterMutation/);
+  const deletion = source.match(/async function deleteInboxItem[\s\S]*?\n\}/)![0];
+  const clearing = source.match(/async function clearInboxHistory[\s\S]*?\n\}/)![0];
+  assert.match(deletion, /finally \{\s+inboxDeletionsInFlight.delete\(item.message_id\);\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+void loadInbox\(\);/);
+  assert.match(clearing, /finally \{\s+inboxClearInFlight = false;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+void loadInbox\(\);/);
 });
 
 test("Apply and Reset carry the sender and clear query expansion", () => {
@@ -241,18 +236,20 @@ test("Apply and Reset carry the sender and clear query expansion", () => {
 });
 
 test("span refresh stops when superseded before or during append", async () => {
-  const body = source.match(/async function refreshLoadedInboxSpan\(\): Promise<void> \{([\s\S]*?)\n\}/)![1];
+  const body = source.match(/async function runInboxRefresh\([\s\S]*?\): Promise<boolean> \{([\s\S]*?)\n\}/)![1];
   for (const stopAt of [1, 2]) {
     for (const committed of [true, false]) {
       const run = new Function("stopAt", "committed", `
         let inboxItems = [1, 2, 3], inboxNextCursor = "next", inboxQueryEpoch = 0, calls = 0;
-        async function loadInbox() {
+        async function loadInboxPage() {
           calls++;
           inboxItems = calls === 1 ? [1] : [1, 2];
           if (calls === stopAt) { if (committed) inboxQueryEpoch++; return committed; }
           if (calls > stopAt) inboxNextCursor = null;
           return true;
         }
+        const intent = { kind: "span", target: 3 }, effectScope = null;
+        const current = () => inboxQueryEpoch === 0;
         return (async () => { await (async () => { ${body} })(); return calls; })();
       `);
       assert.equal(await run(stopAt, committed), stopAt, "superseded span must stop at its interrupted load");
@@ -267,7 +264,7 @@ test("expansion survives renders and first-page reloads until query, delete, or 
   assert.match(render, /setAttribute\("aria-expanded", String\(!content.hidden\)\)/);
   assert.match(render, /setAttribute\("aria-controls", content.id\)/);
   assert.doesNotMatch(render, /expandedInboxMessages.clear|expandedInboxMessages.*filter/);
-  const load = source.match(/async function loadInbox\([\s\S]*?\n\}/)![0];
+  const load = source.match(/async function loadInboxPage\([\s\S]*?\n\}/)![0];
   assert.doesNotMatch(load, /expandedInboxMessages/);
   assert.match(source, /const result = await inboxRemovalClient.delete\(item.message_id\);\s+if \(!result\) return;\s+expandedInboxMessages.delete\(item.message_id\)/);
   const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];

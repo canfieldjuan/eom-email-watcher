@@ -1,3 +1,4 @@
+import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
 import { mailboxPendingMessage } from "./mailboxProgress";
 import { confirmAction } from "./confirmation";
 import { calendarOutcomeNotice, latestCalendarOutcome, type CalendarWriteOutcome } from "./calendarOutcome";
@@ -1028,6 +1029,7 @@ let inboxPageStateGeneration = 0;
 let inboxSenderNavigationError: string | null = null;
 const expandedInboxMessages = new Set<string>();
 let inboxItems: InboxItem[] = [];
+let inboxItemsEpoch: number | null = null;
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
 let inboxProposalExpiryTimer: number | null = null;
@@ -1037,7 +1039,6 @@ const inboxDeletionsInFlight = new Set<string>();
 const automationDecisionsInFlight = new Set<string>();
 const automationDecisionRefreshRequired = new Map<string, number>();
 let inboxClearInFlight = false;
-let inboxReloadAfterMutation = false;
 let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
   limit: 25,
@@ -1081,6 +1082,25 @@ let mailboxOperationRevisionReady = false;
 let mailOperationInFlight = false;
 let mailAccountMutationsInFlight = 0;
 let mailAccountMutationEpoch = 0;
+
+const inboxReload = new InboxReload<MailboxEffectScope>({
+  epoch: () => inboxQueryEpoch,
+  blocked: inboxReloadBlocked,
+  currentScope: mailboxEffectScopeIsCurrent,
+  run: runInboxRefresh,
+});
+
+function inboxReloadBlocked(): boolean {
+  return !configurationReady || mailOperationInFlight || inboxMutationInFlight();
+}
+
+function wakeInboxReload(): void {
+  if (inboxReloadBlocked() && inboxPageState === "loading") {
+    inboxPageState = "pending";
+    if (inboxItems.length === 0) renderInbox(inboxItems);
+  }
+  inboxReload.wake();
+}
 
 function observeMailboxOperationRevision(revision: unknown): boolean {
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) {
@@ -1148,6 +1168,7 @@ async function runMailAccountMutation<T extends { mailbox_operation_revision: nu
   }
   mailAccountMutationsInFlight += 1;
   mailOperationInFlight = true;
+  wakeInboxReload();
   try {
     const result = await operation();
     if (!observeMailboxOperationRevision(result.mailbox_operation_revision)) {
@@ -1162,6 +1183,7 @@ async function runMailAccountMutation<T extends { mailbox_operation_revision: nu
   } finally {
     mailAccountMutationsInFlight -= 1;
     mailOperationInFlight = mailAccountMutationsInFlight > 0;
+    wakeInboxReload();
   }
 }
 
@@ -2514,11 +2536,6 @@ function selectInboxSender(sender: string | null): void {
   activeInboxQuery = { ...activeInboxQuery, sender };
   clearInboxPageForAccountChange("Sender filter changed. Refreshing local history...");
   renderInboxSenderNavigation(inboxSenderNavigationError);
-  if (inboxMutationInFlight()) {
-    inboxReloadAfterMutation = true;
-  } else {
-    void loadInbox();
-  }
 }
 
 function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
@@ -2549,6 +2566,7 @@ function clearInboxPageForAccountChange(message: string): void {
   renderInbox(inboxItems);
   inboxStatus.textContent = message;
   delete inboxStatus.dataset.kind;
+  void loadInbox();
 }
 
 function commitInboxQueryFromControls(): void {
@@ -2562,9 +2580,12 @@ function commitInboxQueryFromControls(): void {
   if (accountScopeChanged) {
     clearInboxPageForAccountChange("Email account filter changed. Refreshing local history…");
   } else {
+    inboxRequestGeneration += 1;
     inboxQueryEpoch += 1;
+    inboxPageState = "pending";
     expandedInboxMessages.clear();
     renderInbox(inboxItems);
+    void loadInbox();
   }
 }
 
@@ -2600,12 +2621,6 @@ async function refreshInboxRemovalStatuses(): Promise<void> {
   }
 }
 
-function resumeInboxReloadAfterMutation(): void {
-  if (inboxMutationInFlight() || !inboxReloadAfterMutation) return;
-  inboxReloadAfterMutation = false;
-  void loadInbox();
-}
-
 function setInboxControlsBusy(busy: boolean): void {
   for (const control of inboxFilterForm.elements) {
     if (
@@ -2633,6 +2648,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
 
   inboxDeletionsInFlight.add(item.message_id);
   inboxRequestGeneration += 1;
+  wakeInboxReload();
   setInboxControlsBusy(true);
   renderInbox(inboxItems);
   try {
@@ -2651,10 +2667,9 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
     inboxStatus.dataset.kind = "error";
   } finally {
     inboxDeletionsInFlight.delete(item.message_id);
-    inboxReloadAfterMutation = true;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
-    resumeInboxReloadAfterMutation();
+    void loadInbox();
   }
 }
 
@@ -2667,6 +2682,7 @@ async function clearInboxHistory(): Promise<void> {
 
   inboxClearInFlight = true;
   inboxRequestGeneration += 1;
+  wakeInboxReload();
   setInboxControlsBusy(true);
   renderInbox(inboxItems);
   try {
@@ -2697,10 +2713,9 @@ async function clearInboxHistory(): Promise<void> {
     inboxStatus.dataset.kind = "error";
   } finally {
     inboxClearInFlight = false;
-    inboxReloadAfterMutation = true;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
-    resumeInboxReloadAfterMutation();
+    void loadInbox();
   }
 }
 
@@ -2713,12 +2728,12 @@ function inboxStatusLabel(): string {
   return `Showing ${count} matching message${count === 1 ? "" : "s"}.${more}${availability}`;
 }
 
-async function loadInbox(
+async function loadInboxPage(
   append = false,
   effectScope: MailboxEffectScope | null = null,
 ): Promise<boolean> {
   if (!mailboxEffectScopeIsCurrent(effectScope)) return false;
-  if (inboxMutationInFlight()) return false;
+  if (inboxReloadBlocked()) return false;
   if (append && !inboxNextCursor) return false;
   const generation = ++inboxRequestGeneration;
   const cursor = append ? inboxNextCursor : null;
@@ -2765,6 +2780,7 @@ async function loadInbox(
     attachmentCapabilityDiagnostics.clear();
     inboxCapabilityUnavailableCount = 0;
     inboxItems = page.items;
+    inboxItemsEpoch = inboxQueryEpoch;
     inboxPageState = "loaded";
   } else {
     const known = new Set(inboxItems.map((item) => item.message_id));
@@ -2804,13 +2820,36 @@ async function loadInbox(
   return true;
 }
 
-async function refreshLoadedInboxSpan(): Promise<void> {
-  const epoch = inboxQueryEpoch;
-  const loadedCount = inboxItems.length;
-  if (!await loadInbox() || epoch !== inboxQueryEpoch) return;
-  while (inboxItems.length < loadedCount && inboxNextCursor) {
-    if (!await loadInbox(true) || epoch !== inboxQueryEpoch) return;
+async function runInboxRefresh(
+  intent: InboxRefreshIntent,
+  effectScope: MailboxEffectScope | null,
+  current: () => boolean,
+): Promise<boolean> {
+  if (!await loadInboxPage(false, effectScope)) return false;
+  if (!current()) return false;
+  if (intent.kind === "span") {
+    while (inboxItems.length < intent.target && inboxNextCursor) {
+      if (!await loadInboxPage(true, effectScope) || !current()) return false;
+    }
   }
+  return true;
+}
+
+async function loadInbox(
+  append = false,
+  effectScope: MailboxEffectScope | null = null,
+): Promise<boolean> {
+  // User append remains a one-shot operation on the current cursor.
+  if (append) return !inboxReload.running && await loadInboxPage(true, effectScope);
+  return inboxReload.request({ kind: "first" }, effectScope);
+}
+
+async function refreshLoadedInboxSpan(): Promise<void> {
+  // Retained rows may still belong to the previous filter while its replacement loads.
+  const intent: InboxRefreshIntent = inboxItemsEpoch === inboxQueryEpoch
+    ? { kind: "span", target: inboxItems.length }
+    : { kind: "first" };
+  await inboxReload.request(intent);
 }
 
 function scheduleConnectQueueRefresh(): void {
@@ -4049,8 +4088,7 @@ function renderHealthUnknown(): void {
 }
 
 function renderHealth(health: HealthStatus, senderObservationVersion: number): void {
-  const inboxScopeChanged = renderMailAccounts(health.mail);
-  if (inboxScopeChanged && configurationReady && !mailOperationInFlight) void loadInbox();
+  renderMailAccounts(health.mail);
   gmailLabelSenderCount = gmailLabelSenderCountAfterHealth(
     gmailLabelSenderCount,
     health.watchlist_count,
@@ -4311,6 +4349,10 @@ async function startConfiguredDesktop(
 function renderConfigAdmissionState(status: ConfigAdmissionState): void {
   const startupEpoch = ++configuredStartupEpoch;
   configurationReady = false;
+  inboxRequestGeneration += 1;
+  inboxQueryEpoch += 1;
+  inboxReload.cancel();
+  inboxPageState = "pending";
   setConfiguredNavigation(false);
   settingsForm.hidden = true;
   configInitializeForm.hidden = true;
@@ -5031,12 +5073,10 @@ autostartEnabledInput.addEventListener("change", () => {
 inboxFilterForm.addEventListener("submit", (event) => {
   event.preventDefault();
   commitInboxQueryFromControls();
-  void loadInbox();
 });
 inboxReset.addEventListener("click", () => {
   inboxFilterForm.reset();
   commitInboxQueryFromControls();
-  void loadInbox();
 });
 inboxLoadMore.addEventListener("click", () => void loadInbox(true));
 inboxClear.addEventListener("click", () => void clearInboxHistory());
