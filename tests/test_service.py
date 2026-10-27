@@ -2237,6 +2237,7 @@ def test_recovery_backoff_is_visible_in_check_result(tmp_path: Path) -> None:
     assert recovery is not None
     assert result["recovery_pending"] is True
     assert result["recovery_state"] == "backoff"
+    assert result["mailbox_poll_state"] == "unknown"
     assert result["recovery_failure_code"] == "gmail_recovery_provider_unavailable"
     assert result["recovery_next_retry_at"] == recovery.next_retry_at
     assert store.state()[0] == "100"
@@ -2342,6 +2343,7 @@ def test_dry_run_stale_recovery_reads_one_broad_page_and_reports_truncated(
     assert result["discovered"] == 1
     assert result["incomplete"] is True
     assert result["reason"] == "recovery_truncated"
+    assert result["mailbox_poll_state"] == "unknown"
     assert store.state()[0] == "old"
     assert store.gmail_recovery_state("gmail-default") is None
     assert store.recent(1) == []
@@ -4513,6 +4515,8 @@ def test_stale_cursor_recovers_with_search(tmp_path: Path) -> None:
     result = Watcher(cfg, store, FakeGmail(stale=True), FakeModel()).check()
     assert result["stale_cursor_recovered"] is True
     assert store.state()[0] == "200"
+
+    assert result["mailbox_poll_state"] == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -6972,3 +6976,124 @@ def test_mailbox_poll_state_failed_capture_preserves_cursor_and_retry(tmp_path):
     assert result["discovered"] == 1
     again = Watcher(cfg, store, gateway, FakeModel()).check()
     assert again["discovered"] == 0
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+@pytest.mark.parametrize("drained", [False, True])
+def test_mailbox_poll_state_inbox_recovery_twins(tmp_path, recovered, drained):
+    """C1/C5: recovered Inbox results are unknown even when the recovery drains."""
+    cfg, store, account_id, credential, identity, cursor = _imap_sent_scaffold(tmp_path)
+
+    class InboxRecovery(SentPollingGateway):
+        recovered_since = None
+
+        def changes_since(self, position):
+            assert position == cursor
+            if recovered:
+                raise StaleMailboxCursor("test Inbox cursor expired")
+            return MailboxChanges((), cursor, drained=drained)
+
+        def recover_since(self, addresses, since):
+            self.recovered_since = since
+            return MailboxChanges((), cursor, drained=drained)
+
+    gateway = InboxRecovery(credential, identity, cursor)
+    result = Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()).check(
+        deliver_notifications=False, _gated_allowed=False,
+    )
+    assert result["mailbox_poll_state"] == (
+        "unknown" if recovered else "drained" if drained else "pending"
+    )
+    assert result["stale_cursor_recovered"] is recovered
+    assert (gateway.recovered_since is not None) is recovered
+    assert store.state(provider="imap", account_id=account_id)[0] == cursor
+
+
+@pytest.mark.parametrize(
+    ("case", "inbox_drained", "expected"),
+    [
+        ("pending", True, "pending"),
+        ("drained", True, "drained"),
+        ("unavailable", True, "drained"),
+        ("unavailable", False, "pending"),
+        ("unknown", True, "unknown"),
+        ("unknown", False, "unknown"),
+        ("missing_position", True, "unknown"),
+        ("missing_position", False, "unknown"),
+        ("recovered", True, "unknown"),
+        ("recovered", False, "unknown"),
+        ("recovered_pending", True, "unknown"),
+        ("recovered_pending", False, "unknown"),
+    ],
+)
+def test_mailbox_poll_state_sent_mapping_twins(
+    tmp_path, monkeypatch, case, inbox_drained, expected,
+):
+    """C1: run actual scope/cursor owners; unknown dominates either Inbox outcome."""
+    cfg, store, account_id, credential, identity, cursor = _imap_sent_scaffold(tmp_path)
+    _active_entitlement(monkeypatch)
+
+    class SentMapping(SentPollingGateway):
+        def changes_since(self, position):
+            return MailboxChanges((), cursor, drained=inbox_drained)
+
+        def sent_scope(self):
+            self.sent_calls.append("scope")
+            if case == "unknown":
+                raise MailboxError("test scope unavailable")
+            return "unavailable" if case == "unavailable" else "available"
+
+        def sent_initial_cursor(self):
+            if case == "missing_position":
+                self.sent_calls.append("initial_failed")
+                raise MailboxError("test initial position unavailable")
+            return super().sent_initial_cursor()
+
+        def sent_changes_since(self, position):
+            self.sent_calls.append(("changes", position))
+            if case.startswith("recovered"):
+                raise StaleMailboxCursor("test Sent cursor expired")
+            return MailboxChanges((), self.sent_cursor, drained=case != "pending")
+
+        def sent_recover_since(self, since):
+            return replace(super().sent_recover_since(since), drained=case != "recovered_pending")
+
+    gateway = SentMapping(credential, identity, cursor)
+    result = Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()).check(
+        deliver_notifications=False,
+    )
+    assert result["mailbox_poll_state"] == expected
+    changes = [
+        call for call in gateway.sent_calls if isinstance(call, tuple) and call[0] == "changes"
+    ]
+    assert len(changes) == int(case in {"pending", "drained", "recovered", "recovered_pending"})
+    recoveries = [
+        call for call in gateway.sent_calls if isinstance(call, tuple) and call[0] == "recover"
+    ]
+    assert len(recoveries) == int(case.startswith("recovered"))
+    position = store.folder_state(
+        provider="imap", account_id=account_id, mailbox_identity_key=identity, folder="sent",
+    )
+    if case in {"unknown", "unavailable", "missing_position"}:
+        assert position is None
+    else:
+        assert position[0] == (
+            f"eom-imap-v2:{credential}:77:3"
+            if case.startswith("recovered") else gateway.sent_cursor
+        )
+
+
+def test_mailbox_poll_state_sent_missing_position_at_poll_owner(tmp_path):
+    """C1: a positionless available folder is unknown, independently of scope errors."""
+    cfg, store, account_id, credential, identity, cursor = _imap_sent_scaffold(tmp_path)
+    gateway = SentPollingGateway(credential, identity, cursor)
+    watcher = Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel())
+    now = datetime.now(UTC)
+    assert watcher._poll_sent_folder(
+        mailbox_identity_key=identity, label_selectors=(), gated_allowed=True,
+        vendor_snapshot=None, checked_at=now,
+        retention_cutoff=now - timedelta(days=cfg.retention_days),
+        folders=frozenset({"inbox", "sent"}), sent_scope="available",
+        dry_run=False, dry_run_messages=[],
+    ) == (0, False, "unknown")
+    assert gateway.sent_calls == []
