@@ -530,6 +530,17 @@ def _manager_record(block: str, names: tuple[str, ...]) -> dict[str, str]:
         else:
             record[key] = value
     name = record.get("Id")
+    # Native systemd omits ExecStart for an absent service, even with --all.
+    # Normalize only that empty command; the full field set is still required.
+    if (
+        name and name.endswith(".service")
+        and "ExecStart" not in record
+        and record.get("LoadState") == "not-found"
+        and record.get("ActiveState") == "inactive"
+        and record.get("MainPID") == "0"
+        and record.get("ControlPID") == "0"
+    ):
+        record["ExecStart"] = ""
     common = set(_MANAGER_FIELDS) - {"MainPID", "ControlPID", "Unit", "ExecStart"}
     required = common | (
         {"Unit"} if name and name.endswith(".timer") else
