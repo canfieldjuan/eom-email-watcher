@@ -229,11 +229,13 @@ def phase_outcomes(attempt: Path) -> dict:
     return phases
 
 
-def run_installer(installer: Path, installation: Path, folder: Path, label: str):
+def run_installer(
+    installer: Path, installation: Path, folder: Path, label: str, *, update: bool = True
+):
     attempt = folder / label
     attempt.mkdir(mode=0o700)
     result = subprocess.run(
-        [str(installer), "/S", "/UPDATE", "/D=" + str(installation)],
+        [str(installer), "/S", *(["/UPDATE"] if update else []), "/D=" + str(installation)],
         capture_output=True,
         timeout=240,
         env=powershell_environment(TEMP=str(attempt), TMP=str(attempt)),

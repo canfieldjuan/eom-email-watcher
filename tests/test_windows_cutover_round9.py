@@ -115,6 +115,52 @@ def test_native_installed_catalog_abort_then_retry(tmp_path, retain_binding):
     assert result["cleanup"]["quiesced"] is True
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native NSIS catalog file I/O")
+@pytest.mark.parametrize("case", ["clean", "inherited", "unwritable"])
+def test_native_catalog_error_state_belongs_to_its_file_open(case):
+    from windows_catalog_retry_fixture import qualified_compiler, run_catalog_error_state
+
+    packet = Path(os.environ["EW_QUALIFICATION_TEST_OUTPUT"]).parent
+    output = Path(os.environ["EW_QUALIFICATION_TEST_OUTPUT"]) / ("catalog-error-" + case)
+    result = run_catalog_error_state(output, qualified_compiler(packet), case)
+    if case == "unwritable":
+        assert result["exit_code"] != 0
+        assert result["catalog"] is None
+    else:
+        assert result["exit_code"] == 0, result
+        assert result["catalog"] == [
+            "EW-PACKAGE-FILES-V1", "public.exe", "EW-APP-IMAGE|public.exe",
+        ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native ordinary fresh NSIS installation")
+def test_native_fresh_install_without_update_flag(tmp_path):
+    import hashlib
+    import json
+
+    from prove_windows_cutover import run_installer
+
+    setup = list((ROOT / "desktop/src-tauri/target/release/bundle/nsis").glob("*-setup.exe"))
+    assert len(setup) == 1
+    output = Path(os.environ["EW_QUALIFICATION_TEST_OUTPUT"]) / "catalog-fresh-install"
+    output.mkdir()
+    installation = tmp_path / "fresh-install"
+    assert not installation.exists()
+    result, _ = run_installer(setup[0], installation, output, "fresh", update=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    catalog = installation / "windows-package-files-v1.txt"
+    receipt = json.loads(
+        (installation / "windows-source-cutover-v1.json").read_text(encoding="utf-8-sig")
+    )
+    assert receipt["program_catalog_sha256"] == hashlib.sha256(catalog.read_bytes()).hexdigest()
+    engine = installation / "eom-mail-engine.exe"
+    assert receipt["engine_sha256"] == hashlib.sha256(engine.read_bytes()).hexdigest()
+    packaged_engine = ROOT / "desktop/src-tauri/binaries/eom-mail-engine-x86_64-pc-windows-msvc.exe"
+    assert engine.read_bytes() == packaged_engine.read_bytes()
+    (output / "installed-catalog.txt").write_bytes(catalog.read_bytes())
+    (output / "installed-receipt.json").write_text(json.dumps(receipt, indent=2))
+
+
 def test_file_hash_owner_has_no_cmdlet_autoload_dependency():
     source = (ROOT / "desktop/src-tauri/windows/cutover.ps1").read_text()
     assert "Get-FileHash" not in source, "File hashing still depends on module autoload"

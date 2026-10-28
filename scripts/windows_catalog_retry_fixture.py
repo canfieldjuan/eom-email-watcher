@@ -427,6 +427,64 @@ try {
     return state
 
 
+def catalog_error_state_source(case: str) -> str:
+    """Execute the product macro with controlled incoming state and real file I/O."""
+    if case not in {"clean", "inherited", "unwritable"}:
+        raise ValueError("Unknown catalog error-state case")
+    template = (
+        'Section Install\n'
+        '  File "/oname=public.exe" "${MAINBINARYSRCPATH}"\n'
+        'SectionEnd\n'
+    )
+    before = (
+        '  CreateDirectory "$PLUGINSDIR\\ew-package-files-v1.txt"\n'
+        if case == "unwritable" else ""
+    )
+    before += "  SetErrors\n" if case == "inherited" else "  ClearErrors\n"
+    return (
+        'Unicode true\n!include "FileFunc.nsh"\n'
+        'Name "EW catalog error-state proof"\nRequestExecutionLevel user\n'
+        f'OutFile "catalog-{case}.exe"\n'
+        + catalog_macro(template)
+        + '\nFunction .onInit\n  InitPluginsDir\n'
+        + before
+        + '  !insertmacro EW_PREPARE_PACKAGE_CATALOG\n'
+        + f'  CopyFiles /SILENT "$EW_PACKAGE_PROGRAM_CATALOG" '
+        f'"$EXEDIR\\catalog-{case}.txt"\n'
+        + 'FunctionEnd\nSection Install\nSectionEnd\n'
+    )
+
+
+def run_catalog_error_state(output: Path, compiler: Path, case: str) -> dict:
+    """Compile and run the real catalog owner on Windows; retain failed receipts."""
+    assert os.name == "nt", "Catalog I/O proof requires native Windows"
+    output.mkdir(parents=True, exist_ok=False)
+    source = output / f"catalog-{case}.nsi"
+    source.write_text(catalog_error_state_source(case), encoding="utf-8")
+    binary = output / f"catalog-{case}.exe"
+    compiled = subprocess.run(
+        [str(compiler), str(source)], cwd=output, capture_output=True, timeout=40
+    )
+    (output / "compile.stdout.log").write_bytes(compiled.stdout)
+    (output / "compile.stderr.log").write_bytes(compiled.stderr)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    result = subprocess.run([str(binary), "/S"], capture_output=True, timeout=40)
+    catalog = output / f"catalog-{case}.txt"
+    receipt = {
+        "case": case,
+        "compiler_sha256": sha(compiler),
+        "source_sha256": sha(source),
+        "binary_sha256": sha(binary),
+        "exit_code": result.returncode,
+        "catalog": catalog.read_text(encoding="utf-16").splitlines()
+        if catalog.exists() else None,
+    }
+    (output / "result.json").write_text(json.dumps(receipt, indent=2))
+    (output / "run.stdout.log").write_bytes(result.stdout)
+    (output / "run.stderr.log").write_bytes(result.stderr)
+    return receipt
+
+
 if __name__ == "__main__":
     import argparse
 

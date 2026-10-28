@@ -28,6 +28,7 @@ def catalog_macro(template: str) -> str:
         "  Push $0",
         "  InitPluginsDir",
         '  StrCpy $EW_PACKAGE_PROGRAM_CATALOG "$PLUGINSDIR\\ew-package-files-v1.txt"',
+        "  ClearErrors",
         '  FileOpen $EW_PACKAGE_CATALOG_HANDLE "$EW_PACKAGE_PROGRAM_CATALOG" w',
         "  IfErrors 0 +2",
         '    Abort "Unable to write package file catalog"',
