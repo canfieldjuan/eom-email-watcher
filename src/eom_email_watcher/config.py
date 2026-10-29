@@ -1538,7 +1538,7 @@ def _link_unnamed_candidate_at(
 ) -> None:
     linkat = _linkat_function()
     if linkat is None:
-        raise OSError(errno.ENOSYS, "linkat with AT_EMPTY_PATH is unavailable")
+        raise OSError(errno.ENOSYS, "unnamed candidate publication is unavailable")
     linkat.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
@@ -1547,12 +1547,14 @@ def _link_unnamed_candidate_at(
         ctypes.c_int,
     ]
     linkat.restype = ctypes.c_int
+    # The proc-fd form publishes the held inode without CAP_DAC_READ_SEARCH.
+    # The destination remains relative to its held parent and never overwrites.
     result = linkat(
-        candidate_fd,
-        b"",
+        -100,  # AT_FDCWD; ignored for the absolute proc-fd source
+        os.fsencode(f"/proc/self/fd/{candidate_fd}"),
         parent_fd,
         os.fsencode(candidate_name),
-        0x1000,  # AT_EMPTY_PATH
+        0x400,  # AT_SYMLINK_FOLLOW
     )
     if result != 0:
         error_number = ctypes.get_errno()

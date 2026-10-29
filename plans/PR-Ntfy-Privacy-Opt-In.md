@@ -223,3 +223,75 @@ Parked hardening: issue #137 records the later opaque notification mode.
 | `tests/test_notifications.py` | 133 |
 | `tests/test_service.py` | 28 |
 | **Total** | **536** |
+
+## Bounded ordinary-user configuration publication repair (2026-10-28)
+
+Operator acceptance: “Let’s start the bounded configuration-save repair. Keep it
+separate and leave my live app and settings alone.”
+
+Root cause: config.py:_link_unnamed_candidate_at, introduced by 153e0d4b, uses
+linkat AT_EMPTY_PATH. An ordinary user with no effective capabilities cannot use
+that operation on the native qualification kernel. The actual source owner
+returns ENOENT; the documented proc-fd form links the same unnamed inode. The
+installed setup form fails at that owner.
+
+Required change surface: the shared publication helper and its regression tests.
+Use linkat(AT_FDCWD, /proc/self/fd/<held candidate descriptor>, held parent
+descriptor, destination name, AT_SYMLINK_FOLLOW) for every caller. First-run, ntfy
+candidate and disposition publication retain one owner. The source path is built
+only from the internal descriptor, never user input. No privilege probing or
+fallback; missing procfs/link failure propagates the existing bounded refusal.
+Keep fully written/fsynced private candidate, destination EEXIST refusal, held
+parent validation, inode checks, rollback and directory-fsync ordering.
+
+Explicit non-scope: no schema, API, polling, unit payload, dependency, live
+app/settings/timer, named temporary file workaround, privilege grant, root app
+launch, rename-over fallback or downstream retry.
+
+Assumptions/blockers: isolated guest and synthetic profile only. Native ordinary
+user proof, not host-kernel success alone, is required.
+
+Verification plan: fail-first regression plus native unprivileged source and
+installed setup. Test same inode/content/mode, existing target preserved, missing
+proc/link failure and invalid descriptor refuse without publication. Preserve
+adjacent config and ntfy parent replacement/race, crash/recovery and durability
+tests. Removed-fix mutant must fail. Ruff, package build, exact-head CI and
+independent reviews remain gates.
+
+Implementation summary: the shared helper now uses the documented unprivileged
+proc-fd link operation. The source descriptor still identifies the fully written
+candidate; the destination is still relative to the held parent. No downstream
+special cases were added or became redundant. Existing transaction validation,
+non-overwrite, durability and rollback remain in their original owners.
+
+Cold diff audit:
+- `src/eom_email_watcher/config.py:_link_unnamed_candidate_at`: changes only the
+  link source/flag and unavailable-primitive wording. Every existing caller uses
+  this owner. Native before/after and installed setup prove the origin fix.
+- `tests/test_config_publication_native.py`: adds native syscall regression,
+  inode/content/private-mode assertions, existing-target preservation and failure
+  non-publication. Each assertion maps to the verification plan above. The
+  existing platform-contract marker selects Linux, where these tests execute;
+  existing Windows-only cases retain their existing selection rules.
+- This appended contract records the bounded acceptance and evidence without
+  changing the original notification disclosure contract.
+
+Verification results:
+- Local fail-first: `1 failed, 5 deselected in 0.36s` at the old syscall arguments.
+- Native ordinary user, effective capabilities zero: `2 failed in 1.30s` before
+  the fix, including the existing first-run initialization test. Restoring the
+  old helper after the fix yields `2 failed in 0.42s`; fixed source restored.
+- Configuration/native-publication/ntfy transaction tests under umask 022:
+  local `317 passed, 2 deselected in 11.91s`; native Linux
+  `317 passed, 2 deselected in 11.57s`. Deselections are existing Windows-only
+  tests, not new skips or weakened assertions.
+- Actual unavailable procfs in an isolated mount namespace: ordinary user gets
+  ENOENT and no config is published. No fallback or privilege grant.
+- Ruff: `All checks passed!`; package build and `packaged-engine-smoke: ok`.
+- Installed ordinary-user desktop setup creates a private config and opens the
+  inbox. Installed binaries match the built package. Live host binary hashes,
+  config metadata and timer states match the pre-qualification baseline.
+
+Gap audit: NOT DONE. Implementation and native origin proof are complete;
+exact-head CI, independent review and merge gates remain. Full polling
+qualification belongs to #145 and is not claimed by this bounded repair.
