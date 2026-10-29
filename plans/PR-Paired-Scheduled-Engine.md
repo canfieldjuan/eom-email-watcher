@@ -1111,3 +1111,62 @@ profile/model/mail changes. Cold audit cold-diff-audit-v12.md.
 
 Gap audit DONE local origin fix/reproduction/regressions/mutations/native parity;
 NOT DONE new-head CI and independent oversight after the grouped push. Hold stays.
+
+### Bounded native absent-service metadata repair (2026-10-28)
+
+Operator acceptance: “Authorize bounded Linux repair”. Separate from Windows
+installer PR #307 and polling changes.
+
+Root cause: `_manager_record` (deployment.py:534-540), introduced by d36d6c67,
+requires ExecStart for not-found service records. Native systemd255 omits that
+property even with --all; a fresh installed desktop refuses before config creation.
+The native output, screenshot and package identity are retained in the durable
+145-poll-backlog/isolated-qualification evidence packet.
+
+Required change surface: normalize missing ExecStart at `_manager_record` only
+for an absent inactive .service with MainPID=0 and ControlPID=0. Keep the complete
+required-field set and all graph/identity/activation refusals. Use that one owner
+for capture and snapshot readers; no downstream workaround or redundant rule.
+The captured shipped-unit records become a public regression fixture.
+
+Explicit non-scope: no Windows installer, polling policy, scheduled unit payload,
+schema, dependencies, manager substitution, dummy units, live app/config/timers,
+or admission bypass.
+
+Assumptions/blockers: native Ubuntu proof guest is isolated and authorized.
+Fresh installed configuration creation, not just direct parser acceptance, is
+required. Exact-head CI and independent reviews remain merge gates.
+
+Verification plan: fail-first native record admission; explicit-empty twin;
+loaded, active, nonzero/invalid process IDs, extra/duplicate/partial fields and
+partial deployment refusals. Run adjacent deployment tests and Ruff, rebuild the
+package and exercise its fresh ordinary-user UI. Preserve captured fail/pass
+evidence and prove the live baseline unchanged.
+
+Implementation summary: `_manager_record` normalizes only the absent inactive
+service/zero-PID omitted command. Full required metadata and downstream graph
+validation remain unchanged. No special case was added to a consumer.
+
+Verification: captured native omitted-command cases failed before the fix
+(3 failed, 3 passed); after it the regression file passed22 and adjacent deployment
+files passed412. Ruff and diff-check pass. Rebuilt packaged-engine smoke passes.
+The installed package's engine/desktop bytes match its archive. The same ordinary
+guest now renders the setup form and installed config.ntfy_disclosure.status
+returns ok/state missing. Live binaries/config metadata/timer states unchanged.
+
+Cold diff audit: deployment.py:_manager_record owns the sole normalization;
+tests/test_deployment_absent_native.py covers native omitted/empty twins, both
+parser readers, malformed metadata and partial graph refusal.
+tests/data/systemd255-absent-watcher-units.txt contains unchanged shipped-unit
+blocks captured from systemd255; SHA256
+066aecc4129b37af3634f51e3fe88693f00daddb35a81dba4cf0a37dff6f82d2.
+This canonical plan records scope and qualification; no other product owner moved.
+
+Gap audit: NOT DONE full fresh setup and PR gates. Submitting the native form
+revealed a separate pre-existing config.py:_link_unnamed_candidate_at failure
+(origin153e0d4b): AT_EMPTY_PATH requires a capability the ordinary user lacks.
+The actual owner returns ENOENT; the documented unprivileged proc-fd control
+links the same inode. No config.py workaround was made; separate operator scope
+authorization was requested. Do not call configuration creation or issue145
+polling qualification complete. Retained packet: linux-repair-verification.json,
+linux-repaired-native-launch.log and linux-publication-isolation.txt.
