@@ -87,10 +87,27 @@ class Analysis(BaseModel):
     priority: Literal["urgent", "high", "normal", "low"]
     summary: str = Field(min_length=1, max_length=800)
     action_required: bool
-    suggested_action: str | None = Field(default=None, max_length=500)
-    deadline_text: str | None = Field(default=None, max_length=200)
-    deadline_iso: str | None = None
+    # Nullable but required: the prompt names every key, so an omitted key is a
+    # schema mismatch rather than an implicit null.
+    suggested_action: str | None = Field(max_length=500)
+    deadline_text: str | None = Field(max_length=200)
+    deadline_iso: str | None
     confidence: float = Field(ge=0, le=1)
+
+
+def analysis_response_schema() -> dict[str, object]:
+    """Decoder schema for email analysis, sent by both the direct and gateway paths.
+
+    The date bound lives here rather than on Analysis because validate_analysis
+    clears a malformed deadline instead of rejecting the answer. The inference
+    gateway admits no "pattern" or "format" keyword, so an exact YYYY-MM-DD length
+    is the strongest date bound a decoder can enforce through it.
+    """
+    schema = Analysis.model_json_schema()
+    deadline = schema["properties"]["deadline_iso"]
+    string_branch = next(branch for branch in deadline["anyOf"] if branch.get("type") == "string")
+    string_branch["minLength"] = string_branch["maxLength"] = len("YYYY-MM-DD")
+    return schema
 
 
 SYSTEM_PROMPT = """You classify and summarize an inbound email for the mailbox owner.
@@ -408,7 +425,7 @@ class LocalModel:
             system_prompt=SYSTEM_PROMPT,
             user_prompt=prompt,
             schema_name="email_analysis",
-            schema=Analysis.model_json_schema(),
+            schema=analysis_response_schema(),
             max_tokens=500,
         )
         return validate_analysis(_json_object(content), received_at)
@@ -719,7 +736,7 @@ class GatewayModel:
                 attachment_names=bounded_gateway_attachment_names(attachment_names),
                 current_local_time=current_local_time,
             ),
-            schema=Analysis.model_json_schema(),
+            schema=analysis_response_schema(),
             max_output_tokens=500,
         )
         try:
