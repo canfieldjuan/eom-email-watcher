@@ -1,13 +1,16 @@
 # Email-analysis output schema matches its contract — #310
 
-Status: proposed contract only. No production code, test, corpus, prompt, setting or
-installation change. Implementation starts only after operator acceptance is recorded here.
+Status: accepted contract only. No production code, test, corpus, prompt, setting or
+installation change in this PR.
 
 ## Operator acceptance
 
-Pending. Record Juan's verbatim decision and the accepted commit here, merge this PR as
-contract-only after CI and review, then implement R1–R4 in a separate PR on the merged
-contract, starting with fail-first regressions.
+Juan accepted the reviewed contract at `e9bea7ee662fef26b66909fd75aa1918b755aff6` in the
+coding chat on 2026-10-30, verbatim: “I accept let’s continue”. The Codex review of that commit
+completed with no findings.
+
+Merge this PR as contract-only after CI, then implement R1–R4 in a separate PR on the merged
+contract, starting with fail-first regressions. The GPU settling run needs a separate operator go.
 
 Base: `3edcae19de0fff45ebc808aa5650e17a411a2e45`.
 
