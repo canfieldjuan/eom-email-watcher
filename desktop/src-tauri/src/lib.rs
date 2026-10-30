@@ -1155,8 +1155,8 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
     {
         if attempt.state == AdmissionState::Admitted
             && attempt.workers.as_ref().is_none_or(|workers| {
-                workers
-                    .revalidate()
+                let revalidated = workers.revalidate();
+                revalidated
                     .inspect_err(|error| report_admission_failure("install_revalidation", error))
                     .is_err()
             })

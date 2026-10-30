@@ -39,3 +39,11 @@ Effect-trace: admission refusal becomes diagnosable | existing decision-site Res
 ## Gap audit
 
 NOT DONE: native Windows CI/build, independent exact-head review, diagnostic guest replay and the underlying refusal's origin remain. No merge, live install, promotion, timing claim or issue completion is authorized by this diagnostic contract.
+
+## CI correction within the diagnostic scope
+
+Reproduction: at ba688e1a5085fda8c15a89b9a54bbcffd7a79fa5, the existing native startup source-order guard fails with “staged workers must revalidate their admission token,” matching desktop CI.
+Origin: this diagnostic commit changed AdmissionCoordinator::install_attempt in lib.rs so rustfmt split workers.revalidate() across lines. The unchanged source-order guard requires the intact call before workers.activate(). Runtime ordering remained intact; the diagnostic source shape violated its existing guard.
+Required fix: bind the result once with `let revalidated = workers.revalidate();`, then inspect that result and branch exactly as before. No test, assertion, gate, timeout, error or activation rule changes. Keep the existing regression as the fail-first guard; do not duplicate it. Run pnpm test, formatting/lint and the relevant native admission/order tests. This correction does not authorize permanent merge or guest use before exact-head green CI and delta review.
+
+Correction results: the existing guard failed before the binding change and passed afterward. Full `pnpm test` passed all 248 tests with no skips using a private `TMPDIR` outside Git. The initial full run had five fixture-generation failures because `/tmp/.git` made the default temporary directory a forbidden evidence destination; the shared evidence guard correctly refused it. No fixture, assertion, guard or host Git marker changed. Native admission tests passed (16), the staged-worker ordering test passed (1), formatting and Clippy passed. Raw before/after logs and the environment-failure log are retained in the correction receipt. Exact-head CI and oversight delta review remain pending.
