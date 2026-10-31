@@ -12,7 +12,7 @@ Only `tests/test_invoice_compatibility.py` and this evidence summary are added.
 
 | Accepted invariant | Proof in this slice | Limit |
 | --- | --- | --- |
-| Selection identity | Full credential-free 1.0/2.0 snapshot round-trip, stale interactive refusal before mailbox/POST, provider version/instance changes and mixed-version catalog matching | Automation-fire scheduling refusal is a later proof slice. |
+| Selection identity | Full credential-free 1.0/2.0 snapshot round-trip, stale interactive refusal before mailbox/POST, provider version/instance changes, mixed-version catalog matching and duplicate exact-identity refusal for both versions | Automation-fire scheduling refusal is a later proof slice. |
 | Explicit recovery | API rule creation/reselection through versioned rules.put, original selection retained across fresh interpreter reopen, stale expected-version refusal | API-only; no desktop rule editor claim, no concurrent-thread race claim. |
 | Terminal provider errors | Real loopback HTTP 400 UNSUPPORTED_CAPABILITY and accepted-then-failed INTERRUPTED status through the shared client and existing engine owners; original request identity retained and repeated pump does not POST | Uses the reference server, not an installed Invoice Processor; terminal behavior across a process restart and full user-path recovery remain pending. |
 | Historical output | Synthetic InvoiceRecord 1.1 bytes returned over HTTP, fresh-process retained request/result check, original capability identity, rejection of substituted 2.0 context, opaque presentation and exact export without discovery | No typed invoice adoption; certificate behavior unchanged. |
@@ -23,9 +23,17 @@ The HTTP fixture reuses ReferenceProvider's listener, registration, authenticati
 
 - Initial adjacent baseline passed. The new selection tests passed before any runtime edit.
 - The first HTTP attempt failed in the newly written test helper: `_prepare_or_create_generic_connect_job` returns a content callback, but the helper passed that callback as bytes. The helper now calls it before returning its data; the original HTTP cases pass. This was an uncommitted fixture defect, not a product failure or a weakened assertion.
-- Focused plus adjacent run: `43 passed in 12.83s`, with no platform exclusions. Includes the new file, fixed-adoption and reference-provider tests, and existing stale-version, nonretryable refusal and output presentation/export regressions.
+- Focused plus adjacent run: `45 passed in 18.79s`, with no platform exclusions. Includes the new file, fixed-adoption and reference-provider tests, and existing stale-version, nonretryable refusal and output presentation/export regressions.
 - Ruff check passes. No broad local suite duplicated CI; native/platform results remain CI gates.
 - Mutation in an isolated source copy removed exact capability-version matching at `_discover_selected_generic_capability`. The stale selection test failed with “stale invoice selection reached mailbox or POST”; production source was untouched. This guards the invariant rather than merely echoing the implementation.
+
+## Duplicate-match review regression
+
+The coverage omission originated in proof commit `6549346be924c218db0d7de5aed50195a8ee9ebe`, in `test_mixed_catalog_matches_exact_saved_invoice_version` at `tests/test_invoice_compatibility.py:128`. Mixed versions prove exact selection but cannot exercise two entries with the same identity. The existing product owner, `engine_api.py:3183`, `_discover_selected_generic_capability`, already rejects ambiguity; its guard originated in `2c6eb559` and is unchanged.
+
+Reproduction and isolation: in a separate source copy, changing only that owner's `len(matches) != 1` to `len(matches) == 0` left the original proof file green (`10 passed in 4.67s`). The added parameterized public-API regression supplies two exact identities for each of invoice 1.0 and 2.0, differing only in their display label. It requires `capability_unavailable`, forbids mailbox and client construction, and asserts no job was persisted. With the isolated mutation, both cases fail at the forbidden mailbox boundary (`2 failed in 1.10s`); with unchanged product source, the focused/adjacent run passes (`45 passed in 18.79s`, no exclusions), as do Ruff lint and format checks.
+
+This closes the accepted duplicate-selection proof requirement without a new product rule, downstream patch, skip or weakened assertion. Wrong-protocol completed-output integrity remains in the next slice.
 
 ## Explicit non-scope, implementation summary and cold diff audit
 

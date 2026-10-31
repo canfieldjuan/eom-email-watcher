@@ -142,6 +142,38 @@ def test_mixed_catalog_matches_exact_saved_invoice_version(monkeypatch):
         assert parameters == {}
 
 
+@pytest.mark.parametrize("version", ["1.0", "2.0"])
+def test_duplicate_invoice_identity_refuses_before_handoff(
+    invoice_runtime,
+    monkeypatch,
+    version,
+):
+    config_path, runtime = invoice_runtime
+    selected = invoice_capability(version)
+    duplicate = replace(selected, action_label="Another label for the same identity")
+    monkeypatch.setattr(
+        connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected, duplicate)),
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("ambiguous invoice selection reached mailbox or POST")
+
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", forbidden)
+    monkeypatch.setattr(connect, "ConnectV2Client", forbidden)
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "capability_unavailable"
+    assert runtime.store.connect_job(REQUEST_ID) is None
+
+
 def test_api_invoice_reselection_preserves_old_version_after_process_reopen(
     invoice_runtime,
     monkeypatch,
