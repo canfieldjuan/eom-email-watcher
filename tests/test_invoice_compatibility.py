@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 from dataclasses import replace
@@ -560,3 +561,162 @@ print(json.dumps({"request": job.request_json.decode(), "result": job.result_jso
     assert Path(exported["path"]).read_bytes() == output.payload
     assert runtime.store.connect_job(REQUEST_ID) == before
     assert provider.post_attempt_count() == 1
+
+
+@pytest.fixture
+def completed_invoice(invoice_runtime, invoice_http_provider, monkeypatch):
+    config_path, runtime = invoice_runtime
+    provider, _ = invoice_http_provider
+    selected, prepared, content = prepare_http_job(invoice_runtime, monkeypatch)
+    engine_api._run_generic_connect_job(runtime, selected, prepared, content)
+    job = runtime.store.connect_job(REQUEST_ID)
+    assert job.status == "completed"
+    assert provider.post_attempt_count() == 1
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("retained invoice read attempted discovery, mailbox or provider access")
+
+    monkeypatch.setattr(connect, "discover_capabilities", forbidden)
+    monkeypatch.setattr(connect, "ConnectV2Client", forbidden)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", forbidden)
+    yield config_path, runtime, job
+    assert provider.post_attempt_count() == 1
+
+
+def reopened_invoice_outputs(store_path):
+    script = """
+import base64, json, sys
+from pathlib import Path
+from eom_email_watcher.db import Store
+store = Store(Path(sys.argv[1]))
+job = store.connect_job(sys.argv[2])
+try:
+    outputs = store.completed_connect_outputs(job)
+except RuntimeError:
+    result = {"accepted": False}
+else:
+    result = {"accepted": True, "outputs": [
+        {**item.metadata(), "payload_base64": base64.b64encode(item.payload).decode()}
+        for item in outputs]}
+print(json.dumps(result))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(store_path), REQUEST_ID],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize(
+    ("corruption", "api_code"),
+    [
+        ("payload", "output_invalid"),
+        ("hash", "output_invalid"),
+        ("size", "output_invalid"),
+        ("encoding", "output_invalid"),
+    ],
+)
+def test_retained_invoice_integrity_refuses_after_reopen(
+    completed_invoice, tmp_path, corruption, api_code
+):
+    config_path, runtime, original = completed_invoice
+    # Permissive-side control uses the same actual stored record in a fresh interpreter.
+    assert reopened_invoice_outputs(runtime.store.path) == {
+        "accepted": True,
+        "outputs": json.loads(original.result_json)["outputs"],
+    }
+    result = json.loads(original.result_json)
+    output = result["outputs"][0]
+    if corruption == "payload":
+        payload = base64.b64decode(output["payload_base64"])
+        altered = bytes([payload[0] ^ 1]) + payload[1:]
+        output["payload_base64"] = base64.b64encode(altered).decode()
+    elif corruption == "hash":
+        output["sha256"] = "0" * 64
+    elif corruption == "size":
+        output["byte_size"] += 1
+    elif corruption == "encoding":
+        output["payload_base64"] = "!invalid-base64!"
+    value = json.dumps(result).encode()
+    # Corrupt only the disposable persisted record; application writes cannot create this state.
+    with runtime.store.connection() as db:
+        db.execute(
+            "UPDATE connect_attachment_jobs SET result_json = ? WHERE job_id = ?",
+            (value, REQUEST_ID),
+        )
+    corrupted = runtime.store.connect_job(REQUEST_ID)
+    assert corrupted.request_json == original.request_json
+    with pytest.raises(RuntimeError, match="Completed Connect v2"):
+        runtime.store.completed_connect_outputs(corrupted)
+    assert reopened_invoice_outputs(runtime.store.path) == {"accepted": False}
+    destination = tmp_path / "refused-export"
+    destination.mkdir()
+    payload = {
+        "message_id": "message-1",
+        "part_id": "2",
+        "job_id": REQUEST_ID,
+        "artifact_id": OUTPUT_ID,
+    }
+    for operation in ("connect.output.present", "connect.output.export"):
+        request_payload = dict(payload)
+        if operation.endswith("export"):
+            request_payload["destination_dir"] = str(destination)
+        response = engine_api._response(api_request(config_path, operation, request_payload))
+        assert response["ok"] is False
+        assert response["error"]["code"] == api_code
+        assert list(destination.iterdir()) == []
+        assert runtime.store.connect_job(REQUEST_ID) == corrupted
+
+
+@pytest.mark.parametrize("field", ["message_id", "part_id", "job_id", "artifact_id"])
+def test_retained_invoice_output_selection_refuses_mismatched_identity(
+    completed_invoice, tmp_path, field
+):
+    config_path, runtime, original = completed_invoice
+    payload = {
+        "message_id": "message-1",
+        "part_id": "2",
+        "job_id": REQUEST_ID,
+        "artifact_id": OUTPUT_ID,
+    }
+    payload[field] = "8dd9fa73-98db-412e-8329-21a4e95b7d27"
+    destination = tmp_path / "wrong-identity-export"
+    destination.mkdir()
+    for operation in ("connect.output.present", "connect.output.export"):
+        request_payload = dict(payload)
+        if operation.endswith("export"):
+            request_payload["destination_dir"] = str(destination)
+        response = engine_api._response(api_request(config_path, operation, request_payload))
+        assert response["ok"] is False
+        assert response["error"]["code"] == "not_found"
+        assert list(destination.iterdir()) == []
+        assert runtime.store.connect_job(REQUEST_ID) == original
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("protocol_version", 1), ("status", "failed"), ("result_json", None)],
+)
+def test_retained_invoice_record_shape_refuses_at_store_owner(completed_invoice, field, value):
+    _, runtime, original = completed_invoice
+    # Persisted states have a stronger schema guard; prove it without disabling constraints.
+    with (
+        pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"),
+        runtime.store.connection() as db,
+    ):
+        db.execute(
+            f"UPDATE connect_attachment_jobs SET {field} = ? WHERE job_id = ?",
+            (value, REQUEST_ID),
+        )
+    assert runtime.store.connect_job(REQUEST_ID) == original
+    assert reopened_invoice_outputs(runtime.store.path) == {
+        "accepted": True,
+        "outputs": json.loads(original.result_json)["outputs"],
+    }
+    # Direct owner boundary: isolate the reader guard from both SQL and API guards.
+    invalid_record = replace(original, **{field: value})
+    with pytest.raises(RuntimeError, match="missing its durable result"):
+        runtime.store.completed_connect_outputs(invalid_record)
