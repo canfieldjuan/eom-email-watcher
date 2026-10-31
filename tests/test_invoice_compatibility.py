@@ -617,6 +617,7 @@ print(json.dumps(result))
         ("hash", "output_invalid"),
         ("size", "output_invalid"),
         ("encoding", "output_invalid"),
+        ("nonalphabet_encoding", "output_invalid"),
     ],
 )
 def test_retained_invoice_integrity_refuses_after_reopen(
@@ -640,6 +641,13 @@ def test_retained_invoice_integrity_refuses_after_reopen(
         output["byte_size"] += 1
     elif corruption == "encoding":
         output["payload_base64"] = "!invalid-base64!"
+    elif corruption == "nonalphabet_encoding":
+        original_payload = base64.b64decode(output["payload_base64"], validate=True)
+        output["payload_base64"] = output["payload_base64"][:4] + "!" + output["payload_base64"][4:]
+        # Only the encoding is invalid: permissive decoding retains the exact bytes and metadata.
+        assert base64.b64decode(output["payload_base64"], validate=False) == original_payload
+        assert len(original_payload) == output["byte_size"]
+        assert hashlib.sha256(original_payload).hexdigest() == output["sha256"]
     value = json.dumps(result).encode()
     # Corrupt only the disposable persisted record; application writes cannot create this state.
     with runtime.store.connection() as db:

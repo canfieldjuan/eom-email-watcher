@@ -29,6 +29,16 @@ The initial test attempted to persist schema-invalid record shapes and failed at
 - Ruff initially found nested-context formatting. After that syntax-only correction, the affected shape cases passed again (`3 passed in 2.49s`), with Ruff check and format clean. Other test bodies are unchanged from the focused run.
 - Isolated source-copy mutation removed only `or job.protocol_version != 2` at `Store.completed_connect_outputs`. The protocol case failed with `DID NOT RAISE <class 'RuntimeError'>` (`1 failed, 2 deselected in 1.15s`). The working product source was never modified. This proves the required wrong-protocol test reaches the owner rather than passing on a later guard.
 
+## Strict-encoding review delta
+
+Oversight R1 identified a missing correct-bytes malformed-encoding control in `deb82a2259789a4e938e437df06eae5c09bbf3e8`, at `tests/test_invoice_compatibility.py:641-642`, `test_retained_invoice_integrity_refuses_after_reopen`. The original junk string did not isolate encoding validity from the other integrity checks. The added case inserts only a non-alphabet character into the authentic retained encoding and independently verifies that permissive decoding yields the original bytes with the unchanged correct size/hash. It then requires refusal at the store reader, after fresh-process reopen, and through present/export with no output file or record mutation. The original case and all its assertions remain.
+
+Mutation results refine R1's proposed negative control: `_validate_generic_result` at `db.py:5647` uses strict base64 decoding, but `db.py:5651` also compares canonical re-encoding to the stored string. Both existing checks originate in `ba567790`. Removing only strict decoding still refuses a correct-bytes string with an extra character through canonical comparison; the new test passes (`1 passed, 23 deselected in 1.74s`). This is overlapping enforcement at the same owner, not a product defect, and no single-mutant kill is claimed.
+
+In an isolated source copy, removing strict decoding **and** canonical comparison leaves the original junk-encoding case green (`1 passed, 23 deselected in 1.65s`) but the new correct-bytes case fails at the expected refusal assertion (`DID NOT RAISE <class 'RuntimeError'>`, `1 failed, 23 deselected in 1.25s`). Product source remains unchanged. The combined negative control proves the new case detects acceptance of noncanonical encoding without relying on a hash/size mismatch.
+
+Latest focused/adjacent run under umask 022: `29 passed in 15.24s`, no exclusions. Ruff lint and format pass. Earlier receipts above remain historical evidence for the initial proof commit; these results cover the test delta. Exact-head CI/connector/oversight review must run again after push.
+
 ## Cold diff audit
 
 `tests/test_invoice_compatibility.py`: adds a completed-result fixture, fresh-process output reader and parameterized negative controls; existing positive replay tests and assertions remain intact. These map to the accepted replay/integrity requirements. `plans/PR-Invoice-Output-Integrity-Proof.md`: records this mapping, actual receipts, initial fixture failure and limits. No schema, source, dependency or public contract changes.
