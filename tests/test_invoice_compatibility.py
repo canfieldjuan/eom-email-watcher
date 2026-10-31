@@ -567,6 +567,14 @@ print(json.dumps({"request": job.request_json.decode(), "result": job.result_jso
 def completed_invoice(invoice_runtime, invoice_http_provider, monkeypatch):
     config_path, runtime = invoice_runtime
     provider, _ = invoice_http_provider
+    payload_factory = legacy_invoice_payload
+
+    def padded_payload(source):
+        payload = payload_factory(source)
+        # JSON trailing whitespace preserves the record while guaranteeing base64 padding.
+        return payload + b" " * ((1 - len(payload)) % 3)
+
+    monkeypatch.setattr(sys.modules[__name__], "legacy_invoice_payload", padded_payload)
     selected, prepared, content = prepare_http_job(invoice_runtime, monkeypatch)
     engine_api._run_generic_connect_job(runtime, selected, prepared, content)
     job = runtime.store.connect_job(REQUEST_ID)
@@ -618,6 +626,7 @@ print(json.dumps(result))
         ("size", "output_invalid"),
         ("encoding", "output_invalid"),
         ("nonalphabet_encoding", "output_invalid"),
+        ("padding_bits", "output_invalid"),
     ],
 )
 def test_retained_invoice_integrity_refuses_after_reopen(
@@ -641,11 +650,21 @@ def test_retained_invoice_integrity_refuses_after_reopen(
         output["byte_size"] += 1
     elif corruption == "encoding":
         output["payload_base64"] = "!invalid-base64!"
-    elif corruption == "nonalphabet_encoding":
-        original_payload = base64.b64decode(output["payload_base64"], validate=True)
-        output["payload_base64"] = output["payload_base64"][:4] + "!" + output["payload_base64"][4:]
-        # Only the encoding is invalid: permissive decoding retains the exact bytes and metadata.
-        assert base64.b64decode(output["payload_base64"], validate=False) == original_payload
+    elif corruption in ("nonalphabet_encoding", "padding_bits"):
+        encoded = output["payload_base64"]
+        original_payload = base64.b64decode(encoded, validate=True)
+        if corruption == "nonalphabet_encoding":
+            output["payload_base64"] = encoded[:4] + "!" + encoded[4:]
+        else:
+            assert encoded.endswith("==")
+            alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            noncanonical = alphabet[alphabet.index(encoded[-3]) + 1]
+            output["payload_base64"] = encoded[:-3] + noncanonical + "=="
+        # Both corruptions retain exact bytes; padding-bit corruption also uses a valid alphabet.
+        assert (
+            base64.b64decode(output["payload_base64"], validate=corruption == "padding_bits")
+            == original_payload
+        )
         assert len(original_payload) == output["byte_size"]
         assert hashlib.sha256(original_payload).hexdigest() == output["sha256"]
     value = json.dumps(result).encode()

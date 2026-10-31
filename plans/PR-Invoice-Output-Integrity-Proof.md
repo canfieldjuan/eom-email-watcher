@@ -37,7 +37,11 @@ Mutation results refine R1's proposed negative control: `_validate_generic_resul
 
 In an isolated source copy, removing strict decoding **and** canonical comparison leaves the original junk-encoding case green (`1 passed, 23 deselected in 1.65s`) but the new correct-bytes case fails at the expected refusal assertion (`DID NOT RAISE <class 'RuntimeError'>`, `1 failed, 23 deselected in 1.25s`). Product source remains unchanged. The combined negative control proves the new case detects acceptance of noncanonical encoding without relying on a hash/size mismatch.
 
-Latest focused/adjacent run under umask 022: `29 passed in 15.24s`, no exclusions. Ruff lint and format pass. Earlier receipts above remain historical evidence for the initial proof commit; these results cover the test delta. Exact-head CI/connector/oversight review must run again after push.
+First encoding-delta focused/adjacent run under umask 022: `29 passed in 15.24s`, no exclusions. Ruff lint and format pass. Earlier receipts above remain historical evidence for the initial proof commit; these results cover the test delta. Exact-head CI/connector/oversight review must run again after push.
+
+Oversight withdrew the original R1 in mailbox `7a0dc7fc` after confirming the canonical check. Its replacement identifies the missing valid-alphabet/nonzero-padding-bits control, still a coverage omission from `deb82a2259789a4e938e437df06eae5c09bbf3e8`. The initial non-alphabet test remains as an extra refusal case. The completed-invoice integrity fixture now appends only trailing JSON whitespace so its real HTTP output requires base64 padding; the record content is unchanged. The padding-bit case alters only unused bits, verifies that even `validate=True` decodes identical payload bytes with the original hash/size, and applies the same store/reopen/present/export assertions.
+
+The replacement single-clause mutation removes only the canonical re-encoding comparison in an isolated source copy. The earlier encoding cases remain green (`2 passed, 23 deselected in 2.86s`); the padding-bit case fails at the expected RuntimeError assertion (`1 failed, 24 deselected in 1.12s`). This single-clause kill is the decisive R1 negative control; the combined mutation above is historical evidence, not its substitute. Final focused/adjacent run: `30 passed in 14.67s`, no exclusions; Ruff check/format clean. Product checks and existing assertions are unchanged. Exact-head review and CI remain required.
 
 ## Cold diff audit
 
