@@ -6,7 +6,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -271,7 +271,12 @@ def invoice_http_provider(tmp_path, monkeypatch):
     runtime_dir = tmp_path / "provider-runtime"
     runtime_dir.mkdir(mode=0o700)
     provider = ReferenceProvider.start(runtime_dir)
-    state = {"version": "1.0", "outcome": "completed", "requests": []}
+    state = {
+        "version": "1.0",
+        "outcome": "completed",
+        "requests": [],
+        "confirmation_required": False,
+    }
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
     original_manifest = provider.server.manifest
 
@@ -285,7 +290,10 @@ def invoice_http_provider(tmp_path, monkeypatch):
                 "accepts": [{"media_type": "application/pdf", "max_bytes": 1024}],
                 "produces": [INVOICE_MEDIA_TYPE],
                 "parameters": [],
-                "effects": {"external": False, "confirmation_required": False},
+                "effects": {
+                    "external": False,
+                    "confirmation_required": state["confirmation_required"],
+                },
             }
         ]
         return value
@@ -446,7 +454,7 @@ def test_legacy_invoice_http_failures_are_terminal_without_resubmission(
     monkeypatch,
     outcome,
 ):
-    _, runtime = invoice_runtime
+    config_path, runtime = invoice_runtime
     provider, state = invoice_http_provider
     selected, prepared, content = prepare_http_job(invoice_runtime, monkeypatch)
     if outcome == "interrupted":
@@ -487,6 +495,121 @@ def test_legacy_invoice_http_failures_are_terminal_without_resubmission(
         engine_api._pump_generic_connect_lane(runtime, runtime.store.connect_job(REQUEST_ID))
     assert provider.post_attempt_count() == 1
     assert len(state["requests"]) == 1
+    assert stored.error_retryable == 0
+    dispatch_before = runtime.store.connect_dispatch(REQUEST_ID)
+    original_request = api_request(
+        config_path, "connect.attachment.invoke", invocation_payload(selected)
+    )
+    # Real interpreter restart: no parent Runtime, mocks or decoded objects are inherited.
+    script = """
+import json, sys
+from dataclasses import asdict
+from pathlib import Path
+from unittest.mock import patch
+from connect_automate import connect
+from eom_email_watcher import engine_api
+from eom_email_watcher.runtime import load_runtime
+request = json.loads(sys.stdin.read())
+runtime = load_runtime(Path(request["config_path"]))
+job_id = request["payload"]["request_id"]
+access_attempts = []
+def forbidden(name):
+    def refuse(*args, **kwargs):
+        access_attempts.append(name)
+        raise AssertionError("terminal work attempted " + name)
+    return refuse
+with (
+    patch.object(engine_api, "_automation_entitlement_active", return_value=True),
+    patch.object(connect, "require_connect_entitlement", return_value=None),
+    patch.object(connect, "discover_capabilities", side_effect=forbidden("catalog discovery")),
+    patch.object(connect, "registered_capability_for_reconciliation",
+                 side_effect=forbidden("registration discovery")),
+    patch.object(connect, "ConnectV2Client", side_effect=forbidden("provider client")),
+    patch.object(engine_api.GmailGateway, "from_token", side_effect=forbidden("mailbox")),
+):
+    for _ in range(2):
+        engine_api._pump_generic_connect_lane(runtime, runtime.store.connect_job(job_id))
+    responses = [engine_api._response(request) for _ in range(2)]
+print(json.dumps({"job": asdict(runtime.store.connect_job(job_id)),
+                  "dispatch": asdict(runtime.store.connect_dispatch(job_id)),
+                  "responses": responses, "access_attempts": access_attempts},
+                 default=lambda value: value.hex()))
+"""
+    reopened = subprocess.run(
+        [sys.executable, "-c", script],
+        input=json.dumps(original_request),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    observation = json.loads(reopened.stdout)
+    assert observation["access_attempts"] == []
+    assert observation["job"] == json.loads(json.dumps(asdict(stored), default=lambda v: v.hex()))
+    assert observation["dispatch"] == json.loads(
+        json.dumps(asdict(dispatch_before), default=lambda v: v.hex())
+    )
+    for response in observation["responses"]:
+        assert response["ok"] is False
+        assert response["error"]["code"] == stored.error_code.casefold()
+    assert provider.post_attempt_count() == 1
+    assert len(state["requests"]) == 1
+
+    # Deliberate current selection is a separate admission, never a relabelled old request.
+    state.update(version="2.0", outcome="completed", confirmation_required=True)
+    current = connect.discover_capabilities().items[0]
+    assert current.capability_version == "2.0"
+    assert current.confirmation_required is True
+    replacement_id = "99999999-9999-4999-8999-999999999999"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unconfirmed invoice replacement reached mailbox")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(engine_api.GmailGateway, "from_token", forbidden)
+        reused = engine_api._response(
+            api_request(
+                config_path,
+                "connect.attachment.invoke",
+                invocation_payload(current, confirmed=True),
+            )
+        )
+        assert reused["ok"] is False
+        assert reused["error"]["code"] == "request_id_conflict"
+        unconfirmed = engine_api._response(
+            api_request(
+                config_path,
+                "connect.attachment.invoke",
+                invocation_payload(current, request_id=replacement_id),
+            )
+        )
+        assert unconfirmed["ok"] is False
+        assert unconfirmed["error"]["code"] == "confirmation_required"
+    assert runtime.store.connect_job(replacement_id) is None
+    assert runtime.store.connect_job(REQUEST_ID) == stored
+    assert provider.post_attempt_count() == 1
+
+    replacement = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(current, request_id=replacement_id, confirmed=True),
+        )
+    )
+    assert replacement["ok"] is True
+    assert replacement["data"]["status"] == "completed"
+    assert replacement["data"]["job_id"] == replacement_id
+    assert replacement["data"]["capability"] == {"id": "invoice.extract", "version": "2.0"}
+    new_job = runtime.store.connect_job(replacement_id)
+    assert new_job.request_json != stored.request_json
+    assert new_job.capability_version == "2.0"
+    assert [request["job_id"] for request in state["requests"]] == [REQUEST_ID, replacement_id]
+    replay = engine_api._response(original_request)
+    assert replay["ok"] is False
+    assert replay["error"]["code"] == stored.error_code.casefold()
+    assert runtime.store.connect_job(REQUEST_ID) == stored
+    assert runtime.store.connect_dispatch(REQUEST_ID) == dispatch_before
+    assert provider.post_attempt_count() == 2
 
 
 def test_completed_legacy_invoice_replays_unchanged_after_rediscovery(
