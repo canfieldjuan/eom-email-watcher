@@ -415,11 +415,29 @@ struct AdmissionAttempt<W> {
     workers: Option<W>,
 }
 
+fn admission_failure_diagnostic(stage: &'static str, error: &EngineError) -> String {
+    let code = if (1..=64).contains(&error.code.len())
+        && error
+            .code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        error.code.as_str()
+    } else {
+        "invalid_code"
+    };
+    format!("configuration admission failed at {stage} ({code})")
+}
+
+fn report_admission_failure(stage: &'static str, error: &EngineError) {
+    eprintln!("{}", admission_failure_diagnostic(stage, error));
+}
+
 fn run_admission_attempt<W>(
     inspect: impl FnOnce() -> Result<NtfyDisclosureStatus, EngineError>,
     admit: impl FnOnce() -> Result<W, EngineError>,
 ) -> AdmissionAttempt<W> {
-    match inspect() {
+    match inspect().inspect_err(|error| report_admission_failure("inspect", error)) {
         Ok(NtfyDisclosureStatus::Missing) => AdmissionAttempt {
             state: AdmissionState::Missing,
             workers: None,
@@ -434,16 +452,18 @@ fn run_admission_attempt<W>(
             state: AdmissionState::ManualRepairRequired,
             workers: None,
         },
-        Ok(NtfyDisclosureStatus::NormalAdmission) => match admit() {
-            Ok(workers) => AdmissionAttempt {
-                state: AdmissionState::Admitted,
-                workers: Some(workers),
-            },
-            Err(_) => AdmissionAttempt {
-                state: AdmissionState::ManualRepairRequired,
-                workers: None,
-            },
-        },
+        Ok(NtfyDisclosureStatus::NormalAdmission) => {
+            match admit().inspect_err(|error| report_admission_failure("stage_workers", error)) {
+                Ok(workers) => AdmissionAttempt {
+                    state: AdmissionState::Admitted,
+                    workers: Some(workers),
+                },
+                Err(_) => AdmissionAttempt {
+                    state: AdmissionState::ManualRepairRequired,
+                    workers: None,
+                },
+            }
+        }
     }
 }
 
@@ -1004,7 +1024,9 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
         expected_generation: u64,
         staged: W,
     ) -> Result<(), EngineError> {
-        staged.revalidate()?;
+        staged
+            .revalidate()
+            .inspect_err(|error| report_admission_failure("activate_mutation", error))?;
         let mut inner = self.inner.lock().map_err(|_| {
             EngineError::host("host_error", "Configuration admission coordinator stopped")
         })?;
@@ -1132,10 +1154,12 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
         W: AdmissionWorkerSet,
     {
         if attempt.state == AdmissionState::Admitted
-            && attempt
-                .workers
-                .as_ref()
-                .is_none_or(|workers| workers.revalidate().is_err())
+            && attempt.workers.as_ref().is_none_or(|workers| {
+                let revalidated = workers.revalidate();
+                revalidated
+                    .inspect_err(|error| report_admission_failure("install_revalidation", error))
+                    .is_err()
+            })
         {
             attempt.state = AdmissionState::ManualRepairRequired;
             attempt.workers = None;
@@ -1174,7 +1198,11 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
             if inner.state == AdmissionState::Admitted
                 && let Some(workers) = inner.workers.as_ref()
             {
-                if workers.revalidate().is_ok() {
+                if workers
+                    .revalidate()
+                    .inspect_err(|error| report_admission_failure("refresh_revalidation", error))
+                    .is_ok()
+                {
                     (
                         AdmissionTransition {
                             status: ConfigAdmissionStatus::Admitted,
@@ -1297,7 +1325,13 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
             if inner.state == AdmissionState::Admitted
                 && let Some(workers) = inner.workers.as_ref()
             {
-                if workers.revalidate().is_ok() {
+                if workers
+                    .revalidate()
+                    .inspect_err(|error| {
+                        report_admission_failure("acknowledge_revalidation", error)
+                    })
+                    .is_ok()
+                {
                     (
                         AdmissionTransition {
                             status: ConfigAdmissionStatus::Admitted,
@@ -1348,7 +1382,9 @@ fn stage_admitted_workers(
     observer: AdmissionErrorObserver,
     expectation: Option<InitializationAdmissionExpectation>,
 ) -> Result<AdmissionWorkers, EngineError> {
-    let snapshot = engine.admission_snapshot()?;
+    let snapshot = engine
+        .admission_snapshot()
+        .inspect_err(|error| report_admission_failure("snapshot", error))?;
     if let Some(expectation) = expectation {
         expectation.verify(
             &snapshot.settings,
@@ -3054,6 +3090,99 @@ esac"#,
         assert_eq!(admitted.state, AdmissionState::Admitted);
         assert!(admitted.workers.is_some());
         assert_eq!(*events.borrow(), ["status", "settings/workers"]);
+    }
+
+    #[test]
+    fn admission_refusals_report_the_deciding_stage_and_code() {
+        for (case, expected) in [
+            (
+                "admission_errors_hold_workers_and_expose_only_manual_repair",
+                vec![
+                    "inspect (engine_timeout)",
+                    "stage_workers (configuration_error)",
+                ],
+            ),
+            (
+                "stale_snapshot_drops_staged_workers_before_any_activation",
+                vec!["install_revalidation (conflict)"],
+            ),
+            (
+                "admitted_refresh_revokes_workers_when_retained_token_is_stale",
+                vec!["refresh_revalidation (conflict)"],
+            ),
+            (
+                "admitted_acknowledgement_revalidates_retained_binding_and_fails_closed_when_stale",
+                vec!["acknowledge_revalidation (conflict)"],
+            ),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([&format!("tests::{case}"), "--exact", "--nocapture"])
+                .output()
+                .expect("run existing fail-closed admission regression");
+            assert!(output.status.success(), "{case}: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "{case} did not run: {stdout}"
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            for diagnostic in expected {
+                assert!(
+                    stderr.lines().any(|line| {
+                        line == format!("configuration admission failed at {diagnostic}")
+                    }),
+                    "missing admission diagnostic {diagnostic}: {stderr}"
+                );
+            }
+            assert!(!stderr.contains("private diagnostic"));
+            assert!(!stderr.contains("Configuration admission snapshot changed"));
+        }
+    }
+
+    #[test]
+    fn admission_diagnostic_refuses_unbounded_or_non_identifier_codes() {
+        for code in [
+            String::new(),
+            "a".repeat(65),
+            "PRIVATE_SENTINEL /private/config.toml\nsecond line".to_owned(),
+            "engine timeout".to_owned(),
+            "engine-timeout".to_owned(),
+            "engine_timeout\0".to_owned(),
+            "é".to_owned(),
+        ] {
+            let error = EngineError::host(&code, "private message");
+            assert_eq!(
+                admission_failure_diagnostic("inspect", &error),
+                "configuration admission failed at inspect (invalid_code)"
+            );
+        }
+        for code in [
+            "a".to_owned(),
+            "0".to_owned(),
+            "_".to_owned(),
+            "a".repeat(63),
+            "a".repeat(64),
+            "engine_timeout_2".to_owned(),
+        ] {
+            let error = EngineError::host(&code, "private message");
+            assert_eq!(
+                admission_failure_diagnostic("inspect", &error),
+                format!("configuration admission failed at inspect ({code})")
+            );
+        }
+    }
+
+    #[test]
+    fn admission_diagnostic_names_stage_and_code_without_error_message() {
+        let error = EngineError::host("engine_timeout", "private config contents");
+        let line = admission_failure_diagnostic("refresh_revalidation", &error);
+        assert_eq!(
+            line,
+            "configuration admission failed at refresh_revalidation (engine_timeout)"
+        );
+        assert!(!line.contains("private config contents"));
     }
 
     #[test]
