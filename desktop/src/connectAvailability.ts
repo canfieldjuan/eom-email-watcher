@@ -20,8 +20,8 @@ export function capabilitySelectionRecovery(
   if (retryable === true) return null;
   switch (code) {
     case "capability_unavailable":
-    case "provider_unavailable":
       break;
+    case "provider_unavailable":
     case "unsupported_capability":
     case "UNSUPPORTED_CAPABILITY":
       if (retryable !== false) return null;

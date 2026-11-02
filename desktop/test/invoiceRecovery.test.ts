@@ -73,6 +73,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
   const confirmations: string[] = [];
   let allowConfirmation = true;
   let invocationHold: Promise<void> | null = null;
+  let replacementStatus = "completed";
   const item = { message_id: "message-1", provider: "fixture", account_id: "fixture",
     sender: "sender@example.test", received_at: "2026-11-02T00:00:00Z", subject: "Synthetic invoice",
     admission: null, action_required: null, calendar_proposal: null, status: "notified",
@@ -107,7 +108,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
       invocations.push(structuredClone(args));
       await invocationHold;
       if (args.capability.version === "1.0") throw refusal;
-      return { status: "completed", outputs: [], job_id: args.requestId };
+      return { status: replacementStatus, outputs: [], job_id: args.requestId };
     },
   });
   vm.runInContext(code, context);
@@ -124,12 +125,13 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
   return { context, item, old, current, invocations, confirmations, render, refresh, button,
     setCatalog: (items: typeof catalog) => { catalog = items; },
     holdInvocation: (promise: Promise<void>) => { invocationHold = promise; },
+    setReplacementStatus: (status: string) => { replacementStatus = status; },
     setConfirmation: (value: boolean) => { allowConfirmation = value; } };
 }
 
 for (const code of ["capability_unavailable", "provider_unavailable"]) {
   test(`refused selection stays visible after catalog refresh: ${code}`, async () => {
-    const h = harness({ code, message: "Opaque fixture reason" });
+    const h = harness({ code, message: "Opaque fixture reason", retryable: false });
     h.setCatalog([h.current]); // Cutover after rendering, before the user clicks.
     await h.button("Read invoice 1.0").click();
     assert.ok(rendered(h.context.inboxList).includes(recovery), rendered(h.context.inboxList));
@@ -179,6 +181,70 @@ test("unsupported selection recovery requires a nonretryable refusal", async () 
   }
 });
 
+test("temporary or unspecified provider absence preserves its request without reselection copy", async () => {
+  for (const retryable of [true, undefined]) {
+    const h = harness({ code: "provider_unavailable", message: "Provider is temporarily unavailable", retryable });
+    await h.button("Read invoice 1.0").click();
+    await h.refresh();
+    assert.equal(rendered(h.context.inboxList).includes(recovery), false);
+    assert.equal(h.context.attachmentRequestIds.size, 1);
+    await h.button("Read invoice 1.0").click();
+    assert.equal(h.invocations[1].requestId, h.invocations[0].requestId);
+  }
+});
+
+test("successful deliberate replacement clears the notice while declining preserves it", async () => {
+  for (const status of ["requested", "accepted", "processing", "completed"]) {
+    const h = harness();
+    await h.button("Read invoice 1.0").click();
+    h.setCatalog([h.current]);
+    h.setReplacementStatus(status);
+    await h.refresh();
+    h.setConfirmation(false);
+    await h.button("Read invoice 2.0").click();
+    assert.ok(rendered(h.context.inboxList).includes(recovery));
+    assert.equal(h.invocations.length, 1);
+    h.setConfirmation(true);
+    await h.button("Read invoice 2.0").click();
+    assert.equal(rendered(h.context.inboxList).includes(recovery), false, status);
+    await h.refresh();
+    assert.equal(rendered(h.context.inboxList).includes(recovery), false, status);
+    assert.equal(h.invocations.length, 2);
+  }
+});
+
+test("an earlier replacement success cannot erase a newer concurrent refusal", async () => {
+  const h = harness();
+  await h.button("Read invoice 1.0").click();
+  h.setCatalog([h.old, h.current]);
+  await h.refresh();
+  let release!: () => void;
+  h.holdInvocation(new Promise<void>(resolve => { release = resolve; }));
+  const earlierSuccess = h.button("Read invoice 2.0").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.invocations.length, 2);
+  h.holdInvocation(Promise.resolve());
+  await h.button("Read invoice 1.0").click();
+  release();
+  await earlierSuccess;
+  assert.equal(h.invocations.length, 3);
+  assert.ok(rendered(h.context.inboxList).includes(recovery));
+});
+
+test("a different capability success cannot clear the invoice selection refusal", async () => {
+  const h = harness();
+  await h.button("Read invoice 1.0").click();
+  h.setCatalog([{
+    ...h.current,
+    capability: { ...h.current.capability, id: "document.translate",
+      action: { label: "Translate document", description: "Synthetic translation" } },
+  }]);
+  await h.refresh();
+  await h.button("Translate document").click();
+  assert.equal(h.invocations.length, 2);
+  assert.ok(rendered(h.context.inboxList).includes(recovery));
+});
+
 test("catalog refresh during an invocation cannot erase its later refusal or submit new work", async () => {
   const h = harness();
   let release!: () => void;
@@ -212,7 +278,7 @@ test("persisted unsupported legacy result renders its reason and recovery withou
   h.item.attachments[0].capability_results.push({
     protocol_version: 2, provider: h.old.provider, capability_id: "invoice.extract", capability_version: "1.0",
     job_id: "old-terminal-job", status: "failed", dispatch_state: "terminal", summary: null,
-    error: { code: "UNSUPPORTED_CAPABILITY", message: "Original terminal refusal" },
+    error: { code: "UNSUPPORTED_CAPABILITY", message: "Original terminal refusal", retryable: false },
   });
   for (const catalog of [[], [h.current]]) {
     h.setCatalog(catalog);
@@ -220,6 +286,22 @@ test("persisted unsupported legacy result renders its reason and recovery withou
     assert.ok(rendered(h.context.inboxList).includes("Original terminal refusal"));
     assert.ok(rendered(h.context.inboxList).includes(recovery));
     assert.equal(nodes(h.context.inboxList).some(node => node.textContent.startsWith("Resume ")), false);
+    assert.equal(h.invocations.length, 0);
+  }
+});
+
+test("persisted provider errors consume stored retryability without inventing a terminal signal", async () => {
+  for (const retryable of [false, true, undefined]) {
+    const h = harness();
+    h.item.attachments[0].capability_results.push({
+      protocol_version: 2, provider: h.old.provider, capability_id: "invoice.extract", capability_version: "1.0",
+      job_id: "stored-provider-job", status: "failed", dispatch_state: "terminal", summary: null,
+      error: { code: "provider_unavailable", message: "Stored provider reason", retryable },
+    });
+    h.setCatalog([h.current]);
+    await h.refresh();
+    assert.equal(rendered(h.context.inboxList).includes(recovery), retryable === false);
+    assert.ok(rendered(h.context.inboxList).includes("Stored provider reason"));
     assert.equal(h.invocations.length, 0);
   }
 });

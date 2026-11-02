@@ -12,11 +12,11 @@ import {
 test("selection recovery uses exact structured refusal codes and requires terminal unsupported work", () => {
   const selection = { id: "invoice.extract", version: "1.0" };
   const expected = "Saved selection invoice.extract 1.0 is unavailable. Choose an available action to make a new selection.";
-  for (const code of ["capability_unavailable", "provider_unavailable"]) {
+  for (const code of ["capability_unavailable"]) {
     assert.equal(capabilitySelectionRecovery(code, selection), expected);
     assert.equal(capabilitySelectionRecovery(code, selection, true), null);
   }
-  for (const code of ["UNSUPPORTED_CAPABILITY", "unsupported_capability"]) {
+  for (const code of ["provider_unavailable", "UNSUPPORTED_CAPABILITY", "unsupported_capability"]) {
     assert.equal(capabilitySelectionRecovery(code, selection, false), expected);
     assert.equal(capabilitySelectionRecovery(code, selection, true), null);
     assert.equal(capabilitySelectionRecovery(code, selection), null);

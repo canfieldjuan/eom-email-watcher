@@ -122,7 +122,7 @@ interface AttachmentCapabilityResult {
   updated_at: string;
   summary: ConnectSummary | null;
   outputs?: ConnectOutputMetadata[];
-  error: { code: string; message: string } | null;
+  error: { code: string; message: string; retryable?: boolean } | null;
 }
 
 interface ConnectInvocationResult {
@@ -1017,7 +1017,7 @@ let connectStatusRefreshInFlight = false;
 let connectEntitlementActive: boolean | null = null;
 const attachmentCapabilities = new Map<string, ConnectCapability[]>();
 const attachmentCapabilityDiagnostics = new Map<string, string>();
-const attachmentSelectionRefusals = new Map<string, string>();
+const attachmentSelectionRefusals = new Map<string, { text: string; capabilityId: string }>();
 const attachmentInvocationsInFlight = new Set<string>();
 const attachmentRequestIds = new Map<string, string>();
 const capabilityOutputPresentations = new Map<string, ConnectOutputPresentation>();
@@ -1664,7 +1664,7 @@ function renderCapabilityResult(
     const recovery = result.status === "failed"
       ? capabilitySelectionRecovery(result.error?.code ?? null, {
           id: result.capability_id, version: result.capability_version,
-        }, false)
+        }, result.error?.retryable ?? null)
       : null;
     if (recovery) detail.textContent += ` ${recovery}`;
     presentation.append(detail);
@@ -2126,6 +2126,8 @@ function renderInbox(items: InboxItem[]): void {
           delete inboxStatus.dataset.kind;
           let result: ConnectInvocationResult | undefined;
           let invocationError: unknown;
+          const refusalKey = attachmentKey(item.message_id, attachment.part_id);
+          const previousRefusal = attachmentSelectionRefusals.get(refusalKey);
           try {
             result = await invoke<ConnectInvocationResult>(
               "attachment_capability_invoke",
@@ -2147,6 +2149,12 @@ function renderInbox(items: InboxItem[]): void {
               },
             );
             attachmentRequestIds.delete(key);
+            if (
+              previousRefusal?.capabilityId === capability.capability.id &&
+              attachmentSelectionRefusals.get(refusalKey) === previousRefusal
+            ) {
+              attachmentSelectionRefusals.delete(refusalKey);
+            }
           } catch (error) {
             invocationError = error;
             const code = errorCode(error);
@@ -2157,7 +2165,7 @@ function renderInbox(items: InboxItem[]): void {
             // retain their identity for the existing reconciliation path.
             if (recovery) {
               attachmentSelectionRefusals.set(
-                attachmentKey(item.message_id, attachment.part_id), recovery,
+                refusalKey, { text: recovery, capabilityId: capability.capability.id },
               );
               attachmentRequestIds.delete(key);
             }
@@ -2194,7 +2202,7 @@ function renderInbox(items: InboxItem[]): void {
         const notice = document.createElement("p");
         notice.className = "attachment-summary-error";
         notice.setAttribute("role", "status");
-        notice.textContent = refusal;
+        notice.textContent = refusal.text;
         row.append(notice);
       }
       for (const result of attachment.capability_results ?? []) {
