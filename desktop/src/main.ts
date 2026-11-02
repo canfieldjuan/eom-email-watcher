@@ -51,6 +51,7 @@ import {
   type CalendarConsentStatus,
 } from "./calendarConsent";
 import {
+  capabilitySelectionRecovery,
   classifyCapabilityDiagnostic,
   durableCapabilityStatus,
 } from "./connectAvailability";
@@ -1016,6 +1017,7 @@ let connectStatusRefreshInFlight = false;
 let connectEntitlementActive: boolean | null = null;
 const attachmentCapabilities = new Map<string, ConnectCapability[]>();
 const attachmentCapabilityDiagnostics = new Map<string, string>();
+const attachmentSelectionRefusals = new Map<string, string>();
 const attachmentInvocationsInFlight = new Set<string>();
 const attachmentRequestIds = new Map<string, string>();
 const capabilityOutputPresentations = new Map<string, ConnectOutputPresentation>();
@@ -1427,6 +1429,7 @@ function clearMessageOwnedUiState(messageId?: string): void {
   const collections = [
     attachmentCapabilities,
     attachmentCapabilityDiagnostics,
+    attachmentSelectionRefusals,
     attachmentInvocationsInFlight,
     attachmentRequestIds,
     capabilityOutputPresentations,
@@ -1658,6 +1661,12 @@ function renderCapabilityResult(
     detail.textContent =
       durableCapabilityStatus(result, providerLabel, actionLabel) ??
       `Local capability status: ${result.status}`;
+    const recovery = result.status === "failed"
+      ? capabilitySelectionRecovery(result.error?.code ?? null, {
+          id: result.capability_id, version: result.capability_version,
+        }, false)
+      : null;
+    if (recovery) detail.textContent += ` ${recovery}`;
     presentation.append(detail);
   }
   row.append(presentation);
@@ -2140,6 +2149,18 @@ function renderInbox(items: InboxItem[]): void {
             attachmentRequestIds.delete(key);
           } catch (error) {
             invocationError = error;
+            const code = errorCode(error);
+            const recovery = capabilitySelectionRecovery(
+              code, capability.capability, errorRetryable(error),
+            );
+            // Only an authoritative refusal ends this request. Transport errors
+            // retain their identity for the existing reconciliation path.
+            if (recovery) {
+              attachmentSelectionRefusals.set(
+                attachmentKey(item.message_id, attachment.part_id), recovery,
+              );
+              attachmentRequestIds.delete(key);
+            }
           } finally {
             attachmentInvocationsInFlight.delete(key);
           }
@@ -2166,6 +2187,16 @@ function renderInbox(items: InboxItem[]): void {
         actions.append(invokeButton);
       }
       row.append(attachmentDetails, actions);
+      const refusal = attachmentSelectionRefusals.get(
+        attachmentKey(item.message_id, attachment.part_id),
+      );
+      if (refusal) {
+        const notice = document.createElement("p");
+        notice.className = "attachment-summary-error";
+        notice.setAttribute("role", "status");
+        notice.textContent = refusal;
+        row.append(notice);
+      }
       for (const result of attachment.capability_results ?? []) {
         renderCapabilityResult(row, result, item.message_id, attachment.part_id);
       }

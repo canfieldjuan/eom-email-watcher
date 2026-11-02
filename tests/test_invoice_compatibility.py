@@ -88,6 +88,10 @@ def test_invoice_selection_roundtrip_preserves_full_snapshot(version):
     ("change", "expected_code"),
     [
         ({}, "capability_unavailable"),
+        (
+            {"capability_id": "document.translate", "capability_version": "1.0"},
+            "capability_unavailable",
+        ),
         ({"app_version": "2.0.0"}, "provider_unavailable"),
         ({"instance_id": INSTANCE_B}, "provider_unavailable"),
     ],
@@ -491,6 +495,11 @@ def test_legacy_invoice_http_failures_are_terminal_without_resubmission(
     assert stored.error_code == (
         "INTERRUPTED" if outcome == "interrupted" else "UNSUPPORTED_CAPABILITY"
     )
+    assert stored.error_message == (
+        "Legacy work was interrupted"
+        if outcome == "interrupted"
+        else "Selected version is unsupported"
+    )
     for _ in range(2):
         engine_api._pump_generic_connect_lane(runtime, runtime.store.connect_job(REQUEST_ID))
     assert provider.post_attempt_count() == 1
@@ -552,6 +561,7 @@ print(json.dumps({"job": asdict(runtime.store.connect_job(job_id)),
     for response in observation["responses"]:
         assert response["ok"] is False
         assert response["error"]["code"] == stored.error_code.casefold()
+        assert response["error"]["message"] == stored.error_message
     assert provider.post_attempt_count() == 1
     assert len(state["requests"]) == 1
 
@@ -607,6 +617,7 @@ print(json.dumps({"job": asdict(runtime.store.connect_job(job_id)),
     replay = engine_api._response(original_request)
     assert replay["ok"] is False
     assert replay["error"]["code"] == stored.error_code.casefold()
+    assert replay["error"]["message"] == stored.error_message
     assert runtime.store.connect_job(REQUEST_ID) == stored
     assert runtime.store.connect_dispatch(REQUEST_ID) == dispatch_before
     assert provider.post_attempt_count() == 2
