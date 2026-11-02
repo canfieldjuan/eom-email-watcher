@@ -136,7 +136,8 @@ def test_saved_legacy_invoice_selection_refuses_before_handoff(
         (None, "provider_unavailable", True),
         ({"app_id": "other-app", "instance_id": INSTANCE_B}, None, True),
         ({"app_version": "2.0.0"}, None, False),
-        ({"instance_id": INSTANCE_B}, None, False),
+        ({"instance_id": INSTANCE_B}, None, True),
+        ({"instance_id": INSTANCE_B, "app_version": "2.0.0"}, None, True),
         ({"app_id": "other-app"}, None, False),
         ({"app_version": "2.0.0"}, "provider_unavailable", True),
     ],
@@ -222,6 +223,48 @@ def test_invoice_real_catalog_distinguishes_changed_identity_from_failed_discove
     assert unavailable.value.code == "provider_unavailable"
     assert unavailable.value.retryable is True
     assert provider.post_attempt_count() == 0
+
+
+def test_invoice_selected_instance_down_with_same_app_peer_stays_retryable(
+    invoice_runtime, invoice_http_provider, tmp_path, monkeypatch,
+):
+    config_path, runtime = invoice_runtime
+    selected_provider, _state = invoice_http_provider
+    selected = connect.discover_capabilities().items[0]
+    selected_manifest = selected_provider.server.manifest
+    peer = ReferenceProvider.start(tmp_path / "provider-runtime")
+    peer_manifest = peer.server.manifest
+
+    def peer_invoice_manifest():
+        value = peer_manifest()
+        value["capabilities"] = selected_manifest()["capabilities"]
+        return value
+
+    monkeypatch.setattr(peer.server, "manifest", peer_invoice_manifest)
+    try:
+        # Keep the selected registration but stop only this disposable listener.
+        # SDK discovery must skip it while the same-app peer remains reachable.
+        selected_provider.server.shutdown()
+        selected_provider.server.server_close()
+        selected_provider.thread.join(timeout=5)
+        catalog = connect.discover_capabilities()
+        assert catalog.diagnostic_code is None
+        assert catalog.items
+        assert all(item.app_id == selected.app_id for item in catalog.items)
+        assert all(item.instance_id == peer.instance_id for item in catalog.items)
+        request = api_request(
+            config_path, "connect.attachment.invoke", invocation_payload(selected),
+        )
+        responses = [engine_api._response(request) for _ in range(2)]
+        for response in responses:
+            assert response["error"]["code"] == "provider_unavailable"
+            assert response["error"]["retryable"] is True
+        assert runtime.store.connect_job(REQUEST_ID) is None
+        assert selected_provider.post_attempt_count() == 0
+        assert peer.post_attempt_count() == 0
+        print("INVOICE_RESTART_ERROR=" + json.dumps(responses[0]["error"]))
+    finally:
+        peer.stop()
 
 
 def test_mixed_catalog_matches_exact_saved_invoice_version(monkeypatch):

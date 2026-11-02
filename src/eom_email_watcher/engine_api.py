@@ -3152,12 +3152,11 @@ def _discover_selected_generic_capability(
 
     instance_id = str(provider["instance_id"])
 
-    def discover(instance: str | None) -> connect.CapabilityCatalog:
-        return connect.discover_capabilities(
-            provider_instance_id=instance,
-            remaining_timeout=remaining_timeout,
-            required_manifest_features=("fixed-parameters-v1",),
-        )
+    catalog = connect.discover_capabilities(
+        provider_instance_id=instance_id,
+        remaining_timeout=remaining_timeout,
+        required_manifest_features=("fixed-parameters-v1",),
+    )
 
     def matching_provider(item: connect.DiscoveredCapability) -> bool:
         return (
@@ -3166,17 +3165,12 @@ def _discover_selected_generic_capability(
             and item.instance_id == instance_id
         )
 
-    catalog = discover(instance_id)
-    if not catalog.items and catalog.diagnostic_code in {None, "provider_unavailable"}:
-        # Only the missing-provider path needs a wider catalog to distinguish
-        # disappearance from a reachable replacement instance.
-        catalog = discover(None)
     provider_items = tuple(item for item in catalog.items if matching_provider(item))
     if not provider_items:
-        # A reachable related identity proves this snapshot changed. Empty or
-        # incomplete discovery cannot establish that and remains retryable.
+        # Only the reachable selected instance can prove its app identity changed.
+        # Another instance of the same app may coexist while this one restarts.
         identity_changed = catalog.diagnostic_code is None and any(
-            item.app_id == provider["app_id"] or item.instance_id == instance_id
+            item.instance_id == instance_id and not matching_provider(item)
             for item in catalog.items
         )
         raise ApiError(
