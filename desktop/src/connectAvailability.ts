@@ -1,3 +1,5 @@
+import type { ConnectCapabilityRef } from "./connectTypes";
+
 export const CONNECT_ENTITLEMENT_REQUIRED = "connect_entitlement_required";
 
 export type CapabilityDiscoveryPresentation = "none" | "locked" | "unavailable";
@@ -8,6 +10,26 @@ export function classifyCapabilityDiagnostic(
   if (diagnosticCode === null) return "none";
   if (diagnosticCode === CONNECT_ENTITLEMENT_REQUIRED) return "locked";
   return "unavailable";
+}
+
+export function capabilitySelectionRecovery(
+  code: string | null,
+  selection: ConnectCapabilityRef,
+  retryable: boolean | null = null,
+): string | null {
+  if (retryable === true) return null;
+  switch (code) {
+    case "capability_unavailable":
+      break;
+    case "provider_unavailable":
+    case "unsupported_capability":
+    case "UNSUPPORTED_CAPABILITY":
+      if (retryable !== false) return null;
+      break;
+    default:
+      return null;
+  }
+  return `Saved selection ${selection.id} ${selection.version} is unavailable. Choose an available action to make a new selection.`;
 }
 
 export interface DurableCapabilityState {

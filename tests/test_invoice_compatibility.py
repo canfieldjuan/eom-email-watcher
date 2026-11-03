@@ -88,6 +88,10 @@ def test_invoice_selection_roundtrip_preserves_full_snapshot(version):
     ("change", "expected_code"),
     [
         ({}, "capability_unavailable"),
+        (
+            {"capability_id": "document.translate", "capability_version": "1.0"},
+            "capability_unavailable",
+        ),
         ({"app_version": "2.0.0"}, "provider_unavailable"),
         ({"instance_id": INSTANCE_B}, "provider_unavailable"),
     ],
@@ -123,6 +127,144 @@ def test_saved_legacy_invoice_selection_refuses_before_handoff(
         assert response["error"]["code"] == expected_code
         assert runtime.store.connect_job(REQUEST_ID) is None
         assert encode_selection(saved) == frozen
+
+
+@pytest.mark.parametrize(
+    ("change", "diagnostic", "retryable"),
+    [
+        (None, None, True),
+        (None, "provider_unavailable", True),
+        ({"app_id": "other-app", "instance_id": INSTANCE_B}, None, True),
+        ({"app_version": "2.0.0"}, None, False),
+        ({"instance_id": INSTANCE_B}, None, True),
+        ({"instance_id": INSTANCE_B, "app_version": "2.0.0"}, None, True),
+        ({"app_id": "other-app"}, None, False),
+        ({"app_version": "2.0.0"}, "provider_unavailable", True),
+    ],
+)
+def test_invoice_provider_unavailability_preserves_structured_retryability(
+    invoice_runtime, monkeypatch, change, diagnostic, retryable,
+):
+    config_path, runtime = invoice_runtime
+    saved = invoice_capability()
+    offered = () if change is None else (replace(saved, **change),)
+
+    def discover(**kwargs):
+        # Match SDK filtering: an old instance filter cannot see its replacement.
+        instance_id = kwargs.get("provider_instance_id")
+        items = tuple(item for item in offered if instance_id in (None, item.instance_id))
+        return connect.CapabilityCatalog(items, diagnostic)
+
+    monkeypatch.setattr(connect, "discover_capabilities", discover)
+    monkeypatch.setattr(
+        engine_api.GmailGateway, "from_token",
+        lambda *args: pytest.fail("unavailable selection reached mailbox handoff"),
+    )
+    response = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(saved))
+    )
+    assert response["error"]["code"] == "provider_unavailable"
+    assert response["error"].get("retryable") is retryable
+    assert runtime.store.connect_job(REQUEST_ID) is None
+
+
+@pytest.mark.parametrize("diagnostic", [None, "provider_unavailable"])
+def test_invoice_exact_identity_still_matches_in_a_mixed_catalog(monkeypatch, diagnostic):
+    saved = invoice_capability()
+    def deadline():
+        return 7.0
+    calls = []
+
+    def discover(**kwargs):
+        calls.append(kwargs)
+        return connect.CapabilityCatalog(
+            (replace(saved, instance_id=INSTANCE_B), saved, invoice_capability("2.0")),
+            diagnostic,
+        )
+
+    monkeypatch.setattr(connect, "discover_capabilities", discover)
+    payload = invocation_payload(saved)
+    selected, parameters = engine_api._discover_selected_generic_capability(
+        payload["provider"], payload["capability"], {}, remaining_timeout=deadline,
+    )
+    assert selected == saved
+    assert parameters == {}
+    assert len(calls) == 1
+    assert calls[0]["remaining_timeout"] is deadline
+    assert calls[0]["required_manifest_features"] == ("fixed-parameters-v1",)
+
+
+def test_invoice_real_catalog_distinguishes_changed_identity_from_failed_discovery(
+    invoice_runtime, invoice_http_provider, monkeypatch,
+):
+    provider, _state = invoice_http_provider
+    selected = connect.discover_capabilities().items[0]
+    payload = invocation_payload(selected)
+    original_manifest = provider.server.manifest
+
+    def upgraded_manifest():
+        value = original_manifest()
+        value["app"]["version"] = "9.0.0"
+        return value
+
+    monkeypatch.setattr(provider.server, "manifest", upgraded_manifest)
+    with pytest.raises(engine_api.ApiError) as mismatch:
+        engine_api._discover_selected_generic_capability(
+            payload["provider"], payload["capability"], {},
+        )
+    assert mismatch.value.code == "provider_unavailable"
+    assert mismatch.value.retryable is False
+
+    monkeypatch.setattr(provider.server, "manifest", lambda: {})
+    with pytest.raises(engine_api.ApiError) as unavailable:
+        engine_api._discover_selected_generic_capability(
+            payload["provider"], payload["capability"], {},
+        )
+    assert unavailable.value.code == "provider_unavailable"
+    assert unavailable.value.retryable is True
+    assert provider.post_attempt_count() == 0
+
+
+def test_invoice_selected_instance_down_with_same_app_peer_stays_retryable(
+    invoice_runtime, invoice_http_provider, tmp_path, monkeypatch,
+):
+    config_path, runtime = invoice_runtime
+    selected_provider, _state = invoice_http_provider
+    selected = connect.discover_capabilities().items[0]
+    selected_manifest = selected_provider.server.manifest
+    peer = ReferenceProvider.start(tmp_path / "provider-runtime")
+    peer_manifest = peer.server.manifest
+
+    def peer_invoice_manifest():
+        value = peer_manifest()
+        value["capabilities"] = selected_manifest()["capabilities"]
+        return value
+
+    monkeypatch.setattr(peer.server, "manifest", peer_invoice_manifest)
+    try:
+        # Keep the selected registration but stop only this disposable listener.
+        # SDK discovery must skip it while the same-app peer remains reachable.
+        selected_provider.server.shutdown()
+        selected_provider.server.server_close()
+        selected_provider.thread.join(timeout=5)
+        catalog = connect.discover_capabilities()
+        assert catalog.diagnostic_code is None
+        assert catalog.items
+        assert all(item.app_id == selected.app_id for item in catalog.items)
+        assert all(item.instance_id == peer.instance_id for item in catalog.items)
+        request = api_request(
+            config_path, "connect.attachment.invoke", invocation_payload(selected),
+        )
+        responses = [engine_api._response(request) for _ in range(2)]
+        for response in responses:
+            assert response["error"]["code"] == "provider_unavailable"
+            assert response["error"]["retryable"] is True
+        assert runtime.store.connect_job(REQUEST_ID) is None
+        assert selected_provider.post_attempt_count() == 0
+        assert peer.post_attempt_count() == 0
+        print("INVOICE_RESTART_ERROR=" + json.dumps(responses[0]["error"]))
+    finally:
+        peer.stop()
 
 
 def test_mixed_catalog_matches_exact_saved_invoice_version(monkeypatch):
@@ -491,6 +633,11 @@ def test_legacy_invoice_http_failures_are_terminal_without_resubmission(
     assert stored.error_code == (
         "INTERRUPTED" if outcome == "interrupted" else "UNSUPPORTED_CAPABILITY"
     )
+    assert stored.error_message == (
+        "Legacy work was interrupted"
+        if outcome == "interrupted"
+        else "Selected version is unsupported"
+    )
     for _ in range(2):
         engine_api._pump_generic_connect_lane(runtime, runtime.store.connect_job(REQUEST_ID))
     assert provider.post_attempt_count() == 1
@@ -552,6 +699,7 @@ print(json.dumps({"job": asdict(runtime.store.connect_job(job_id)),
     for response in observation["responses"]:
         assert response["ok"] is False
         assert response["error"]["code"] == stored.error_code.casefold()
+        assert response["error"]["message"] == stored.error_message
     assert provider.post_attempt_count() == 1
     assert len(state["requests"]) == 1
 
@@ -607,6 +755,7 @@ print(json.dumps({"job": asdict(runtime.store.connect_job(job_id)),
     replay = engine_api._response(original_request)
     assert replay["ok"] is False
     assert replay["error"]["code"] == stored.error_code.casefold()
+    assert replay["error"]["message"] == stored.error_message
     assert runtime.store.connect_job(REQUEST_ID) == stored
     assert runtime.store.connect_dispatch(REQUEST_ID) == dispatch_before
     assert provider.post_attempt_count() == 2

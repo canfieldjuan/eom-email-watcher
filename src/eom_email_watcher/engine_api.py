@@ -3151,28 +3151,32 @@ def _discover_selected_generic_capability(
 ) -> tuple[connect.DiscoveredCapability, dict[str, str | int | bool]]:
 
     instance_id = str(provider["instance_id"])
-    if remaining_timeout is None:
-        catalog = connect.discover_capabilities(
-            provider_instance_id=instance_id,
-            required_manifest_features=("fixed-parameters-v1",),
-        )
-    else:
-        catalog = connect.discover_capabilities(
-            provider_instance_id=instance_id,
-            remaining_timeout=remaining_timeout,
-            required_manifest_features=("fixed-parameters-v1",),
-        )
-    provider_items = tuple(
-        item
-        for item in catalog.items
-        if item.app_id == provider["app_id"]
-        and item.app_version == provider["version"]
-        and item.instance_id == instance_id
+
+    catalog = connect.discover_capabilities(
+        provider_instance_id=instance_id,
+        remaining_timeout=remaining_timeout,
+        required_manifest_features=("fixed-parameters-v1",),
     )
+
+    def matching_provider(item: connect.DiscoveredCapability) -> bool:
+        return (
+            item.app_id == provider["app_id"]
+            and item.app_version == provider["version"]
+            and item.instance_id == instance_id
+        )
+
+    provider_items = tuple(item for item in catalog.items if matching_provider(item))
     if not provider_items:
+        # Only the reachable selected instance can prove its app identity changed.
+        # Another instance of the same app may coexist while this one restarts.
+        identity_changed = catalog.diagnostic_code is None and any(
+            item.instance_id == instance_id and not matching_provider(item)
+            for item in catalog.items
+        )
         raise ApiError(
             "provider_unavailable",
             "The selected local capability provider is unavailable.",
+            retryable=not identity_changed,
         )
     matches = tuple(
         item
