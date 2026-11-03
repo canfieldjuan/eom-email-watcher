@@ -17,12 +17,14 @@ from test_connect_v2_engine_api import (
     OUTPUT_ID,
     PDF,
     REQUEST_ID,
+    TEST_MAILBOX_IDENTITY_KEY,
     SeededMailboxGateway,
     api_request,
     capability,
     contract_rule_definition,
     invocation_payload,
     patch_runtime,
+    seed_second_attachment,
     seeded_runtime,
 )
 
@@ -561,9 +563,7 @@ def legacy_invoice_payload(source):
     )
 
 
-def prepare_http_job(invoice_runtime, monkeypatch):
-    _, runtime = invoice_runtime
-
+def install_invoice_mailbox(monkeypatch):
     class Mailbox(SeededMailboxGateway):
         def set_operation_timeout(self, timeout):
             pass
@@ -572,6 +572,11 @@ def prepare_http_job(invoice_runtime, monkeypatch):
             return PDF
 
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: Mailbox())
+
+
+def prepare_http_job(invoice_runtime, monkeypatch):
+    _, runtime = invoice_runtime
+    install_invoice_mailbox(monkeypatch)
     catalog = connect.discover_capabilities()
     assert len(catalog.items) == 1
     selected = catalog.items[0]
@@ -587,6 +592,126 @@ def prepare_http_job(invoice_runtime, monkeypatch):
     )
     assert stored is not None
     return selected, prepared, content()
+
+
+def test_saved_invoice_confirmation_cannot_authorize_replacement(
+    invoice_runtime, invoice_http_provider, monkeypatch
+):
+    config_path, runtime = invoice_runtime
+    store = runtime.store
+    provider, state = invoice_http_provider
+    install_invoice_mailbox(monkeypatch)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    state.update(confirmation_required=True, outcome="accepted")
+
+    def call(operation, payload=None):
+        return engine_api._response(api_request(config_path, operation, payload))
+
+    def prepare_fire(message_id, rule_version, capability_version):
+        store.mark_analyzed(
+            message_id,
+            {
+                "category": "informational",
+                "priority": "normal",
+                "summary": "A synthetic invoice arrived.",
+                "action_required": True,
+                "suggested_action": "Review the invoice.",
+                "deadline_text": None,
+                "deadline_iso": None,
+                "confidence": 0.9,
+            },
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            body_chars=None,
+            body_source_chars=None,
+        )
+        assert call("connect.queue.pump")["ok"] is True
+        (fire,) = store.automation_fires_for_message(message_id)
+        assert fire.rule_id == rule_id
+        assert fire.rule_version == rule_version
+        assert fire.state == "awaiting_confirmation"
+        assert fire.job_id is None
+        assert fire.confirmed is False
+        assert fire.prepared_identity_sha256 is not None
+        assert json.loads(fire.prepared_identity_json)["capability"] == {
+            "id": "invoice.extract",
+            "version": capability_version,
+        }
+        (attempt,) = store.automation_fire_attempts(fire.fire_id)
+        assert store.connect_job(attempt.dispatch_request_id) is None
+        assert provider.post_attempt_count() == 0
+        return fire, attempt.dispatch_request_id
+
+    def decision(fire):
+        return {
+            "fire_id": fire.fire_id,
+            "expected_version": fire.state_version,
+            "prepared_identity_sha256": fire.prepared_identity_sha256,
+            "decision": "confirmed",
+        }
+
+    (legacy,) = connect.discover_capabilities().items
+    created = call("automation.rules.put", {"definition": invoice_rule(legacy)})
+    assert created["ok"] is True
+    rule_id = created["data"]["rule"]["summary"]["rule_id"]
+    old_fire, old_job_id = prepare_fire("message-1", 1, "1.0")
+    old_decision = decision(old_fire)
+    assert call("automation.fire.decide", old_decision)["data"]["state"] == "pending_dispatch"
+    assert store.automation_confirmation_matches(store.automation_fire(old_fire.fire_id))
+    assert provider.post_attempt_count() == 0
+
+    state["version"] = "2.0"
+    (current,) = connect.discover_capabilities().items
+    replaced = call(
+        "automation.rules.put",
+        {"rule_id": rule_id, "expected_version": 1, "definition": invoice_rule(current)},
+    )
+    assert replaced["ok"] is True
+    assert replaced["data"]["rule"]["summary"]["version"] == 2
+    seed_second_attachment(runtime)
+    new_fire, new_job_id = prepare_fire("message-2", 2, "2.0")
+    assert new_job_id != old_job_id
+    assert new_fire.prepared_identity_sha256 != old_fire.prepared_identity_sha256
+
+    refused = store.automation_fire(old_fire.fire_id)
+    assert refused.state == "manual_review"
+    assert refused.reason == "capability_unavailable"
+    assert refused.rule_version == old_fire.rule_version
+    assert refused.prepared_identity_sha256 == old_fire.prepared_identity_sha256
+    assert store.automation_confirmation_matches(refused)
+    assert store.connect_job(old_job_id) is None
+
+    replayed = call("automation.fire.decide", old_decision)
+    assert replayed["ok"] is False
+    assert replayed["error"]["code"] == "stale_automation_fire"
+    new_decision = decision(new_fire)
+    substituted = call(
+        "automation.fire.decide",
+        {**new_decision, "prepared_identity_sha256": old_fire.prepared_identity_sha256},
+    )
+    assert substituted["ok"] is False
+    assert substituted["error"]["code"] == "stale_automation_fire"
+    assert call("connect.queue.pump")["ok"] is True
+    assert store.automation_fire(new_fire.fire_id) == new_fire
+    assert store.connect_job(new_job_id) is None
+    assert provider.post_attempt_count() == 0
+
+    approved = call("automation.fire.decide", new_decision)
+    assert approved["data"]["state"] == "pending_dispatch"
+    assert call("connect.queue.pump")["ok"] is True
+    assert call("connect.queue.pump")["ok"] is True
+    submitted = store.automation_fire(new_fire.fire_id)
+    assert submitted.state == "submitted"
+    assert submitted.job_id == new_job_id
+    assert store.automation_confirmation_matches(submitted)
+    job = store.connect_job(new_job_id)
+    assert job.status == "accepted"
+    assert job.capability_version == "2.0"
+    assert provider.post_attempt_count() == 1
+    (request,) = state["requests"]
+    assert request["job_id"] == new_job_id
+    assert request["capability"] == {"id": "invoice.extract", "version": "2.0"}
+    assert store.automation_fire(old_fire.fire_id) == refused
+    assert store.connect_job(old_job_id) is None
 
 
 @pytest.mark.parametrize("outcome", ["refused", "interrupted"])
