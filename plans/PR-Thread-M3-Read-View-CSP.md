@@ -1,7 +1,9 @@
 # Thread View M3: Local Reads, Desktop View, CSP, and Inbox Copy
 
-Status: proposed; docs-only draft for oversight review and Juan's acceptance of
-an exact revision. No implementation is authorized by this document's creation.
+Status: baseline plan and D-body amendment accepted by Juan at
+`36f704b1edce651eff9dd9788b60a62ec3207756`. This docs-only follow-up consumes
+his newly authorized identity-unavailable scope extension. Oversight review and
+fresh exact-revision acceptance remain required before implementing the extension.
 
 Ownership lane: thread-view-m3. Baseline: `main` at
 `1e39d16ad3e1d51979c5ec9b6699cf1cdb2f5110` (PR #323 merge).
@@ -32,9 +34,10 @@ M2 has stored data without the M3 reading surface:
 
 ## Required change surface
 
-This PR adds this plan and the separately committed narrow D-body amendment
-authorized by Juan. After final exact-revision acceptance, implementation PRs
-may touch the following owners, with tests beside them:
+The accepted baseline plan and first D-body amendment authorize implementation
+through the following owners, with tests beside them. This docs-only follow-up
+extends only the identity-unavailable body state; implementing that extension
+requires fresh exact-revision acceptance:
 
 | Surface | Purpose |
 | --- | --- |
@@ -82,11 +85,13 @@ storage cannot support these reads, return to the plan with evidence before code
 4. Oversight accepted the plan-only correction at `54a4936`. Juan then authorized
    the narrow D-body amendment for retained vendor-attributed messages with
    unresolved mailbox identity on 2026-11-03 (America/Chicago), as a separate
-   contract commit for review. That commit is `475a843`. Scope authorization is
-   not final acceptance: oversight PASS and Juan's explicit acceptance of the
-   final contract-and-plan revision remain pending. Changes to accepted behavior
-   require a reviewed delta and fresh
-   exact-revision acceptance. A review PASS alone does not authorize code.
+   contract commit for review. That commit is `475a843`. Oversight passed and Juan
+   accepted the final contract-and-plan revision `36f704b`. A later synthetic
+   upgrade proved that the same unresolved thread can also contain unattributed
+   messages. Juan authorized the narrow extension in contract commit `0e7b6be`;
+   its review and fresh acceptance remain pending. Changes to accepted behavior
+   require a reviewed delta and fresh exact-revision acceptance. A review PASS
+   alone does not authorize code.
 5. Preflight found the old primary checkout dirty with benchmark/model work.
    This plan uses an independent clone from the baseline and leaves it alone.
    The existing Email Watcher session was idle; its latest task was a #278 closure
@@ -230,8 +235,10 @@ the rules of [D-body](../docs/THREAD_VIEW_CONTRACT.md#d-body-stored-bodies) and
    recreate a target predicate in `thread_reads.py`.
 3. Project D-body's unresolved-identity case as `mailbox_identity_unavailable` in
    both the message-list body state and the expanded body response. Select it
-   from the stored attribution and `_effective_message_identity_sql` in the same
-   snapshot, and render D-body's exact label. No body or unavailable-marker lookup
+   for every visible member after validating the thread's owned/linked vendor
+   relationship and `_effective_message_identity_sql` in the same snapshot,
+   and render D-body's exact label. The individual member's attribution can be
+   null. No body or unavailable-marker lookup
    is needed for that branch. Keep the message's existing retained-header read
    scope. This narrowly authorized case adds no general `not_followed` state and
    is not inferred merely from an absent follow-cache row.
@@ -279,7 +286,25 @@ contains only that contract amendment and its status/revision record. This plan
 consumes the definition rather than defining another body state for the same case.
 Generic `not_followed` and unknown-state success labels remain excluded. Following,
 admission, reconciliation, removal, and retained visibility are unchanged. No
-implementation is authorized until the final contract-and-plan revision is accepted.
+implementation was authorized until the final contract-and-plan revision was accepted.
+
+Juan accepted `36f704b`, including that first amendment. Subsequent implementation
+preparation reproduced a schema-28-upgraded Gmail thread with two retained logical
+messages: one attributed to the vendor and one with null attribution. Both have
+the same native key and unresolved effective identity; D-derived creates no
+follow row, while the existing vendor relationship makes both headers visible.
+The first amendment named only the attributed member, leaving the second without
+a permitted successful body state. The case cannot be dropped or mislabeled as
+pending, nor can its body be read to manufacture another state.
+
+Juan explicitly authorized extending the same D-body state to every visible
+message of that vendor-related unresolved-identity thread, as a separate contract
+commit for oversight and fresh exact-revision acceptance. `0e7b6be` owns that
+definition; this plan consumes it. Before implementation, add proof that both
+attributed and unattributed members use the same no-text state, including retained
+body/marker bytes, while RECORD and CONTENT precedence and resolved-identity
+behavior remain unchanged. This authorization does not broaden thread membership,
+create a general unfollowed state, or authorize code before fresh acceptance.
 
 ## Desktop behavior and CSP
 
@@ -413,7 +438,7 @@ After acceptance, implementation evidence must fail before each behavior exists:
 | Vendor relationship | Owned plus linked produces one owned row; linked vendor sees the actual owner and each message's actual attribution; a vendor removal/re-attribution invalidates prior direct reads |
 | Pagination | More than 100 threads/messages/copies, tied dates, invalid legacy dates, last page, empty page, malformed/oversized/wrong-scope cursor, mid-page alias merge, arrival, delete and ownership change; stable sets have no omission/repeat, changed sets restart explicitly |
 | Body | Full, empty, 200,000-character bounded, truncated, source-gone, outside-folders, pending and removal-pending cases; no text in list responses or non-stored union variants; lengths match stored evidence; malformed discriminators reject the read and clear prior text |
-| Identity-unavailable body | A retained vendor-attributed logical message with neither stored identity nor proven continuity remains in its existing retained view and projects the D-body label without body text, including when old body/marker bytes remain; pending removal takes precedence; proved continuity and a stored identity each use normal body eligibility on a fresh read; an absent follow row alone does not select this state; no read resolves identity or fetches content |
+| Identity-unavailable body | Every visible logical message in an owned/linked vendor thread with neither stored identity nor proven continuity projects the D-body label without body text, whether its own attribution is present or null; both cases preserve retained headers and bypass old body/marker bytes; pending removal takes precedence; proved continuity and a stored identity each use normal body eligibility on a fresh read; an absent follow row alone does not select this state; no read resolves identity or fetches content |
 | Removal | Use the existing unqualified 33-row held unit: delete/clear hide metadata/counts/copies/body while bytes remain; unfollow preserves permitted headers but hides content; refollow cannot revive a pending body target; restart and qualified completion preserve these outcomes |
 | Snapshot/race | Commit removal before a read begins and prove no content; pause a read across a writer to prove a consistent snapshot; invalidate a UI request during delete/unfollow/selection and prove its late body/page cannot repaint |
 | Host boundary | Each selector, identity null/string, cursor, limit, discriminator and error survives Python-to-Rust-to-TS; missing/unknown fields are refused rather than silently dropped |
@@ -431,27 +456,26 @@ Record exact commands, revisions and outcomes in implementation evidence.
 
 ## Implementation summary
 
-This revision contains the M3 proposal and Juan's narrowly authorized D-body
-amendment in separate commits. It defines the local read boundary, preserves
-the storage/removal owners and Inbox navigation, and orders CSP proof ahead of
-body UI. No application code, dependencies or schema change.
+This follow-up contains Juan's newly authorized D-body extension and plan
+alignment in separate commits. It closes the proved unattributed-member gap
+without changing visibility, body access or removal precedence. No application
+code, dependencies or schema change.
 
 ## Cold diff audit
 
-`plans/PR-Thread-M3-Read-View-CSP.md` is added. Its sections trace to the M3
-milestone, referenced definitions, M2's retained-copy requirement, and the
-existing Inbox contract. `docs/THREAD_VIEW_CONTRACT.md` changes only D-body's
-authorized identity-unavailable case and the status/revision record. API shapes
-are proposals, not claims of existing code. Contract seam/link checks and the
-two-document scope check cover this docs revision;
-the behavior matrix is required future evidence, not a claimed test result.
+`docs/THREAD_VIEW_CONTRACT.md` extends only D-body's identity-unavailable case and
+updates its acceptance/revision record. This plan aligns the projection and
+verification case, records the reproducible gap, and preserves the existing
+implementation sequence and non-scope. Contract seam/link checks and the
+two-document scope check cover this docs delta; new body-state behavior remains
+future implementation evidence, not a claimed test result.
 
 ## Gap audit
 
 NOT DONE
 
-The narrow contract-amendment scope is authorized and documented. Oversight
-review of that amendment and Juan's final exact-revision acceptance remain
-pending. Scope authorization alone does not permit implementation. Implementation,
-packaged CSP/interaction proof and platform qualification have not run. The plan
-must not be read as acceptance, implementation completion, or deployment approval.
+The narrow extension's scope is authorized and documented. Oversight review and
+Juan's fresh exact-revision acceptance of this delta remain pending. Its
+implementation is blocked until then. Existing implementation work may continue
+within the already accepted baseline scope; this delta does not claim full M3
+completion or grant merge, deployment or platform-qualification authority.
