@@ -74,6 +74,7 @@ envelope without changing its protocol number.
 | `inbox.query` | optional bounded `limit`, opaque `cursor`, mail `provider`/`account_id`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `threads.list` | `vendor_id`; optional paired `provider`/`account_id`, `limit` (1–100), `cursor` | Retained owned/linked logical threads, newest first; no body or summary content |
+| `threads.copies` | `vendor_id`, complete `thread_ref`, canonical `message_id`; optional `copy_ref`, `limit`, `cursor` | Retained physical/location copies with their own saved summaries, or one copy's attachment inventory metadata |
 | `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
 | `inbox.clear` | `{}` | Delete all local inbox messages and message-owned state while preserving mailbox and outbound state |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
@@ -297,8 +298,44 @@ returns `stale_cursor`; restart at page one. A wrong selector, malformed/oversiz
 cursor, or absent last tuple returns `invalid_request`. The last page returns
 `next_cursor: null`. Each page rechecks visibility in its own single snapshot.
 
-The remaining M3 message, body and copy reads and typed desktop forwarding are
-separate implementation slices under the accepted M3 plan.
+### Local thread copies (M3)
+
+`threads.copies` uses the same ungated, query-only snapshot and paging bounds.
+It rechecks the vendor's owned/linked relationship, complete scope and canonical
+message membership before reading retained summaries or inventory. A physical
+duplicate ID cannot replace the canonical message ID. Delete/clear targets are
+absent through RECORD; body-only removal does not hide these retained details.
+No body, provider attachment token, local file path or attachment bytes are read
+or returned.
+
+`thread_ref` must contain exactly `provider`, `account_id`,
+`mailbox_identity_key` (explicit null or a lowercase 64-character hex digest),
+and `thread_key` (nonempty, at most 512 UTF-8 bytes). Existing account/provider
+validators normalize the first two. IMAP keys resolve through retained aliases
+with cycle detection, then require visible membership in the requested complete
+scope. Missing targets and foreign scopes are `not_found`; native provider keys
+are opaque. A changed alias resolution stales an existing cursor.
+
+The response contains resolved `thread_ref`, canonical `message_id`, `items`, and
+`next_cursor`. Without `copy_ref`, each item contains source `copy_ref`, sorted
+`locations`, the actual stored row's `summary` or null, and `attachment_count`.
+Multiple locations of one source form one copy, ordered by canonical source
+byte order. A location-only copy has no independent saved summary.
+
+With `copy_ref`, the items are that source's recorded inventory, ordered by
+stored position then part identity. Each item contains `part_id`, `filename`,
+`media_type`, and `byte_size` (null when the declared size is unknown). The
+catalog's `source_provider_message_id` owns attribution, including a catalog on
+the canonical row that came from a location-only copy. Legacy catalogs fall back
+to their actual stored row's source. A source outside the logical unit is
+`not_found`; it never creates an invented copy.
+
+Copy and inventory cursor selectors are distinct. Revisions include the resolved
+ref, vendor relationship and projected summaries/inventory; changes return `stale_cursor`. Both forms
+remain local metadata reads with no action controls or retrieval.
+
+The remaining M3 message/body reads and typed desktop forwarding are separate
+implementation slices under the accepted M3 plan.
 
 Schema v30 (thread view M2.1) records, for every captured message, its To and Cc recipients in
 header order and the admitted folders it is in ([D-scope](THREAD_VIEW_CONTRACT.md#d-scope-in-scope-messages-and-retention):
