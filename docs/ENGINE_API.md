@@ -75,6 +75,7 @@ envelope without changing its protocol number.
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `threads.list` | `vendor_id`; optional paired `provider`/`account_id`, `limit` (1–100), `cursor` | Retained owned/linked logical threads, newest first; no body or summary content |
 | `threads.copies` | `vendor_id`, complete `thread_ref`, canonical `message_id`; optional `copy_ref`, `limit`, `cursor` | Retained physical/location copies with their own saved summaries, or one copy's attachment inventory metadata |
+| `threads.body` | `vendor_id`, complete `thread_ref`, canonical `message_id` | Local stored plain text and lengths, or a text-free body state |
 | `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
 | `inbox.clear` | `{}` | Delete all local inbox messages and message-owned state while preserving mailbox and outbound state |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
@@ -297,6 +298,37 @@ from the caller is never trusted. Changed membership, headers, ownership or orde
 returns `stale_cursor`; restart at page one. A wrong selector, malformed/oversized
 cursor, or absent last tuple returns `invalid_request`. The last page returns
 `next_cursor: null`. Each page rechecks visibility in its own single snapshot.
+
+### Local thread body (M3)
+
+`threads.body` validates the same complete scope, vendor relationship, IMAP alias
+and canonical RECORD-visible message membership as copy reads. It returns
+`{thread_ref, message_id, body}` with the resolved ref, in one query-only SQLite
+snapshot. It never initializes storage, constructs a runtime, gates on Connect,
+fetches mail, or substitutes a summary or another physical copy's body.
+
+`body_state.project` is the shared state owner for expansion and later message
+lists. It checks CONTENT eligibility for every row of the logical unit before
+reading stored body or unavailable-marker data. A held body-only removal returns
+`{state: "removal_pending"}`, even after refollow. Delete/clear is already absent
+through RECORD (`not_found`). Next, unresolved effective identity returns
+`{state: "mailbox_identity_unavailable"}` for every visible member of the validated
+vendor-related thread, including unattributed members. Neither early state reads
+body or marker data. Proven legacy continuity uses the normal resolved rules.
+
+For a resolved followed canonical message, stored text returns
+`{state: "stored", text, stored_chars, source_chars}`. Empty text is valid; lengths
+come from storage, not the analysis-input truncation marker. The stored length
+must equal the text's character count, be at most 200,000, and not exceed the
+source length. Without stored text, the state is `source_gone`, `outside_folders`
+or `pending`; those objects contain only `state`. A malformed stored row/marker
+or inconsistent follow invariant fails with `runtime_error`, without returning
+text or inventing another successful state. The helper's metadata-only mode
+does not select the text column.
+
+Unknown payload fields, including paging fields, and invalid selectors return
+`invalid_request`. Missing vendor/thread/canonical-message membership returns
+`not_found`. The view consumes the exact D-body/D-removal labels for these states.
 
 ### Local thread copies (M3)
 

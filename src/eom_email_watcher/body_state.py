@@ -1,8 +1,120 @@
 """Local body state; D-derived owns invalidation and reconcile owns fetching."""
 
 import json
+from typing import Literal, TypedDict, overload
 
 from .mime import MAX_STORED_BODY_CHARS
+
+
+class BodyStatus(TypedDict):
+    state: Literal[
+        "removal_pending",
+        "mailbox_identity_unavailable",
+        "pending",
+        "source_gone",
+        "outside_folders",
+    ]
+
+
+class StoredBodyMetadata(TypedDict):
+    state: Literal["stored"]
+    stored_chars: int
+    source_chars: int
+
+
+class StoredBody(StoredBodyMetadata):
+    text: str
+
+
+type Body = BodyStatus | StoredBody
+type BodyProjection = Body | StoredBodyMetadata
+
+
+@overload
+def project(
+    db,
+    message_id: str,
+    *,
+    mailbox_identity_key: str | None,
+    include_text: Literal[True],
+) -> Body: ...
+
+
+@overload
+def project(
+    db,
+    message_id: str,
+    *,
+    mailbox_identity_key: str | None,
+    include_text: Literal[False] = False,
+) -> BodyStatus | StoredBodyMetadata: ...
+
+
+def project(
+    db,
+    message_id: str,
+    *,
+    mailbox_identity_key: str | None,
+    include_text: bool = False,
+) -> BodyProjection:
+    """Project a validated canonical member using its caller's read snapshot.
+
+    The caller first validates full thread scope, vendor relationship and RECORD
+    membership. This owner applies CONTENT to the entire logical unit before
+    either stored text or unavailable markers can be read. Lists omit text even
+    from the SQL projection; expansion uses the same state selection.
+    """
+    from . import removal
+    from .db import _followed_message_sql, _logical_unit
+
+    unit = _logical_unit(db, message_id)
+    if unit is None:
+        raise RuntimeError("Retained body membership is unavailable")
+    if any(not removal.CONTENT.message_available(db, row_id) for row_id in unit.rows):
+        return {"state": "removal_pending"}
+    if mailbox_identity_key is None:
+        return {"state": "mailbox_identity_unavailable"}
+    followed = db.execute(
+        f"""SELECT 1 FROM logical_messages m JOIN thread_follow f
+        ON {_followed_message_sql("m")} WHERE m.message_id=?""",
+        (message_id,),
+    ).fetchone()
+    if followed is None:
+        raise RuntimeError("Retained body follow state is inconsistent")
+    columns = "text,stored_chars,source_chars" if include_text else "stored_chars,source_chars"
+    stored = db.execute(
+        f"SELECT {columns} FROM message_bodies WHERE message_id=?",
+        (message_id,),
+    ).fetchone()
+    if stored is not None:
+        count, source = stored["stored_chars"], stored["source_chars"]
+        if (
+            type(count) is not int
+            or type(source) is not int
+            or not 0 <= count <= MAX_STORED_BODY_CHARS
+            or source < count
+        ):
+            raise RuntimeError("Stored body lengths are invalid")
+        result: StoredBodyMetadata = {
+            "state": "stored",
+            "stored_chars": count,
+            "source_chars": source,
+        }
+        if include_text:
+            text = stored["text"]
+            if not isinstance(text, str) or len(text) != count:
+                raise RuntimeError("Stored body text is invalid")
+            return {**result, "text": text}
+        return result
+    marker = db.execute(
+        "SELECT reason FROM message_body_unavailable WHERE message_id=?",
+        (message_id,),
+    ).fetchone()
+    if marker is None:
+        return {"state": "pending"}
+    if marker["reason"] not in {"source_gone", "outside_folders"}:
+        raise RuntimeError("Stored body unavailable reason is invalid")
+    return {"state": marker["reason"]}
 
 
 def ensure_schema(db):

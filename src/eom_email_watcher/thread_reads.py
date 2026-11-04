@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, TypedDict
 
+from . import body_state
 from .db import (
     Store,
     _decode_json_bytes,
@@ -75,6 +76,28 @@ class CopyPage(TypedDict):
     message_id: str
     items: list[CopyItem] | list[InventoryItem]
     next_cursor: str | None
+
+
+class BodyResponse(TypedDict):
+    thread_ref: dict[str, str | None]
+    message_id: str
+    body: body_state.Body
+
+
+def read_body(store: Store, vendor_id: str, requested: ThreadRef, message_id: str) -> BodyResponse:
+    with snapshot(store) as db:
+        ref, members, _ = _selected_thread(db, vendor_id, requested)
+        _selected_message(members, message_id)
+        return {
+            "thread_ref": asdict(ref),
+            "message_id": message_id,
+            "body": body_state.project(
+                db,
+                message_id,
+                mailbox_identity_key=ref.mailbox_identity_key,
+                include_text=True,
+            ),
+        }
 
 
 def _json(value: object) -> bytes:
