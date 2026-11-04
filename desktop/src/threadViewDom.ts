@@ -13,7 +13,7 @@ const threadKey = (ref: ThreadRef) => `thread:${JSON.stringify(ref)}`;
 const accountKey = (account: { provider: string; account_id: string }) => JSON.stringify([account.provider, account.account_id]);
 const regionId = (kind: string, ...keys: string[]) => `thread-${kind}-${encodeURIComponent(JSON.stringify(keys))}`;
 const dateLabel = (value: string | null) => value && Number.isFinite(Date.parse(value))
-  ? new Date(value).toLocaleString() : "Time not recorded";
+  ? new Date(value).toLocaleString() : "Date unavailable";
 
 /** Plain DOM consumer of local read state. No mail/provider text enters an HTML sink. */
 export class ThreadViewDom {

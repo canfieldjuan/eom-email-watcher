@@ -69,6 +69,7 @@ test("retained vendor/account/linked scope and hostile headers render as text on
   assert.match(text(h.root), /History partial — only locally retained messages are shown/);
   assert.match(text(h.root), /Linked/); assert.ok(text(h.root).includes(thread.owner_vendor.display_name));
   assert.match(text(h.root), /Mailbox identity unavailable/);
+  assert.ok(nodes(h.root).some(n => n.textContent === "Date unavailable · 1 logical message"));
   const open = h.button(thread.subject);
   assert.equal(open.attributes.get("aria-expanded"), "false");
   for (const control of nodes(h.root).filter(n => n.attributes.has("aria-controls"))) {
@@ -78,6 +79,7 @@ test("retained vendor/account/linked scope and hostile headers render as text on
   assert.ok(text(h.root).includes(message.sender));
   assert.ok(text(h.root).includes(hostile));
   assert.match(text(h.root), /Outbound/); assert.match(text(h.root), /No attributed vendor/);
+  assert.ok(nodes(h.root).some(n => n.textContent === "Outbound · Date unavailable"));
   assert.match(text(h.root), /Sent mail unavailable/);
   assert.equal(nodes(h.root).filter(n => ["SCRIPT", "IMG", "IFRAME", "A", "FORM"].includes(n.tagName)).length, 0);
   assert.ok(h.calls.every(c => ["threads_list", "threads_messages"].includes(c.command)));
