@@ -30,7 +30,7 @@ from connect_automate.locking import (
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from . import deployment, private_storage, removal, source_locks
+from . import deployment, private_storage, removal, source_locks, thread_reads
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -5912,6 +5912,28 @@ def _vendor_item(vendor: dict[str, object], config: Config) -> dict[str, object]
     }
 
 
+def _threads_list(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"vendor_id", "provider", "account_id", "limit", "cursor"})
+    vendor_id = _vendor_id(payload)
+    provider, account_id = None, None
+    if payload.get("provider") is not None or payload.get("account_id") is not None:
+        try:
+            provider, account_id = _mail_account_key(payload)
+        except ApiError as error:
+            raise ApiError("invalid_request", str(error)) from error
+    limit = _bounded_limit(payload, default=25, maximum=100)
+    # The ordinary runtime initializes storage and constructs a model. Neither
+    # belongs to M3's read class; use only the validated config's retained path.
+    store = Store(load_config(_config_path(request)).database_file)
+    try:
+        return thread_reads.list_threads(
+            store, vendor_id, provider=provider, account_id=account_id,
+            limit=limit, cursor=payload.get("cursor"),
+        )
+    except thread_reads.ThreadReadError as error:
+        raise ApiError(error.code, str(error)) from error
+
+
 def _vendors_list(request: dict[str, object]) -> dict[str, object]:
     """Read class (contract D-ops): never gated."""
     _payload(request, set())
@@ -6442,6 +6464,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "watchlist.add": _watchlist_add,
     "watchlist.list": _watchlist,
     "watchlist.remove": _watchlist_remove,
+    "threads.list": _threads_list,
     "vendors.list": _vendors_list,
     "vendors.create": _vendors_create,
     "vendors.rename": _vendors_rename,
