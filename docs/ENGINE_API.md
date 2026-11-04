@@ -304,9 +304,16 @@ cursor, or absent last tuple returns `invalid_request`. The last page returns
 
 `threads.messages` uses the same query-only, scoped read snapshot and 25/100 page
 bounds. It returns `{thread, items, next_cursor}`. `thread` contains resolved
-`thread_ref`, `relation` (`owned` or `linked`), `owner_vendor`, and the fixed
+`thread_ref`, `relation` (`owned` or `linked`), `owner_vendor`, required `subject`, and the fixed
 `history_notice`: "History partial — only locally retained messages are shown".
 It makes no mailbox-completeness or capture claim.
+
+`thread.subject` is the thread title: the newest visible logical message's
+subject, with the same canonical-source tie-break and "No subject" fallback as
+`threads.list`. Both reads use one shared title rule. The title is computed
+across all visible members in this message snapshot, independently of the page,
+and participates in the cursor revision. The desktop uses this fresh context for
+the open-thread heading; a cached list subject is not a fallback on invalidation.
 
 Each item contains canonical `message_id`, stored `subject`, derived `direction`
 (`inbound` or `outbound`), `sender`, nullable `sender_name`, `attributed_vendor`

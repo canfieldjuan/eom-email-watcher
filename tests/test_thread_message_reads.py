@@ -41,6 +41,7 @@ def test_owned_linked_direction_attribution_and_copy_count_are_real_derived_meta
         "thread_ref": asdict(selection(store, linked)),
         "relation": "linked",
         "owner_vendor": {"vendor_id": owner, "display_name": "Vendor"},
+        "subject": "Quote",
         "history_notice": "History partial — only locally retained messages are shown",
     }
     assert [item["message_id"] for item in page["items"]] == ["m", "reply", "unattributed"]
