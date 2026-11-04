@@ -73,6 +73,7 @@ envelope without changing its protocol number.
 | `watcher.check` | optional `dry_run` boolean | Poll the active mail account with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.query` | optional bounded `limit`, opaque `cursor`, mail `provider`/`account_id`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
+| `threads.list` | `vendor_id`; optional paired `provider`/`account_id`, `limit` (1–100), `cursor` | Retained owned/linked logical threads, newest first; no body or summary content |
 | `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
 | `inbox.clear` | `{}` | Delete all local inbox messages and message-owned state while preserving mailbox and outbound state |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
@@ -257,9 +258,47 @@ vendor, whom the message names, or is a mail account's own address. `not_found` 
 vendor, or an address the vendor does not have. `watchlist.remove` of a vendor address also returns
 `conflict`, naming the vendor. Vendor mutations share the watchlist mutation lock.
 
-Schema v29 also gives every stored message a thread key under
-[D-identity](THREAD_VIEW_CONTRACT.md#d-identity-message-identity-direction-and-thread-keys). No
-operation returns it before the thread view.
+### Local thread list (M3)
+
+`threads.list` is an ungated local read. It opens one query-only SQLite snapshot;
+it does not initialize or upgrade storage, construct a model, discover a provider,
+resolve mailbox identity, reconcile, or fetch mail. Reads work for retained
+disconnected accounts. A missing database/vendor returns `not_found` without
+creating a database. Storage initialization remains its existing owner's job.
+
+The payload requires the existing canonical UUIDv4 `vendor_id`. `provider` and
+`account_id` must both be absent/null (all retained accounts) or both supplied
+(one normalized account selector). `limit` defaults to 25 and accepts integers
+1–100, excluding booleans. Unknown fields and invalid selectors return
+`invalid_request`, never a wider query.
+
+The response is `{items, next_cursor}`. Each item contains `thread_ref` with
+`provider`, `account_id`, explicit `mailbox_identity_key` (string or null), and
+`thread_key`; `relation` (`owned` or `linked`); `owner_vendor` with `vendor_id`
+and `display_name`; `subject`; `latest_received_at`; and `message_count`.
+The identity null is the retained unresolved legacy bucket, not the current
+mailbox. Proven continuity uses the existing effective-identity owner. Thread
+keys follow [D-identity](THREAD_VIEW_CONTRACT.md#d-identity-message-identity-direction-and-thread-keys).
+Logical copies count once. Owned takes precedence over linked. Ownership and
+timestamps reuse the derived-state owners; deleted/cleared logical units are
+excluded through the shared RECORD visibility projection even while bytes remain.
+
+Threads order by newest logical received time, with the least canonical source
+and complete scope/key breaking ties. Invalid legacy dates sort last and return
+null; empty subjects return `No subject`. The list describes retained history,
+not complete mailbox history. Body/summary content is never selected here.
+
+Cursors are untrusted, canonical base64url JSON bounded to 4 KiB. Version 1 binds
+SHA-256 digests of the normalized selector (including operation, limit and
+ordering version), the visible ordered projection, and the actual last ordering
+tuple. Digesting the last tuple keeps long retained source IDs bounded; an offset
+from the caller is never trusted. Changed membership, headers, ownership or ordering
+returns `stale_cursor`; restart at page one. A wrong selector, malformed/oversized
+cursor, or absent last tuple returns `invalid_request`. The last page returns
+`next_cursor: null`. Each page rechecks visibility in its own single snapshot.
+
+The remaining M3 message, body and copy reads and typed desktop forwarding are
+separate implementation slices under the accepted M3 plan.
 
 Schema v30 (thread view M2.1) records, for every captured message, its To and Cc recipients in
 header order and the admitted folders it is in ([D-scope](THREAD_VIEW_CONTRACT.md#d-scope-in-scope-messages-and-retention):
