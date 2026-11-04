@@ -151,7 +151,7 @@ cannot observe a pre-removal result. No body response is cached on disk.
 | Operation | Request payload | Data returned |
 | --- | --- | --- |
 | `threads.list` | `vendor_id`, optional `provider`, `account_id`, `limit`, `cursor` | `{items, next_cursor}`; each item has `thread_ref`, `relation`, `owner_vendor`, `subject`, `latest_received_at`, `message_count` |
-| `threads.messages` | `vendor_id`, `thread_ref`, optional `limit`, `cursor` | `{thread, items, next_cursor}`; thread has resolved ref, relation, owner, history notice; each item has canonical `message_id`, subject, direction, sender/address/name, attributed vendor, received time, `body_state`, `copy_count` |
+| `threads.messages` | `vendor_id`, `thread_ref`, optional `limit`, `cursor` | `{thread, items, next_cursor}`; thread has resolved ref, relation, owner, required `subject` (thread title), history notice; each item has canonical `message_id`, subject, direction, sender/address/name, attributed vendor, received time, `body_state`, `copy_count` |
 | `threads.body` | `vendor_id`, `thread_ref`, canonical `message_id` | `{thread_ref, message_id, body}` with the discriminated body shape below |
 | `threads.copies` | `vendor_id`, `thread_ref`, canonical `message_id`, optional `copy_ref`, `limit`, `cursor` | `{thread_ref, message_id, items, next_cursor}`; without `copy_ref`, pages of copies; with it, pages of that copy's attachment inventory metadata |
 
@@ -201,6 +201,12 @@ bind their cursors to their distinct selector shape. There are no action control
   tie-breaks still apply. No date is invented.
 - The thread title is the newest visible message's subject (same tie-break),
   with "No subject" for empty subjects. Counts count visible logical messages.
+  Juan's open-thread heading decision also uses this title. One shared helper
+  owns the title rule for `threads.list` and `threads.messages`; the latter
+  computes `thread.subject` in its existing snapshot across all visible members,
+  independently of the requested page. That context field participates in the
+  message-page revision. The desktop renders the fresh context subject and clears
+  it on invalidation; it never falls back to the cached selected list row.
 - Use versioned keyset cursors bounded to 4 KiB, bound to operation, normalized
   account/vendor/thread/message selectors, limit, ordering version, last tuple,
   and a SHA-256 revision of the ordered projection. Compute the revision in the

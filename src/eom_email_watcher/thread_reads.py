@@ -89,6 +89,7 @@ class ThreadContext(TypedDict):
     thread_ref: dict[str, str | None]
     relation: Literal["owned", "linked"]
     owner_vendor: VendorRef
+    subject: str
     history_notice: str
 
 
@@ -126,6 +127,7 @@ def list_messages(
             "thread_ref": asdict(ref),
             "relation": "owned" if owner[2] == vendor_id else "linked",
             "owner_vendor": vendors[owner[2]],
+            "subject": _thread_title(members)[0],
             "history_notice": HISTORY_NOTICE,
         }
         projected = []
@@ -330,6 +332,12 @@ def _newest(member):
     return (not math.isfinite(epoch), -epoch if math.isfinite(epoch) else 0, source)
 
 
+def _thread_title(members):
+    """One title rule for list rows and open-thread context, before pagination."""
+    latest, order = min(members, key=lambda item: _newest(item[1]))
+    return latest["subject"] or "No subject", order
+
+
 def _selected_thread(db, vendor_id: str, requested: ThreadRef):
     """Resolve an IMAP alias, then validate complete live scope and relationship."""
     vendors = _vendors(db)
@@ -485,7 +493,7 @@ def list_threads(
             owner = _follow_owner(member for _, member in members)
             if owner is None or not any(row["vendor_id"] == vendor_id for row, _ in members):
                 continue
-            latest, order = min(members, key=lambda item: _newest(item[1]))
+            subject, order = _thread_title(members)
             epoch = order[0]
             source = min(member[1] for _, member in members)
             key = (
@@ -500,7 +508,7 @@ def list_threads(
                 "thread_ref": asdict(ref),
                 "relation": "owned" if owner[2] == vendor_id else "linked",
                 "owner_vendor": vendors[owner[2]],
-                "subject": latest["subject"] or "No subject",
+                "subject": subject,
                 "latest_received_at": datetime.fromtimestamp(epoch, UTC).isoformat()
                 if math.isfinite(epoch)
                 else None,
