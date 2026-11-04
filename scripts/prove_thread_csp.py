@@ -7,6 +7,7 @@ No install, live profile, provider or Windows qualification is part of this proo
 """
 
 import argparse
+import base64
 import hashlib
 import http.server
 import json
@@ -49,6 +50,9 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--driver", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--thread-view", action="store_true", help="Also exercise synthetic M3 history"
+    )
     args = parser.parse_args()
     if not __debug__:
         parser.error("Run without Python optimization so every proof assertion executes")
@@ -109,6 +113,11 @@ def main():
     sink = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
     sink_thread = threading.Thread(target=sink.serve_forever, daemon=True)
     sink_thread.start()
+    thread_fixture = None
+    if args.thread_view:
+        from thread_view_proof import seed_history
+
+        thread_fixture = seed_history(profile, f"http://127.0.0.1:{sink.server_port}")
     session = None
     with (output / "host.log").open("w") as log:
         process = subprocess.Popen(
@@ -166,7 +175,9 @@ def main():
 
             deadline = time.monotonic() + 40
             while not script(
-                'const tab = document.querySelector("#vendors-tab"); return !!tab && !tab.disabled;'
+                'const tab = document.querySelector("#vendors-tab"); '
+                'const watchlist = document.querySelector("#watchlist-status"); '
+                'return !!tab && !tab.disabled && watchlist?.dataset.kind === "success";'
             ):
                 if time.monotonic() > deadline:
                     raise RuntimeError("Production UI did not reach admitted navigation")
@@ -185,6 +196,50 @@ def main():
             assert startup["stylesheets"] and all(
                 "/assets/" in item for item in startup["stylesheets"]
             ), startup
+            thread_view = None
+            if thread_fixture is not None:
+                from thread_view_proof import exercise
+
+                display_env = dict(env, **json.loads((output / "display.json").read_text()))
+                window_id = subprocess.check_output(
+                    ["xdotool", "search", "--sync", "--name", "^Email Watcher$"],
+                    env=display_env,
+                    text=True,
+                    timeout=15,
+                ).splitlines()[-1]
+
+                def resize(width, height):
+                    subprocess.run(
+                        ["xdotool", "windowsize", "--sync", window_id, str(width), str(height)],
+                        env=display_env,
+                        check=True,
+                        timeout=10,
+                    )
+
+                def screenshot(name):
+                    encoded = request(base, f"/session/{session}/screenshot")
+                    (output / name).write_bytes(base64.b64decode(encoded))
+
+                def keypress(key):
+                    subprocess.run(
+                        ["xdotool", "windowfocus", "--sync", window_id, "key", key],
+                        env=display_env,
+                        check=True,
+                        timeout=10,
+                    )
+
+                try:
+                    thread_view = exercise(script, thread_fixture, resize, screenshot, keypress)
+                except Exception:
+                    screenshot("thread-failure.png")
+                    diagnostic = script("""return {
+                        text: document.body.innerText,
+                        vendors: document.querySelector('#vendor-list')?.innerText,
+                        status: document.querySelector('#vendors-status')?.innerText,
+                        scripts: [...document.scripts].map(s => s.src)
+                    };""")
+                    (output / "thread-failure.json").write_text(json.dumps(diagnostic, indent=2))
+                    raise
             for tab in ("vendors", "watchlist", "inbox", "settings"):
                 deadline = time.monotonic() + 20
                 while script(
@@ -297,6 +352,9 @@ def main():
             assert not attempts, attempts
             result = {
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "sidecar_sha256": hashlib.sha256(
+                    binary.with_name("eom-mail-engine").read_bytes()
+                ).hexdigest(),
                 "head": subprocess.check_output(
                     ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
                 ).strip(),
@@ -304,10 +362,16 @@ def main():
                     (ROOT / "desktop/src-tauri/tauri.conf.json").read_bytes()
                 ).hexdigest(),
                 "probe_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "thread_probe_sha256": hashlib.sha256(
+                    (ROOT / "scripts/thread_view_proof.py").read_bytes()
+                ).hexdigest()
+                if args.thread_view
+                else None,
                 "source_diff": subprocess.check_output(
                     ["git", "diff", "--stat"], cwd=ROOT, text=True
                 ),
                 "startup": startup,
+                "thread_view": thread_view,
                 "native_dialog": "Ok",
                 "effective_policy": policy,
                 "violations": events,

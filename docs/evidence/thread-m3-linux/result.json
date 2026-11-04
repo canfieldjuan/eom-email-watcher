@@ -1,0 +1,107 @@
+{
+  "binary_sha256": "36e9946ce3e4b0464ceb00d616f449802b8f65aa3893fcf275b6d31597038101",
+  "sidecar_sha256": "c9c04b0c060f46ea12d897a2c08e4d1f0f9fb2053896e972876e43ceccefc4ca",
+  "head": "f77748f3e81ce657695cd530236bcf9ba8b72e40",
+  "config_sha256": "2203f04366af30407c176fcacac18e0468ae37f22db7e7e80ba660a1672538bd",
+  "probe_sha256": "bfe883c1ab3d6a5a911abfa6b0218a577016f0e24f0abc7a7b2947ef62e89712",
+  "thread_probe_sha256": "4cb355d4193c2ff098e20dd240083bf79452e702fb1dd6afaf4997ef461e858a",
+  "source_diff": "",
+  "startup": {
+    "styled": "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif",
+    "stylesheets": [
+      "tauri://localhost/assets/index-CULQirAI.css"
+    ],
+    "url": "tauri://localhost",
+    "admission": "admitted"
+  },
+  "thread_view": {
+    "messages": 30,
+    "newest_heading_outside_first_page": true,
+    "copies": 2,
+    "body_literal": true,
+    "late_body_fenced": true,
+    "identity_unavailable": true,
+    "empty_body_and_unavailable_states": true,
+    "disconnected_sent_scope": "not_polled",
+    "empty": true,
+    "keyboard_body": true,
+    "width": {
+      "left": 33,
+      "body_scroll": 572,
+      "right": 607,
+      "font": "16px",
+      "inner": 640,
+      "scroll": 640,
+      "body_width": 572
+    },
+    "text_zoom": {
+      "left": 33,
+      "body_scroll": 572,
+      "right": 607,
+      "font": "32px",
+      "inner": 640,
+      "scroll": 640,
+      "body_width": 572
+    },
+    "source_scope": {
+      "provider": "gmail",
+      "account_id": "retained",
+      "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "thread_key": "shared-native"
+    }
+  },
+  "native_dialog": "Ok",
+  "effective_policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+  "violations": [
+    {
+      "directive": "script-src-elem",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "inline"
+    },
+    {
+      "directive": "script-src-attr",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "inline"
+    },
+    {
+      "directive": "script-src-elem",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "http://127.0.0.1:40521/script"
+    },
+    {
+      "directive": "img-src",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "http://127.0.0.1:40521/image"
+    },
+    {
+      "directive": "connect-src",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "http://127.0.0.1:40521/fetch"
+    },
+    {
+      "directive": "connect-src",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "http://127.0.0.1:40521/beacon"
+    },
+    {
+      "directive": "frame-src",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "http://127.0.0.1:40521"
+    },
+    {
+      "directive": "form-action",
+      "policy": "default-src 'none'; base-uri 'none'; font-src 'self'; object-src 'none'; form-action 'none'; frame-src 'none'; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-kDhndNzwNiuXV/aA6ml3Fn8zK7s1hpempU3Rqszp78c='; connect-src ipc: http://ipc.localhost",
+      "disposition": "enforce",
+      "blocked": "http://127.0.0.1:40521/form"
+    }
+  ],
+  "remote_requests": [],
+  "result": "PASS"
+}
