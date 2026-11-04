@@ -147,6 +147,8 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     "mail_account_reconnect",
     "mail_accounts_list",
     "settings_get",
+    "threads_list",
+    "threads_copies",
     "watcher_check",
     "watchlist_list",
   ];
