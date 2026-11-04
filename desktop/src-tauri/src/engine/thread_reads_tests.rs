@@ -332,6 +332,27 @@ const UNSTORED_STATES: [&str; 5] = [
 ];
 
 #[test]
+fn thread_reads_message_body_responses_reject_silent_shape_loss() {
+    let mut valid = message_page(json!({"state": "pending"}));
+    valid["next_cursor"] = Value::Null;
+    assert!(serde_json::from_value::<ThreadMessagePage>(valid.clone()).is_ok());
+    for pointer in ["", "/thread", "/thread/owner_vendor", "/items/0"] {
+        let mut input = valid.clone();
+        input.pointer_mut(pointer).unwrap()["body"] = json!("unexpected content");
+        assert!(
+            serde_json::from_value::<ThreadMessagePage>(input).is_err(),
+            "unknown field at {pointer}"
+        );
+    }
+    valid.as_object_mut().unwrap().remove("next_cursor");
+    assert!(serde_json::from_value::<ThreadMessagePage>(valid).is_err());
+    let mut response = body_response(json!({"state": "pending"}));
+    assert!(serde_json::from_value::<ThreadBodyResponse>(response.clone()).is_ok());
+    response["unexpected"] = json!("unexpected content");
+    assert!(serde_json::from_value::<ThreadBodyResponse>(response).is_err());
+}
+
+#[test]
 fn thread_reads_message_body_queries_are_closed_and_preserve_scope() {
     let query: ThreadMessagesQuery = serde_json::from_value(message_query()).unwrap();
     assert_eq!(serde_json::to_value(query).unwrap(), message_query());
@@ -457,6 +478,7 @@ fn thread_reads_body_process_refuses_invalid_text_lengths_and_cap() {
         json!({"state": "stored", "text": "🙂", "stored_chars": 2, "source_chars": 2}),
         json!({"state": "stored", "text": "body", "stored_chars": 4, "source_chars": 3}),
         json!({"state": "stored", "text": "x".repeat(200_001), "stored_chars": 200_001, "source_chars": 200_001}),
+        json!({"state": "stored", "text": "x".repeat(200_001), "stored_chars": 200_000, "source_chars": 200_001}),
         json!({"state": "stored", "text": "", "stored_chars": -1, "source_chars": 0}),
         json!({"state": "stored", "text": "", "stored_chars": true, "source_chars": 0}),
         json!({"state": "stored", "text": "", "stored_chars": 0.5, "source_chars": 1}),
