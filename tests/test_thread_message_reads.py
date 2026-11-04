@@ -289,6 +289,21 @@ def test_imap_alias_resolution_stales_the_page_and_wrong_scope_never_leaks(tmp_p
     assert error.value.code == "stale_cursor"
 
 
+def message_api_request(tmp_path, **change):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('timezone = "UTC"\n')
+    return {
+        "protocol": 1,
+        "operation": "threads.messages",
+        "config_path": str(config_path),
+        "payload": {
+            "vendor_id": "11111111-1111-4111-8111-111111111111",
+            "thread_ref": asdict(thread_reads.ThreadRef("gmail", "mailbox", None, "native")),
+            **change,
+        },
+    }
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -304,18 +319,16 @@ def test_invalid_message_payload_fails_before_config(tmp_path, monkeypatch, chan
     monkeypatch.setattr(
         engine_api, "load_config", lambda _: pytest.fail("invalid request read config")
     )
-    result = engine_api._response(
-        {
-            "protocol": 1,
-            "operation": "threads.messages",
-            "payload": {
-                "vendor_id": "11111111-1111-4111-8111-111111111111",
-                "thread_ref": asdict(thread_reads.ThreadRef("gmail", "mailbox", None, "native")),
-                **change,
-            },
-        }
-    )
+    result = engine_api._response(message_api_request(tmp_path, **change))
     assert result["error"]["code"] == "invalid_request"
+
+
+def test_valid_message_payload_reaches_config_in_same_admission_harness(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        engine_api, "load_config", lambda _: pytest.fail("valid request reached config")
+    )
+    with pytest.raises(pytest.fail.Exception, match="valid request reached config"):
+        engine_api._response(message_api_request(tmp_path))
 
 
 def test_message_api_is_read_only_and_rejects_malformed_cursor(tmp_path, monkeypatch):
