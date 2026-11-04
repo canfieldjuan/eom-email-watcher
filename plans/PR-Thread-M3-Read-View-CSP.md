@@ -32,8 +32,9 @@ M2 has stored data without the M3 reading surface:
 
 ## Required change surface
 
-This PR adds only this plan. After acceptance, implementation PRs may touch the
-following owners, with tests beside them:
+This PR adds this plan and the separately committed narrow D-body amendment
+authorized by Juan. After final exact-revision acceptance, implementation PRs
+may touch the following owners, with tests beside them:
 
 | Surface | Purpose |
 | --- | --- |
@@ -78,17 +79,21 @@ storage cannot support these reads, return to the plan with evidence before code
    M3 always describes the view as locally retained, potentially partial history;
    it never claims a complete mailbox conversation. No new history-proof storage
    is proposed. Existing Sent-scope health remains the source of that notice.
-4. Oversight returned NOT PASS at `a8adb22` because the plan introduced body labels
-   absent from D-body. The plan-only correction below removes those instructions;
-   the missing eligibility outcome remains an explicit contract-decision blocker.
-   PASS on a final revision and Juan's explicit acceptance remain pending.
-   Changes to accepted behavior require a reviewed delta and fresh
+4. Oversight accepted the plan-only correction at `54a4936`. Juan then authorized
+   the narrow D-body amendment for retained vendor-attributed messages with
+   unresolved mailbox identity on 2026-11-03 (America/Chicago), as a separate
+   contract commit for review. That commit is `475a843`. Scope authorization is
+   not final acceptance: oversight PASS and Juan's explicit acceptance of the
+   final contract-and-plan revision remain pending. Changes to accepted behavior
+   require a reviewed delta and fresh
    exact-revision acceptance. A review PASS alone does not authorize code.
 5. Preflight found the old primary checkout dirty with benchmark/model work.
    This plan uses an independent clone from the baseline and leaves it alone.
    The existing Email Watcher session was idle; its latest task was a #278 closure
    audit. Open PRs #314, #311 and #237 have no changed file in common with this
-   one-file plan. This is not evidence that Juan has paused those owners. Recheck
+   initial one-file plan. A second overlap check before the authorized D-body
+   amendment also found no open PR changing that contract. This is not evidence
+   that Juan has paused those owners. Recheck
    activity and file overlap before any implementation branch.
 
 ## Local read contract
@@ -223,15 +228,15 @@ the rules of [D-body](../docs/THREAD_VIEW_CONTRACT.md#d-body-stored-bodies) and
    It returns none of the held text or unavailable reason as a substitute.
    Retained headers, summaries and inventory keep their existing eligibility. Do not
    recreate a target predicate in `thread_reads.py`.
-3. Require current followed/body eligibility before selecting text. The successful
-   body outcome for a retained message without provable eligibility is not settled
-   by D-body. This is an implementation blocker, not a new `not_followed` state
-   or an instruction to return a substitute label. Keep the retained-header read
-   scope and all existing body barriers; do not hide the message, infer eligibility
-   from retained bytes, or falsely map it to source-gone, outside-folders or pending
-   merely to fit the existing state set. Resolve the owning contract decision with
-   Juan before implementing this branch.
-4. Otherwise project `stored`, `source_gone`, `outside_folders`, or `pending`
+3. Project D-body's unresolved-identity case as `mailbox_identity_unavailable` in
+   both the message-list body state and the expanded body response. Select it
+   from the stored attribution and `_effective_message_identity_sql` in the same
+   snapshot, and render D-body's exact label. No body or unavailable-marker lookup
+   is needed for that branch. Keep the message's existing retained-header read
+   scope. This narrowly authorized case adds no general `not_followed` state and
+   is not inferred merely from an absent follow-cache row.
+4. For the remaining eligible followed-message cases, project `stored`,
+   `source_gone`, `outside_folders`, or `pending`
    from `message_bodies`/`message_body_unavailable`, with the exact D-body labels.
    Partial text displays the D-body N/M marker from stored lengths, independent
    of the Inbox's model-input truncation marker.
@@ -244,15 +249,16 @@ erase or hide retained summaries; a summary is never presented as the missing bo
 An unexpected or malformed body discriminator is an invalid read response, not
 a successful body state. Reject that response, clear the body container and use
 the ordinary load-error path; never render its text or retain a prior body. This
-adds no fallback body label and does not turn a valid but unsettled eligibility
-case into a transport error to evade the contract decision in step 3.
+adds no fallback body label. A valid case outside the owning definitions cannot
+be hidden, relabeled, treated as corrupt data or used to weaken a body barrier;
+such a case requires a separate contract decision before implementation.
 
-### Review finding and decision required
+### Review finding and authorized amendment
 
 [Oversight review 5762105258](https://github.com/canfieldjuan/eom-email-watcher/pull/324#pullrequestreview-5762105258)
 correctly identified the extra `not_followed` state and "Body state unavailable"
-label in `a8adb22`. A separate D-body amendment is a proposed scope expansion;
-it is not authorized by that review. This revision changes only the plan.
+label in `a8adb22`. The plan-only correction at `54a4936` removed both; oversight
+confirmed that correction in mail `6848e593ec094cb5b41e5219faf6ee48`.
 
 The review's general explanation that linked threads need not be followed needs
 qualification. D-attribution's linked condition entails a vendor-attributed
@@ -265,16 +271,15 @@ When removing the last attribution ends the vendor relationship, this plan's
 same-snapshot membership check specifies `not_found` for a stale vendor
 request. It does not need a successful unfollowed body state.
 
-Recommendation for Juan's scope decision: authorize a narrowly bounded D-body
-proposal for retained messages with unresolved effective mailbox identity.
-Proposed copy for review is "Body not stored (mailbox identity unavailable)";
-this is not an accepted label or an implementation instruction. Keep a generic
-`not_followed` success state out of this vendor-scoped M3 surface unless a
-reachable case is demonstrated. Keep unexpected schema values on the ordinary
-failed-read path. Do not change following, admission, reconciliation, removal,
-or retained visibility to avoid this decision. No contract file changes until
-Juan explicitly authorizes that scope; no implementation until the final
-contract and plan revision is accepted.
+Juan's subsequent verbatim authorization, relayed from the Lead Intake chat,
+permits the narrow D-body amendment in PR #324 with the label
+"Body not stored (mailbox identity unavailable)", as a separate contract commit
+for oversight review and his final exact-revision acceptance. Commit `475a843`
+contains only that contract amendment and its status/revision record. This plan
+consumes the definition rather than defining another body state for the same case.
+Generic `not_followed` and unknown-state success labels remain excluded. Following,
+admission, reconciliation, removal, and retained visibility are unchanged. No
+implementation is authorized until the final contract-and-plan revision is accepted.
 
 ## Desktop behavior and CSP
 
@@ -407,7 +412,8 @@ After acceptance, implementation evidence must fail before each behavior exists:
 | Logical content | Several physical copies appear once in the timeline; location-only copies and retained duplicate summaries/inventory remain distinguishable; canonical promotion and equal source/date ties preserve order |
 | Vendor relationship | Owned plus linked produces one owned row; linked vendor sees the actual owner and each message's actual attribution; a vendor removal/re-attribution invalidates prior direct reads |
 | Pagination | More than 100 threads/messages/copies, tied dates, invalid legacy dates, last page, empty page, malformed/oversized/wrong-scope cursor, mid-page alias merge, arrival, delete and ownership change; stable sets have no omission/repeat, changed sets restart explicitly |
-| Body | Full, empty, 200,000-character bounded, truncated, source-gone, outside-folders, pending and removal-pending cases; no text in list responses or non-stored union variants; lengths match stored evidence; malformed discriminators reject the read and clear prior text; the unresolved eligibility case needs the decision above before its proof can be specified |
+| Body | Full, empty, 200,000-character bounded, truncated, source-gone, outside-folders, pending and removal-pending cases; no text in list responses or non-stored union variants; lengths match stored evidence; malformed discriminators reject the read and clear prior text |
+| Identity-unavailable body | A retained vendor-attributed logical message with neither stored identity nor proven continuity remains in its existing retained view and projects the D-body label without body text, including when old body/marker bytes remain; pending removal takes precedence; proved continuity and a stored identity each use normal body eligibility on a fresh read; an absent follow row alone does not select this state; no read resolves identity or fetches content |
 | Removal | Use the existing unqualified 33-row held unit: delete/clear hide metadata/counts/copies/body while bytes remain; unfollow preserves permitted headers but hides content; refollow cannot revive a pending body target; restart and qualified completion preserve these outcomes |
 | Snapshot/race | Commit removal before a read begins and prove no content; pause a read across a writer to prove a consistent snapshot; invalidate a UI request during delete/unfollow/selection and prove its late body/page cannot repaint |
 | Host boundary | Each selector, identity null/string, cursor, limit, discriminator and error survives Python-to-Rust-to-TS; missing/unknown fields are refused rather than silently dropped |
@@ -425,24 +431,27 @@ Record exact commands, revisions and outcomes in implementation evidence.
 
 ## Implementation summary
 
-This revision adds only the M3 proposal. It defines the local read boundary,
-preserves the accepted storage/removal owners and Inbox navigation, and orders
-CSP proof ahead of body UI. No application behavior, dependencies or schema change.
+This revision contains the M3 proposal and Juan's narrowly authorized D-body
+amendment in separate commits. It defines the local read boundary, preserves
+the storage/removal owners and Inbox navigation, and orders CSP proof ahead of
+body UI. No application code, dependencies or schema change.
 
 ## Cold diff audit
 
-Only `plans/PR-Thread-M3-Read-View-CSP.md` is added. Each section traces to the M3
-milestone, its referenced definitions, M2's retained-copy requirement, or the
-existing Inbox contract. API shapes are proposals, not claims of existing code.
-Contract seam/link checks and the one-file diff check cover this docs revision;
+`plans/PR-Thread-M3-Read-View-CSP.md` is added. Its sections trace to the M3
+milestone, referenced definitions, M2's retained-copy requirement, and the
+existing Inbox contract. `docs/THREAD_VIEW_CONTRACT.md` changes only D-body's
+authorized identity-unavailable case and the status/revision record. API shapes
+are proposals, not claims of existing code. Contract seam/link checks and the
+two-document scope check cover this docs revision;
 the behavior matrix is required future evidence, not a claimed test result.
 
 ## Gap audit
 
 NOT DONE
 
-Oversight's required eligibility-state finding is not closed: the plan no longer
-invents labels, but the owning contract decision needs Juan's explicit scope
-authorization and acceptance of the resulting exact revision. Implementation,
+The narrow contract-amendment scope is authorized and documented. Oversight
+review of that amendment and Juan's final exact-revision acceptance remain
+pending. Scope authorization alone does not permit implementation. Implementation,
 packaged CSP/interaction proof and platform qualification have not run. The plan
 must not be read as acceptance, implementation completion, or deployment approval.
