@@ -149,6 +149,8 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     "settings_get",
     "threads_list",
     "threads_copies",
+    "threads_messages",
+    "threads_body",
     "watcher_check",
     "watchlist_list",
   ];

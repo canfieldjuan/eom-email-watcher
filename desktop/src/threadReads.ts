@@ -33,6 +33,17 @@ export interface ThreadInventoryQuery extends ThreadMessageSelector {
 
 export type ThreadCopiesQuery = ThreadCopyQuery | ThreadInventoryQuery;
 
+export interface ThreadMessagesQuery extends ThreadPaging {
+  vendor_id: string;
+  thread_ref: ThreadRef;
+}
+
+export interface ThreadBodyQuery {
+  vendor_id: string;
+  thread_ref: ThreadRef;
+  message_id: string;
+}
+
 export interface ThreadVendor {
   vendor_id: string;
   display_name: string;
@@ -73,6 +84,50 @@ export interface ThreadCopyPage<Item> {
   next_cursor: string | null;
 }
 
+export interface ThreadUnstoredBody {
+  state: "pending" | "source_gone" | "outside_folders" | "removal_pending" | "mailbox_identity_unavailable";
+}
+
+export interface ThreadStoredBodyState {
+  state: "stored";
+  stored_chars: number;
+  source_chars: number;
+}
+
+export type ThreadBodyState = ThreadStoredBodyState | ThreadUnstoredBody;
+export type ThreadBody = (ThreadStoredBodyState & { text: string }) | ThreadUnstoredBody;
+
+export interface ThreadContext {
+  thread_ref: ThreadRef;
+  relation: "owned" | "linked";
+  owner_vendor: ThreadVendor;
+  history_notice: string;
+}
+
+export interface ThreadMessage {
+  message_id: string;
+  subject: string;
+  direction: "inbound" | "outbound";
+  sender: string;
+  sender_name: string | null;
+  attributed_vendor: ThreadVendor | null;
+  received_at: string | null;
+  body_state: ThreadBodyState;
+  copy_count: number;
+}
+
+export interface ThreadMessagePage {
+  thread: ThreadContext;
+  items: ThreadMessage[];
+  next_cursor: string | null;
+}
+
+export interface ThreadBodyResponse {
+  thread_ref: ThreadRef;
+  message_id: string;
+  body: ThreadBody;
+}
+
 export type ThreadCopiesResult = ThreadCopyPage<ThreadCopy> | ThreadCopyPage<ThreadInventory>;
 export type ThreadReadInvoke = <T>(command: string, args: Record<string, unknown>) => Promise<T>;
 
@@ -85,6 +140,14 @@ export class ThreadReadClient {
 
   list(query: ThreadListQuery): Promise<ThreadPage> {
     return this.invoke<ThreadPage>("threads_list", { query });
+  }
+
+  messages(query: ThreadMessagesQuery): Promise<ThreadMessagePage> {
+    return this.invoke<ThreadMessagePage>("threads_messages", { query });
+  }
+
+  body(query: ThreadBodyQuery): Promise<ThreadBodyResponse> {
+    return this.invoke<ThreadBodyResponse>("threads_body", { query });
   }
 
   copies(query: ThreadCopyQuery): Promise<ThreadCopyPage<ThreadCopy>>;

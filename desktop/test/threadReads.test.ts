@@ -82,14 +82,66 @@ test("read errors reach the caller without retries, fallback or silently dropped
   }
 });
 
-test("TypeScript requires explicit identity, paired account selectors and correct copy result types", () => {
+test("messages and bodies preserve complete selectors, resolved refs and every body state", async () => {
+  const unstored = ["pending", "source_gone", "outside_folders", "removal_pending", "mailbox_identity_unavailable"];
+  for (const identity of [null, "b".repeat(64)]) {
+    for (const body of [...unstored.map(state => ({ state })),
+      { state: "stored", text: "", stored_chars: 0, source_chars: 0 },
+      { state: "stored", text: "🙂e\u0301", stored_chars: 3, source_chars: 8 }]) {
+      const thread_ref = { ...ref, mailbox_identity_key: identity };
+      const resolved = { ...thread_ref, thread_key: "survivor" };
+      const bodyQuery = { vendor_id: "vendor", thread_ref, message_id: "canonical" };
+      const messagesQuery = { vendor_id: "vendor", thread_ref, limit: 7, cursor: "messages-cursor" };
+      const bodyResult = { thread_ref: resolved, message_id: "canonical", body };
+      const { text: _text, ...body_state } = body as typeof body & { text?: string };
+      const messagesResult = { thread: { thread_ref: resolved, relation: "linked",
+        owner_vendor: { vendor_id: "owner", display_name: "Owner" }, history_notice: "Partial history" },
+        items: [{ message_id: "canonical", subject: "<literal subject>", direction: "outbound",
+          sender: "sender@example.test", sender_name: null, attributed_vendor: null,
+          received_at: null, body_state, copy_count: 2 }], next_cursor: "next" };
+      const calls: unknown[] = [];
+      const invoke: ThreadReadInvoke = async <T>(command: string, args: Record<string, unknown>) => {
+        calls.push(structuredClone({ command, args }));
+        return (command === "threads_body" ? bodyResult : messagesResult) as T;
+      };
+      const client = new ThreadReadClient(invoke);
+      assert.strictEqual(await client.messages(messagesQuery), messagesResult);
+      assert.strictEqual(await client.body(bodyQuery), bodyResult);
+      assert.deepEqual(calls, [
+        { command: "threads_messages", args: { query: messagesQuery } },
+        { command: "threads_body", args: { query: bodyQuery } },
+      ]);
+    }
+  }
+});
+
+test("message and body errors propagate once without narrowing invalid runtime selectors", async () => {
+  for (const code of ["stale_cursor", "not_found", "invalid_request", "runtime_error"]) {
+    const error = { code, message: "Local read failed" };
+    const calls: unknown[] = [];
+    const client = new ThreadReadClient(async (command, args) => {
+      calls.push(structuredClone({ command, args }));
+      throw error;
+    });
+    const messages = { vendor_id: "vendor", thread_ref: { ...ref, unknown: "scope" }, unexpected: true };
+    const body = { ...messages, message_id: "canonical", cursor: "invalid-body-paging" };
+    await assert.rejects(client.messages(messages), caught => caught === error);
+    await assert.rejects(client.body(body), caught => caught === error);
+    assert.deepEqual(calls, [
+      { command: "threads_messages", args: { query: messages } },
+      { command: "threads_body", args: { query: body } },
+    ]);
+  }
+});
+
+test("TypeScript requires complete selectors and closed message/body/copy shapes", () => {
   const directory = mkdtempSync(join(tmpdir(), "thread-types-"));
   try {
     const modulePath = fileURLToPath(new URL("../src/threadReads.ts", import.meta.url));
     const fixture = join(directory, "contract.ts");
     writeFileSync(fixture, `
 import { ThreadReadClient } from ${JSON.stringify(modulePath)};
-import type { ThreadRef, ThreadListQuery, ThreadCopy, ThreadInventory, ThreadCopyPage } from ${JSON.stringify(modulePath)};
+import type { ThreadRef, ThreadListQuery, ThreadCopy, ThreadInventory, ThreadCopyPage, ThreadBody, ThreadBodyState, ThreadMessage, ThreadMessagePage, ThreadBodyResponse } from ${JSON.stringify(modulePath)};
 declare const client: ThreadReadClient;
 const ref: ThreadRef = { provider: "imap", account_id: "account", mailbox_identity_key: null, thread_key: "thread" };
 const all: ThreadListQuery = { vendor_id: "vendor" };
@@ -114,6 +166,35 @@ const wrong: typeof copies = client.copies({ ...base, copy_ref: "source" });
 const wrongAgain: typeof inventory = client.copies(base);
 // @ts-expect-error selected message is always canonical and required
 client.copies({ vendor_id: "vendor", thread_ref: ref });
+const messages: Promise<ThreadMessagePage> = client.messages({ vendor_id: "vendor", thread_ref: ref, limit: 4, cursor: null });
+const body: Promise<ThreadBodyResponse> = client.body(base);
+const stored: ThreadBody = { state: "stored", text: "", stored_chars: 0, source_chars: 0 };
+const metadata: ThreadBodyState = { state: "stored", stored_chars: 0, source_chars: 0 };
+const unavailable: ThreadBody = { state: "mailbox_identity_unavailable" };
+// @ts-expect-error body must select a canonical message
+client.body({ vendor_id: "vendor", thread_ref: ref });
+// @ts-expect-error body does not paginate
+client.body({ ...base, cursor: "cursor" });
+// @ts-expect-error message list has no message selector
+client.messages({ vendor_id: "vendor", thread_ref: ref, message_id: "canonical" });
+// @ts-expect-error stored full body requires text
+const missingText: ThreadBody = { state: "stored", stored_chars: 0, source_chars: 0 };
+// @ts-expect-error metadata never has text
+const metadataText: ThreadBodyState = { state: "stored", stored_chars: 0, source_chars: 0, text: "hidden" };
+// @ts-expect-error nonstored state never has text
+const pendingText: ThreadBody = { state: "pending", text: "hidden" };
+// @ts-expect-error nonstored state never has stored lengths
+const pendingLength: ThreadBodyState = { state: "pending", stored_chars: 0, source_chars: 0 };
+// @ts-expect-error body states are closed
+const unknown: ThreadBody = { state: "unknown" };
+declare const message: ThreadMessage;
+const senderName: string | null = message.sender_name;
+const attributed: { vendor_id: string; display_name: string } | null = message.attributed_vendor;
+const received: string | null = message.received_at;
+// @ts-expect-error directions are closed
+const wrongDirection: ThreadMessage = { ...message, direction: "sideways" };
+// @ts-expect-error sender_name is required even when null
+const missingName: ThreadMessage = { message_id: "canonical", subject: "", direction: "inbound", sender: "a@example.test", attributed_vendor: null, received_at: null, body_state: unavailable, copy_count: 1 };
 `);
     const compiler = fileURLToPath(new URL("../node_modules/typescript/lib/tsc.js", import.meta.url));
     const result = spawnSync(process.execPath, [compiler, "--noEmit", "--strict", "--skipLibCheck",

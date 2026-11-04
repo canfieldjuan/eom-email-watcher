@@ -13,8 +13,9 @@ use engine::{
     ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
     GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
     HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, PreparedAutomationRule, ThreadCopiesQuery, ThreadCopiesResult,
-    ThreadListQuery, ThreadPage, Vendor, VendorDeleted, WatchedSender,
+    NtfyDisclosureStatus, PreparedAutomationRule, ThreadBodyQuery, ThreadBodyResponse,
+    ThreadCopiesQuery, ThreadCopiesResult, ThreadListQuery, ThreadMessagePage, ThreadMessagesQuery,
+    ThreadPage, Vendor, VendorDeleted, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -2471,6 +2472,32 @@ async fn watchlist_remove(
 
 // Local thread reads retain the startup admission permit, with no Connect gate.
 #[tauri::command]
+async fn threads_messages(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    query: ThreadMessagesQuery,
+) -> Result<ThreadMessagePage, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.thread_messages(query))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn threads_body(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    query: ThreadBodyQuery,
+) -> Result<ThreadBodyResponse, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.thread_body(query))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn threads_list(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
@@ -2743,6 +2770,8 @@ pub fn run() {
             settings_update,
             threads_list,
             threads_copies,
+            threads_messages,
+            threads_body,
             vendors_address_add,
             vendors_address_remove,
             vendors_create,

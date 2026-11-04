@@ -1381,6 +1381,142 @@ pub enum ThreadCopiesResult {
     Inventory(ThreadCopyPage<ThreadInventory>),
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadMessagesQuery {
+    pub vendor_id: String,
+    pub thread_ref: ThreadRef,
+    #[serde(default = "thread_page_limit")]
+    pub limit: u16,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadBodyQuery {
+    pub vendor_id: String,
+    pub thread_ref: ThreadRef,
+    pub message_id: String,
+}
+
+// Matches mime.MAX_STORED_BODY_CHARS; counts are Unicode scalar values, not bytes.
+const MAX_THREAD_BODY_CHARS: u64 = 200_000;
+
+fn valid_thread_body_lengths(stored: u64, source: u64) -> bool {
+    stored <= MAX_THREAD_BODY_CHARS && source >= stored
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ThreadBodyState {
+    Stored {
+        stored_chars: u64,
+        source_chars: u64,
+    },
+    Pending {},
+    SourceGone {},
+    OutsideFolders {},
+    RemovalPending {},
+    MailboxIdentityUnavailable {},
+}
+
+impl ThreadBodyState {
+    fn valid(&self) -> bool {
+        match self {
+            Self::Stored {
+                stored_chars,
+                source_chars,
+            } => valid_thread_body_lengths(*stored_chars, *source_chars),
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ThreadBody {
+    Stored {
+        text: String,
+        stored_chars: u64,
+        source_chars: u64,
+    },
+    Pending {},
+    SourceGone {},
+    OutsideFolders {},
+    RemovalPending {},
+    MailboxIdentityUnavailable {},
+}
+
+impl ThreadBody {
+    fn valid(&self) -> bool {
+        match self {
+            Self::Stored {
+                text,
+                stored_chars,
+                source_chars,
+            } => {
+                valid_thread_body_lengths(*stored_chars, *source_chars)
+                    && text
+                        .chars()
+                        .take(MAX_THREAD_BODY_CHARS as usize + 1)
+                        .count() as u64
+                        == *stored_chars
+            }
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadContext {
+    pub thread_ref: ThreadRef,
+    pub relation: ThreadRelation,
+    pub owner_vendor: ThreadVendor,
+    pub history_notice: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadMessage {
+    pub message_id: String,
+    pub subject: String,
+    pub direction: ThreadDirection,
+    pub sender: String,
+    #[serde(deserialize_with = "present_nullable")]
+    pub sender_name: Option<String>,
+    #[serde(deserialize_with = "present_nullable")]
+    pub attributed_vendor: Option<ThreadVendor>,
+    #[serde(deserialize_with = "present_nullable")]
+    pub received_at: Option<String>,
+    pub body_state: ThreadBodyState,
+    pub copy_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadMessagePage {
+    pub thread: ThreadContext,
+    pub items: Vec<ThreadMessage>,
+    #[serde(deserialize_with = "present_nullable")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadBodyResponse {
+    pub thread_ref: ThreadRef,
+    pub message_id: String,
+    pub body: ThreadBody,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct CertificateExpiryLedger {
     pub items: Vec<Value>,
@@ -3088,6 +3224,31 @@ impl Engine {
 
     pub fn list_threads(&self, query: ThreadListQuery) -> Result<ThreadPage, EngineError> {
         self.request("threads.list", json!(query))
+    }
+
+    pub fn thread_messages(
+        &self,
+        query: ThreadMessagesQuery,
+    ) -> Result<ThreadMessagePage, EngineError> {
+        let page: ThreadMessagePage = self.request("threads.messages", json!(query))?;
+        if page.items.iter().any(|item| !item.body_state.valid()) {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned invalid body metadata",
+            ));
+        }
+        Ok(page)
+    }
+
+    pub fn thread_body(&self, query: ThreadBodyQuery) -> Result<ThreadBodyResponse, EngineError> {
+        let response: ThreadBodyResponse = self.request("threads.body", json!(query))?;
+        if !response.body.valid() {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid body",
+            ));
+        }
+        Ok(response)
     }
 
     pub fn thread_copies(
