@@ -75,6 +75,7 @@ from .db import (
     CERTIFICATE_CAPABILITY_ID,
     CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
     CONNECT_RETRY_DELAYS_SECONDS,
+    MAX_THREAD_KEY_BYTES,
     AutomationRuleDetail,
     AutomationRuleLimitExceeded,
     AutomationRuleNotFound,
@@ -97,6 +98,7 @@ from .db import (
     NotificationIntent,
     Store,
     VendorAddressConflict,
+    _require_mailbox_identity_key,
 )
 from .deployment import DeploymentError
 from .gmail import (
@@ -5912,6 +5914,47 @@ def _vendor_item(vendor: dict[str, object], config: Config) -> dict[str, object]
     }
 
 
+def _thread_ref(value: object) -> thread_reads.ThreadRef:
+    if not isinstance(value, dict) or set(value) != {
+        "provider", "account_id", "mailbox_identity_key", "thread_key",
+    }:
+        raise ApiError("invalid_request", "thread_ref requires exactly the complete scope")
+    try:
+        provider, account_id = _mail_account_key(value)
+        identity = value["mailbox_identity_key"]
+        if identity is not None:
+            identity = _require_mailbox_identity_key(identity)
+        key = value["thread_key"]
+        if not isinstance(key, str) or not key or len(key.encode("utf-8")) > MAX_THREAD_KEY_BYTES:
+            raise ValueError("thread_key must be nonempty text of at most 512 UTF-8 bytes")
+    except (ValueError, ApiError) as error:
+        raise ApiError("invalid_request", str(error)) from error
+    return thread_reads.ThreadRef(provider, account_id, identity, key)
+
+
+def _threads_copies(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {
+        "vendor_id", "thread_ref", "message_id", "copy_ref", "limit", "cursor",
+    })
+    vendor = _vendor_id(payload)
+    ref = _thread_ref(payload.get("thread_ref"))
+    message = payload.get("message_id")
+    if not isinstance(message, str) or not message.strip():
+        raise ApiError("invalid_request", "message_id must be a non-empty string")
+    copy = payload.get("copy_ref")
+    if copy is not None and (not isinstance(copy, str) or not copy.strip()):
+        raise ApiError("invalid_request", "copy_ref must be a non-empty string")
+    limit = _bounded_limit(payload, default=25, maximum=100)
+    store = Store(load_config(_config_path(request)).database_file)
+    try:
+        return thread_reads.list_copies(
+            store, vendor, ref, message, copy_ref=copy,
+            limit=limit, cursor=payload.get("cursor"),
+        )
+    except thread_reads.ThreadReadError as error:
+        raise ApiError(error.code, str(error)) from error
+
+
 def _threads_list(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"vendor_id", "provider", "account_id", "limit", "cursor"})
     vendor_id = _vendor_id(payload)
@@ -6465,6 +6508,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "watchlist.list": _watchlist,
     "watchlist.remove": _watchlist_remove,
     "threads.list": _threads_list,
+    "threads.copies": _threads_copies,
     "vendors.list": _vendors_list,
     "vendors.create": _vendors_create,
     "vendors.rename": _vendors_rename,

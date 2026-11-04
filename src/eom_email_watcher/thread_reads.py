@@ -7,7 +7,7 @@ import json
 import math
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, TypedDict
 
@@ -16,6 +16,7 @@ from .db import (
     _decode_json_bytes,
     _effective_message_identity_sql,
     _follow_owner,
+    _logical_unit,
     _thread_member,
 )
 
@@ -52,6 +53,27 @@ class ThreadItem(TypedDict):
 
 class ThreadPage(TypedDict):
     items: list[ThreadItem]
+    next_cursor: str | None
+
+
+class CopyItem(TypedDict):
+    copy_ref: str
+    locations: list[str]
+    summary: str | None
+    attachment_count: int
+
+
+class InventoryItem(TypedDict):
+    part_id: str
+    filename: str
+    media_type: str
+    byte_size: int | None
+
+
+class CopyPage(TypedDict):
+    thread_ref: dict[str, str | None]
+    message_id: str
+    items: list[CopyItem] | list[InventoryItem]
     next_cursor: str | None
 
 
@@ -191,6 +213,137 @@ def _members(db, provider=None, account_id=None):
 def _newest(member):
     epoch, source, _ = member
     return (not math.isfinite(epoch), -epoch if math.isfinite(epoch) else 0, source)
+
+
+def _selected_thread(db, vendor_id: str, requested: ThreadRef):
+    """Resolve an IMAP alias, then validate complete live scope and relationship."""
+    vendors = _vendors(db)
+    ref = requested
+    if ref.provider == "imap":
+        seen = set()
+        while True:
+            if ref.thread_key in seen:
+                raise ThreadReadError("not_found", "Retained thread was not found")
+            seen.add(ref.thread_key)
+            alias = db.execute(
+                "SELECT survivor_key FROM thread_key_aliases WHERE old_key=?", (ref.thread_key,)
+            ).fetchone()
+            if alias is None:
+                break
+            ref = replace(ref, thread_key=alias[0])
+    members = _members(db, ref.provider, ref.account_id).get(ref, [])
+    if vendor_id not in vendors or not any(row["vendor_id"] == vendor_id for row, _ in members):
+        raise ThreadReadError("not_found", "Retained thread was not found")
+    return ref, members, vendors
+
+
+def _selected_message(members, message_id):
+    # A physical duplicate ID is not a canonical message selector.
+    for row, _ in members:
+        if row["message_id"] == message_id:
+            return row
+    raise ThreadReadError("not_found", "Retained message was not found")
+
+
+def _copy_projection(db, message_id):
+    unit = _logical_unit(db, message_id)
+    assert unit is not None  # Caller validated canonical RECORD-visible membership.
+    rows = db.execute(
+        "SELECT message_id,provider_message_id,summary FROM messages "
+        "WHERE message_id IN (SELECT value FROM json_each(?)) ORDER BY message_id",
+        (json.dumps(unit.rows),),
+    ).fetchall()
+    copies = {
+        source.provider_message_id: {
+            "copy_ref": source.provider_message_id,
+            "locations": set(),
+            "summary": None,
+            "attachment_count": 0,
+        }
+        for source in unit.sources
+    }
+    for row in rows:
+        copies[row["provider_message_id"]]["summary"] = row["summary"]
+    for row in db.execute(
+        "SELECT provider_message_id,location FROM message_locations WHERE message_id=?",
+        (message_id,),
+    ):
+        copies[row["provider_message_id"]]["locations"].add(row["location"])
+    inventories = defaultdict(list)
+    # The catalog's recorded source owns it, even for a location-only copy.
+    # Legacy catalogs fall back to their actual stored row's source binding.
+    for row in db.execute(
+        """SELECT COALESCE(a.source_provider_message_id,m.provider_message_id) AS source,
+        a.message_id,a.part_id,a.filename,a.media_type,a.byte_size,a.byte_size_known,a.position
+        FROM message_attachments a JOIN messages m USING(message_id)
+        WHERE a.message_id IN (SELECT value FROM json_each(?))""",
+        (json.dumps(unit.rows),),
+    ):
+        if row["source"] not in copies:
+            continue  # No membership in the current logical unit; never invent a copy.
+        copies[row["source"]]["attachment_count"] += 1
+        item: InventoryItem = {
+            "part_id": row["part_id"],
+            "filename": row["filename"],
+            "media_type": row["media_type"],
+            "byte_size": row["byte_size"] if row["byte_size_known"] else None,
+        }
+        inventories[row["source"]].append(
+            ((row["position"], row["part_id"], row["message_id"]), item)
+        )
+    for copy in copies.values():
+        copy["locations"] = sorted(copy["locations"])
+    for inventory in inventories.values():
+        inventory.sort(key=lambda entry: entry[0])
+    return [copies[key] for key in sorted(copies)], dict(inventories)
+
+
+def list_copies(
+    store: Store,
+    vendor_id: str,
+    thread_ref: ThreadRef,
+    message_id: str,
+    *,
+    copy_ref: str | None = None,
+    limit: int = 25,
+    cursor: str | None = None,
+) -> CopyPage:
+    with snapshot(store) as db:
+        ref, members, _ = _selected_thread(db, vendor_id, thread_ref)
+        _selected_message(members, message_id)
+        copies, inventories = _copy_projection(db, message_id)
+        if copy_ref is None:
+            rows, keys = copies, [(copy["copy_ref"],) for copy in copies]
+        else:
+            if copy_ref not in {copy["copy_ref"] for copy in copies}:
+                raise ThreadReadError("not_found", "Retained copy was not found")
+            inventory = inventories.get(copy_ref, [])
+            rows, keys = [item for _, item in inventory], [key for key, _ in inventory]
+        page = _page(
+            rows,
+            keys,
+            selector={
+                "operation": "threads.copies",
+                "vendor_id": vendor_id,
+                "thread_ref": asdict(thread_ref),
+                "message_id": message_id,
+                "copy_ref": copy_ref,
+            },
+            revision={
+                "resolved_ref": asdict(ref),
+                "relationship": {
+                    "owner": _follow_owner(member for _, member in members)[2],
+                    "attribution": sorted(
+                        (row["message_id"], row["vendor_id"]) for row, _ in members
+                    ),
+                },
+                "copies": copies,
+                "inventories": inventories,
+            },
+            limit=limit,
+            cursor=cursor,
+        )
+        return {"thread_ref": asdict(ref), "message_id": message_id, **page}
 
 
 def list_threads(
