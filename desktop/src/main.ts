@@ -65,7 +65,6 @@ import {
   type MailServerConnection,
   type MailServerSecurity,
 } from "./mailServerConnection";
-import "./styles.css";
 
 interface WatchedSender {
   email: string;
