@@ -2,9 +2,12 @@
 
 Status: accepted by the operator on 2026-10-05, with D1-D3 as recommended, and restructured the same day into a definitions-first form (see the revision log). Decision D4 (comparison across a vendor's threads) was added on 2026-10-09, and decision D5 (invoice PDFs as a claim source) was proposed the same day. Each milestone still needs its own accepted plan before code.
 
-PR #324 proposes the narrow unresolved-mailbox-identity body state in D-body.
-Juan authorized that amendment's scope on 2026-11-03 (America/Chicago); oversight
-review and his final exact-revision acceptance remain pending.
+Juan accepted PR #324's plan and narrow unresolved-mailbox-identity D-body
+amendment at `36f704b1edce651eff9dd9788b60a62ec3207756`. He has authorized a
+follow-up extension to every visible message in a vendor-related thread with
+unresolved effective identity. Oversight review and his fresh exact-revision
+acceptance of this extension remain pending; its scope authorization permits no
+implementation of the extension yet.
 
 **How to read and change this contract.**
 
@@ -217,7 +220,7 @@ Each definition is the only place its rule is stated.
   - "Body not stored (source no longer available)";
   - "Body not stored (outside the admitted folders)";
   - "Body not stored yet", pending [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass) stage (c).
-  - "Body not stored (mailbox identity unavailable)" for a retained vendor-attributed message whose mailbox identity is unresolved: neither its stored mailbox identity nor proven legacy continuity supplies that identity. This state carries no body text and is selected before reading retained body or unavailable-marker data, subject to [D-removal](#d-removal-deferred-local-deletions)'s outcome precedence. It does not classify the thread as unfollowed. When identity is resolved, the existing body-eligibility rules determine the state again; this read remains in the read class of [D-ops](#d-ops-operation-classes-and-gating).
+  - "Body not stored (mailbox identity unavailable)" for every visible message in a vendor-related thread whose effective mailbox identity is unresolved: neither its stored mailbox identity nor proven legacy continuity supplies that identity. The thread must be owned by or linked to the selected vendor under [D-attribution](#d-attribution-a-messages-vendor); the message need not itself be attributed to a vendor. This state carries no body text and is selected before reading retained body or unavailable-marker data, subject to [D-removal](#d-removal-deferred-local-deletions)'s outcome precedence. It does not classify the thread as unfollowed or expand which retained messages are visible. When identity is resolved, the existing body-eligibility rules determine the state again; this read remains in the read class of [D-ops](#d-ops-operation-classes-and-gating).
 
 ### D-ops: operation classes and gating
 
@@ -544,6 +547,8 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - **Scopes:** `Mail.Read` and `gmail.readonly` remain the only scopes.
 
 ## Revision log
+
+- M3 identity follow-up: Juan accepted PR #324 at `36f704b1edce651eff9dd9788b60a62ec3207756`, then explicitly authorized extending the same no-text identity-unavailable state to every visible message of a vendor-related thread whose effective mailbox identity is unresolved. A synthetic schema-28 upgrade preserves an attributed and an unattributed message in one native thread with no effective identity or follow-cache row; both headers remain visible. This separate contract commit defines only that extension. Oversight review and Juan's fresh exact-revision acceptance are still required before its implementation; other definitions and removal precedence are unchanged.
 
 - 2026-11-03 (America/Chicago): Juan authorized a narrow D-body amendment in PR #324 for retained vendor-attributed messages with unresolved mailbox identity, with the label "Body not stored (mailbox identity unavailable)", as a separate contract commit for oversight review and his final exact-revision acceptance. This records scope authorization, not final acceptance or permission to implement. Other definitions are unchanged.
 
