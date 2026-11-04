@@ -127,6 +127,7 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
       const inboxLoadMore = { hidden: false }, inboxStatus = { textContent: "", dataset: {} };
       const renders = [], cleared = [];
       const confirmAction = async () => true, inboxMutationInFlight = () => false;
+      const threadReader = { state: { beginMutation() {}, async endMutation() {} } };
       const setInboxControlsBusy = () => {}, wakeInboxReload = () => {}, loadInbox = () => { reloads++; };
       const clearMessageOwnedUiState = id => cleared.push(id ?? "all");
       const renderInbox = items => renders.push({ ids: items.map(item => item.message_id),
@@ -180,6 +181,7 @@ test("Delete handler clears only its accepted cached item and always reloads the
       let inboxRequestGeneration = 0, reloads = 0, calls = 0;
       const inboxStatus = { textContent: "", dataset: {} }, cleared = [];
       const confirmAction = async () => true, inboxMutationInFlight = () => false;
+      const threadReader = { state: { beginMutation() {}, async endMutation() {} } };
       const setInboxControlsBusy = () => {}, renderInbox = () => {}, wakeInboxReload = () => {}, loadInbox = () => { reloads++; };
       const clearMessageOwnedUiState = id => cleared.push(id);
       const inboxRemovalClient = { delete: async id => {
@@ -210,7 +212,7 @@ test("Delete handler clears only its accepted cached item and always reloads the
 test("inbox empty text checks pending loading and failed before existing query texts", () => {
   const empty = source.match(/function renderInbox\([\s\S]*?inboxList.append\(empty\)/)![0];
   assert.match(empty, /empty.textContent = inboxPageState === "pending"\s+\? "Messages not loaded yet\."\s+: inboxPageState === "loading"\s+\? "Loading messages\u2026"\s+: inboxPageState === "failed"\s+\? "Messages could not be loaded\."\s+: activeInboxQuery.sender !== null/, "empty text must prioritize request state over query-derived absence");
-  assert.match(empty, /\? inboxSenderEmptyText\(activeInboxQuery, activeInboxAccountSelection\)\s+: filtered\s+\? "No watched messages match these filters\."\s+: "No watched messages yet\. Add a sender or Gmail label, then run the watcher\.";/);
+  assert.match(empty, /\? inboxSenderEmptyText\(activeInboxQuery, activeInboxAccountSelection\)\s+: filtered\s+\? "No retained messages match these filters\."\s+: "No retained messages yet\.";/);
 });
 
 // R1's held-operation matrix in inboxReload.test.ts executes these handlers.
@@ -220,8 +222,8 @@ test("sender and removal completion share the refresh owner", () => {
   assert.doesNotMatch(source, /inboxReloadAfterMutation|resumeInboxReloadAfterMutation/);
   const deletion = source.match(/async function deleteInboxItem[\s\S]*?\n\}/)![0];
   const clearing = source.match(/async function clearInboxHistory[\s\S]*?\n\}/)![0];
-  assert.match(deletion, /finally \{\s+inboxDeletionsInFlight.delete\(item.message_id\);\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+void loadInbox\(\);/);
-  assert.match(clearing, /finally \{\s+inboxClearInFlight = false;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+void loadInbox\(\);/);
+  assert.match(deletion, /finally \{\s+void threadReader\.state\.endMutation\(\);\s+inboxDeletionsInFlight.delete\(item.message_id\);\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+void loadInbox\(\);/);
+  assert.match(clearing, /finally \{\s+void threadReader\.state\.endMutation\(\);\s+inboxClearInFlight = false;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+void loadInbox\(\);/);
 });
 
 test("Apply and Reset carry the sender and clear query expansion", () => {

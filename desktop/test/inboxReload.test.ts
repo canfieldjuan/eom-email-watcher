@@ -20,6 +20,8 @@ function harness() {
   const calls = [];
   const node = () => ({ textContent: '', dataset: {}, hidden: false, disabled: false });
   const context = vm.createContext({
+    threadReader: { state: { beginMutation: noop, endMutation: async () => {} } },
+    refreshThreadHistory: noop,
     inboxItems: [{message_id:'old-row'}], inboxNextCursor: 'page-two',
     activeInboxQuery: {provider:'imap',account_id:'old',sender:null,limit:25},
     inboxItemsEpoch:0, connectQueueRefresh:null, connectQueueRefreshAgain:false,
