@@ -321,6 +321,27 @@ def test_corrupt_storage_never_creates_a_successful_body_state(tmp_path, change)
         body(store, vendor)
 
 
+def body_api_request(tmp_path, **change):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('timezone = "UTC"\n')
+    return {
+        "protocol": 1,
+        "operation": "threads.body",
+        "config_path": str(config_path),
+        "payload": {
+            "vendor_id": "11111111-1111-4111-8111-111111111111",
+            "thread_ref": {
+                "provider": "gmail",
+                "account_id": "mailbox",
+                "mailbox_identity_key": None,
+                "thread_key": "native",
+            },
+            "message_id": "m",
+            **change,
+        },
+    }
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -330,30 +351,23 @@ def test_corrupt_storage_never_creates_a_successful_body_state(tmp_path, change)
         {"message_id": False},
         {"cursor": "extra"},
         {"limit": 1},
+        {"include_text": True},
     ],
 )
 def test_invalid_body_payload_fails_before_config(tmp_path, monkeypatch, change):
     monkeypatch.setattr(
         engine_api, "load_config", lambda _: pytest.fail("invalid payload read config")
     )
-    result = engine_api._response(
-        {
-            "protocol": 1,
-            "operation": "threads.body",
-            "payload": {
-                "vendor_id": "11111111-1111-4111-8111-111111111111",
-                "thread_ref": {
-                    "provider": "gmail",
-                    "account_id": "mailbox",
-                    "mailbox_identity_key": None,
-                    "thread_key": "native",
-                },
-                "message_id": "m",
-                **change,
-            },
-        }
-    )
+    result = engine_api._response(body_api_request(tmp_path, **change))
     assert result["error"]["code"] == "invalid_request"
+
+
+def test_valid_body_payload_reaches_config_in_same_admission_harness(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        engine_api, "load_config", lambda _: pytest.fail("valid payload reached config")
+    )
+    with pytest.raises(pytest.fail.Exception, match="valid payload reached config"):
+        engine_api._response(body_api_request(tmp_path))
 
 
 def test_body_api_uses_read_class_and_preserves_one_snapshot(tmp_path, monkeypatch):
