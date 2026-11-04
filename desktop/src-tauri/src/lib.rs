@@ -13,7 +13,8 @@ use engine::{
     ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
     GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
     HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, PreparedAutomationRule, Vendor, VendorDeleted, WatchedSender,
+    NtfyDisclosureStatus, PreparedAutomationRule, ThreadCopiesQuery, ThreadCopiesResult,
+    ThreadListQuery, ThreadPage, Vendor, VendorDeleted, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -2468,6 +2469,33 @@ async fn watchlist_remove(
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
+// Local thread reads retain the startup admission permit, with no Connect gate.
+#[tauri::command]
+async fn threads_list(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    query: ThreadListQuery,
+) -> Result<ThreadPage, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_threads(query))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn threads_copies(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    query: ThreadCopiesQuery,
+) -> Result<ThreadCopiesResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.thread_copies(query))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
 // Vendor records (contract D-ops). Operations that can change the watchlist
 // go through the configuration mutation, like watchlist_add and
 // watchlist_remove; the rest only change the database.
@@ -2713,6 +2741,8 @@ pub fn run() {
             mail_accounts_list,
             settings_get,
             settings_update,
+            threads_list,
+            threads_copies,
             vendors_address_add,
             vendors_address_remove,
             vendors_create,

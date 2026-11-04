@@ -1261,6 +1261,126 @@ pub struct InboxPage {
     pub next_cursor: Option<String>,
 }
 
+// Unlike an ordinary Option, these nullable fields must be present on the wire.
+// In particular, omitted identity must never become the unresolved legacy bucket.
+fn present_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+fn thread_page_limit() -> u16 {
+    25
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadRef {
+    pub provider: String,
+    pub account_id: String,
+    #[serde(deserialize_with = "present_nullable")]
+    pub mailbox_identity_key: Option<String>,
+    pub thread_key: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadListQuery {
+    pub vendor_id: String,
+    pub provider: Option<String>,
+    pub account_id: Option<String>,
+    #[serde(default = "thread_page_limit")]
+    pub limit: u16,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadCopiesQuery {
+    pub vendor_id: String,
+    pub thread_ref: ThreadRef,
+    pub message_id: String,
+    pub copy_ref: Option<String>,
+    #[serde(default = "thread_page_limit")]
+    pub limit: u16,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadRelation {
+    Owned,
+    Linked,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadVendor {
+    pub vendor_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadItem {
+    pub thread_ref: ThreadRef,
+    pub relation: ThreadRelation,
+    pub owner_vendor: ThreadVendor,
+    pub subject: String,
+    #[serde(deserialize_with = "present_nullable")]
+    pub latest_received_at: Option<String>,
+    pub message_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadPage {
+    pub items: Vec<ThreadItem>,
+    #[serde(deserialize_with = "present_nullable")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadCopy {
+    pub copy_ref: String,
+    pub locations: Vec<String>,
+    #[serde(deserialize_with = "present_nullable")]
+    pub summary: Option<String>,
+    pub attachment_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadInventory {
+    pub part_id: String,
+    pub filename: String,
+    pub media_type: String,
+    #[serde(deserialize_with = "present_nullable")]
+    pub byte_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadCopyPage<T> {
+    pub thread_ref: ThreadRef,
+    pub message_id: String,
+    pub items: Vec<T>,
+    #[serde(deserialize_with = "present_nullable")]
+    pub next_cursor: Option<String>,
+}
+
+// The selector determines the decode type. Never infer it from an empty page,
+// or accept a mixture of copy and inventory rows through an untagged item union.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum ThreadCopiesResult {
+    Copies(ThreadCopyPage<ThreadCopy>),
+    Inventory(ThreadCopyPage<ThreadInventory>),
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct CertificateExpiryLedger {
     pub items: Vec<Value>,
@@ -2966,6 +3086,23 @@ impl Engine {
             .map(|data| data.items)
     }
 
+    pub fn list_threads(&self, query: ThreadListQuery) -> Result<ThreadPage, EngineError> {
+        self.request("threads.list", json!(query))
+    }
+
+    pub fn thread_copies(
+        &self,
+        query: ThreadCopiesQuery,
+    ) -> Result<ThreadCopiesResult, EngineError> {
+        if query.copy_ref.is_some() {
+            self.request("threads.copies", json!(query))
+                .map(ThreadCopiesResult::Inventory)
+        } else {
+            self.request("threads.copies", json!(query))
+                .map(ThreadCopiesResult::Copies)
+        }
+    }
+
     pub fn create_vendor(&self, display_name: String) -> Result<Vendor, EngineError> {
         self.vendor_mutation(
             "vendors.create",
@@ -3254,6 +3391,9 @@ impl Engine {
         })
     }
 }
+
+#[cfg(test)]
+mod thread_reads_tests;
 
 #[cfg(test)]
 mod tests {
