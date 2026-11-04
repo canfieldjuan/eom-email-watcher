@@ -22,6 +22,7 @@ from .db import (
 )
 
 MAX_CURSOR_BYTES = 4096
+HISTORY_NOTICE = "History partial — only locally retained messages are shown"
 
 
 class ThreadReadError(ValueError):
@@ -82,6 +83,97 @@ class BodyResponse(TypedDict):
     thread_ref: dict[str, str | None]
     message_id: str
     body: body_state.Body
+
+
+class ThreadContext(TypedDict):
+    thread_ref: dict[str, str | None]
+    relation: Literal["owned", "linked"]
+    owner_vendor: VendorRef
+    history_notice: str
+
+
+class MessageItem(TypedDict):
+    message_id: str
+    subject: str
+    direction: Literal["inbound", "outbound"]
+    sender: str
+    sender_name: str | None
+    attributed_vendor: VendorRef | None
+    received_at: str | None
+    body_state: body_state.BodyStatus | body_state.StoredBodyMetadata
+    copy_count: int
+
+
+class MessagePage(TypedDict):
+    thread: ThreadContext
+    items: list[MessageItem]
+    next_cursor: str | None
+
+
+def list_messages(
+    store: Store,
+    vendor_id: str,
+    requested: ThreadRef,
+    *,
+    limit: int = 25,
+    cursor: str | None = None,
+) -> MessagePage:
+    with snapshot(store) as db:
+        ref, members, vendors = _selected_thread(db, vendor_id, requested)
+        owner = _follow_owner(member for _, member in members)
+        assert owner is not None  # The selected vendor relationship was validated.
+        thread: ThreadContext = {
+            "thread_ref": asdict(ref),
+            "relation": "owned" if owner[2] == vendor_id else "linked",
+            "owner_vendor": vendors[owner[2]],
+            "history_notice": HISTORY_NOTICE,
+        }
+        projected = []
+        for row, member in members:
+            epoch, source, _ = member
+            unit = _logical_unit(db, row["message_id"])
+            assert unit is not None
+            key = (
+                not math.isfinite(epoch),
+                epoch if math.isfinite(epoch) else 0,
+                source,
+                row["message_id"],
+            )
+            item: MessageItem = {
+                "message_id": row["message_id"],
+                "subject": row["subject"],
+                "direction": row["direction"],
+                "sender": row["sender"],
+                "sender_name": row["sender_name"],
+                "attributed_vendor": vendors[row["vendor_id"]] if row["vendor_id"] else None,
+                "received_at": datetime.fromtimestamp(epoch, UTC).isoformat()
+                if math.isfinite(epoch)
+                else None,
+                "body_state": body_state.project(
+                    db,
+                    row["message_id"],
+                    mailbox_identity_key=ref.mailbox_identity_key,
+                ),
+                # Match the copy reader's source grouping without selecting saved
+                # summaries or attachment catalogs just to compute this count.
+                "copy_count": len({source.provider_message_id for source in unit.sources}),
+            }
+            projected.append((key, item))
+        projected.sort(key=lambda entry: entry[0])
+        rows = [item for _, item in projected]
+        page = _page(
+            rows,
+            [key for key, _ in projected],
+            selector={
+                "operation": "threads.messages",
+                "vendor_id": vendor_id,
+                "thread_ref": asdict(requested),
+            },
+            revision={"thread": thread, "messages": projected},
+            limit=limit,
+            cursor=cursor,
+        )
+        return {"thread": thread, **page}
 
 
 def read_body(store: Store, vendor_id: str, requested: ThreadRef, message_id: str) -> BodyResponse:
