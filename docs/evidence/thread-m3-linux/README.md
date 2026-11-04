@@ -8,6 +8,9 @@ on 2026-11-04. This is a local qualification, not an installation or deployment.
 - Backend: PR #338, `67463a84fa1471f5f88cf8fd07346f6a160832eb`.
 - Desktop: PR #339, `1283019a50079ccad030bfca46138a4c5c12f5bd`.
 - Local combined implementation commit: `1605666f19f9bb0fc59fa6d7752bbd42fef7fa67`.
+- Combined implementation tree: `3d779bba8f6a3f5e6911d00f3e6f8d9122513e39`.
+  This equals `git merge-tree --write-tree 67463a8 1283019`, so it can be
+  independently recomputed from the two published implementation heads.
 - Local proof-source commit: `f77748f3e81ce657695cd530236bcf9ba8b72e40`.
 - No local combined branch was pushed or used to merge a PR.
 - The two probe source hashes in [result.json](result.json) match the scripts in
