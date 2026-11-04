@@ -33,7 +33,8 @@ const ref = { provider: "imap", account_id: "retained", mailbox_identity_key: nu
 const vendor = { vendor_id: "vendor", display_name: `Vendor ${hostile}` };
 const thread = { thread_ref: ref, relation: "linked", owner_vendor: { vendor_id: "other", display_name: `Owner ${hostile}` },
   subject: `Subject ${hostile}`, latest_received_at: null, message_count: 1 };
-const message = { message_id: "canonical", subject: thread.subject, direction: "outbound", sender: `sender+${"x".repeat(180)}@example.test`,
+const newestSubject = `Newest visible subject ${hostile}`;
+const message = { message_id: "canonical", subject: `Oldest message ${hostile}`, direction: "outbound", sender: `sender+${"x".repeat(180)}@example.test`,
   sender_name: hostile, attributed_vendor: null, received_at: null,
   body_state: { state: "stored", stored_chars: 4, source_chars: 8 }, copy_count: 1 };
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
@@ -46,7 +47,7 @@ function harness() {
   const client = new ThreadReadClient(async <T>(command: string, args: Record<string, any>) => {
     calls.push({ command, args }); if (failure) throw { code: "runtime_error" };
     const data = command === "threads_list" ? { items: [thread], next_cursor: null }
-      : command === "threads_messages" ? { thread: { ...thread, history_notice: "History partial — only locally retained messages are shown" }, items: [message], next_cursor: null }
+      : command === "threads_messages" ? { thread: { ...thread, subject: newestSubject, history_notice: "History partial — only locally retained messages are shown" }, items: [message], next_cursor: null }
       : command === "threads_body" ? { thread_ref: ref, message_id: "canonical", body: { state: "stored", text: literal, stored_chars: [...literal].length, source_chars: [...literal].length + 5 } }
       : args.query.copy_ref ? { thread_ref: ref, message_id: "canonical", items: [{ part_id: "1", filename: hostile, media_type: "text/plain", byte_size: null }], next_cursor: null }
       : { thread_ref: ref, message_id: "canonical", items: [{ copy_ref: "source", locations: [hostile], summary: `Summary ${hostile}`, attachment_count: 1 }], next_cursor: null };
@@ -76,6 +77,8 @@ test("retained vendor/account/linked scope and hostile headers render as text on
     assert.ok(nodes(h.root).some(n => n.id === control.attributes.get("aria-controls")));
   }
   open.click(); await tick();
+  assert.equal(nodes(h.root).find(n => n.tagName === "H3")?.textContent, newestSubject);
+  assert.equal(nodes(h.root).find(n => n.id === "thread-messages")?.attributes.get("aria-label"), `Retained messages in ${newestSubject}`);
   assert.ok(text(h.root).includes(message.sender));
   assert.ok(text(h.root).includes(hostile));
   assert.match(text(h.root), /Outbound/); assert.match(text(h.root), /No attributed vendor/);
@@ -120,13 +123,16 @@ test("back retains account selection and restores its trigger; exit returns to v
 test("failed local refresh clears headers/body and offers a scoped retry, never an empty state", async () => {
   const h = harness(); await h.ui.open(vendor); await h.ui.state.openThread(thread as any);
   await h.ui.state.openBody("canonical"); assert.ok(text(h.root).includes(h.literal));
+  assert.ok(text(h.root).includes(newestSubject));
   h.fail(); const refresh = h.ui.state.refresh();
   assert.equal(text(h.root).includes(h.literal), false);
   assert.equal(text(h.root).includes(thread.subject), false);
+  assert.equal(text(h.root).includes(newestSubject), false);
   await refresh;
   assert.match(text(h.root), /Could not load/); assert.ok(text(h.root).includes(vendor.display_name));
   assert.equal(nodes(h.root).some(n => n.className === "thread-body-text"), false);
   assert.equal(text(h.root).includes(thread.subject), false);
+  assert.equal(text(h.root).includes(newestSubject), false);
   h.button("Retry messages");
   assert.doesNotMatch(text(h.root), /No retained messages/);
 });

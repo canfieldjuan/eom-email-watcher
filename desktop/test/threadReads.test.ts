@@ -95,7 +95,7 @@ test("messages and bodies preserve complete selectors, resolved refs and every b
       const bodyResult = { thread_ref: resolved, message_id: "canonical", body };
       const { text: _text, ...body_state } = body as typeof body & { text?: string };
       const messagesResult = { thread: { thread_ref: resolved, relation: "linked",
-        owner_vendor: { vendor_id: "owner", display_name: "Owner" }, history_notice: "Partial history" },
+        owner_vendor: { vendor_id: "owner", display_name: "Owner" }, subject: "Newest visible subject", history_notice: "Partial history" },
         items: [{ message_id: "canonical", subject: "<literal subject>", direction: "outbound",
           sender: "sender@example.test", sender_name: null, attributed_vendor: null,
           received_at: null, body_state, copy_count: 2 }], next_cursor: "next" };
@@ -141,7 +141,7 @@ test("TypeScript requires complete selectors and closed message/body/copy shapes
     const fixture = join(directory, "contract.ts");
     writeFileSync(fixture, `
 import { ThreadReadClient } from ${JSON.stringify(modulePath)};
-import type { ThreadRef, ThreadListQuery, ThreadCopy, ThreadInventory, ThreadCopyPage, ThreadBody, ThreadBodyState, ThreadMessage, ThreadMessagePage, ThreadBodyResponse } from ${JSON.stringify(modulePath)};
+import type { ThreadRef, ThreadListQuery, ThreadCopy, ThreadInventory, ThreadCopyPage, ThreadBody, ThreadBodyState, ThreadMessage, ThreadMessagePage, ThreadBodyResponse, ThreadContext } from ${JSON.stringify(modulePath)};
 declare const client: ThreadReadClient;
 const ref: ThreadRef = { provider: "imap", account_id: "account", mailbox_identity_key: null, thread_key: "thread" };
 const all: ThreadListQuery = { vendor_id: "vendor" };
@@ -171,6 +171,14 @@ const body: Promise<ThreadBodyResponse> = client.body(base);
 const stored: ThreadBody = { state: "stored", text: "", stored_chars: 0, source_chars: 0 };
 const metadata: ThreadBodyState = { state: "stored", stored_chars: 0, source_chars: 0 };
 const unavailable: ThreadBody = { state: "mailbox_identity_unavailable" };
+const context: ThreadContext = { thread_ref: ref, relation: "owned", owner_vendor: { vendor_id: "v", display_name: "Vendor" }, subject: "Newest", history_notice: "Partial" };
+const { subject: _subject, ...withoutSubject } = context;
+// @ts-expect-error snapshot title is required
+const missingTitle: ThreadContext = withoutSubject;
+// @ts-expect-error snapshot title cannot be null
+const nullTitle: ThreadContext = { ...context, subject: null };
+// @ts-expect-error snapshot title must be a string
+const numericTitle: ThreadContext = { ...context, subject: 123 };
 // @ts-expect-error body must select a canonical message
 client.body({ vendor_id: "vendor", thread_ref: ref });
 // @ts-expect-error body does not paginate

@@ -310,6 +310,7 @@ fn body_query() -> Value {
 fn message_page(state: Value) -> Value {
     json!({"thread": {"thread_ref": thread_ref(Value::Null), "relation": "linked",
         "owner_vendor": {"vendor_id": "owner", "display_name": "Owner"},
+        "subject": "Newest visible subject <literal> β",
         "history_notice": "History partial — only locally retained messages are shown"},
         "items": [{"message_id": "canonical-message", "subject": "<literal>",
             "direction": "outbound", "sender": "me@example.com", "sender_name": null,
@@ -350,6 +351,21 @@ fn thread_reads_message_body_responses_reject_silent_shape_loss() {
     assert!(serde_json::from_value::<ThreadBodyResponse>(response.clone()).is_ok());
     response["unexpected"] = json!("unexpected content");
     assert!(serde_json::from_value::<ThreadBodyResponse>(response).is_err());
+}
+
+#[test]
+fn thread_reads_message_context_requires_a_string_title() {
+    let valid = message_page(json!({"state": "pending"}));
+    let decoded: ThreadMessagePage = serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(decoded.thread.subject, "Newest visible subject <literal> β");
+    let mut missing = valid.clone();
+    missing["thread"].as_object_mut().unwrap().remove("subject");
+    assert!(serde_json::from_value::<ThreadMessagePage>(missing).is_err());
+    for value in [Value::Null, json!(1), json!(true), json!([]), json!({})] {
+        let mut invalid = valid.clone();
+        invalid["thread"]["subject"] = value;
+        assert!(serde_json::from_value::<ThreadMessagePage>(invalid).is_err());
+    }
 }
 
 #[test]

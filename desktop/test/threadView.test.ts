@@ -13,7 +13,7 @@ const message = (message_id = "canonical"): ThreadMessage => ({ message_id, subj
   body_state: { state: "stored", stored_chars: 4, source_chars: 4 }, copy_count: 2 });
 const threads = (items = [item()], next_cursor: string | null = null) => ({ items, next_cursor });
 const messages = (items = [message()], next_cursor: string | null = null, thread_ref = ref) => ({
-  thread: { thread_ref, relation: "owned", owner_vendor: vendor, history_notice: "History partial" }, items, next_cursor,
+  thread: { thread_ref, relation: "owned", owner_vendor: vendor, subject: "Newest subject", history_notice: "History partial" }, items, next_cursor,
 });
 const body = (text = "body") => ({ thread_ref: ref, message_id: "canonical",
   body: { state: "stored", text, stored_chars: [...text].length, source_chars: [...text].length } });
