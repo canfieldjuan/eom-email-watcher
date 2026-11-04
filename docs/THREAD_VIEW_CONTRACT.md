@@ -2,6 +2,10 @@
 
 Status: accepted by the operator on 2026-10-05, with D1-D3 as recommended, and restructured the same day into a definitions-first form (see the revision log). Decision D4 (comparison across a vendor's threads) was added on 2026-10-09, and decision D5 (invoice PDFs as a claim source) was proposed the same day. Each milestone still needs its own accepted plan before code.
 
+PR #324 proposes the narrow unresolved-mailbox-identity body state in D-body.
+Juan authorized that amendment's scope on 2026-11-03 (America/Chicago); oversight
+review and his final exact-revision acceptance remain pending.
+
 **How to read and change this contract.**
 
 - Every rule is stated once, in [Definitions](#definitions). Every other section links to the definition it uses.
@@ -213,6 +217,7 @@ Each definition is the only place its rule is stated.
   - "Body not stored (source no longer available)";
   - "Body not stored (outside the admitted folders)";
   - "Body not stored yet", pending [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass) stage (c).
+  - "Body not stored (mailbox identity unavailable)" for a retained vendor-attributed message whose mailbox identity is unresolved: neither its stored mailbox identity nor proven legacy continuity supplies that identity. This state carries no body text and is selected before reading retained body or unavailable-marker data, subject to [D-removal](#d-removal-deferred-local-deletions)'s outcome precedence. It does not classify the thread as unfollowed. When identity is resolved, the existing body-eligibility rules determine the state again; this read remains in the read class of [D-ops](#d-ops-operation-classes-and-gating).
 
 ### D-ops: operation classes and gating
 
@@ -539,6 +544,8 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - **Scopes:** `Mail.Read` and `gmail.readonly` remain the only scopes.
 
 ## Revision log
+
+- 2026-11-03 (America/Chicago): Juan authorized a narrow D-body amendment in PR #324 for retained vendor-attributed messages with unresolved mailbox identity, with the label "Body not stored (mailbox identity unavailable)", as a separate contract commit for oversight review and his final exact-revision acceptance. This records scope authorization, not final acceptance or permission to implement. Other definitions are unchanged.
 
 - 2026-10-05: proposed, then accepted by the operator with D1-D3 as recommended.
 - 2026-10-05: five Codex review rounds (12, 7, 7, 9, and 7 findings) were each answered with local edits.
