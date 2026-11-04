@@ -1,4 +1,6 @@
 import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
+import { ThreadReadClient } from "./threadReads";
+import { ThreadViewDom } from "./threadViewDom";
 import { mailboxPendingMessage } from "./mailboxProgress";
 import { confirmAction } from "./confirmation";
 import { calendarOutcomeNotice, latestCalendarOutcome, type CalendarWriteOutcome } from "./calendarOutcome";
@@ -512,7 +514,7 @@ app.innerHTML = `
     <header class="intro">
       <p class="eyebrow">Local email watcher</p>
       <h1>Your signal inbox</h1>
-      <p class="lede">Only messages from watched senders or Gmail labels appear here.</p>
+      <p class="lede">Locally retained messages from watched senders and Gmail labels appear here. Followed threads and Sent replies to vendors also appear when captured with Connect.</p>
     </header>
 
     <nav class="view-tabs" aria-label="Watcher views">
@@ -604,7 +606,7 @@ app.innerHTML = `
       </details>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
       <div id="inbox-removal-statuses" aria-live="polite"></div>
-      <ul id="inbox-list" class="inbox-list" aria-label="Recent watched messages"></ul>
+      <ul id="inbox-list" class="inbox-list" aria-label="Recent retained messages"></ul>
       <div class="inbox-page-actions">
         <button id="inbox-load-more" type="button" hidden>Load more</button>
         <button id="inbox-clear" class="danger-action" type="button">Clear local history</button>
@@ -615,7 +617,7 @@ app.innerHTML = `
 
     <section id="watchlist-view" class="view" aria-labelledby="watchlist-tab" hidden>
       <h2>Watched senders</h2>
-      <p class="view-lede">Only exact email addresses on this list are analyzed.</p>
+      <p class="view-lede">Watching an address keeps messages from that sender in the Inbox. Vendor records can also capture followed threads and Sent replies while Connect is active.</p>
       <form id="sender-form" class="sender-form">
         <label>
           <span>Name <small>optional</small></span>
@@ -633,6 +635,7 @@ app.innerHTML = `
     </section>
 
     <section id="vendors-view" class="view" aria-labelledby="vendors-tab" hidden>
+      <div id="vendors-management">
       <h2>Vendors</h2>
       <p class="view-lede">Group the exact addresses each vendor writes from. Adding an address also watches it.</p>
       <div id="vendors-locked" class="vendors-locked" hidden>
@@ -649,6 +652,8 @@ app.innerHTML = `
       </form>
       <p id="vendors-status" class="status" role="status" aria-live="polite">Open this view to load vendors.</p>
       <ul id="vendor-list" class="vendor-list" aria-label="Vendors"></ul>
+      </div>
+      <section id="thread-view" hidden></section>
     </section>
 
     <section id="expiry-ledger-view" class="view" aria-labelledby="expiry-ledger-tab" hidden>
@@ -881,6 +886,46 @@ const vendorForm = requiredElement<HTMLFormElement>("#vendor-form");
 const vendorNameInput = requiredElement<HTMLInputElement>("#vendor-name");
 const vendorsStatus = requiredElement<HTMLParagraphElement>("#vendors-status");
 const vendorList = requiredElement<HTMLUListElement>("#vendor-list");
+const vendorManagement = requiredElement<HTMLElement>("#vendors-management");
+let threadEntryVendorId: string | null = null;
+const threadReader = new ThreadViewDom(requiredElement<HTMLElement>("#thread-view"), new ThreadReadClient(invoke), {
+  accounts: () => mailAccounts,
+  onExit: () => {
+    vendorManagement.hidden = false;
+    const triggers = Array.from(vendorList.querySelectorAll<HTMLButtonElement>("[data-thread-vendor]"));
+    for (const trigger of triggers) trigger.setAttribute("aria-expanded", "false");
+    (triggers.find(trigger => trigger.dataset.threadVendor === threadEntryVendorId) ?? vendorsTab).focus();
+  },
+});
+
+function refreshThreadHistory(): void {
+  if (configurationReady) void threadReader.state.refresh();
+}
+
+function openVendorThreads(vendorId: string, displayName: string): void {
+  threadEntryVendorId = vendorId;
+  vendorManagement.hidden = true;
+  for (const trigger of vendorList.querySelectorAll<HTMLButtonElement>("[data-thread-vendor]")) {
+    trigger.setAttribute("aria-expanded", String(trigger.dataset.threadVendor === vendorId));
+  }
+  void threadReader.open({ vendor_id: vendorId, display_name: displayName });
+}
+
+function reconcileThreadVendor(): boolean {
+  const selected = threadReader.state.vendor;
+  if (!selected) return true;
+  const fresh = vendorRecords.find(vendor => vendor.vendor_id === selected.vendor_id);
+  if (!fresh) {
+    threadReader.state.close();
+    vendorManagement.hidden = false;
+    setVendorsStatus("The selected vendor is no longer available.", "error");
+    vendorsTab.focus();
+    return false;
+  }
+  threadReader.state.vendor = { vendor_id: fresh.vendor_id, display_name: fresh.display_name };
+  refreshThreadHistory();
+  return true;
+}
 const expiryLedgerView = requiredElement<HTMLElement>("#expiry-ledger-view");
 const healthView = requiredElement<HTMLElement>("#health-view");
 const settingsView = requiredElement<HTMLElement>("#settings-view");
@@ -1168,6 +1213,7 @@ async function runMailAccountMutation<T extends { mailbox_operation_revision: nu
     checkNow.disabled = true;
   }
   mailAccountMutationsInFlight += 1;
+  threadReader.state.beginMutation();
   mailOperationInFlight = true;
   wakeInboxReload();
   try {
@@ -1184,6 +1230,7 @@ async function runMailAccountMutation<T extends { mailbox_operation_revision: nu
   } finally {
     mailAccountMutationsInFlight -= 1;
     mailOperationInFlight = mailAccountMutationsInFlight > 0;
+    void threadReader.state.endMutation();
     wakeInboxReload();
   }
 }
@@ -1255,6 +1302,8 @@ function showView(
   const inboxSelected = view === "inbox";
   const watchlistSelected = view === "watchlist";
   const vendorsSelected = view === "vendors";
+  if (vendorsSelected && configurationReady) void threadReader.state.resume();
+  else threadReader.state.suspend();
   const expiryLedgerSelected = view === "expiry-ledger";
   const healthSelected = view === "health";
   const settingsSelected = view === "settings";
@@ -1697,8 +1746,8 @@ function renderInbox(items: InboxItem[]): void {
       : activeInboxQuery.sender !== null
       ? inboxSenderEmptyText(activeInboxQuery, activeInboxAccountSelection)
       : filtered
-      ? "No watched messages match these filters."
-      : "No watched messages yet. Add a sender or Gmail label, then run the watcher.";
+      ? "No retained messages match these filters."
+      : "No retained messages yet.";
     inboxList.append(empty);
     return;
   }
@@ -2684,6 +2733,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
   );
   if (!confirmed || inboxMutationInFlight()) return;
 
+  threadReader.state.beginMutation();
   inboxDeletionsInFlight.add(item.message_id);
   inboxRequestGeneration += 1;
   wakeInboxReload();
@@ -2704,6 +2754,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
   } finally {
+    void threadReader.state.endMutation();
     inboxDeletionsInFlight.delete(item.message_id);
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
@@ -2718,6 +2769,7 @@ async function clearInboxHistory(): Promise<void> {
   );
   if (!confirmed || inboxMutationInFlight()) return;
 
+  threadReader.state.beginMutation();
   inboxClearInFlight = true;
   inboxRequestGeneration += 1;
   wakeInboxReload();
@@ -2750,6 +2802,7 @@ async function clearInboxHistory(): Promise<void> {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
   } finally {
+    void threadReader.state.endMutation();
     inboxClearInFlight = false;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
@@ -2879,10 +2932,12 @@ async function loadInbox(
 ): Promise<boolean> {
   // User append remains a one-shot operation on the current cursor.
   if (append) return !inboxReload.running && await loadInboxPage(true, effectScope);
+  if (mailboxEffectScopeIsCurrent(effectScope)) refreshThreadHistory();
   return inboxReload.request({ kind: "first" }, effectScope);
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {
+  refreshThreadHistory();
   // Retained rows may still belong to the previous filter while its replacement loads.
   const intent: InboxRefreshIntent = inboxItemsEpoch === inboxQueryEpoch
     ? { kind: "span", target: inboxItems.length }
@@ -3485,9 +3540,15 @@ function reconcileInboxAccountScope(): boolean {
 }
 
 function renderMailAccounts(data: MailAccounts): boolean {
+  const threadAccountContext = (accounts: MailAccountStatus[]) => JSON.stringify(accounts.map(account => [
+    account.provider, account.account_id, account.display_name, account.address,
+    account.connected, account.active, account.sent_scope,
+  ]));
+  const threadAccountsChanged = threadAccountContext(mailAccounts) !== threadAccountContext(data.accounts);
   mailAccountCatalogRevision += 1;
   mailProviders = data.providers;
   mailAccounts = data.accounts;
+  if (threadAccountsChanged) refreshThreadHistory();
   const gmailLabelScopeChanged = reconcileGmailLabelScope(mailAccounts);
   if (gmailLabelScopeChanged && !settingsView.hidden && gmailLabelScope !== null) {
     void loadGmailLabelState();
@@ -4316,6 +4377,7 @@ function checkResultMessage(result: CheckResult): string {
 async function runCheck(): Promise<void> {
   if (checkInFlight) return;
   checkInFlight = true;
+  threadReader.state.beginMutation();
   checkNow.disabled = true;
   healthStatus.textContent = "Checking watched mail…";
   try {
@@ -4325,6 +4387,7 @@ async function runCheck(): Promise<void> {
   } catch (error) {
     await Promise.all([loadInbox(), loadHealth(errorMessage(error), "error")]);
   } finally {
+    void threadReader.state.endMutation();
     checkInFlight = false;
     checkNow.disabled = !checkSupported;
   }
@@ -4592,6 +4655,7 @@ settingsForm.addEventListener("submit", (event) => {
   void (async () => {
     if (settingsInFlight) return;
     setSettingsBusy(true);
+    threadReader.state.beginMutation();
     settingsStatus.textContent = "Saving settings…";
     delete settingsStatus.dataset.kind;
     try {
@@ -4621,6 +4685,7 @@ settingsForm.addEventListener("submit", (event) => {
       settingsStatus.textContent = errorMessage(error);
       settingsStatus.dataset.kind = "error";
     } finally {
+      void threadReader.state.endMutation();
       setSettingsBusy(false);
     }
   })();
@@ -4662,7 +4727,7 @@ function setBusy(busy: boolean): void {
   }
   for (const control of [
     ...vendorForm.elements,
-    ...vendorList.querySelectorAll<HTMLElement>("button, input"),
+    ...vendorList.querySelectorAll<HTMLElement>("button:not([data-thread-vendor]), input"),
   ]) {
     if (control instanceof HTMLInputElement || control instanceof HTMLButtonElement) {
       control.disabled = busy;
@@ -4673,12 +4738,14 @@ function setBusy(busy: boolean): void {
 function beginOperation(): boolean {
   if (operationInFlight) return false;
   operationInFlight = true;
+  threadReader.state.beginMutation();
   setBusy(true);
   return true;
 }
 
 function finishOperation(): void {
   operationInFlight = false;
+  void threadReader.state.endMutation();
   setBusy(false);
 }
 
@@ -4845,6 +4912,14 @@ function renderVendors(): void {
     const title = document.createElement("strong");
     title.textContent = vendor.name;
     header.append(title);
+    const threads = document.createElement("button");
+    threads.type = "button";
+    threads.textContent = "View threads";
+    threads.dataset.threadVendor = vendor.vendorId;
+    threads.setAttribute("aria-controls", "thread-view");
+    threads.setAttribute("aria-expanded", String(threadReader.state.vendor?.vendor_id === vendor.vendorId));
+    threads.addEventListener("click", () => openVendorThreads(vendor.vendorId, vendor.name));
+    header.append(threads);
     if (view.canUpdate) {
       const rename = document.createElement("button");
       rename.type = "button";
@@ -4958,7 +5033,8 @@ async function loadVendors(message: string | null = "Vendors are up to date."): 
     vendorRecords = vendors;
     vendorCardDrafts.keepOnly(vendors.map((vendor) => vendor.vendor_id));
     renderVendors();
-    if (message !== null) setVendorsStatus(message, "success");
+    const selectedVendorAvailable = reconcileThreadVendor();
+    if (message !== null && selectedVendorAvailable) setVendorsStatus(message, "success");
   } catch (error) {
     if (vendorListFence.isLatest(request)) vendorFailure(error);
   }
@@ -5169,6 +5245,7 @@ void listen<{ attempted: number }>("watcher://connect-queue", () => {
   if (configurationReady) scheduleConnectQueueRefresh();
 });
 window.addEventListener("focus", () => {
+  refreshThreadHistory();
   if (configurationReady) {
     void loadMailAccounts().then((loaded) => {
       if (loaded) return loadInbox();
@@ -5182,6 +5259,7 @@ window.addEventListener("focus", () => {
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
+  refreshThreadHistory();
   if (!settingsView.hidden && configurationReady) {
     void Promise.all([loadCalendarConsents(), loadGmailLabelState()]);
   } else {
