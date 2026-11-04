@@ -14,10 +14,26 @@ function owner(name: string): string {
 const noop = () => {};
 function harness(names: string[]) {
   const events: string[] = [];
-  const node = () => ({ disabled: false, hidden: false, textContent: "", dataset: {}, setAttribute: noop });
+  const node = () => ({ disabled: false, hidden: false, textContent: "", dataset: {},
+    attributes: new Map(), setAttribute(key: string, value: string) { this.attributes.set(key, value); },
+    append: noop, prepend: noop, replaceChildren: noop, addEventListener: noop,
+    focus: () => events.push("focus") });
+  const shell = node();
   const context = vm.createContext({
     threadReader: { state: { beginMutation: () => events.push("begin"), endMutation: async () => { events.push("end"); },
-      refresh: async () => { events.push("refresh"); }, suspend: () => events.push("suspend"), resume: async () => { events.push("resume"); }, vendor: { vendor_id: "v" } } },
+      refresh: async () => { events.push("refresh"); }, suspend: () => events.push("suspend"), resume: async () => { events.push("resume"); },
+      close: () => events.push("close"), vendor: { vendor_id: "v", display_name: "Before" } } },
+    requiredElement: () => shell, document: { createElement: node },
+    vendorRecords: [], vendorManagement: { hidden: true },
+    setVendorsStatus: (message: string, kind: string) => events.push(`status:${kind}:${message}`),
+    vendorListFence: { begin: () => 1, isLatest: () => true },
+    vendorCardDrafts: { keepOnly: noop }, renderVendors: noop,
+    vendorFailure: (error: unknown) => { throw error; },
+    mailAccounts: [], mailProviders: [], mailAccountCatalogRevision: 0,
+    reconcileGmailLabelScope: () => false, renderInboxAccountOptions: noop,
+    reconcileInboxAccountScope: () => false, mailAccountList: node(), mailProviderActions: node(),
+    mailAccountDetail: () => "Account", providerFor: () => undefined,
+    inboxItemsEpoch: 0, inboxQueryEpoch: 0,
     configurationReady: true, operationInFlight: false, setBusy: noop,
     inboxMutationInFlight: () => false, confirmAction: async () => true,
     inboxDeletionsInFlight: new Set(), inboxClearInFlight: false, inboxRequestGeneration: 0,
@@ -39,6 +55,8 @@ function harness(names: string[]) {
     inboxReload: { running: false, request: async () => { events.push("inbox"); return true; } },
     loadInboxPage: async () => { events.push("append"); return true; },
   });
+  for (const name of ["inboxView", "watchlistView", "vendorsSection", "expiryLedgerView", "healthView", "settingsView",
+    "inboxTab", "watchlistTab", "vendorsTab", "expiryLedgerTab", "healthTab", "settingsTab"]) context[name] = node();
   vm.runInContext(names.map(owner).join("\n"), context);
   return { events, context };
 }
@@ -83,13 +101,62 @@ test("history refresh observes current scope only and append does not disturb th
   await h.context.loadInbox(false, { mutation_epoch: -1 }); assert.deepEqual(h.events, ["inbox"]);
 });
 
+test("actual view lifecycle resumes Vendors and suspends other or unconfigured views", () => {
+  const h = harness(["showView"]);
+  h.context.showView("vendors"); assert.deepEqual(h.events, ["resume"]);
+  assert.equal(h.context.vendorsSection.hidden, false); assert.equal(h.context.inboxView.hidden, true);
+  assert.equal(h.context.vendorsTab.attributes.get("aria-pressed"), "true");
+  h.events.length = 0; h.context.showView("inbox"); assert.deepEqual(h.events, ["suspend"]);
+  assert.equal(h.context.vendorsSection.hidden, true); assert.equal(h.context.inboxView.hidden, false);
+  h.events.length = 0; h.context.configurationReady = false; h.context.showView("vendors");
+  assert.deepEqual(h.events, ["suspend"]);
+});
+
+test("actual account renderer refreshes only changed thread account tuples", () => {
+  const baseline = { provider: "imap", account_id: "one", display_name: "Retained", address: null,
+    connected: false, active: false, sent_scope: "not_polled", last_check: null };
+  for (const change of [{ provider: "gmail" }, { account_id: "two" }, { display_name: "Renamed" },
+    { address: "changed@example.test" }, { connected: true }, { active: true }, { sent_scope: "unavailable" }]) {
+    const h = harness(["refreshThreadHistory", "renderMailAccounts"]);
+    h.context.mailAccounts = [baseline];
+    h.context.renderMailAccounts({ accounts: [{ ...baseline, last_check: "new check" }], providers: [] });
+    assert.deepEqual(h.events, [], `unchanged tuple: ${JSON.stringify(change)}`);
+    h.context.renderMailAccounts({ accounts: [{ ...baseline, ...change }], providers: [] });
+    assert.deepEqual(h.events, ["refresh"], JSON.stringify(change));
+  }
+});
+
+test("actual span refresh revalidates threads and respects configuration readiness", async () => {
+  const h = harness(["refreshThreadHistory", "refreshLoadedInboxSpan"]);
+  await h.context.refreshLoadedInboxSpan(); assert.deepEqual(h.events, ["refresh", "inbox"]);
+  h.events.length = 0; h.context.configurationReady = false;
+  await h.context.refreshLoadedInboxSpan(); assert.deepEqual(h.events, ["inbox"]);
+});
+
+test("actual vendor reload closes removed selection or updates and refreshes retained selection", async () => {
+  for (const present of [false, true]) {
+    const h = harness(["refreshThreadHistory", "reconcileThreadVendor", "loadVendors"]);
+    const fresh = { vendor_id: "v", display_name: "Renamed" };
+    h.context.invoke = async (operation: string) => {
+      assert.equal(operation, "vendors_list"); return present ? [fresh] : [];
+    };
+    await h.context.loadVendors();
+    if (present) {
+      assert.deepEqual(h.events, ["refresh", "status:success:Vendors are up to date."]);
+      assert.equal(h.context.threadReader.state.vendor.display_name, "Renamed");
+      assert.equal(h.context.threadReader.state.vendor.vendor_id, "v");
+      assert.equal(h.context.vendorManagement.hidden, true);
+    } else {
+      assert.deepEqual(h.events, ["close", "status:error:The selected vendor is no longer available.", "focus"]);
+      assert.equal(h.context.vendorManagement.hidden, false);
+    }
+  }
+});
+
 test("entry is read class, lifecycle/settings hooks exist, and approved copy preserves sender distinctions", () => {
   const render = owner("renderVendors");
   assert.ok(render.indexOf('"View threads"') < render.indexOf("if (view.canUpdate)"));
   assert.match(render, /openVendorThreads/);
-  assert.match(owner("showView"), /state\.resume\(/); assert.match(owner("showView"), /state\.suspend\(/);
-  assert.match(owner("renderMailAccounts"), /refreshThreadHistory\(/);
-  assert.match(owner("loadVendors"), /reconcileThreadVendor\(/);
   assert.match(source, /window\.addEventListener\("focus", \(\) => \{\s*refreshThreadHistory\(\)/);
   assert.match(source, /document\.visibilityState !== "visible"\) return;\s*refreshThreadHistory\(\)/);
   const settings = source.slice(source.indexOf('settingsForm.addEventListener("submit"'), source.indexOf('gmailLabelCatalogSelect.addEventListener'));
