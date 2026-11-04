@@ -78,8 +78,11 @@ storage cannot support these reads, return to the plan with evidence before code
    M3 always describes the view as locally retained, potentially partial history;
    it never claims a complete mailbox conversation. No new history-proof storage
    is proposed. Existing Sent-scope health remains the source of that notice.
-4. Oversight PASS on this exact plan revision and Juan's explicit acceptance are
-   pending. Changes to accepted behavior require a reviewed delta and fresh
+4. Oversight returned NOT PASS at `a8adb22` because the plan introduced body labels
+   absent from D-body. The plan-only correction below removes those instructions;
+   the missing eligibility outcome remains an explicit contract-decision blocker.
+   PASS on a final revision and Juan's explicit acceptance remain pending.
+   Changes to accepted behavior require a reviewed delta and fresh
    exact-revision acceptance. A review PASS alone does not authorize code.
 5. Preflight found the old primary checkout dirty with benchmark/model work.
    This plan uses an independent clone from the baseline and leaves it alone.
@@ -220,9 +223,14 @@ the rules of [D-body](../docs/THREAD_VIEW_CONTRACT.md#d-body-stored-bodies) and
    It returns none of the held text or unavailable reason as a substitute.
    Retained headers, summaries and inventory keep their existing eligibility. Do not
    recreate a target predicate in `thread_reads.py`.
-3. If not currently followed (including unproven legacy scope), return
-   `not_followed`: "Body not stored for this unfollowed thread". Retained bytes
-   alone cannot change this state.
+3. Require current followed/body eligibility before selecting text. The successful
+   body outcome for a retained message without provable eligibility is not settled
+   by D-body. This is an implementation blocker, not a new `not_followed` state
+   or an instruction to return a substitute label. Keep the retained-header read
+   scope and all existing body barriers; do not hide the message, infer eligibility
+   from retained bytes, or falsely map it to source-gone, outside-folders or pending
+   merely to fit the existing state set. Resolve the owning contract decision with
+   Juan before implementing this branch.
 4. Otherwise project `stored`, `source_gone`, `outside_folders`, or `pending`
    from `message_bodies`/`message_body_unavailable`, with the exact D-body labels.
    Partial text displays the D-body N/M marker from stored lengths, independent
@@ -233,7 +241,40 @@ no body fallback through duplicate rows, an old alias, a summary, or provider
 fetch. Copy readers apply RECORD through the shared owner before selecting
 retained summaries/inventory and never return bodies. Body-only removal does not
 erase or hide retained summaries; a summary is never presented as the missing body.
-Unknown body states fail closed to "Body state unavailable" with no text.
+An unexpected or malformed body discriminator is an invalid read response, not
+a successful body state. Reject that response, clear the body container and use
+the ordinary load-error path; never render its text or retain a prior body. This
+adds no fallback body label and does not turn a valid but unsettled eligibility
+case into a transport error to evade the contract decision in step 3.
+
+### Review finding and decision required
+
+[Oversight review 5762105258](https://github.com/canfieldjuan/eom-email-watcher/pull/324#pullrequestreview-5762105258)
+correctly identified the extra `not_followed` state and "Body state unavailable"
+label in `a8adb22`. A separate D-body amendment is a proposed scope expansion;
+it is not authorized by that review. This revision changes only the plan.
+
+The review's general explanation that linked threads need not be followed needs
+qualification. D-attribution's linked condition entails a vendor-attributed
+message, and D-follow classifies a thread with such a message as followed.
+In the current source, `db.py:_recompute_derived` writes attribution before
+skipping follow-cache creation for an unresolved effective mailbox identity
+(`:6201-6213` at the baseline). That is the concrete retained legacy case to
+resolve; lack of a proven identity must not be presented as a proven unfollow.
+When removing the last attribution ends the vendor relationship, this plan's
+same-snapshot membership check specifies `not_found` for a stale vendor
+request. It does not need a successful unfollowed body state.
+
+Recommendation for Juan's scope decision: authorize a narrowly bounded D-body
+proposal for retained messages with unresolved effective mailbox identity.
+Proposed copy for review is "Body not stored (mailbox identity unavailable)";
+this is not an accepted label or an implementation instruction. Keep a generic
+`not_followed` success state out of this vendor-scoped M3 surface unless a
+reachable case is demonstrated. Keep unexpected schema values on the ordinary
+failed-read path. Do not change following, admission, reconciliation, removal,
+or retained visibility to avoid this decision. No contract file changes until
+Juan explicitly authorizes that scope; no implementation until the final
+contract and plan revision is accepted.
 
 ## Desktop behavior and CSP
 
@@ -366,7 +407,7 @@ After acceptance, implementation evidence must fail before each behavior exists:
 | Logical content | Several physical copies appear once in the timeline; location-only copies and retained duplicate summaries/inventory remain distinguishable; canonical promotion and equal source/date ties preserve order |
 | Vendor relationship | Owned plus linked produces one owned row; linked vendor sees the actual owner and each message's actual attribution; a vendor removal/re-attribution invalidates prior direct reads |
 | Pagination | More than 100 threads/messages/copies, tied dates, invalid legacy dates, last page, empty page, malformed/oversized/wrong-scope cursor, mid-page alias merge, arrival, delete and ownership change; stable sets have no omission/repeat, changed sets restart explicitly |
-| Body | Full, empty, 200,000-character bounded, truncated, source-gone, outside-folders, pending, not-followed and removal-pending cases; no text in list responses or non-stored union variants; lengths match stored evidence |
+| Body | Full, empty, 200,000-character bounded, truncated, source-gone, outside-folders, pending and removal-pending cases; no text in list responses or non-stored union variants; lengths match stored evidence; malformed discriminators reject the read and clear prior text; the unresolved eligibility case needs the decision above before its proof can be specified |
 | Removal | Use the existing unqualified 33-row held unit: delete/clear hide metadata/counts/copies/body while bytes remain; unfollow preserves permitted headers but hides content; refollow cannot revive a pending body target; restart and qualified completion preserve these outcomes |
 | Snapshot/race | Commit removal before a read begins and prove no content; pause a read across a writer to prove a consistent snapshot; invalidate a UI request during delete/unfollow/selection and prove its late body/page cannot repaint |
 | Host boundary | Each selector, identity null/string, cursor, limit, discriminator and error survives Python-to-Rust-to-TS; missing/unknown fields are refused rather than silently dropped |
@@ -400,6 +441,8 @@ the behavior matrix is required future evidence, not a claimed test result.
 
 NOT DONE
 
-Oversight review and Juan's exact-revision acceptance are pending. Implementation,
+Oversight's required eligibility-state finding is not closed: the plan no longer
+invents labels, but the owning contract decision needs Juan's explicit scope
+authorization and acceptance of the resulting exact revision. Implementation,
 packaged CSP/interaction proof and platform qualification have not run. The plan
 must not be read as acceptance, implementation completion, or deployment approval.
