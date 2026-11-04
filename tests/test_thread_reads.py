@@ -54,6 +54,11 @@ def test_account_provider_and_reused_identity_buckets_remain_separate(tmp_path):
     scopes = {tuple(item["thread_ref"].values()) for item in items}
     assert len(scopes) == 4
     selected = thread_reads.list_threads(store, vendor, provider="gmail", account_id="mailbox")
+    assert len(selected["items"]) == 2
+    assert all(
+        (item["thread_ref"]["provider"], item["thread_ref"]["account_id"]) == ("gmail", "mailbox")
+        for item in selected["items"]
+    )
     assert {item["thread_ref"]["mailbox_identity_key"] for item in selected["items"]} == {
         KEY,
         "a" * 64,
