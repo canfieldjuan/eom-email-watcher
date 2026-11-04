@@ -5932,6 +5932,20 @@ def _thread_ref(value: object) -> thread_reads.ThreadRef:
     return thread_reads.ThreadRef(provider, account_id, identity, key)
 
 
+def _threads_messages(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"vendor_id", "thread_ref", "limit", "cursor"})
+    vendor = _vendor_id(payload)
+    ref = _thread_ref(payload.get("thread_ref"))
+    limit = _bounded_limit(payload, default=25, maximum=100)
+    store = Store(load_config(_config_path(request)).database_file)
+    try:
+        return thread_reads.list_messages(
+            store, vendor, ref, limit=limit, cursor=payload.get("cursor"),
+        )
+    except thread_reads.ThreadReadError as error:
+        raise ApiError(error.code, str(error)) from error
+
+
 def _threads_body(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"vendor_id", "thread_ref", "message_id"})
     vendor = _vendor_id(payload)
@@ -6524,6 +6538,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "threads.list": _threads_list,
     "threads.copies": _threads_copies,
     "threads.body": _threads_body,
+    "threads.messages": _threads_messages,
     "vendors.list": _vendors_list,
     "vendors.create": _vendors_create,
     "vendors.rename": _vendors_rename,

@@ -76,6 +76,7 @@ envelope without changing its protocol number.
 | `threads.list` | `vendor_id`; optional paired `provider`/`account_id`, `limit` (1–100), `cursor` | Retained owned/linked logical threads, newest first; no body or summary content |
 | `threads.copies` | `vendor_id`, complete `thread_ref`, canonical `message_id`; optional `copy_ref`, `limit`, `cursor` | Retained physical/location copies with their own saved summaries, or one copy's attachment inventory metadata |
 | `threads.body` | `vendor_id`, complete `thread_ref`, canonical `message_id` | Local stored plain text and lengths, or a text-free body state |
+| `threads.messages` | `vendor_id`, complete `thread_ref`; optional `limit`, `cursor` | Oldest-first logical message headers, attribution, body-state metadata and copy counts |
 | `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
 | `inbox.clear` | `{}` | Delete all local inbox messages and message-owned state while preserving mailbox and outbound state |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
@@ -298,6 +299,34 @@ from the caller is never trusted. Changed membership, headers, ownership or orde
 returns `stale_cursor`; restart at page one. A wrong selector, malformed/oversized
 cursor, or absent last tuple returns `invalid_request`. The last page returns
 `next_cursor: null`. Each page rechecks visibility in its own single snapshot.
+
+### Local thread messages (M3)
+
+`threads.messages` uses the same query-only, scoped read snapshot and 25/100 page
+bounds. It returns `{thread, items, next_cursor}`. `thread` contains resolved
+`thread_ref`, `relation` (`owned` or `linked`), `owner_vendor`, and the fixed
+`history_notice`: "History partial — only locally retained messages are shown".
+It makes no mailbox-completeness or capture claim.
+
+Each item contains canonical `message_id`, stored `subject`, derived `direction`
+(`inbound` or `outbound`), `sender`, nullable `sender_name`, `attributed_vendor`
+(`{vendor_id, display_name}` or null), nullable logical `received_at`, `body_state`,
+and `copy_count`. Attribution belongs to the individual message, not necessarily
+the thread owner. Copy count groups distinct source IDs exactly like copy detail;
+multiple recorded locations do not create extra logical messages or copies.
+
+The shared body-state projection returns stored state and its two lengths, or
+one text-free state object, under the same precedence as expansion. Lists never
+select body text or saved summaries. Held delete/clear rows remain absent;
+body-only removal keeps eligible headers and projects `removal_pending`.
+
+Order is oldest logical received time first (the latest valid observation across
+its copies), then canonical source byte order and canonical ID as a final total
+tie-break. Invalid dates sort last and return null. The bounded versioned keyset
+cursor binds the requested vendor/ref, page limit, operation, resolved ref,
+relationship and ordered returned metadata, including body states and copy counts.
+A changed projection or alias returns `stale_cursor`; selector mismatch or a
+malformed cursor is `invalid_request`. Every page revalidates current membership.
 
 ### Local thread body (M3)
 
