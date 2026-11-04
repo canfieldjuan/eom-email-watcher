@@ -1480,6 +1480,7 @@ pub struct ThreadContext {
     pub thread_ref: ThreadRef,
     pub relation: ThreadRelation,
     pub owner_vendor: ThreadVendor,
+    pub subject: String,
     pub history_notice: String,
 }
 

@@ -101,6 +101,7 @@ export interface ThreadContext {
   thread_ref: ThreadRef;
   relation: "owned" | "linked";
   owner_vendor: ThreadVendor;
+  subject: string;
   history_notice: string;
 }
 

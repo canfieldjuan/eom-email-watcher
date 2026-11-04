@@ -170,7 +170,7 @@ export class ThreadViewDom {
     }, true, "thread-messages"));
     // After invalidation, a cached list subject is no longer retained evidence.
     // Render a subject only from the current successful message projection.
-    const subject = state.value ? state.value.items[0]?.subject || "No subject" : "Retained thread";
+    const subject = state.value ? state.value.thread.subject : "Retained thread";
     const heading = this.node("h3", subject.trim() ? subject : "No subject");
     heading.tabIndex = -1; heading.dataset.threadFocus = "message-heading";
     const section = this.node("section"); section.id = "thread-messages";
