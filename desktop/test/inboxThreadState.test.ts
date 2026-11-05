@@ -161,17 +161,52 @@ test("every Inbox child fences late success/errors and current stale selection c
   }
 });
 
-test("refresh retains an explicit vendor choice and child stale-cursor restart retains origin and mode", async () => {
-  const h = harness(); await enter(h, true);
-  let pending = h.state.loadMessages(true); h.calls.at(-1)!.reject({ code: "stale_cursor" }); await tick();
+test("automatic zero/one-vendor entry resolves afresh and shows a grown vendor set without loading messages", async () => {
+  for (const vendorMode of [false, true]) {
+    const h = harness(); await enter(h, vendorMode);
+    let pending = h.state.openBody("seed"); h.calls.at(-1)!.resolve(body); await pending;
+    pending = h.state.openCopies("seed"); h.calls.at(-1)!.resolve(copies()); await pending;
+    const before = h.calls.length;
+    pending = h.state.refresh();
+    assert.deepEqual(h.calls.at(-1)!.query, { message_ref: origin, cursor: null });
+    assert.equal(h.state.selectedThread, null); assert.equal(h.state.messages.value, null);
+    assert.equal(h.state.bodies.size, 0); assert.equal(h.state.copies.size, 0);
+    h.calls.at(-1)!.resolve(chooser([vendor, other], null)); await pending;
+    assert.equal(h.calls.length, before + 1, "a grown set must wait for an explicit choice");
+    assert.equal(h.state.resolution.value?.state, "choose_vendor");
+    assert.deepEqual(h.state.resolution.value?.state === "choose_vendor" && h.state.resolution.value.items, [vendor, other]);
+    assert.equal(h.state.vendor, null); assert.equal(h.state.selectedThread, null);
+    assert.equal(h.state.messages.value, null);
+  }
+});
+
+test("a chooser selection is retained on refresh and child stale-cursor restart retains origin and mode", async () => {
+  const h = harness(); let pending = h.state.openInbox(origin, () => true);
+  h.calls.at(-1)!.resolve(chooser([vendor, other], null)); await pending;
+  pending = h.state.chooseVendor("v");
+  assert.deepEqual(h.calls.at(-1)!.query, { message_ref: origin, vendor_id: "v" });
+  h.calls.at(-1)!.resolve(resolved(true)); await tick();
+  h.calls.at(-1)!.resolve(messages(true, "messages-next")); await pending;
+  pending = h.state.loadMessages(true); h.calls.at(-1)!.reject({ code: "stale_cursor" }); await tick();
   assert.deepEqual(h.calls.at(-1)!.query, { vendor_id: "v", thread_ref: ref, inbox_message: origin, cursor: null });
   assert.equal(h.state.messages.changed, true);
   const before = h.calls.length; h.calls.at(-1)!.reject({ code: "stale_cursor" }); await pending;
   assert.equal(h.calls.length, before); assert.equal(h.state.messages.status, "error");
   pending = h.state.refresh(); assert.equal(h.state.selectedThread, null);
   assert.deepEqual(h.calls.at(-1)!.query, { message_ref: origin, vendor_id: "v" });
+  h.calls.at(-1)!.resolve(resolved(true)); await tick();
+  assert.deepEqual(h.calls.at(-1)!.query, { vendor_id: "v", thread_ref: ref, inbox_message: origin, cursor: null });
+  h.calls.at(-1)!.resolve(messages(true)); await pending;
+  assert.equal(h.state.vendor?.vendor_id, "v"); assert.equal(h.state.messages.status, "ready");
+  pending = h.state.refresh();
+  assert.deepEqual(h.calls.at(-1)!.query, { message_ref: origin, vendor_id: "v" });
+  const count = h.calls.length;
   h.calls.at(-1)!.reject({ code: "stale_selection" }); await pending;
+  assert.equal(h.calls.length, count, "lost explicit choice must not select a fallback");
   assert.equal(h.state.resolution.status, "error");
+  pending = h.state.openInbox(origin, () => true);
+  assert.deepEqual(h.calls.at(-1)!.query, { message_ref: origin, cursor: null }, "reopening clears the previous choice");
+  h.calls.at(-1)!.resolve(chooser([vendor, other], null)); await pending;
   assert.equal(threadBodyDisplay({ state: "not_followed" }).text, null);
   assert.equal(threadBodyStateLabel({ state: "not_followed" }), "Body not stored (thread not followed)");
   for (const field of ["text", "stored_chars", "source_chars", "marker"]) {

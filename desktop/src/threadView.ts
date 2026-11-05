@@ -113,6 +113,7 @@ export class ThreadViewState {
   private mutations = 0;
   private selectionGeneration = 0;
   private inbox: { origin: InboxMessageRef; current: () => boolean } | null = null;
+  // Only a user choice persists; automatic resolution must reconsider the vendor set.
   private inboxVendor: string | undefined;
   private readonly client: ThreadReadClient;
   private readonly notify: () => void;
@@ -153,7 +154,7 @@ export class ThreadViewState {
     return this.refresh();
   }
 
-  async resolveInbox(more = false, choice?: string): Promise<void> {
+  async resolveInbox(more = false): Promise<void> {
     const entry = this.inbox;
     if (!entry || !this.allowed()) return;
     const previous = this.resolution.value;
@@ -168,7 +169,7 @@ export class ThreadViewState {
     }
     const current = () => this.inbox === entry && generation === this.selectionGeneration && this.allowed();
     const cursor = more && previous?.state === "choose_vendor" ? previous.next_cursor : null;
-    const vendor = choice ?? this.inboxVendor;
+    const vendor = this.inboxVendor;
     const load = (cursor: string | null) => {
       const query: ThreadResolveQuery = vendor === undefined
         ? { message_ref: entry.origin, cursor }
@@ -184,7 +185,6 @@ export class ThreadViewState {
     if (resolved?.state !== "resolved") return;
     this.selectedThread = structuredClone(resolved.context.thread);
     this.vendor = resolved.context.kind === "vendor" ? { ...resolved.context.vendor } : null;
-    this.inboxVendor = this.vendor?.vendor_id;
     this.messages.reset();
     this.clearChildren();
     this.notify();
@@ -195,8 +195,9 @@ export class ThreadViewState {
     const choices = this.resolution.value;
     if (!this.inbox || !this.allowed() || choices?.state !== "choose_vendor"
       || !choices.items.some(vendor => vendor.vendor_id === vendorId)) return Promise.resolve();
+    this.inboxVendor = vendorId;
     this.invalidate();
-    return this.resolveInbox(false, vendorId);
+    return this.resolveInbox();
   }
 
   selectVendor(vendor: ThreadVendor): Promise<void> {
