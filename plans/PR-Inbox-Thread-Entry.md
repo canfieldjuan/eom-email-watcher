@@ -2,21 +2,27 @@
 
 Status: **contract proposal prepared for oversight review — awaiting Juan's exact-revision acceptance**.
 Source baseline: `main` at `3ed72aec73672a4334f5fcd949b7c60198d40ef8`.
-Local navigation/filter base: `e39c32d39439481fa19f4b6847d8ec4f4b94c906`.
+Deferred local navigation/filter work: `e39c32d39439481fa19f4b6847d8ec4f4b94c906`;
+it is not a dependency of this Inbox-link implementation.
 
-Juan chose: **“We should connect the full thread first.”** This authorizes this
-contract-first proposal, not acceptance of the API/interaction choices below.
-Juan subsequently instructed “Let’s send it to oversight for review.” That authorizes
-this docs-only review PR. Thread-connection implementation still awaits acceptance;
-merge requires Juan's approval for this PR. No build, package or install is authorized.
-This plan supersedes the message-details-first sequencing proposed in
-[the three-pane plan](PR-Inbox-Three-Pane-Reading.md). Its P1/P2 local implementation
-is preserved; its P3 reader must become thread-first under this proposal.
+Juan chose “We should connect the full thread first” and authorized this review PR.
+Oversight passed the earlier head `1f93855`, then note `2472ea66` relayed two direct
+answers: **“Open its thread too”** for non-vendor Inbox messages, and **“Link first”**
+for sequencing. This revision addresses both before code. It explicitly proposes
+amendments in the referenced thread contract; the old PASS does not cover this head.
+Fresh oversight review and Juan's exact-revision acceptance are required. Merge
+requires his approval for this PR. No build, package or install is authorized.
+
+First connect every valid retained Inbox message to its stored conversation in the
+**current Inbox layout**. The [three-pane design](PR-Inbox-Three-Pane-Reading.md) and
+its unpublished P1/P2 work are a later, separate concern. Their implementation is not
+a prerequisite or an implicit permission granted by acceptance of this contract.
 
 ## Root cause and evidence
 
 An Inbox row is a retained logical message, not a thread selector. The UI currently
-has no safe way to turn that selection into M3's scoped thread plus vendor context.
+has no safe way to turn that selection into M3's scoped conversation, and M3 currently
+requires a vendor even when the selected retained message has no vendor relationship.
 
 | Current owner | Evidence and boundary |
 | --- | --- |
@@ -36,39 +42,44 @@ index/schema change. Do not broaden a query and rely only on client-side filteri
 
 ## Contract owners and intended experience
 
-This plan specifies new read mechanics and entry UX under the existing definitions:
-[D-identity](../docs/THREAD_VIEW_CONTRACT.md#d-identity-message-identity-direction-and-thread-keys),
+This revision explicitly amends
 [D-attribution](../docs/THREAD_VIEW_CONTRACT.md#d-attribution-a-messages-vendor),
+[D-identity](../docs/THREAD_VIEW_CONTRACT.md#d-identity-message-identity-direction-and-thread-keys),
+[D-body](../docs/THREAD_VIEW_CONTRACT.md#d-body-stored-bodies) and
+[D-ops](../docs/THREAD_VIEW_CONTRACT.md#d-ops-operation-classes-and-gating).
+Those definition changes are proposed and marked unaccepted in a separate commit.
 [D-follow](../docs/THREAD_VIEW_CONTRACT.md#d-follow-followed-threads),
 [D-derived](../docs/THREAD_VIEW_CONTRACT.md#d-derived-derived-state-and-invalidation),
-[D-body](../docs/THREAD_VIEW_CONTRACT.md#d-body-stored-bodies),
-[D-ops](../docs/THREAD_VIEW_CONTRACT.md#d-ops-operation-classes-and-gating),
-[D-removal](../docs/THREAD_VIEW_CONTRACT.md#d-removal-deferred-local-deletions), and
-[the accepted M3 plan](PR-Thread-M3-Read-View-CSP.md).
-It does not amend those definitions. Historical acceptance-status paragraphs in
-those documents predate subsequent accepted/merged M3 work; they are not a new gate
-on the already implemented body states. This proposal neither rewrites that history
-nor broadens body eligibility.
+[D-removal](../docs/THREAD_VIEW_CONTRACT.md#d-removal-deferred-local-deletions) and
+[the accepted M3 plan](PR-Thread-M3-Read-View-CSP.md) retain their existing owners.
+The read-context extension and one new explanatory no-text state do not broaden
+capture, body storage, content eligibility, retention or claims.
 
-- Selecting an Inbox message opens the **retained thread** in the reading pane after
-  resolution. It does not first require a message-details-only redesign.
-- “Full thread” means all eligible locally retained logical messages in that one
-  conversation, available through M3 paging. It does not mean recovering uncaptured
-  mail, fetching every body at once, or claiming the provider conversation is complete.
-- The message-list predicates stay in force for that list. The reader explicitly says
-  **“Thread history includes other senders and messages outside these Inbox filters.”**
-  Its account is fixed to the selected row, including when the Inbox shows All accounts.
-- Keep M3's newest-subject heading, oldest-first timeline, history/Sent notices,
-  explicit Load more, copy inventory, body expansion, truncation and no-text states.
-  Do not automatically load every page or expand body text when selecting a row.
-- Mark the originating message when its canonical ID is on a loaded thread page.
-  If it is on a later page, show “Selected message is not on the loaded thread page”
-  with the normal Load more control; do not claim that it is absent from the thread.
-- Existing saved analysis/actions remain available in a clearly labelled secondary
-  **Selected message details** section for the originating Inbox row. They keep their
-  current owners/targets; thread cards do not acquire new automation/action controls.
-  If no eligible vendor thread exists, show that outcome and still offer these details.
-  A summary is never substituted for an email body.
+- Add **Open thread** to each current Inbox row, including non-vendor mail. That
+  explicit action resolves the row and opens a conversation view within Inbox.
+  Existing row expansion, saved analysis and action controls remain available unchanged.
+  No row is automatically opened or acted on.
+- While the thread is open, its region replaces the Inbox columns without destroying
+  their query/list/scroll state. **Back to Inbox** restores that state and returns
+  focus to the originating row's Open thread control, or the list heading if it is
+  no longer present. This uses the current layout, not a new three-pane reader.
+- A vendor conversation shows the selected vendor and its owned/linked relation,
+  including the owner when linked. A non-vendor conversation is labelled **“No vendor
+  associated”**; it has no invented vendor or owner. Both show their exact retained
+  account/mailbox context and current thread subject.
+- The thread contains the eligible locally retained messages, available through M3
+  paging. Keep the history/coverage notice; do not fetch uncaptured provider history,
+  load all pages automatically or expand all bodies on entry.
+- Inbox predicates continue to filter its message list, not the opened timeline.
+  Say **“Thread history includes other senders and messages outside these Inbox
+  filters.”** All-accounts Inbox entry still binds to the selected row's exact account.
+- Keep the current newest-subject heading, oldest-first timeline, explicit Load more,
+  copy inventory, body expansion, truncation, Sent notice and applicable no-text states.
+  Mark the originating canonical message when its page is loaded. If not yet on a
+  loaded thread page, say so; do not claim it is absent from the conversation.
+- Saved analysis remains saved analysis, accessible through the existing Inbox row;
+  it is never substituted for an email body. Thread cards gain no new action/automation
+  controls. Reading a non-vendor conversation does not start watching/following it.
 
 ## R1 — a complete Inbox message reference
 
@@ -100,7 +111,7 @@ A null identity matches only the currently unresolved effective-identity bucket.
 If continuity becomes proven after the Inbox page was read, resolution requires
 refreshing the Inbox reference. A known identity is never downgraded to null.
 
-## R2 — one local resolver and explicit vendor choice
+## R2 — one local resolver for both conversation contexts
 
 Propose engine operation `threads.resolve` and host command `threads_resolve`:
 
@@ -119,7 +130,7 @@ cursor is bound to the same reference/limit and the complete candidate projectio
 Malformed or wrong-selector cursors return `invalid_request`; changed candidate
 scope/ownership/names return `stale_cursor` and restart the chooser once visibly.
 Validate a non-null cursor before returning any alternative state, including when
-an earlier multi-vendor result has become a single candidate.
+an earlier multi-vendor result has become one or zero candidates.
 
 In one query-only SQLite snapshot, the resolver:
 
@@ -127,8 +138,10 @@ In one query-only SQLite snapshot, the resolver:
    compares its effective identity, with null-safe equality, to the supplied one.
 2. Derives its current complete thread key/scope and logical membership using the
    existing owners. Resolved IMAP aliases must stay within provider/account/identity.
-3. Derives eligible vendor contexts from current visible message attribution in that
-   thread and the existing follow owner. The seed itself may be unattributed.
+3. Derives the represented vendor set and current follow owner from visible thread
+   members. A zero-vendor set is a valid non-vendor conversation, not unavailability.
+   The originating message need not itself have an attribution. Missing/inconsistent
+   derived data must fail rather than impersonate an empty vendor set.
 4. Returns metadata only, from that same snapshot. No bodies, saved summaries,
    attachment inventory, provider/model calls, reconciliation, repair or migration.
 
@@ -136,9 +149,24 @@ The response is a strict tagged union (required fields, no mixed alternatives):
 
 | State | Fields in addition to `state` | Behavior |
 | --- | --- | --- |
-| `resolved` | `message_ref`, `vendor: VendorRef`, `thread: ThreadItem` | One eligible vendor, or a currently valid explicit vendor choice. The existing ThreadItem carries full scope, current subject/count, owner and selected relation. |
-| `choose_vendor` | `message_ref`, `thread_ref`, `owner_vendor`, `items: VendorRef[]`, `next_cursor` | More than one eligible vendor context for the same conversation. Require user choice; do not silently pick the first, owner, or seed's attributed vendor. Label owner versus linked contexts. |
-| `unavailable` | `message_ref`, `reason: "not_vendor_related"` | The canonical message exists but its thread has no current eligible vendor relationship. Say “No vendor-related retained thread is available for this message.” Do not say no conversation exists. |
+| `resolved` | `message_ref`, `context` | Context is the closed vendor/non-vendor union below. |
+| `choose_vendor` | `message_ref`, `thread_ref`, `owner_vendor`, `items: VendorRef[]`, `next_cursor` | Several represented vendors for one conversation. Require an explicit choice with owner/linked labels; never silently auto-pick. |
+
+```ts
+type ResolvedContext =
+  | { kind: "vendor"; vendor: VendorRef; thread: ThreadItem }
+  | { kind: "non_vendor"; thread: NonVendorThreadItem };
+// NonVendorThreadItem has ThreadItem's ref, subject, date and count fields,
+// but relation is exactly "non_vendor" and owner_vendor is required null.
+```
+
+Without an explicit vendor choice, zero represented vendors returns `non_vendor`,
+one returns `vendor`, and several return `choose_vendor`. An explicit `vendor_id`
+returns a vendor context only while that exact vendor remains represented. If it
+has disappeared, return `stale_selection`, even if the set is now empty or has one
+other member. **Remove the former `unavailable/not_vendor_related` alternative.**
+Every current visible canonical Inbox message with valid derived membership can
+open its retained conversation; ordinary absence of a vendor is never a refusal.
 
 Candidate pagination is deterministic by vendor ID byte order, uses the existing
 bounded cursor mechanism (at most 4096 bytes), and binds the resolved reference,
@@ -150,8 +178,9 @@ Errors carry no thread/body data:
 - `invalid_request`: malformed input or forbidden fields, not a broader retry.
 - `not_found`: no visible canonical message in the requested provider/account;
   this includes stale physical-copy IDs and RECORD-excluded rows.
-- `stale_selection`: the visible row's effective identity changed, or an explicitly
-  chosen vendor is no longer eligible. Clear the reader; refresh the Inbox or chooser.
+- `stale_selection`: the visible row's effective identity changed, an explicitly
+  chosen vendor is no longer eligible, or a non-vendor read context gained a vendor.
+  Clear the reader; refresh the Inbox or chooser.
 - Existing sanitized internal error: inconsistent derived membership/ownership or
   contradictory thread mapping. Never silently classify corrupt/missing derived
   data as an ordinary non-vendor message or offer several guessed thread matches.
@@ -173,127 +202,166 @@ are the chooser case; contradictory thread identities are an error, never a choo
 IMAP merges may resolve through the existing alias owner only within exact mailbox
 scope and with the seed still a visible member of the resolved survivor.
 
-Extend `threads.messages`, `threads.body` and both `threads.copies` query forms with
-an optional **`inbox_message: InboxMessageRef`** guard. Absence retains existing
-vendor-entry behavior; an explicitly supplied null/partial/malformed object is
-rejected. Inbox-origin state requires the guard on every request, retry and page.
-No client/host layer may silently strip it or fall back to an unguarded request.
+Extend `threads.messages`, `threads.body` and both `threads.copies` query forms
+with **two strict selector alternatives**, not a nullable vendor bypass:
 
-In the same snapshot as each projection, validate both:
+```ts
+type VendorSelector = {
+  vendor_id: string;
+  thread_ref: ThreadRef;
+  inbox_message?: InboxMessageRef;
+};
+type NonVendorSelector = {
+  inbox_thread: { thread_ref: ThreadRef; message_ref: InboxMessageRef };
+};
+```
 
-- the supplied thread/vendor selector through M3's current owner; and
-- the originating message's current canonical RECORD visibility, exact effective
-  identity and membership in that resolved thread.
+Each operation adds its existing paging/message/copy fields to exactly one selector.
+The `inbox_thread` field discriminates the new alternative. Reject mixed forms,
+unknown fields, partial/null objects and `vendor_id: null`; never infer a non-vendor
+mode from a missing or invalid legacy vendor selector. Existing vendor entry keeps
+its exact request shape. Inbox-origin vendor reads require `inbox_message`; non-vendor
+reads always require the nested message reference. A client/host must never strip
+these fields or retry without the origin.
 
-A body/copy target may be another message in that thread, but still passes M3's own
-canonical membership and operation-specific eligibility checks. Body text additionally
-goes through the existing CONTENT/body-state owner. The origin guard bypasses none
-of these checks and does not redefine saved-copy-summary eligibility. Bind the guard into message/copy/inventory cursor selectors and
-revision inputs; a cursor from a different seed or vendor entry cannot be reused.
+In the same snapshot as each projection, validate:
 
-When origin membership is gone, clear the Inbox reader rather than showing remaining
-thread content through the stale Inbox link. Do not automatically choose another
-seed, vendor, mailbox, alias or new thread. A valid same-scope IMAP survivor is the
-only existing alias behavior retained here. Current ownership/relation metadata
-must come from the new response, not an old resolver card. Invalidated vendor choices
-return to resolution; no automatic substitution of the remaining candidate.
+- complete scope and current thread membership through the shared projection owner;
+- the originating message's canonical RECORD visibility, exact effective identity
+  and membership in that conversation for either Inbox-origin alternative; and
+- the context: a vendor selector still requires that represented vendor; a non-vendor
+  selector requires an empty represented vendor set and no owner.
+
+This factors shared scoped membership without weakening the vendor-only entry point.
+No general unguarded vendor-independent listing API is added. `threads.list` remains
+vendor-scoped. No client-side scan or synthetic vendor is used.
+
+For message responses, `thread` is a closed context union: existing owned/linked
+relations retain their required owner; `relation: "non_vendor"` requires
+`owner_vendor: null`. Scope, current subject and history notice remain required.
+List responses for vendor browsing keep their existing vendor-only types. Resolver
+and message metadata must agree with their validated context; malformed combinations
+fail strict host decoding. No display fallback supplies an owner or a known identity.
+
+A body/copy target may be another message in the validated conversation. It still
+passes the existing canonical membership and operation-specific eligibility owner.
+Body projection follows R4; saved-copy-summary eligibility remains unchanged. Bind
+selector mode, complete origin, context and relevant current classification into
+message/copy/inventory cursor selectors/revisions. Cursors cannot move between
+origins, vendor/non-vendor modes or vendor browsing. Context changes invalidate the
+read/chooser before any old data is returned; retry means resolving afresh, never
+silently substituting a vendor or dropping its guard.
+
+When the origin is gone, clear the Inbox thread view rather than continuing through
+the stale link. Canonical promotion requires a fresh Inbox selection. A recorded
+same-scope IMAP survivor remains the existing allowed alias case, with origin
+membership checked in the survivor. Current owner/relation/subject come from the
+new response. Contradictory scope, alias cycles and missing derived mapping fail closed.
 
 ## R4 — body/removal/security boundaries
 
-No new body state is introduced. The current D-body and `body_state.project` owner
-remain authoritative, including unresolved mailbox identity for unattributed visible
-messages, removal precedence, and explicit no-text alternatives. The existing
-accepted extension is already implemented on the baseline.
+The explicit D-body amendment adds one read state, **`not_followed`**, with label
+**“Body not stored (thread not followed)”** and no text/length/marker payload. It
+explains why a newly readable non-vendor timeline has headers without a stored body.
+It is not a capture/body-storage policy change or a new reconcile task.
 
-A null-identity vendor thread may resolve and display its eligible headers, with
-M3's identity-unavailable notice and no body text. A disconnected retained account
-may still resolve. Neither case borrows the currently active account's identity.
-Non-vendor messages do not become body-eligible by entering this UI.
+The centralized `body_state.project` owner must apply the amended order, using thread
+classification validated inside the read snapshot (never a client-supplied boolean):
 
-RECORD-held delete/clear targets cannot resolve, seed a chooser or authorize a child
-read while their bytes remain. CONTENT-held unfollow cleanup cannot expose held body
-bytes or body-unavailable marker data through a new endpoint. Resolver reads select metadata only; subsequent
-body/copy projections keep their existing owners. Existing eligible saved analysis
-remains distinct from body storage and is never a substitute for inaccessible text.
-No direct messages/body-table shortcut may bypass logical visibility.
+1. RECORD exclusion rejects the target/origin before projection.
+2. Any existing CONTENT exclusion in the logical unit produces `removal_pending`,
+   including unfollow cleanup/refollow cases whose bytes remain physically stored.
+3. An unfollowed conversation produces `not_followed` without reading body bytes or
+   unavailable-marker data, including when its effective identity is unresolved.
+4. A followed conversation with unresolved identity retains
+   `mailbox_identity_unavailable`, also before body/marker access.
+5. Only an eligible followed, identified message uses the existing stored/partial,
+   pending, source-gone or outside-folders projections. Valid stored bodies appear
+   where the current owners permit; physical presence alone never grants visibility.
 
-The operations remain local read class with current startup admission checks, no
-Connect entitlement gate and no provider/model/network side effect. Existing paid
-capture/body-storage rules are unchanged. Preserve M3's production CSP, text-only
-DOM sinks, strict body union, length bounds, escaped copy metadata, and explicit body
-expansion. No HTML, markdown renderer, remote image, attachment download or automatic
-link activation is added. New error logging must not include message text or identifiers.
+The unresolved-identity followed case remains derived from visible attribution,
+not the absence of a follow-cache row (that cache cannot represent a null key).
+No duplicate body-state selector belongs in the resolver, host or renderer. Host and
+UI closed unions must explicitly admit the new state and refuse text on every no-text
+alternative. The already accepted identity-unavailable behavior for unattributed
+members of a vendor-related thread remains intact.
 
-## R5 — entry state, lifecycle and reading-pane integration
+Both conversation contexts show eligible retained headers and existing copy metadata.
+Disconnected accounts still permit local reading. No active-account identity is
+borrowed; no raw bytes are exposed through saved analysis or alternate endpoints.
+Eligible saved summaries keep their distinct existing semantics. A visible no-vendor
+thread with an unexpected residual body still cannot expose it outside the order above.
 
-Use the existing `ThreadReadClient`/`ThreadViewState`/`ThreadViewDom` projection and
-rendering owners, extended for an Inbox origin. Do not call `selectVendor` as a
-shortcut that lists every thread before opening the selected one. Provide a direct
-resolved-entry transition that sets validated vendor, thread and required origin
-guard together, clears child state, then requests that thread's first message page.
+Delete/clear barriers, pending-status persistence and public completed/deferred outcomes
+remain with D-removal. New reads never equate unreadability with completed deletion.
+All new operations are local read class with current startup admission, no entitlement
+gate and no provider/model call. Capture, body storage, retention and claims stay
+unchanged. Preserve production CSP, text-only DOM sinks, explicit body expansion,
+length limits, escaped copy metadata and existing no-text labels. No HTML/markdown
+renderer, remote images, attachment downloads or automatic link activation is added.
+New error logs contain neither message content nor mailbox identifiers.
 
-The Inbox and Vendors may have separate state instances of the same reusable reader.
-Give each DOM instance a stable unique prefix for headings, regions, controls and
-focus keys; hidden vendor controls must not share IDs with the Inbox reader.
-Inbox entry uses Back to messages and its fixed account label, not Back to vendors
-or an account picker that silently changes the guard's scope.
+## R5 — link first in today's Inbox, with shared lifecycle fencing
 
-The Inbox selection owner binds requests to the exact message reference, committed
-query epoch, entry/vendor-choice generation, mailbox-operation revision, and visible
-view. Invalidate before notifying/rendering. A superseded resolver, chooser, message,
-body, copy or inventory response cannot commit data or trigger another read.
+Reuse `ThreadReadClient`, `ThreadViewState` and `ThreadViewDom`. Add a direct resolved
+entry transition that installs context, thread and required origin together, clears
+children and loads the first message page. It must not list every vendor/thread first.
+An active non-vendor entry is an explicit state, not a fake VendorRef: existing
+`vendor !== null` visibility/allowed checks must become mode-aware without enabling
+unselected or suspended readers. Vendor browsing keeps its current behavior.
 
-Preserve the original plan's query/action safeguards, applied to the thread reader:
+Use a separate Inbox-origin instance of the reusable reader with unique DOM prefixes
+for headings, body/copy regions, aria-controls and focus keys. The existing Vendors
+instance remains independent. The Inbox thread region has Back to Inbox and the fixed
+source-account label, not an account picker that can widen its origin. Keep current
+Inbox columns, filters, row expansion/actions, widths and pagination; hide and restore
+them as specified above. No three-pane layout or e39c32d cherry-pick in this step.
 
-- Query commits, exact-sender/account changes, reset, accepted deletion/clear and
-  configuration invalidation clear old reader data immediately. Previous-query rows
-  retained after a failed filter refresh are labelled and cannot open a reader.
-- Load more appends the existing Inbox cursor page and preserves current selection.
-  It does not open a row or restart the thread. Same-query refresh clears child data
-  while revalidating the selected source row; an absent selected ID in the loaded
-  span becomes unavailable, not a claim of deletion or a reason to auto-page.
-- Account/catalog/verified-identity, vendor, watchlist, inbox-span and relevant
-  configuration changes must invalidate/revalidate the Inbox entry as well as the
-  current Vendors reader. Preserve mailbox-operation effect fencing and mutation
-  begin/end nesting. Centralize lifecycle dispatch so one surface cannot be missed.
-- Hiding a view suspends its reads and clears bodies/copies. Returning, focus refresh
-  or retry revalidates the current origin before displaying retained content again.
-- Existing removal holds apply to all reader instances before writes begin. Pending
-  outcomes survive restart through the existing status owner. Late async completions
-  cannot reopen held or removed content.
-- Retain one owner for saved-analysis actions, confirmations, expiry timers, pending
-  decisions and refresh fences. Selection alone performs reads, never an action.
-  Actions in Selected message details remain bound to that row; in-flight completion
-  cannot transfer to another selected row or any other thread member.
+Entry requests bind to the complete source reference, committed query epoch,
+entry/vendor-choice generation, mailbox-operation revision and visible view.
+Invalidate all children before notifying/rendering. Superseded resolver, chooser,
+message, body, copy or inventory responses cannot commit or launch further reads.
 
-Use the accepted direction of three contained panes: searchable watched senders,
-filtered message list, retained-thread reader. Preserve P1/P2 in `e39c32d` and all
-existing filter/account/page-size meanings. The responsive layout still reduces to
-two/one pane with explicit navigation, preserves selection/scroll, exposes Load more,
-and keeps full addresses and controls usable at narrow widths and enlarged text.
+- Scope/query changes, reset, accepted delete/clear and configuration invalidation
+  clear the old thread. Retained previous-query rows cannot open it until current.
+- Existing Inbox Load more preserves state without reopening a thread. Same-query
+  refresh revalidates the source row before refreshing the reader; absence from the
+  current loaded Inbox span is unavailable, not a deletion claim or auto-page trigger.
+- Account/catalog/verified-identity, vendor, watchlist, Inbox-span and relevant
+  configuration changes invalidate both reader instances. Centralize this dispatch
+  and preserve mailbox-effect fencing and nested mutation holds.
+- Hide/Back suspends the Inbox reader and clears bodies/copies; returning via its
+  entry action resolves again. Focus/resume refresh cannot reuse stale origin data.
+- Deletion/clear/unfollow holds invalidate both readers before writes. Durable pending
+  notices stay with their existing owner; late completions cannot reopen content.
+- Existing Inbox action handlers, confirmations, expiry timers, decision refresh and
+  source ownership remain unchanged. Open thread is read-only. A returning action
+  result never applies to another selected row or another thread member.
 
 ## Implementation slices after contract acceptance
 
-1. **Scoped projection/resolver:** add required Inbox reference and Python resolver;
-   document the API, strict unions, candidate paging and errors. Prove scope,
-   canonical visibility, metadata-only reads and removal barriers. No reader UI yet.
-2. **Guarded M3 reads:** add optional origin validation to the shared message/body/copy
-   owners and cursor bindings. Preserve all vendor-entry behavior. Prove deletion,
-   identity changes, promotion, alias and stale-cursor cases before host wiring.
-3. **Typed host/client and entry state:** add strict Rust/TS types, read-class command,
-   complete forwarding, resolver/chooser state and direct guarded entry. Wire every
-   lifecycle/mutation owner to both reader instances. No raw/untyped fallback.
-4. **Thread-first pane:** connect Inbox row selection, vendor chooser, source context,
-   the reused M3 reader and secondary saved-analysis/actions; namespace DOM IDs and
-   preserve action ownership. A successfully resolved row opens a thread here.
-5. **Contained layout and qualification:** finish three/two/one-pane geometry,
-   accessibility, large-history tests and synthetic native proof under production CSP.
+1. **Projection/resolver:** required Inbox reference, Python resolver, zero/one/many
+   vendor context classification, strict unions, candidate paging and API documentation.
+2. **Scoped reads/body state:** shared membership plus strict vendor/non-vendor selector
+   alternatives, per-request origin guard, cursor bindings and the central no-text
+   state/precedence amendment. Prove barrier and identity cases before host wiring.
+3. **Typed host/client and entry state:** strict Rust/TS contracts, local command,
+   complete forwarding, mode-aware resolver/chooser/direct entry and shared lifecycle
+   dispatch for the Vendors and Inbox-origin reader instances.
+4. **Current-Inbox entry:** Open thread on every current row, existing reusable thread
+   region with Back to Inbox, correct vendor/non-vendor labels, preserved row actions,
+   focus/scroll and narrow-window checks. This delivers the link before redesign.
 
-Keep each change reviewable; split a slice further if its diff mixes independent
-owners. Recheck main, worktrees and PR overlap before each implementation branch.
-The prior local navigation commit is a frozen dependency, not a submitted or accepted
-PR. Preserve it or deliberately carry it forward only within later authorized work;
-do not overwrite it or publish it as a side effect of this docs task.
+Run permitted tests in each slice; any build/native qualification requires separate
+authorization under the current no-build rule. Before release/promotion, qualify the
+new native entry under production CSP once that work is authorized; no implicit release.
+
+**Later and separate:** review/accept the three-pane design, then deliberately carry
+forward the frozen navigation/filter work `e39c32d` and implement contained panes.
+That code is unsubmitted and is neither a dependency nor part of PR #343. Do not
+publish or overwrite it through this contract review. Recheck live work, main and
+PR overlap for each small implementation concern. No milestone depends on the later
+redesign to make its shipped link usable.
 
 ## Acceptance tests and evidence
 
@@ -301,14 +369,14 @@ do not overwrite it or publish it as a side effect of this docs task.
 | --- | --- |
 | Inbox projection and strict wire | Every reference field present and row-consistent; explicit null identity succeeds; Python/Rust reject missing/null-object/extra/wrong-type fields. TS types require the reference and forwarding retains invalid runtime fields for host rejection. No legacy provider/account default manufactures a new selector. Older response fails closed. |
 | Account/identity | Same native thread ID and source-message lookalikes across providers/accounts and reused account IDs with distinct mailbox identities stay separate. Test a null legacy bucket beside known identities and null→proven transition. Assert exact returned seed/thread/vendor and both provider/account predicates; removing either filter must fail the tests. |
-| Vendor contexts | Single vendor, multiple linked/owned vendors, unattributed seed, outbound seed, seed's vendor different from owner, no vendor, renamed/deleted vendor. More than 100 candidates page without omission or false uniqueness; changed choices/owner/name stale the chooser cursor. A stale explicit choice never silently falls back. |
+| Vendor/non-vendor contexts | Zero vendors opens a non-vendor conversation, one resolves its vendor, several require choice. Include unattributed/outbound seed, seed's vendor different from owner, rename/delete, and empty→one/many or vendor→empty changes during every read. No null-vendor bypass, synthetic owner or stale-choice fallback. More than 100 candidates page correctly; a cursor from a former chooser cannot become an implicit new context. |
 | Duplicates/aliases | Canonical plus physical/location-only copies appears once; physical-copy input and canonical promotion require refresh; no-Message-ID best-effort remains. IMAP survivor/alias, equal provider keys in another identity, missing/cyclic alias and corrupt derived mapping fail safely or resolve only the correct survivor. |
-| Every child operation | Guard present on message/body/copy/inventory first page, append, retry and stale restart. Forged/wrong-scope/removed seed cannot authorize a valid unrelated thread. Guard-bound cursor cannot move between seeds or into vendor entry. Same-snapshot assertions cover check/projection races. |
-| Removal/body states | Held 33-row logical delete/clear with bytes retained, restart, partial completion, unfollow/refollow and CONTENT-held body; no resolver/body/copy leak. Stored/partial/pending/source-gone/outside-folders/removal-pending/identity-unavailable states remain exact, with no text on no-text branches. Deferred public status remains truthful. |
+| Every child operation | Strict vendor and non-vendor shapes; missing/null/mixed selectors fail. Guard present on message/body/copy/inventory first page, append, retry and stale restart for both contexts. Forged/wrong-scope/removed seed cannot authorize a valid unrelated thread. Guard-bound cursor cannot move between seeds or into vendor entry. Same-snapshot assertions cover check/projection races. |
+| Removal/body states | Held 33-row logical delete/clear with bytes retained, restart, partial completion, unfollow/refollow and CONTENT-held body; no resolver/body/copy leak. Add not-followed alongside the existing states. Assert CONTENT before not-followed before unresolved identity before bytes/markers, including residual body and null identity. Every no-text branch carries no text/length payload; no provider/model or reconcile task is launched. Deferred public status remains truthful. |
 | Request fencing | Resolve A/B in both orders; vendor choice then account/identity change; hidden/resumed views; query change and retained old rows; deletion during resolver/messages/body/copy/inventory reads; alias or vendor change during paging; rejected refresh. No old content, child invocation, focus jump or action transfers to the new selection. |
-| Existing UX/actions | P1/P2 search/committed-vs-draft filters, exact sender, All accounts, missing Active, page sizes, Load more and old error behavior stay intact. Saved actions retain source ownership; selected off-page source is not mislabelled missing. Vendor-reader workflows and IDs remain correct alongside the Inbox instance. |
+| Current Inbox UX/actions | Each retained row has Open thread, including exact-sender/label-admitted non-vendor mail. Existing filter/sender/account/page-size semantics, row expansion/actions and Load more remain unchanged on main, without e39c32d. Back restores query/list/scroll/focus; no action executes on entry. Both reader instances have unique IDs; an off-page thread origin is not mislabelled absent. |
 | Safety/qualification | Fail-first regressions, focused Python/host/TS/DOM suites plus relevant existing M3/removal suites; TypeScript build, Rust formatting/Clippy. Synthetic native IPC with production CSP, hostile subject/body/filename/URL text, two reader instances, offline/inactive entitlement, 220+ senders and >100 messages/copies. No network effect or dependency/schema change. |
-| Layout/accessibility | Wide 1920/1524, 1024, 640×520, 320 CSS px and 200% text/zoom: contained lists/reader, no horizontal page overflow, keyboard scroll/choice/Back, unique aria-controls targets, clear empty/loading/error states, focus return and no query change on resize. |
+| Link accessibility before redesign | Wide 1920/1524, 1024, 640×520, 320 CSS px and 200% text/zoom: usable current Inbox and reused thread region, keyboard Open/choice/Back, no new clipping or horizontal overflow, unique aria-controls, focus return and unchanged query on resize. Prove this on main without the navigation/pane redesign. Full contained three-pane geometry is deferred to its separate plan. |
 
 ## Local conflict check, review gates and audit
 
@@ -318,21 +386,24 @@ the untouched dirty benchmark checkout. The Email Watcher owner was idle after w
 in the separate `local-connect-status` repository. Nothing was paused or altered.
 
 Open PRs #314 (model schema), #311 (admission diagnostic) and #237 (inspection contract
-status) do not overlap these two plan documents. The future host-command slice will
-touch `desktop/src-tauri/src/lib.rs`, also changed by #311; resolve/recheck that overlap
+status) do not overlap these plan documents and the thread contract. The future
+host-command slice will touch `desktop/src-tauri/src/lib.rs`, also changed by #311;
+resolve/recheck that overlap
 before code there. This does not block the local contract proposal.
 
 Required change surface is identified above: Inbox projection/API/types, shared thread
-read owners/cursors, typed host dispatch, reader state/DOM, Inbox lifecycle/layout and
-focused regression/qualification evidence. No capture, retention, vendor matching,
-body normalization/storage, automation policy, schema, dependency or CSP relaxation.
+read and body-state owners/cursors, typed host dispatch, reader state/DOM, current-Inbox
+entry/lifecycle and focused regression/qualification evidence. No capture, retention,
+vendor matching, body normalization/storage, automation policy,
+schema, dependency or CSP relaxation. The proposed no-text read state is explicit.
 No new persistent token, authorization secret or provider call is proposed.
 
 Juan must accept the exact final contract revision before thread-connection code.
 Any separately authorized oversight/connector review is tied to that revision; a
 semantic review fix requires renewed acceptance of the changed contract.
 If oversight finds a definition needs changing, stop and seek authorization for that
-narrow amendment instead of patching around it. This review submission does not authorize a merge. Juan's latest direct instruction
+narrow amendment instead of patching around it. This review submission does not
+authorize a merge. Juan's latest direct instruction
 requires his approval for each PR, in addition to exact-head oversight PASS, connector
 review and all applicable checks. No build, package, install or live app/settings
 change is allowed. Later build/native qualification in the acceptance matrix requires
@@ -341,14 +412,16 @@ separate authorization; contract acceptance alone does not lift that restriction
 The repository's pull-request CI builds installers even for docs. This review-only
 head uses `[skip ci]` to obey the no-build instruction, without changing workflows or
 branch protection. CI is unfulfilled, not green; it is not waived as a merge gate.
-The performed checks are doc scope, relative links/anchors and whitespace. No runtime
-or native-qualification result is claimed.
+The performed checks are doc scope, relative links/anchors, whitespace and the existing
+thread-contract seam test. No runtime or native-qualification result is claimed.
 
-Implementation summary: two plan documents only against main. The unpublished
+Implementation summary: two plan documents plus the explicit thread-contract amendment
+against main. The unpublished
 navigation/filter implementation is preserved on its own local branch and excluded
-from this PR. Existing application code and contract definitions are unchanged. Cold diff audit: this file owns the
-new resolver/guard/entry mechanics, slices and tests; the earlier plan records the
-chosen direction and points here rather than retaining competing sequencing.
+from this PR. Application code is unchanged; only the marked
+D-attribution/D-identity/D-body/D-ops amendment changes definitions. Cold diff audit:
+the amended definitions own read context/scope/body-state rules; this file supplies
+wire mechanics, slices and tests; the three-pane file explicitly defers redesign.
 
 Gap audit: **DONE for the local proposal; NOT DONE for implementation/qualification.**
 Current native behavior is not claimed by this document. Review and Juan's

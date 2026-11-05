@@ -1,6 +1,6 @@
 # Inbox: three panes and contained reading
 
-Status: **thread-first proposal prepared for oversight review; exact-revision acceptance pending**.
+Status: **deferred three-pane design reference — not an Inbox-link prerequisite or implementation authorization**.
 Baseline: `main` at `3ed72aec73672a4334f5fcd949b7c60198d40ef8`.
 Juan requested a searchable watched-sender list, an exact-sender message list with an
 all-senders option, and a selected message or thread in a reading pane.
@@ -9,14 +9,18 @@ On 2026-11-05 Juan said “Let’s get started with our next slice.” This sess
 that as permission for P1/P2, implemented locally at
 `e39c32d39439481fa19f4b6847d8ec4f4b94c906`. It was not an explicit choice of a
 message-details-first reader or exact-revision acceptance of the entire plan.
-Juan subsequently chose **“We should connect the full thread first.”**
-[The Inbox thread-entry proposal](PR-Inbox-Thread-Entry.md) now owns the resolver,
-thread-first reader, proposed API changes, implementation order and acceptance tests.
-P1/P2 stays preserved outside this docs-only PR. Juan subsequently authorized sending
-the plan to oversight. No thread-connection code is authorized before review/acceptance;
-merge requires his approval for this PR. Build, package, install, deployment and live
-app/settings changes remain prohibited. Future build/native qualification needs
-separate authorization.
+Juan subsequently chose “We should connect the full thread first.” Oversight note
+`2472ea66` now relays the more precise sequencing decision: **“Link first.”** It also
+relays **“Open its thread too”** for non-vendor mail. The
+[Inbox-link contract](PR-Inbox-Thread-Entry.md) and its explicit thread-definition
+amendment cover every valid retained Inbox conversation in the current layout first.
+
+**This three-pane plan is deferred.** Its P1/P2 commit stays frozen, unsubmitted and
+outside PR #343's application scope. The Inbox link must work from main without it.
+After that link is reviewed and accepted, this design needs its own later review and
+acceptance before further redesign code. Accepting PR #343 does not authorize the
+three-pane implementation. Merge still needs Juan's approval for each PR; no build,
+package, install, deployment or live app/settings change is authorized.
 
 ## Root cause and current capability
 
@@ -35,7 +39,7 @@ separation of reading from finding, rather than missing exact-sender filtering.
 | `threadReads.ts`, `threadView.ts`, `threadViewDom.ts` | M3 reads retained vendor-related threads with complete scoped identity, oldest-first messages, explicit local body expansion and copy inventory. Entry today is Vendors → View threads. It is not a general reader for arbitrary Inbox rows. |
 | `main.ts`: `loadInboxPage`, `runInboxRefresh`; `inboxReload.ts` | Request generation, query epoch, account-effect checks, coalesced first-page/span refresh and explicit Load more. These remain the data owners. |
 
-## Proposed experience
+## Proposed experience — later, separate redesign
 
 ```text
 Inbox                 [Search subject or summary…] [Search] [Filters]
@@ -102,12 +106,10 @@ signals. Do not invent unread markers, sender totals, thread counts or full-body
 
 ### P3 — message list and one reading pane
 
-**Direction update:** the default reader is the resolved retained thread under
-[the thread-entry contract proposal](PR-Inbox-Thread-Entry.md), with saved analysis
-and existing actions in a secondary Selected message details section. The following
-selection/action safeguards remain requirements, but do not authorize building a
-message-details-only reader first.
-
+**Deferred integration:** once the current-Inbox link exists, reuse its accepted
+vendor/non-vendor entry and shared reader in this pane. This section proposes only
+the later layout/selection changes; it does not move those changes into the link's
+scope or redefine its read selectors and body states.
 - Replace inline multi-card expansion with one selected-thread reading pane. Start
   with “Select a message to view its retained thread”; do not auto-select or invoke an
   action. Selection is an explicit native button action, keyed by the new complete
@@ -173,12 +175,12 @@ message-details-only reader first.
 
 ## Thread integration decision and safety
 
-Juan chose thread connection first. The proposed message-details-first order is
-superseded by [PR-Inbox-Thread-Entry.md](PR-Inbox-Thread-Entry.md). A required scoped
-Inbox message reference, local resolver, explicit vendor-context choice where needed,
-and guarded subsequent M3 reads are proposed there for acceptance before code.
-This does not expand M3 body eligibility or assert complete provider history.
-The existing Vendors thread reader remains available.
+Juan chose the Inbox link before this redesign. The current-layout link and explicit
+vendor-independent extension are defined in
+[PR-Inbox-Thread-Entry.md](PR-Inbox-Thread-Entry.md) and the marked amendments in the
+thread contract. This later pane consumes those accepted owners; it must not implement
+a competing resolver, fake vendor or extra body-state policy. The Vendors reader
+remains available throughout.
 That connection must reuse M3's state/read/render owners rather than build a second
 body reader. Preserve [THREAD_VIEW_CONTRACT](../docs/THREAD_VIEW_CONTRACT.md) D-scope,
 D-identity, D-body, D-ops and D-removal, plus [M3's plan](PR-Thread-M3-Read-View-CSP.md):
@@ -192,17 +194,18 @@ other senders, and must label that distinction rather than silently filter its t
 
 ## Required change surface and explicit non-scope
 
-Current edit: this proposal and the linked thread-entry proposal only. UI owners include:
+Current review edit: two plans and the explicit thread-contract amendment. Later redesign UI owners include:
 `desktop/src/main.ts`, `styles.css`, `inboxSenderNav.ts`, and a small Inbox selection/
 detail-render module if extraction is needed. Move existing detail rendering without
 duplicating action decisions. Preserve `inboxReload.ts`, account/removal/decision owners
 and their semantics. Update the relevant Inbox DOM/state tests and old layout assertions
 only for the expressly accepted layout changes.
 
-P1/P2 remains UI-only. P3 now depends on the Python API, Rust bridge and guarded M3
-read changes specified in the thread-entry proposal. Neither proposal changes schema,
-dependencies, storage, admission, capture, retention, Connect entitlement, automation,
-notification, calendar, watchlist management or M3 body policy. No provider fetch on
+P1/P2 remains UI-only and deferred. P3 later consumes the already reviewed Python,
+Rust and M3 read changes from the current-Inbox link. Its explicit definition amendment
+owns the new no-text read state; this redesign proposes no additional body-policy change.
+Neither work changes schema, dependencies, capture, retention, entitlement, automation,
+notification, calendar or watchlist management. No provider fetch on
 reading, HTML email rendering, reply/compose, bulk action, live mailbox probe, new theme or generalized component rewrite.
 
 Explicit amendments proposed to older UI plans: bounded/searchable sender navigation;
@@ -224,14 +227,15 @@ and focus behavior. All other filter, account, paging and sender semantics are p
   recheck that work before implementing the host slice.
 - The original draft is preserved at `27548b5` in `email-watcher-inbox-plan`.
   The review branch `codex/inbox-thread-entry-review` is in a separate owned worktree,
-  `email-watcher-inbox-thread-review`, based directly on main and containing only these
-  two plan documents. The original plan/navigation branches are unchanged. Recheck
+  `email-watcher-inbox-thread-review`, based directly on main and containing these
+  two plan documents and the explicit thread-contract amendment. The original
+  plan/navigation branches are unchanged. Recheck
   live work, main and overlapping hunks before implementation.
 - The relayed three-pane direction is the visual reference available in this session;
   no claim is made that a pixel comparison against the earlier mockup was performed.
-- Juan chose to connect the full thread first. The remaining review is acceptance of
-  the concrete thread-entry contract; a directional choice is not exact-revision
-  acceptance or authorization to submit a PR.
+- Juan chose a usable Inbox link first, including non-vendor conversations. Review
+  the amended link contract now. This layout remains a separate later concern; the
+  earlier local P1/P2 implementation does not make it a link prerequisite.
 
 ## Verification plan
 
@@ -239,9 +243,11 @@ For this draft: inspect current source/contracts, worktree/PR overlap, Markdown 
 document-only diff and whitespace. No application tests or builds are needed to validate
 an unimplemented design; the following are future acceptance evidence, not claimed results.
 
-P1/P2 is already local. After acceptance of the thread-entry proposal, follow its
-scoped resolver, guarded reads, typed entry state, thread-first pane, and layout/native
-qualification slices. The former message-details-first staging is superseded.
+P1/P2 is already local but deferred. First complete the separately reviewed link in
+main's existing Inbox, with its own tests. Later review/accept this redesign and carry
+forward P1/P2 deliberately, then integrate the existing thread reader into contained
+panes. This table describes future redesign qualification, not acceptance evidence for
+the current-Inbox link.
 
 | Boundary | Required proof before implementation is complete |
 | --- | --- |
@@ -259,16 +265,13 @@ to produce screenshots. Record platform/viewport gaps honestly; do not weaken gu
 
 ## Implementation summary and cold diff audit
 
-This revision updates two local plan documents to Juan's thread-first choice. P1/P2
-code at `e39c32d` is unchanged. The linked proposal owns the resolver, required scoped
-reference, origin guards and thread-first implementation sequence. This document
-preserves layout/filter/action safeguards and removes the competing prior sequence.
-Document-only scope, relative-link/anchor and whitespace checks cover this edit.
+This document remains a later design reference. The current PR instead amends the
+thread definitions and plans the link in today's Inbox. The earlier navigation/filter
+code at `e39c32d` is excluded and unchanged. This update removes its dependency on the
+link's delivery order without altering the proposed filter/layout safeguards.
 
 ## Gap audit
 
-DONE for the local design update; NOT DONE for thread-connection implementation.
-Oversight review and Juan's exact-revision acceptance remain outstanding. This PR
-contains no application code. CI is deliberately not triggered because its workflow
-builds installers; it is not green or waived. No merge, build or installation is
-authorized by this docs-only review submission.
+DONE for recording the deferral; NOT DONE for redesign acceptance/implementation.
+Current-Inbox link acceptance does not authorize further work on these panes. CI is
+not triggered because it builds installers; no merge/build/install is authorized.
