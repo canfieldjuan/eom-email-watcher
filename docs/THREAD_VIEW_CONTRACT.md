@@ -9,6 +9,13 @@ unresolved effective identity. Oversight review and his fresh exact-revision
 acceptance of this extension remain pending; its scope authorization permits no
 implementation of the extension yet.
 
+PR #343 contains a **proposed, not yet accepted** Inbox-entry amendment to
+D-attribution, D-identity, D-body and D-ops. Juan's 2026-11-05 decisions, relayed in
+oversight note `2472ea66`, were “Open its thread too” for non-vendor Inbox mail and
+“Link first” for sequencing. They authorize preparing this amendment, not its
+implementation. Fresh oversight review and Juan's exact-revision acceptance are
+required before code. The installed/accepted vendor-entry behavior remains unchanged.
+
 **How to read and change this contract.**
 
 - Every rule is stated once, in [Definitions](#definitions). Every other section links to the definition it uses.
@@ -92,6 +99,8 @@ Each definition is the only place its rule is stated.
   - the threads it owns ([D-follow](#d-follow-followed-threads));
   - plus, listed as linked, the threads that contain a message attributed to it.
 
+- **Reader context — proposed PR #343 amendment.** Vendor entry retains the represented-vendor requirement above. An Inbox entry may also open a conversation with no currently represented vendor, using only the validated origin selector of [D-identity](#d-identity-message-identity-direction-and-thread-keys). Its context is labelled “No vendor associated”; no synthetic vendor or owner is created. One represented vendor supplies the vendor context; several require an explicit choice with owner/linked labels. A no-vendor context is valid only while the represented set is empty; a change invalidates that context and requires resolution again. This read classification does not assign attribution, follow a thread, expand capture, or change claims/body eligibility.
+
 ### D-scope: in-scope messages and retention
 
 - **Folders.** A message is in scope only while it is in an admitted folder:
@@ -151,6 +160,7 @@ Each definition is the only place its rule is stated.
   - IMAP uses components: messages whose id sets overlap form one component. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list. A message that touches no component forms its own.
   - Which messages share a component does not depend on arrival order. The key does: it is an opaque UUIDv4 handle, allocated when its component is created. No rule may depend on a key's value, only on its members.
   - Every captured message has a thread key, including one whose provider omits a thread id, which forms its own thread.
+- **Inbox-origin read selector — proposed PR #343 amendment.** A current canonical retained message supplies an exact `(provider, account, effective mailbox identity, message_id)` reference. Effective identity uses its stored value or proven legacy continuity; an unresolved null remains a distinct bucket, never a wildcard or a substitute for the active account. Resolution derives the complete thread identity from that visible message. Every resulting read revalidates the origin's canonical visibility, identity and membership in the requested conversation in the same snapshot as its projection. A missing/stale origin, contradictory mapping or out-of-scope alias does not authorize another conversation. The no-vendor context of [D-attribution](#d-attribution-a-messages-vendor) cannot be requested without this origin binding. Canonical promotion requires a refreshed Inbox selection; recorded same-scope IMAP survivor aliases retain the rule below.
 - **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member under the canonical order sorts first, whether or not its members have a `Message-ID`, and it keeps its key. In that transaction:
   - every row naming a merged key is re-keyed, including earlier aliases, and aliases are recorded.
 
@@ -220,12 +230,15 @@ Each definition is the only place its rule is stated.
   - "Body not stored (source no longer available)";
   - "Body not stored (outside the admitted folders)";
   - "Body not stored yet", pending [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass) stage (c).
+  - **Proposed PR #343 addition:** “Body not stored (thread not followed)” for a visible message whose currently resolved thread has no represented vendor under [D-follow](#d-follow-followed-threads). Its wire state is `not_followed`, carrying no text. This explains existing body ineligibility when Inbox opens non-vendor conversations; it neither schedules a fetch nor makes remaining stored bytes eligible.
   - "Body not stored (mailbox identity unavailable)" for every visible message in a vendor-related thread whose effective mailbox identity is unresolved: neither its stored mailbox identity nor proven legacy continuity supplies that identity. The thread must be owned by or linked to the selected vendor under [D-attribution](#d-attribution-a-messages-vendor); the message need not itself be attributed to a vendor. This state carries no body text and is selected before reading retained body or unavailable-marker data, subject to [D-removal](#d-removal-deferred-local-deletions)'s outcome precedence. It does not classify the thread as unfollowed or expand which retained messages are visible. When identity is resolved, the existing body-eligibility rules determine the state again; this read remains in the read class of [D-ops](#d-ops-operation-classes-and-gating).
+
+- **Read-state precedence — proposed PR #343 amendment.** Validate record visibility through [D-removal](#d-removal-deferred-local-deletions) before a body projection. For a visible message, CONTENT exclusion keeps the existing pending-removal outcome first; otherwise an unfollowed thread selects `not_followed`; otherwise unresolved effective identity selects `mailbox_identity_unavailable`; only then may the existing eligible stored-body or unavailable-marker projection run. The two latter no-text branches do not read held body/marker data. A non-vendor message with unresolved identity therefore shows the unfollowed state, while a vendor-related one keeps the accepted identity-unavailable state. The centralized body-state owner applies this order using validated current thread classification, not an untrusted request flag or the absence of a null-identity follow-cache row. Stored text is shown only when its pre-existing eligibility and CONTENT checks permit it, not merely because bytes exist.
 
 ### D-ops: operation classes and gating
 
 - **Every operation belongs to exactly one class.**
-  - **read:** `vendors.list`, and listing threads, messages, bodies, claims, and discrepancies.
+  - **read:** `vendors.list`, and listing threads, messages, bodies, claims, and discrepancies. The proposed PR #343 extension includes resolving an Inbox-origin selector and reading its guarded conversation in either context defined by [D-attribution](#d-attribution-a-messages-vendor).
     - Never gated, and never calls a provider or model.
   - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, body storage, reconcile, and claim extraction.
     - All need the paid entitlement `connect.capability_exchange` (decision D3, `require_connect_entitlement`).
@@ -379,6 +392,7 @@ Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No mi
   - Admission is unchanged.
 - **M2, capture:** [D-capture](#d-capture-what-is-stored-and-its-provenance), [D-follow](#d-follow-followed-threads), [D-derived](#d-derived-derived-state-and-invalidation), [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass), [D-body](#d-body-stored-bodies), and [D-scope](#d-scope-in-scope-messages-and-retention). That includes Sent capture and the purge, with the retention settings copy.
 - **M3, the thread view**, with its CSP and the inbox copy.
+  - Proposed Inbox-link extension: [PR-Inbox-Thread-Entry.md](../plans/PR-Inbox-Thread-Entry.md), using the read definitions above in the current Inbox. The separate three-pane design follows afterward.
 - **M4, [D-claims](#d-claims-claims-and-comparability).** Deploying the extractor makes coverage stale, so retained messages get claim attempts.
 - **M6, invoice claims (decision D5):** the invoice-record source of [D-claims](#d-claims-claims-and-comparability), after M4 and the accepted provider and consumer contracts named in Dependencies.
 - **M5, domains and suggestions:** the domain operations of [D-ops](#d-ops-operation-classes-and-gating), and suggestion candidates under [D-vendor](#d-vendor-vendors-and-vendor_ofaddress).
@@ -622,3 +636,5 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-16 UTC: Juan accepted contract-only amendment `60bf1a1`, relayed verbatim by oversight, "Accept; re-follow keeps (Recommended)". The option text was: "Accept the amendment, with one condition: a thread you re-follow before that first check is left out of the conversion, and its stored bodies stay and show again. Only threads still unfollowed at that moment get scheduled for removal." Current follow state is evaluated under the guard at bootstrap. Before-bootstrap refollow preserves eligible bodies and creates no receipt for them; after-receipt refollow does not cancel the target. The plan requires both proofs before implementation can be complete.
 
 - 2026-10-16 UTC: after the earlier first-entry/refollow acceptance, Juan said, verbatim, "i dont like that gap, can we do better", then answered oversight's migration-time proposal, "send it" (relay #261 issuecomment-6208159519). Migration-transaction conversion supersedes the bootstrap, marker and special before-bootstrap refollow rule of `60bf1a1`/`45eac91`; no bootstrap/marker code was written. The same helper/signed issuer and unchanged physical completion/source-lock owners remain. The contract-only revision must prove migration-exclusive authority, selection and rollback before implementation; a fallback or new user-visible outcome returns to Juan.
+
+- 2026-11-05: proposed PR #343 Inbox-entry amendment, not yet accepted. Oversight note `2472ea66` relays Juan's “Open its thread too” and “Link first” decisions. D-attribution adds an explicit no-vendor read context; D-identity owns its required Inbox-origin binding; D-body adds the no-text `not_followed` projection/precedence while preserving body eligibility; D-ops classifies the new reads. The implementation plan opens conversations in the existing Inbox before the separate three-pane redesign. No application code is included; fresh oversight review and exact-revision acceptance are pending.
