@@ -52,7 +52,7 @@ function mailboxMutationHarness(): MailboxMutationHarness {
      function inboxMutationInFlight() { return false; }
      function setInboxControlsBusy(_busy) {}
      function wakeInboxReload() {}
-     const threadReader = { state: { beginMutation() {}, async endMutation() {} } };
+     const threadHistory = { beginMutation() {}, async endMutation() {} };
      ${executable}
      return {
        run: runMailAccountMutation,

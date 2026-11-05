@@ -1190,6 +1190,7 @@ pub struct InboxAdmission {
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
+    pub thread_entry_ref: InboxMessageRef,
     #[serde(default = "default_mail_provider")]
     pub provider: String,
     #[serde(default = "default_mail_account_id")]
@@ -1271,11 +1272,27 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+// Optional when absent, but an explicitly null guard must not become no guard.
+fn present_nonnull<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+fn present_null<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <()>::deserialize(deserializer)
+}
+
 fn thread_page_limit() -> u16 {
     25
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadRef {
     pub provider: String,
@@ -1283,6 +1300,61 @@ pub struct ThreadRef {
     #[serde(deserialize_with = "present_nullable")]
     pub mailbox_identity_key: Option<String>,
     pub thread_key: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InboxMessageRef {
+    pub provider: String,
+    pub account_id: String,
+    #[serde(deserialize_with = "present_nullable")]
+    pub mailbox_identity_key: Option<String>,
+    pub message_id: String,
+}
+
+impl InboxMessageRef {
+    fn matches_scope(&self, thread: &ThreadRef) -> bool {
+        self.provider == thread.provider
+            && self.account_id == thread.account_id
+            && self.mailbox_identity_key == thread.mailbox_identity_key
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxThreadSelector {
+    pub thread_ref: ThreadRef,
+    pub message_ref: InboxMessageRef,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ThreadResolveQuery {
+    Choice {
+        message_ref: InboxMessageRef,
+        vendor_id: String,
+    },
+    Candidates {
+        message_ref: InboxMessageRef,
+        #[serde(default = "thread_page_limit")]
+        limit: u16,
+        cursor: Option<String>,
+    },
+}
+
+impl ThreadResolveQuery {
+    fn origin(&self) -> &InboxMessageRef {
+        match self {
+            Self::Choice { message_ref, .. } | Self::Candidates { message_ref, .. } => message_ref,
+        }
+    }
+
+    fn vendor(&self) -> Option<&str> {
+        match self {
+            Self::Choice { vendor_id, .. } => Some(vendor_id),
+            Self::Candidates { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1297,15 +1369,39 @@ pub struct ThreadListQuery {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadCopiesQuery {
-    pub vendor_id: String,
-    pub thread_ref: ThreadRef,
-    pub message_id: String,
-    pub copy_ref: Option<String>,
-    #[serde(default = "thread_page_limit")]
-    pub limit: u16,
-    pub cursor: Option<String>,
+#[serde(untagged, deny_unknown_fields)]
+pub enum ThreadCopiesQuery {
+    Vendor {
+        vendor_id: String,
+        thread_ref: ThreadRef,
+        #[serde(
+            default,
+            deserialize_with = "present_nonnull",
+            skip_serializing_if = "Option::is_none"
+        )]
+        inbox_message: Option<InboxMessageRef>,
+        message_id: String,
+        copy_ref: Option<String>,
+        #[serde(default = "thread_page_limit")]
+        limit: u16,
+        cursor: Option<String>,
+    },
+    Inbox {
+        inbox_thread: InboxThreadSelector,
+        message_id: String,
+        copy_ref: Option<String>,
+        #[serde(default = "thread_page_limit")]
+        limit: u16,
+        cursor: Option<String>,
+    },
+}
+
+impl ThreadCopiesQuery {
+    fn inventory(&self) -> bool {
+        match self {
+            Self::Vendor { copy_ref, .. } | Self::Inbox { copy_ref, .. } => copy_ref.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1313,6 +1409,12 @@ pub struct ThreadCopiesQuery {
 pub enum ThreadRelation {
     Owned,
     Linked,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonVendorRelation {
+    NonVendor,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1332,6 +1434,94 @@ pub struct ThreadItem {
     #[serde(deserialize_with = "present_nullable")]
     pub latest_received_at: Option<String>,
     pub message_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NonVendorThreadItem {
+    pub thread_ref: ThreadRef,
+    pub relation: NonVendorRelation,
+    #[serde(deserialize_with = "present_null")]
+    pub owner_vendor: (),
+    pub subject: String,
+    #[serde(deserialize_with = "present_nullable")]
+    pub latest_received_at: Option<String>,
+    pub message_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResolvedThreadContext {
+    Vendor {
+        vendor: ThreadVendor,
+        thread: ThreadItem,
+    },
+    NonVendor {
+        thread: NonVendorThreadItem,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ThreadResolveResult {
+    Resolved {
+        message_ref: InboxMessageRef,
+        context: ResolvedThreadContext,
+    },
+    ChooseVendor {
+        message_ref: InboxMessageRef,
+        thread_ref: ThreadRef,
+        owner_vendor: ThreadVendor,
+        items: Vec<ThreadVendor>,
+        #[serde(deserialize_with = "present_nullable")]
+        next_cursor: Option<String>,
+    },
+}
+
+fn vendor_relation_matches(relation: &ThreadRelation, vendor: &str, owner: &ThreadVendor) -> bool {
+    match relation {
+        ThreadRelation::Owned => vendor == owner.vendor_id,
+        ThreadRelation::Linked => vendor != owner.vendor_id,
+    }
+}
+
+impl ThreadResolveResult {
+    fn valid_for(&self, query: &ThreadResolveQuery) -> bool {
+        match self {
+            Self::Resolved {
+                message_ref,
+                context,
+            } => {
+                message_ref == query.origin()
+                    && match context {
+                        ResolvedThreadContext::Vendor { vendor, thread } => {
+                            message_ref.matches_scope(&thread.thread_ref)
+                                && query
+                                    .vendor()
+                                    .is_none_or(|selected| selected == vendor.vendor_id)
+                                && vendor_relation_matches(
+                                    &thread.relation,
+                                    &vendor.vendor_id,
+                                    &thread.owner_vendor,
+                                )
+                        }
+                        ResolvedThreadContext::NonVendor { thread } => {
+                            query.vendor().is_none()
+                                && message_ref.matches_scope(&thread.thread_ref)
+                        }
+                    }
+            }
+            Self::ChooseVendor {
+                message_ref,
+                thread_ref,
+                ..
+            } => {
+                query.vendor().is_none()
+                    && message_ref == query.origin()
+                    && message_ref.matches_scope(thread_ref)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1382,21 +1572,47 @@ pub enum ThreadCopiesResult {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadMessagesQuery {
-    pub vendor_id: String,
-    pub thread_ref: ThreadRef,
-    #[serde(default = "thread_page_limit")]
-    pub limit: u16,
-    pub cursor: Option<String>,
+#[serde(untagged, deny_unknown_fields)]
+pub enum ThreadMessagesQuery {
+    Vendor {
+        vendor_id: String,
+        thread_ref: ThreadRef,
+        #[serde(
+            default,
+            deserialize_with = "present_nonnull",
+            skip_serializing_if = "Option::is_none"
+        )]
+        inbox_message: Option<InboxMessageRef>,
+        #[serde(default = "thread_page_limit")]
+        limit: u16,
+        cursor: Option<String>,
+    },
+    Inbox {
+        inbox_thread: InboxThreadSelector,
+        #[serde(default = "thread_page_limit")]
+        limit: u16,
+        cursor: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadBodyQuery {
-    pub vendor_id: String,
-    pub thread_ref: ThreadRef,
-    pub message_id: String,
+#[serde(untagged, deny_unknown_fields)]
+pub enum ThreadBodyQuery {
+    Vendor {
+        vendor_id: String,
+        thread_ref: ThreadRef,
+        #[serde(
+            default,
+            deserialize_with = "present_nonnull",
+            skip_serializing_if = "Option::is_none"
+        )]
+        inbox_message: Option<InboxMessageRef>,
+        message_id: String,
+    },
+    Inbox {
+        inbox_thread: InboxThreadSelector,
+        message_id: String,
+    },
 }
 
 // Matches mime.MAX_STORED_BODY_CHARS; counts are Unicode scalar values, not bytes.
@@ -1418,6 +1634,7 @@ pub enum ThreadBodyState {
     OutsideFolders {},
     RemovalPending {},
     MailboxIdentityUnavailable {},
+    NotFollowed {},
 }
 
 impl ThreadBodyState {
@@ -1445,6 +1662,7 @@ pub enum ThreadBody {
     OutsideFolders {},
     RemovalPending {},
     MailboxIdentityUnavailable {},
+    NotFollowed {},
 }
 
 impl ThreadBody {
@@ -1475,13 +1693,40 @@ pub enum ThreadDirection {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadContext {
-    pub thread_ref: ThreadRef,
-    pub relation: ThreadRelation,
-    pub owner_vendor: ThreadVendor,
-    pub subject: String,
-    pub history_notice: String,
+#[serde(untagged, deny_unknown_fields)]
+pub enum ThreadContext {
+    Vendor {
+        thread_ref: ThreadRef,
+        relation: ThreadRelation,
+        owner_vendor: ThreadVendor,
+        subject: String,
+        history_notice: String,
+    },
+    NonVendor {
+        thread_ref: ThreadRef,
+        relation: NonVendorRelation,
+        #[serde(deserialize_with = "present_null")]
+        owner_vendor: (),
+        subject: String,
+        history_notice: String,
+    },
+}
+
+impl ThreadContext {
+    fn valid_for(&self, query: &ThreadMessagesQuery) -> bool {
+        match (self, query) {
+            (
+                Self::Vendor {
+                    relation,
+                    owner_vendor,
+                    ..
+                },
+                ThreadMessagesQuery::Vendor { vendor_id, .. },
+            ) => vendor_relation_matches(relation, vendor_id, owner_vendor),
+            (Self::NonVendor { .. }, ThreadMessagesQuery::Inbox { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2136,7 +2381,7 @@ impl Engine {
     }
 
     pub fn query_inbox(&self, query: InboxQuery) -> Result<InboxPage, EngineError> {
-        self.request(
+        let page: InboxPage = self.request(
             "inbox.query",
             json!({
                 "limit": query.limit,
@@ -2150,7 +2395,19 @@ impl Engine {
                 "status": query.status,
                 "keyword": query.keyword,
             }),
-        )
+        )?;
+        if page.items.iter().any(|item| {
+            item.thread_entry_ref.message_id != item.message_id
+                || item.thread_entry_ref.provider != item.provider
+                || item.thread_entry_ref.account_id != item.account_id
+                || item.thread_entry_ref.message_id.is_empty()
+        }) {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid Inbox origin",
+            ));
+        }
+        Ok(page)
     }
 
     pub fn connect_catalog(&self) -> Result<ConnectCapabilities, EngineError> {
@@ -3227,12 +3484,27 @@ impl Engine {
         self.request("threads.list", json!(query))
     }
 
+    pub fn resolve_thread(
+        &self,
+        query: ThreadResolveQuery,
+    ) -> Result<ThreadResolveResult, EngineError> {
+        let response: ThreadResolveResult = self.request("threads.resolve", json!(query))?;
+        if !response.valid_for(&query) {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid thread resolution",
+            ));
+        }
+        Ok(response)
+    }
+
     pub fn thread_messages(
         &self,
         query: ThreadMessagesQuery,
     ) -> Result<ThreadMessagePage, EngineError> {
         let page: ThreadMessagePage = self.request("threads.messages", json!(query))?;
-        if page.items.iter().any(|item| !item.body_state.valid()) {
+        if !page.thread.valid_for(&query) || page.items.iter().any(|item| !item.body_state.valid())
+        {
             return Err(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine returned invalid body metadata",
@@ -3256,7 +3528,7 @@ impl Engine {
         &self,
         query: ThreadCopiesQuery,
     ) -> Result<ThreadCopiesResult, EngineError> {
-        if query.copy_ref.is_some() {
+        if query.inventory() {
             self.request("threads.copies", json!(query))
                 .map(ThreadCopiesResult::Inventory)
         } else {
@@ -3554,6 +3826,8 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod inbox_thread_tests;
 #[cfg(test)]
 mod thread_reads_tests;
 
@@ -3955,8 +4229,10 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
     }
 
     #[test]
-    fn protocol_v1_inbox_defaults_attachments_from_older_engines() {
+    fn inbox_origin_keeps_optional_attachment_defaults() {
         let item: InboxItem = serde_json::from_value(json!({
+            "thread_entry_ref": {"provider": "gmail", "account_id": "gmail-default",
+                "mailbox_identity_key": null, "message_id": "message-1"},
             "message_id": "message-1",
             "received_at": "2026-08-29T12:00:00+00:00",
             "sender": "sender@example.com",
@@ -3980,7 +4256,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
             "notified_at": null,
             "last_error": null
         }))
-        .expect("protocol-v1 inbox row without attachments must remain valid");
+        .expect("inbox row with required origin and without optional attachments remains valid");
 
         assert!(item.attachments.is_empty());
         assert_eq!(item.calendar_proposal, None);
@@ -3995,6 +4271,8 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
     #[test]
     fn inbox_body_truncation_contract_is_typed() {
         let item: InboxItem = serde_json::from_value(json!({
+            "thread_entry_ref": {"provider": "gmail", "account_id": "gmail-default",
+                "mailbox_identity_key": null, "message_id": "message-1"},
             "message_id": "message-1",
             "received_at": "2026-08-29T12:00:00+00:00",
             "sender": "sender@example.com",
@@ -4067,6 +4345,8 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
     #[test]
     fn inbox_calendar_proposal_contract_is_typed_without_private_identity() {
         let item: InboxItem = serde_json::from_str(r#"{
+            "thread_entry_ref": {"provider": "microsoft365", "account_id": "microsoft365-account",
+                "mailbox_identity_key": null, "message_id": "message-1"},
             "message_id": "message-1",
             "provider": "microsoft365",
             "account_id": "microsoft365-account",
@@ -4147,6 +4427,8 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
                 "graph_event_id": if status == "completed" { Some("created-event") } else { None }
             });
             let item: InboxItem = serde_json::from_value(json!({
+                "thread_entry_ref": {"provider": "gmail", "account_id": "gmail-default",
+                    "mailbox_identity_key": null, "message_id": "message-1"},
                 "message_id": "message-1", "received_at": "2026-09-07T12:00:00+00:00",
                 "sender": "sender@example.com", "subject": "Meeting request",
                 "status": "analyzed", "attempts": 0,

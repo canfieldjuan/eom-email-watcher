@@ -73,9 +73,10 @@ fn thread_reads_requests_preserve_complete_scope_and_defaults() {
         input.as_object_mut().unwrap().remove(key);
     }
     let query: ThreadCopiesQuery = serde_json::from_value(input).unwrap();
-    assert_eq!(query.limit, 25);
-    assert_eq!(query.copy_ref, None);
-    assert_eq!(query.cursor, None);
+    let encoded = serde_json::to_value(query).unwrap();
+    assert_eq!(encoded["limit"], 25);
+    assert_eq!(encoded["copy_ref"], Value::Null);
+    assert_eq!(encoded["cursor"], Value::Null);
 }
 
 #[test]
@@ -161,7 +162,7 @@ fn thread_reads_response_types_reject_silent_shape_loss() {
 }
 
 #[cfg(unix)]
-fn process_fixture(directory: &Path, response: Value) -> Engine {
+pub(super) fn process_fixture(directory: &Path, response: Value) -> Engine {
     let response_path = directory.join("response.json");
     fs::write(&response_path, serde_json::to_vec(&response).unwrap()).unwrap();
     Engine::with_command(
@@ -178,7 +179,7 @@ fn process_fixture(directory: &Path, response: Value) -> Engine {
 }
 
 #[cfg(unix)]
-fn captured_payload(directory: &Path, operation: &str) -> Value {
+pub(super) fn captured_payload(directory: &Path, operation: &str) -> Value {
     let request: Value =
         serde_json::from_slice(&fs::read(directory.join("request.json")).unwrap()).unwrap();
     assert_eq!(request["protocol"], 1);
@@ -324,12 +325,13 @@ fn body_response(body: Value) -> Value {
     json!({"thread_ref": resolved, "message_id": "canonical-message", "body": body})
 }
 
-const UNSTORED_STATES: [&str; 5] = [
+const UNSTORED_STATES: [&str; 6] = [
     "pending",
     "source_gone",
     "outside_folders",
     "removal_pending",
     "mailbox_identity_unavailable",
+    "not_followed",
 ];
 
 #[test]
@@ -357,7 +359,10 @@ fn thread_reads_message_body_responses_reject_silent_shape_loss() {
 fn thread_reads_message_context_requires_a_string_title() {
     let valid = message_page(json!({"state": "pending"}));
     let decoded: ThreadMessagePage = serde_json::from_value(valid.clone()).unwrap();
-    assert_eq!(decoded.thread.subject, "Newest visible subject <literal> β");
+    assert_eq!(
+        serde_json::to_value(decoded.thread).unwrap()["subject"],
+        "Newest visible subject <literal> β"
+    );
     let mut missing = valid.clone();
     missing["thread"].as_object_mut().unwrap().remove("subject");
     assert!(serde_json::from_value::<ThreadMessagePage>(missing).is_err());
@@ -378,8 +383,9 @@ fn thread_reads_message_body_queries_are_closed_and_preserve_scope() {
     input.as_object_mut().unwrap().remove("limit");
     input.as_object_mut().unwrap().remove("cursor");
     let query: ThreadMessagesQuery = serde_json::from_value(input).unwrap();
-    assert_eq!(query.limit, 25);
-    assert_eq!(query.cursor, None);
+    let encoded = serde_json::to_value(query).unwrap();
+    assert_eq!(encoded["limit"], 25);
+    assert_eq!(encoded["cursor"], Value::Null);
     for field in ["vendor_id", "thread_ref", "message_id"] {
         let mut input = body_query();
         input.as_object_mut().unwrap().remove(field);

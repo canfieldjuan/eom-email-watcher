@@ -7,6 +7,18 @@ export interface ThreadRef {
   thread_key: string;
 }
 
+export interface InboxMessageRef {
+  provider: string;
+  account_id: string;
+  mailbox_identity_key: string | null;
+  message_id: string;
+}
+
+export type ThreadSelector =
+  | { vendor_id: string; thread_ref: ThreadRef; inbox_message?: InboxMessageRef; inbox_thread?: never }
+  | { inbox_thread: { thread_ref: ThreadRef; message_ref: InboxMessageRef };
+      vendor_id?: never; thread_ref?: never; inbox_message?: never };
+
 interface ThreadPaging {
   limit?: number;
   cursor?: string | null;
@@ -17,32 +29,22 @@ export type ThreadListQuery = ThreadPaging & { vendor_id: string } & (
   | { provider: string; account_id: string }
 );
 
-interface ThreadMessageSelector extends ThreadPaging {
-  vendor_id: string;
-  thread_ref: ThreadRef;
-  message_id: string;
-}
+type ThreadMessageSelector = ThreadSelector & ThreadPaging & { message_id: string };
 
-export interface ThreadCopyQuery extends ThreadMessageSelector {
-  copy_ref?: null;
-}
+export type ThreadCopyQuery = ThreadMessageSelector & { copy_ref?: null };
 
-export interface ThreadInventoryQuery extends ThreadMessageSelector {
-  copy_ref: string;
-}
+export type ThreadInventoryQuery = ThreadMessageSelector & { copy_ref: string };
 
 export type ThreadCopiesQuery = ThreadCopyQuery | ThreadInventoryQuery;
 
-export interface ThreadMessagesQuery extends ThreadPaging {
-  vendor_id: string;
-  thread_ref: ThreadRef;
-}
+export type ThreadMessagesQuery = ThreadSelector & ThreadPaging;
 
-export interface ThreadBodyQuery {
-  vendor_id: string;
-  thread_ref: ThreadRef;
-  message_id: string;
-}
+export type ThreadBodyQuery = ThreadSelector & { message_id: string };
+
+export type ThreadResolveQuery = { message_ref: InboxMessageRef } & (
+  | { vendor_id: string; limit?: never; cursor?: never }
+  | (ThreadPaging & { vendor_id?: never })
+);
 
 export interface ThreadVendor {
   vendor_id: string;
@@ -57,6 +59,20 @@ export interface ThreadItem {
   latest_received_at: string | null;
   message_count: number;
 }
+
+export type NonVendorThreadItem = Omit<ThreadItem, "relation" | "owner_vendor"> & {
+  relation: "non_vendor";
+  owner_vendor: null;
+};
+
+export type ResolvedThreadContext =
+  | { kind: "vendor"; vendor: ThreadVendor; thread: ThreadItem }
+  | { kind: "non_vendor"; thread: NonVendorThreadItem };
+
+export type ThreadResolveResult =
+  | { state: "resolved"; message_ref: InboxMessageRef; context: ResolvedThreadContext }
+  | { state: "choose_vendor"; message_ref: InboxMessageRef; thread_ref: ThreadRef;
+      owner_vendor: ThreadVendor; items: ThreadVendor[]; next_cursor: string | null };
 
 export interface ThreadPage {
   items: ThreadItem[];
@@ -85,7 +101,7 @@ export interface ThreadCopyPage<Item> {
 }
 
 export interface ThreadUnstoredBody {
-  state: "pending" | "source_gone" | "outside_folders" | "removal_pending" | "mailbox_identity_unavailable";
+  state: "pending" | "source_gone" | "outside_folders" | "removal_pending" | "mailbox_identity_unavailable" | "not_followed";
 }
 
 export interface ThreadStoredBodyState {
@@ -97,13 +113,16 @@ export interface ThreadStoredBodyState {
 export type ThreadBodyState = ThreadStoredBodyState | ThreadUnstoredBody;
 export type ThreadBody = (ThreadStoredBodyState & { text: string }) | ThreadUnstoredBody;
 
-export interface ThreadContext {
+interface ThreadContextMetadata {
   thread_ref: ThreadRef;
-  relation: "owned" | "linked";
-  owner_vendor: ThreadVendor;
   subject: string;
   history_notice: string;
 }
+
+export type ThreadContext = ThreadContextMetadata & (
+  | { relation: "owned" | "linked"; owner_vendor: ThreadVendor }
+  | { relation: "non_vendor"; owner_vendor: null }
+);
 
 export interface ThreadMessage {
   message_id: string;
@@ -141,6 +160,10 @@ export class ThreadReadClient {
 
   list(query: ThreadListQuery): Promise<ThreadPage> {
     return this.invoke<ThreadPage>("threads_list", { query });
+  }
+
+  resolve(query: ThreadResolveQuery): Promise<ThreadResolveResult> {
+    return this.invoke<ThreadResolveResult>("threads_resolve", { query });
   }
 
   messages(query: ThreadMessagesQuery): Promise<ThreadMessagePage> {

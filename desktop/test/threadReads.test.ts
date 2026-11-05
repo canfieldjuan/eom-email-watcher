@@ -141,7 +141,7 @@ test("TypeScript requires complete selectors and closed message/body/copy shapes
     const fixture = join(directory, "contract.ts");
     writeFileSync(fixture, `
 import { ThreadReadClient } from ${JSON.stringify(modulePath)};
-import type { ThreadRef, ThreadListQuery, ThreadCopy, ThreadInventory, ThreadCopyPage, ThreadBody, ThreadBodyState, ThreadMessage, ThreadMessagePage, ThreadBodyResponse, ThreadContext } from ${JSON.stringify(modulePath)};
+import type { ThreadRef, ThreadListQuery, ThreadCopy, ThreadInventory, ThreadCopyPage, ThreadBody, ThreadBodyState, ThreadMessage, ThreadMessagePage, ThreadBodyResponse, ThreadContext, InboxMessageRef, ThreadResolveResult } from ${JSON.stringify(modulePath)};
 declare const client: ThreadReadClient;
 const ref: ThreadRef = { provider: "imap", account_id: "account", mailbox_identity_key: null, thread_key: "thread" };
 const all: ThreadListQuery = { vendor_id: "vendor" };
@@ -195,6 +195,40 @@ const pendingText: ThreadBody = { state: "pending", text: "hidden" };
 const pendingLength: ThreadBodyState = { state: "pending", stored_chars: 0, source_chars: 0 };
 // @ts-expect-error body states are closed
 const unknown: ThreadBody = { state: "unknown" };
+const origin: InboxMessageRef = { provider: "imap", account_id: "retained", mailbox_identity_key: null, message_id: "seed" };
+client.resolve({ message_ref: origin });
+client.resolve({ message_ref: origin, limit: 3, cursor: "page" });
+client.resolve({ message_ref: origin, vendor_id: "choice" });
+const guarded = { ...base, inbox_message: origin };
+client.messages(guarded); client.body(guarded); client.copies(guarded);
+const inbox = { inbox_thread: { thread_ref: ref, message_ref: origin } };
+client.messages(inbox); client.body({ ...inbox, message_id: "target" });
+const inboxCopies: typeof copies = client.copies({ ...inbox, message_id: "target" });
+const inboxInventory: typeof inventory = client.copies({ ...inbox, message_id: "target", copy_ref: "copy" });
+const nonVendor: ThreadContext = { ...context, relation: "non_vendor", owner_vendor: null };
+const notFollowed: ThreadBody = { state: "not_followed" };
+// @ts-expect-error origin identity must be explicit even when null
+const incompleteOrigin: InboxMessageRef = { provider: "imap", account_id: "retained", message_id: "seed" };
+// @ts-expect-error resolver choice never carries paging
+client.resolve({ message_ref: origin, vendor_id: "choice", cursor: null });
+// @ts-expect-error nullable vendor is not an entry mode
+client.resolve({ message_ref: origin, vendor_id: null });
+// @ts-expect-error origin is required
+client.resolve({ vendor_id: "choice" });
+// @ts-expect-error selector forms cannot be mixed
+client.messages({ ...inbox, vendor_id: "vendor", thread_ref: ref });
+// @ts-expect-error nested origin cannot be omitted
+client.body({ inbox_thread: { thread_ref: ref }, message_id: "target" });
+// @ts-expect-error a null origin cannot silently become legacy vendor browsing
+client.copies({ ...base, inbox_message: null });
+// @ts-expect-error non-vendor context never has an owner
+const inventedOwner: ThreadContext = { ...nonVendor, owner_vendor: { vendor_id: "v", display_name: "V" } };
+// @ts-expect-error vendor context requires an owner
+const missingOwner: ThreadContext = { ...context, owner_vendor: null };
+// @ts-expect-error no text is allowed on not_followed
+const residual: ThreadBody = { state: "not_followed", text: "held" };
+// @ts-expect-error a resolved non-vendor context cannot carry a vendor
+const wrongResolution: ThreadResolveResult = { state: "resolved", message_ref: origin, context: { kind: "non_vendor", vendor: { vendor_id: "v", display_name: "V" }, thread: { thread_ref: ref, relation: "non_vendor", owner_vendor: null, subject: "S", latest_received_at: null, message_count: 1 } } };
 declare const message: ThreadMessage;
 const senderName: string | null = message.sender_name;
 const attributed: { vendor_id: string; display_name: string } | null = message.attributed_vendor;

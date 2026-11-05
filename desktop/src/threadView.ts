@@ -1,6 +1,7 @@
 import type {
   ThreadReadClient, ThreadVendor, ThreadRef, ThreadItem, ThreadPage, ThreadMessagePage,
   ThreadBodyResponse, ThreadCopy, ThreadInventory, ThreadCopyPage, ThreadListQuery,
+  InboxMessageRef, NonVendorThreadItem, ThreadResolveResult, ThreadResolveQuery, ThreadSelector,
 } from "./threadReads.ts";
 
 const BODY_LABELS = {
@@ -9,6 +10,7 @@ const BODY_LABELS = {
   outside_folders: "Body not stored (outside the admitted folders)",
   removal_pending: "Body removal pending until the local upgrade completes",
   mailbox_identity_unavailable: "Body not stored (mailbox identity unavailable)",
+  not_followed: "Body not stored (thread not followed)",
 };
 
 export function threadBodyStateLabel(value: unknown): string {
@@ -55,14 +57,16 @@ export class ThreadReadState<T> {
   }
 
   async read(load: () => Promise<T>, notify: () => void, merge?: (old: T, fresh: T) => T,
-    staleRestart?: () => Promise<T>, clearChildren: () => void = () => {}): Promise<void> {
+    staleRestart?: () => Promise<T>, clearChildren: () => void = () => {},
+    selectionCurrent: () => boolean = () => true): Promise<void> {
     if (merge && this.status === "loading") return;
     const previous = merge ? this.value : null;
     const generation = ++this.generation;
-    const current = () => generation === this.generation;
+    const current = () => generation === this.generation && selectionCurrent();
     this.status = "loading";
     if (!merge) { this.value = null; this.changed = false; }
     notify();
+    if (!current()) return;
     try {
       let fresh: T;
       let restarted = false;
@@ -75,6 +79,7 @@ export class ThreadReadState<T> {
         restarted = true;
         clearChildren();
         notify();
+        if (!current()) return;
         fresh = await staleRestart(); // A single restart, using the identical selector.
       }
       if (!current()) return;
@@ -97,7 +102,8 @@ const inventoryKey = (message: string, copy: string) => JSON.stringify([message,
 export class ThreadViewState {
   vendor: ThreadVendor | null = null;
   account: Account = null;
-  selectedThread: ThreadItem | null = null;
+  selectedThread: ThreadItem | NonVendorThreadItem | null = null;
+  readonly resolution = new ThreadReadState<ThreadResolveResult>();
   readonly threads = new ThreadReadState<ThreadPage>();
   readonly messages = new ThreadReadState<ThreadMessagePage>();
   readonly bodies = new Map<string, ThreadReadState<ThreadBodyResponse>>();
@@ -105,6 +111,9 @@ export class ThreadViewState {
   readonly inventory = new Map<string, ThreadReadState<ThreadCopyPage<ThreadInventory>>>();
   private visible = true;
   private mutations = 0;
+  private selectionGeneration = 0;
+  private inbox: { origin: InboxMessageRef; current: () => boolean } | null = null;
+  private inboxVendor: string | undefined;
   private readonly client: ThreadReadClient;
   private readonly notify: () => void;
 
@@ -121,13 +130,78 @@ export class ThreadViewState {
   }
 
   invalidate(): void {
+    this.selectionGeneration += 1;
+    this.resolution.reset();
     this.threads.reset();
     this.messages.reset();
     this.clearChildren();
+    if (this.inbox) { this.vendor = null; this.selectedThread = null; }
     this.notify();
   }
 
+  get inboxOrigin(): InboxMessageRef | null {
+    return this.inbox ? { ...this.inbox.origin } : null;
+  }
+
+  openInbox(origin: InboxMessageRef, current: () => boolean): Promise<void> {
+    this.inbox = { origin: structuredClone(origin), current };
+    this.inboxVendor = undefined;
+    this.vendor = null;
+    this.account = { provider: origin.provider, account_id: origin.account_id };
+    this.selectedThread = null;
+    this.visible = true;
+    return this.refresh();
+  }
+
+  async resolveInbox(more = false, choice?: string): Promise<void> {
+    const entry = this.inbox;
+    if (!entry || !this.allowed()) return;
+    const previous = this.resolution.value;
+    if (more && (previous?.state !== "choose_vendor" || !previous.next_cursor
+      || this.resolution.status === "loading")) return;
+    const generation = ++this.selectionGeneration;
+    if (!more) {
+      this.vendor = null;
+      this.selectedThread = null;
+      this.messages.reset();
+      this.clearChildren();
+    }
+    const current = () => this.inbox === entry && generation === this.selectionGeneration && this.allowed();
+    const cursor = more && previous?.state === "choose_vendor" ? previous.next_cursor : null;
+    const vendor = choice ?? this.inboxVendor;
+    const load = (cursor: string | null) => {
+      const query: ThreadResolveQuery = vendor === undefined
+        ? { message_ref: entry.origin, cursor }
+        : { message_ref: entry.origin, vendor_id: vendor };
+      return this.client.resolve(query);
+    };
+    await this.resolution.read(() => load(cursor), this.notify,
+      more ? (old, fresh) => old.state === "choose_vendor" && fresh.state === "choose_vendor"
+        ? { ...fresh, items: [...old.items, ...fresh.items] } : fresh : undefined,
+      cursor ? () => load(null) : undefined, () => this.clearChildren(), current);
+    if (!current() || this.resolution.status !== "ready") return;
+    const resolved = this.resolution.value;
+    if (resolved?.state !== "resolved") return;
+    this.selectedThread = structuredClone(resolved.context.thread);
+    this.vendor = resolved.context.kind === "vendor" ? { ...resolved.context.vendor } : null;
+    this.inboxVendor = this.vendor?.vendor_id;
+    this.messages.reset();
+    this.clearChildren();
+    this.notify();
+    if (current()) await this.loadMessages();
+  }
+
+  chooseVendor(vendorId: string): Promise<void> {
+    const choices = this.resolution.value;
+    if (!this.inbox || !this.allowed() || choices?.state !== "choose_vendor"
+      || !choices.items.some(vendor => vendor.vendor_id === vendorId)) return Promise.resolve();
+    this.invalidate();
+    return this.resolveInbox(false, vendorId);
+  }
+
   selectVendor(vendor: ThreadVendor): Promise<void> {
+    this.inbox = null;
+    this.inboxVendor = undefined;
     this.vendor = { ...vendor };
     this.account = null;
     this.selectedThread = null;
@@ -136,12 +210,15 @@ export class ThreadViewState {
   }
 
   selectAccount(account: Account): Promise<void> {
+    if (this.inbox) return Promise.resolve();
     this.account = account ? { ...account } : null;
     this.selectedThread = null;
     return this.refresh();
   }
 
   openThread(thread: ThreadItem): Promise<void> {
+    if (this.inbox) return Promise.resolve();
+    this.selectionGeneration += 1;
     this.selectedThread = structuredClone(thread);
     this.threads.reset();
     this.messages.reset();
@@ -151,11 +228,14 @@ export class ThreadViewState {
   }
 
   backToThreads(): Promise<void> {
+    if (this.inbox) { this.close(); return Promise.resolve(); }
     this.selectedThread = null;
     return this.refresh();
   }
 
   close(): void {
+    this.inbox = null;
+    this.inboxVendor = undefined;
     this.vendor = null;
     this.selectedThread = null;
     this.account = null;
@@ -165,27 +245,48 @@ export class ThreadViewState {
   suspend(): void { this.visible = false; this.invalidate(); }
   resume(): Promise<void> { this.visible = true; return this.refresh(); }
   beginMutation(): void { this.mutations += 1; this.invalidate(); }
-  endMutation(): Promise<void> { this.mutations = Math.max(0, this.mutations - 1); return this.refresh(); }
+  endMutation(refresh = true): Promise<void> {
+    this.mutations = Math.max(0, this.mutations - 1);
+    return refresh ? this.refresh() : Promise.resolve();
+  }
 
   refresh(): Promise<void> {
     this.invalidate();
+    if (this.inbox) return this.resolveInbox();
     return this.selectedThread ? this.loadMessages() : this.loadThreads();
   }
 
-  private allowed(): boolean { return this.visible && this.mutations === 0 && this.vendor !== null; }
+  private allowed(): boolean {
+    return this.visible && this.mutations === 0 && (this.inbox ? this.inbox.current() : this.vendor !== null);
+  }
+
+  private guarded<T>(load: () => Promise<T>): Promise<T> {
+    const generation = this.selectionGeneration, entry = this.inbox;
+    if (!entry) return load();
+    return load().catch(error => {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (entry && this.inbox === entry && generation === this.selectionGeneration && this.allowed()
+        && (code === "not_found" || code === "stale_selection")) {
+        this.invalidate();
+        this.resolution.status = "error";
+        this.notify();
+      }
+      throw error;
+    });
+  }
 
   private page<T extends Page>(state: ThreadReadState<T>, more: boolean,
     load: (cursor: string | null) => Promise<T>, clearChildren: () => void = () => {}): Promise<void> {
     if (!this.allowed() || (more && (!state.value?.next_cursor || state.status === "loading"))) return Promise.resolve();
     const cursor = more ? state.value!.next_cursor : null;
     if (!more) clearChildren();
-    return state.read(() => load(cursor), this.notify,
+    return state.read(() => this.guarded(() => load(cursor)), this.notify,
       more ? (old, fresh) => ({ ...fresh, items: [...old.items, ...fresh.items] }) : undefined,
-      cursor ? () => load(null) : undefined, clearChildren);
+      cursor ? () => this.guarded(() => load(null)) : undefined, clearChildren, () => this.allowed());
   }
 
   loadThreads(more = false): Promise<void> {
-    if (!this.vendor) return Promise.resolve();
+    if (!this.vendor || this.inbox) return Promise.resolve();
     const query: ThreadListQuery = this.account
       ? { vendor_id: this.vendor.vendor_id, ...this.account }
       : { vendor_id: this.vendor.vendor_id };
@@ -193,8 +294,9 @@ export class ThreadViewState {
   }
 
   loadMessages(more = false): Promise<void> {
-    if (!this.vendor || !this.selectedThread) return Promise.resolve();
-    const query = { vendor_id: this.vendor.vendor_id, thread_ref: this.selectedThread.thread_ref };
+    if (!this.selectedThread) return Promise.resolve();
+    const query = this.threadSelector(this.selectedThread.thread_ref);
+    if (!query) return Promise.resolve();
     return this.page(this.messages, more, async cursor => {
       const result = await this.client.messages({ ...query, cursor });
       for (const message of result.items) threadBodyStateLabel(message.body_state);
@@ -202,9 +304,21 @@ export class ThreadViewState {
     }, () => this.clearChildren());
   }
 
-  private selector(message_id: string): { vendor_id: string; thread_ref: ThreadRef; message_id: string } | null {
+  private threadSelector(thread_ref: ThreadRef): ThreadSelector | null {
+    if (!this.allowed()) return null;
+    if (this.inbox && this.selectedThread?.relation === "non_vendor") {
+      return { inbox_thread: { thread_ref, message_ref: this.inbox.origin } };
+    }
+    if (!this.vendor) return null;
+    return this.inbox
+      ? { vendor_id: this.vendor.vendor_id, thread_ref, inbox_message: this.inbox.origin }
+      : { vendor_id: this.vendor.vendor_id, thread_ref };
+  }
+
+  private selector(message_id: string): (ThreadSelector & { message_id: string }) | null {
     if (!this.allowed() || !this.messages.value?.items.some(item => item.message_id === message_id)) return null;
-    return { vendor_id: this.vendor!.vendor_id, thread_ref: this.messages.value.thread.thread_ref, message_id };
+    const selector = this.threadSelector(this.messages.value.thread.thread_ref);
+    return selector ? { ...selector, message_id } : null;
   }
 
   openBody(message_id: string): Promise<void> {
@@ -213,11 +327,11 @@ export class ThreadViewState {
     this.bodies.get(message_id)?.reset();
     const state = new ThreadReadState<ThreadBodyResponse>();
     this.bodies.set(message_id, state);
-    return state.read(async () => {
+    return state.read(() => this.guarded(async () => {
       const result = await this.client.body(query);
       threadBodyDisplay(result.body);
       return result;
-    }, this.notify);
+    }), this.notify, undefined, undefined, () => {}, () => this.allowed());
   }
 
   closeBody(message_id: string): void {
