@@ -5932,6 +5932,40 @@ def _thread_ref(value: object) -> thread_reads.ThreadRef:
     return thread_reads.ThreadRef(provider, account_id, identity, key)
 
 
+def _inbox_message_ref(value: object) -> thread_reads.InboxMessageRef:
+    if not isinstance(value, dict) or set(value) != {
+        "provider", "account_id", "mailbox_identity_key", "message_id",
+    }:
+        raise ApiError("invalid_request", "message_ref requires exactly the complete scope")
+    try:
+        provider, account_id = _mail_account_key(value)
+        identity = value["mailbox_identity_key"]
+        if identity is not None:
+            identity = _require_mailbox_identity_key(identity)
+    except (ValueError, ApiError) as error:
+        raise ApiError("invalid_request", str(error)) from error
+    message = value["message_id"]
+    if not isinstance(message, str) or not message:
+        raise ApiError("invalid_request", "message_id must be a non-empty string")
+    return thread_reads.InboxMessageRef(provider, account_id, identity, message)
+
+
+def _threads_resolve(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"message_ref", "vendor_id", "limit", "cursor"})
+    ref = _inbox_message_ref(payload.get("message_ref"))
+    vendor = _vendor_id(payload) if "vendor_id" in payload else None
+    if vendor is not None and {"limit", "cursor"} & payload.keys():
+        raise ApiError("invalid_request", "Explicit vendor choice does not accept paging fields")
+    limit = _bounded_limit(payload, default=25, maximum=100)
+    store = Store(load_config(_config_path(request)).database_file)
+    try:
+        return thread_reads.resolve_inbox(
+            store, ref, vendor_id=vendor, limit=limit, cursor=payload.get("cursor"),
+        )
+    except thread_reads.ThreadReadError as error:
+        raise ApiError(error.code, str(error)) from error
+
+
 def _threads_messages(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"vendor_id", "thread_ref", "limit", "cursor"})
     vendor = _vendor_id(payload)
@@ -6536,6 +6570,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "watchlist.list": _watchlist,
     "watchlist.remove": _watchlist_remove,
     "threads.list": _threads_list,
+    "threads.resolve": _threads_resolve,
     "threads.copies": _threads_copies,
     "threads.body": _threads_body,
     "threads.messages": _threads_messages,

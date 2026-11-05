@@ -14347,6 +14347,10 @@ class Store:
 
     def recent(self, limit: int) -> list[dict[str, object]]:
         items, _ = self.query_inbox(limit=limit)
+        # The legacy recent projection has no thread-entry identity contract.
+        # Keep that shape at its owner; only inbox.query exposes the new selector.
+        for item in items:
+            del item["thread_entry_ref"]
         return items
 
     def query_inbox(
@@ -14409,6 +14413,7 @@ class Store:
         with self.connection() as db:
             rows = db.execute(
                 f"""SELECT message_id, provider, account_id, received_at,
+                {_effective_message_identity_sql("m")} AS thread_entry_identity,
                 sender, sender_name, subject, status,
                 analysis_at, category, priority, summary, action_required, suggested_action,
                 deadline_text, deadline_iso, confidence, attempts, next_retry_at,
@@ -14416,7 +14421,7 @@ class Store:
                 analysis_error_code, analysis_retry_after_seconds,
                 analysis_body_chars, analysis_body_source_chars,
                 admission_kind, admission_selector_id, admission_display_name, admitted_at
-                FROM logical_messages{where}
+                FROM logical_messages AS m{where}
                 ORDER BY received_at DESC, message_id DESC LIMIT ?""",
                 parameters,
             ).fetchall()
@@ -14434,6 +14439,12 @@ class Store:
     ) -> list[dict[str, object]]:
         items = [dict(row) for row in rows]
         for item in items:
+            item["thread_entry_ref"] = {
+                "provider": item["provider"],
+                "account_id": item["account_id"],
+                "mailbox_identity_key": item.pop("thread_entry_identity"),
+                "message_id": item["message_id"],
+            }
             if item["analysis_retryable"] is not None:
                 item["analysis_retryable"] = bool(item["analysis_retryable"])
             body_chars = item.pop("analysis_body_chars")
