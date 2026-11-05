@@ -37,7 +37,7 @@ def project(
     message_id: str,
     *,
     mailbox_identity_key: str | None,
-    thread_followed: bool = True,
+    thread_followed: bool,
     include_text: Literal[True],
 ) -> Body: ...
 
@@ -48,7 +48,7 @@ def project(
     message_id: str,
     *,
     mailbox_identity_key: str | None,
-    thread_followed: bool = True,
+    thread_followed: bool,
     include_text: Literal[False] = False,
 ) -> BodyStatus | StoredBodyMetadata: ...
 
@@ -58,7 +58,7 @@ def project(
     message_id: str,
     *,
     mailbox_identity_key: str | None,
-    thread_followed: bool = True,
+    thread_followed: bool,
     include_text: bool = False,
 ) -> BodyProjection:
     """Project a validated canonical member using its caller's read snapshot.

@@ -100,41 +100,98 @@ def test_each_child_accepts_only_its_current_guarded_context(
 REF = {"provider": "gmail", "account_id": "mailbox", "mailbox_identity_key": KEY,
        "thread_key": "native"}
 VALID_INBOX = {"thread_ref": REF, "message_ref": origin()}
+VALID_VENDOR = "12345678-1234-4234-8234-123456789abc"
 INVALID_SELECTORS = [
-    {}, {"vendor_id": None, "thread_ref": REF},
-    {"vendor_id": "vendor", "thread_ref": REF, "inbox_message": None},
-    {"vendor_id": "vendor", "thread_ref": REF, "inbox_message": {}},
-    {"vendor_id": "vendor", "thread_ref": REF, "inbox_message": origin(extra=True)},
-    {"vendor_id": "vendor", "thread_ref": REF, "inbox_message": origin(message_id="")},
-    {"vendor_id": "vendor", "thread_ref": REF, "inbox_message": origin(message_id=4)},
-    {"inbox_thread": None}, {"inbox_thread": {}}, {"inbox_thread": []},
-    {"inbox_thread": {"thread_ref": REF}},
-    {"inbox_thread": {"message_ref": origin()}},
-    {"inbox_thread": {**VALID_INBOX, "extra": 1}},
-    {"inbox_thread": {**VALID_INBOX, "thread_ref": None}},
-    {"inbox_thread": {**VALID_INBOX, "message_ref": None}},
-    {"inbox_thread": {**VALID_INBOX, "message_ref": origin(account_id=None)}},
-    {"inbox_thread": {**VALID_INBOX, "message_ref": origin(mailbox_identity_key="unknown")}},
-    {"inbox_thread": {**VALID_INBOX, "message_ref": {
+    ({}, "vendor_id must be a canonical UUIDv4 string"),
+    ({"vendor_id": None, "thread_ref": REF}, "vendor_id must be a canonical UUIDv4 string"),
+    *[({"vendor_id": VALID_VENDOR, "thread_ref": REF, "inbox_message": value}, reason)
+      for value, reason in [
+          (None, "message_ref requires exactly the complete scope"),
+          ({}, "message_ref requires exactly the complete scope"),
+          (origin(extra=True), "message_ref requires exactly the complete scope"),
+          (origin(message_id=""), "message_id must be a non-empty string"),
+          (origin(message_id=4), "message_id must be a non-empty string"),
+      ]],
+    *[({"inbox_thread": value}, "inbox_thread requires a thread and message reference")
+      for value in [None, {}, [], {"thread_ref": REF}, {"message_ref": origin()},
+                    {**VALID_INBOX, "extra": 1}]],
+    ({"inbox_thread": {**VALID_INBOX, "thread_ref": None}},
+     "thread_ref requires exactly the complete scope"),
+    ({"inbox_thread": {**VALID_INBOX, "message_ref": None}},
+     "message_ref requires exactly the complete scope"),
+    ({"inbox_thread": {**VALID_INBOX, "message_ref": origin(account_id=None)}},
+     "account_id must be a non-empty string"),
+    ({"inbox_thread": {**VALID_INBOX, "message_ref": origin(mailbox_identity_key="unknown")}},
+     "mailbox identity key must be a lower-case SHA-256 digest"),
+    ({"inbox_thread": {**VALID_INBOX, "message_ref": {
         k: v for k, v in origin().items() if k != "mailbox_identity_key"
-    }}},
-    *[{"inbox_thread": VALID_INBOX, key: value} for key, value in [
-        ("vendor_id", "vendor"), ("vendor_id", None), ("thread_ref", REF),
-        ("inbox_message", origin()), ("inbox_message", None), ("thread_followed", False),
+    }}}, "message_ref requires exactly the complete scope"),
+    *[({"inbox_thread": VALID_INBOX, key: value}, "Thread selectors cannot be mixed")
+      for key, value in [
+        ("vendor_id", VALID_VENDOR), ("vendor_id", None), ("thread_ref", REF),
+        ("inbox_message", origin()), ("inbox_message", None),
     ]],
+    ({"inbox_thread": VALID_INBOX, "thread_followed": False},
+     "Unsupported payload fields: thread_followed"),
 ]
 
 
-@pytest.mark.parametrize("operation,fields", CHILDREN)
-@pytest.mark.parametrize("selector", INVALID_SELECTORS)
-def test_invalid_selector_never_reaches_configuration(monkeypatch, operation, fields, selector):
-    def forbidden(*args, **kwargs):
-        pytest.fail("Malformed selector reached configuration/storage")
+@pytest.fixture
+def selector_admission(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+
+    def forbidden(config_path):
+        assert config_path == path
+        pytest.fail("Selector reached configuration/storage")
 
     monkeypatch.setattr(engine_api, "load_config", forbidden)
-    error(engine_api._response({
-        "protocol": 1, "operation": operation, "payload": {**selector, **fields},
-    }), "invalid_request")
+
+    def call(operation, selector, **fields):
+        return engine_api._response({
+            "protocol": 1, "operation": operation, "config_path": str(path),
+            "payload": {**selector, **fields},
+        })
+
+    return call
+
+
+@pytest.mark.parametrize("operation,fields", CHILDREN)
+@pytest.mark.parametrize("selector,reason", INVALID_SELECTORS)
+def test_invalid_selector_never_reaches_configuration(
+    selector_admission, operation, fields, selector, reason,
+):
+    result = selector_admission(operation, selector, **fields)
+    error(result, "invalid_request")
+    assert result["error"]["message"] == reason
+
+
+@pytest.mark.parametrize("operation,fields", CHILDREN)
+@pytest.mark.parametrize("selector", [
+    {"vendor_id": VALID_VENDOR, "thread_ref": REF},
+    {"vendor_id": VALID_VENDOR, "thread_ref": REF, "inbox_message": origin()},
+    {"inbox_thread": VALID_INBOX},
+])
+def test_valid_selector_reaches_configuration_in_same_admission_harness(
+    selector_admission, operation, fields, selector,
+):
+    with pytest.raises(pytest.fail.Exception, match="Selector reached configuration/storage"):
+        selector_admission(operation, selector, **fields)
+
+
+@pytest.mark.parametrize("identity", [None, KEY])
+@pytest.mark.parametrize("include_text", [False, True])
+def test_body_projection_requires_explicit_thread_classification(
+    tmp_path, monkeypatch, identity, include_text,
+):
+    store, _ = setup_context(tmp_path, vendor=False)
+    forbid_body_reads(store, monkeypatch)
+    with thread_reads.snapshot(store) as db:
+        with pytest.raises(TypeError, match="required keyword-only argument: 'thread_followed'"):
+            body_state.project(db, "m", mailbox_identity_key=identity, include_text=include_text)
+        assert body_state.project(
+            db, "m", mailbox_identity_key=identity,
+            thread_followed=False, include_text=include_text,
+        ) == {"state": "not_followed"}
 
 
 @pytest.mark.parametrize("vendor", [False, True])
