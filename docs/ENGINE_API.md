@@ -74,6 +74,7 @@ envelope without changing its protocol number.
 | `inbox.query` | optional bounded `limit`, opaque `cursor`, mail `provider`/`account_id`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `threads.list` | `vendor_id`; optional paired `provider`/`account_id`, `limit` (1–100), `cursor` | Retained owned/linked logical threads, newest first; no body or summary content |
+| `threads.resolve` | complete `message_ref`; optional `vendor_id` **or** candidate `limit` (1–100)/`cursor` | Resolve a canonical Inbox origin to its retained conversation; zero/one vendor resolves, several require a paged choice |
 | `threads.copies` | `vendor_id`, complete `thread_ref`, canonical `message_id`; optional `copy_ref`, `limit`, `cursor` | Retained physical/location copies with their own saved summaries, or one copy's attachment inventory metadata |
 | `threads.body` | `vendor_id`, complete `thread_ref`, canonical `message_id` | Local stored plain text and lengths, or a text-free body state |
 | `threads.messages` | `vendor_id`, complete `thread_ref`; optional `limit`, `cursor` | Oldest-first logical message headers, attribution, body-state metadata and copy counts |
@@ -300,6 +301,51 @@ returns `stale_cursor`; restart at page one. A wrong selector, malformed/oversiz
 cursor, or absent last tuple returns `invalid_request`. The last page returns
 `next_cursor: null`. Each page rechecks visibility in its own single snapshot.
 
+### Inbox-origin thread resolution
+
+Under the [accepted Inbox-entry plan](../plans/PR-Inbox-Thread-Entry.md),
+`threads.resolve` is a metadata-only local read using the same query-only snapshot
+owner as M3. It never initializes, repairs, reconciles, calls a provider/model, checks
+an entitlement or reads bodies/attachment inventories. Current startup admission still
+applies. A retained disconnected account remains readable.
+
+`message_ref` is a required object containing exactly `provider`, `account_id`,
+`mailbox_identity_key` (string or explicit null) and nonempty `message_id`. Provider,
+account and identity use M3 validation; the message ID is retained exactly, never
+trimmed or case-folded. Null identity selects only the unresolved effective-identity
+bucket, not the active account. Unknown/missing/malformed fields return `invalid_request`.
+
+The canonical RECORD-visible origin determines its complete thread in that snapshot.
+Physical-copy aliases are not accepted as canonical IDs. After canonical promotion,
+refresh the Inbox reference; after an IMAP merge, the current canonical row determines
+the survivor. Missing derived members or contradictory mapping returns a sanitized
+`runtime_error`, never a partial or guessed conversation. A missing/held/wrong-account
+origin returns `not_found`; changed effective identity returns `stale_selection`.
+
+The response is one of two closed alternatives:
+
+- `{state: "resolved", message_ref, context}`. `context` is either
+  `{kind: "vendor", vendor: VendorRef, thread: ThreadItem}`, or
+  `{kind: "non_vendor", thread}`. The latter thread has the same ref/title/date/count
+  fields as `ThreadItem`, but `relation: "non_vendor"` and `owner_vendor: null`.
+  Zero represented vendors resolves the non-vendor context; one resolves its vendor.
+- `{state: "choose_vendor", message_ref, thread_ref, owner_vendor, items, next_cursor}`.
+  Several represented vendors require an explicit choice. `items` contains VendorRefs
+  in vendor-ID byte order, never an implicit first/owner selection.
+
+Optional `vendor_id` revalidates an explicit choice; it cannot be combined with even
+null paging fields. A vendor that is no longer represented returns `stale_selection`
+instead of another vendor or the non-vendor context. Without `vendor_id`, candidate
+`limit` defaults to 25 (integer 1–100, no booleans). Cursors use M3's 4096-byte bound
+and bind origin, limit, resolved thread, current owner and all candidate IDs/names.
+Changed candidates/ownership return `stale_cursor`, even when a former chooser has
+become zero or one vendor. Malformed/wrong-origin/wrong-limit cursors return
+`invalid_request`; validation precedes returning a different response alternative.
+
+This resolver does not authorize an unguarded child read. Guarded vendor/non-vendor
+message/body/copy selectors and host/UI wiring are subsequent implementation slices;
+this slice changes neither existing M3 read selectors nor body eligibility.
+
 ### Local thread messages (M3)
 
 `threads.messages` uses the same query-only, scoped read snapshot and 25/100 page
@@ -456,7 +502,18 @@ a Connect provider. Rows include their mail source, existing category, and order
 attachment and durable capability-result metadata. `inbox.recent` remains available for existing
 CLI and host compatibility.
 
-Each row, from `inbox.query` and from `inbox.recent` (which returns the same projection), also
+Each `inbox.query` row now includes required `thread_entry_ref`, projected from that
+same canonical row: `{provider, account_id, mailbox_identity_key, message_id}`.
+Effective identity is the stored identity or proven legacy continuity; unresolved
+identity is explicit null. It is not inferred from the active account. The nested
+reference agrees with the row's provider/account/message ID. Consumers must preserve
+the complete reference for thread entry, and fail closed if it is absent/malformed.
+This additive engine projection ships with the strict host/client slice before the
+new Inbox entry is released; no stored schema or Inbox filter/paging rule changes.
+The legacy `inbox.recent` projection omits this new reference and preserves its
+existing response shape; it is not a thread-entry source.
+
+Each row, from `inbox.query` and from `inbox.recent`, also
 reports whether its stored analysis read the whole body. Schema v28 stores the
 normalized body length the model received and the normalized length before the `body_char_limit`
 cut, written in the same transaction as the analysis. Rows expose them as `body_analyzed_chars` and

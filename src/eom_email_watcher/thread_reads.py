@@ -39,6 +39,14 @@ class ThreadRef:
     thread_key: str
 
 
+@dataclass(frozen=True)
+class InboxMessageRef:
+    provider: str
+    account_id: str
+    mailbox_identity_key: str | None
+    message_id: str
+
+
 class VendorRef(TypedDict):
     vendor_id: str
     display_name: str
@@ -302,12 +310,18 @@ def _vendors(db) -> dict[str, VendorRef]:
     }
 
 
-def _members(db, provider=None, account_id=None):
+def _members(db, provider=None, account_id=None, *, thread: ThreadRef | None = None):
     condition, parameters = (
         ("", ())
         if provider is None
         else ("WHERE m.provider=? AND m.account_id=?", (provider, account_id))
     )
+    if thread is not None:
+        assert (provider, account_id) == (thread.provider, thread.account_id)
+        condition += (
+            f" AND {_effective_message_identity_sql('m')} IS ? AND m.thread_key=?"
+        )
+        parameters += (thread.mailbox_identity_key, thread.thread_key)
     # logical_messages owns RECORD eligibility, including the whole held unit.
     # Explicit columns keep body bytes and saved summaries out of list reads.
     rows = db.execute(
@@ -325,6 +339,103 @@ def _members(db, provider=None, account_id=None):
         member = _thread_member(db, row, row["vendor_id"])
         grouped[ref].append((row, member))
     return grouped
+
+
+def _inbox_thread(db, origin: InboxMessageRef):
+    """Bind one visible canonical row before deriving its complete conversation."""
+    row = db.execute(
+        f"""SELECT m.thread_key, {_effective_message_identity_sql('m')} AS identity
+        FROM logical_messages m
+        WHERE m.provider=? AND m.account_id=? AND m.message_id=?""",
+        (origin.provider, origin.account_id, origin.message_id),
+    ).fetchone()
+    if row is None:
+        raise ThreadReadError("not_found", "Retained Inbox message was not found")
+    if row["identity"] != origin.mailbox_identity_key:
+        raise ThreadReadError("stale_selection", "Inbox identity changed; refresh the selection")
+    ref = ThreadRef(origin.provider, origin.account_id, row["identity"], row["thread_key"])
+    if not isinstance(ref.thread_key, str) or not ref.thread_key:
+        raise RuntimeError("Retained thread mapping is inconsistent")
+    # D-identity rekeys canonical rows in the merge transaction. An origin still
+    # naming a retired key is inconsistent, not authority to follow another row.
+    if ref.provider == "imap" and db.execute(
+        "SELECT 1 FROM thread_key_aliases WHERE old_key=?", (ref.thread_key,)
+    ).fetchone():
+        raise RuntimeError("Retained thread mapping is inconsistent")
+    expected_ids = {
+        row[0] for row in db.execute(
+            f"""SELECT m.message_id FROM logical_messages m
+            WHERE m.provider=? AND m.account_id=?
+            AND {_effective_message_identity_sql('m')} IS ? AND m.thread_key=?""",
+            (ref.provider, ref.account_id, ref.mailbox_identity_key, ref.thread_key),
+        )
+    }
+    members = _members(db, ref.provider, ref.account_id, thread=ref).get(ref, [])
+    # The ordinary member projection joins derived rows. Missing derived data
+    # must not shrink the conversation or masquerade as a zero-vendor result.
+    if origin.message_id not in expected_ids or expected_ids != {
+        row["message_id"] for row, _ in members
+    }:
+        raise RuntimeError("Retained thread membership is inconsistent")
+    return ref, members
+
+
+def resolve_inbox(
+    store: Store,
+    origin: InboxMessageRef,
+    *,
+    vendor_id: str | None = None,
+    limit: int = 25,
+    cursor: str | None = None,
+) -> dict:
+    """Metadata-only entry; absence of a vendor never makes a valid row unreadable."""
+    with snapshot(store) as db:
+        ref, members = _inbox_thread(db, origin)
+        vendors = _vendors(db)
+        represented = {row["vendor_id"] for row, _ in members} - {None}
+        if not represented <= vendors.keys():
+            raise RuntimeError("Retained thread attribution is inconsistent")
+        candidates = [vendors[key] for key in sorted(represented)]
+        owner = _follow_owner(member for _, member in members)
+        owner_vendor = vendors[owner[2]] if owner is not None else None
+        message_ref = asdict(origin)
+        # Validate even when a previously paged chooser has become zero/one.
+        page = _page(
+            candidates,
+            [(item["vendor_id"],) for item in candidates],
+            selector={"operation": "threads.resolve", "message_ref": message_ref},
+            revision={
+                "thread_ref": asdict(ref), "owner_vendor": owner_vendor,
+                "candidates": candidates,
+            },
+            limit=limit,
+            cursor=cursor,
+        )
+        if vendor_id is not None and vendor_id not in represented:
+            raise ThreadReadError("stale_selection", "Vendor context changed; resolve again")
+        if vendor_id is None and len(candidates) > 1:
+            return {
+                "state": "choose_vendor", "message_ref": message_ref,
+                "thread_ref": asdict(ref), "owner_vendor": owner_vendor, **page,
+            }
+        selected = vendor_id or (candidates[0]["vendor_id"] if candidates else None)
+        subject, order = _thread_title(members)
+        epoch = order[0]
+        thread = {
+            "thread_ref": asdict(ref),
+            "subject": subject,
+            "latest_received_at": datetime.fromtimestamp(epoch, UTC).isoformat()
+            if math.isfinite(epoch) else None,
+            "message_count": len(members),
+            "relation": "non_vendor" if selected is None else (
+                "owned" if owner[2] == selected else "linked"
+            ),
+            "owner_vendor": owner_vendor,
+        }
+        context = {"kind": "non_vendor", "thread": thread} if selected is None else {
+            "kind": "vendor", "vendor": vendors[selected], "thread": thread,
+        }
+        return {"state": "resolved", "message_ref": message_ref, "context": context}
 
 
 def _newest(member):
