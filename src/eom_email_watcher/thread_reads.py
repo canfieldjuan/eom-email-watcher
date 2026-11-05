@@ -47,6 +47,13 @@ class InboxMessageRef:
     message_id: str
 
 
+@dataclass(frozen=True)
+class InboxThreadSelector:
+    """Explicit non-vendor alternative; it can never omit its origin."""
+
+    message_ref: InboxMessageRef
+
+
 class VendorRef(TypedDict):
     vendor_id: str
     display_name: str
@@ -95,8 +102,8 @@ class BodyResponse(TypedDict):
 
 class ThreadContext(TypedDict):
     thread_ref: dict[str, str | None]
-    relation: Literal["owned", "linked"]
-    owner_vendor: VendorRef
+    relation: Literal["owned", "linked", "non_vendor"]
+    owner_vendor: VendorRef | None
     subject: str
     history_notice: str
 
@@ -121,20 +128,24 @@ class MessagePage(TypedDict):
 
 def list_messages(
     store: Store,
-    vendor_id: str,
+    vendor_id: str | InboxThreadSelector,
     requested: ThreadRef,
     *,
+    inbox_message: InboxMessageRef | None = None,
     limit: int = 25,
     cursor: str | None = None,
 ) -> MessagePage:
     with snapshot(store) as db:
-        ref, members, vendors = _selected_thread(db, vendor_id, requested)
+        ref, members, vendors = _selected_thread(
+            db, vendor_id, requested, inbox_message=inbox_message,
+        )
         owner = _follow_owner(member for _, member in members)
-        assert owner is not None  # The selected vendor relationship was validated.
         thread: ThreadContext = {
             "thread_ref": asdict(ref),
-            "relation": "owned" if owner[2] == vendor_id else "linked",
-            "owner_vendor": vendors[owner[2]],
+            "relation": "non_vendor" if owner is None else (
+                "owned" if owner[2] == vendor_id else "linked"
+            ),
+            "owner_vendor": vendors[owner[2]] if owner is not None else None,
             "subject": _thread_title(members)[0],
             "history_notice": HISTORY_NOTICE,
         }
@@ -163,6 +174,7 @@ def list_messages(
                     db,
                     row["message_id"],
                     mailbox_identity_key=ref.mailbox_identity_key,
+                    thread_followed=owner is not None,
                 ),
                 # Match the copy reader's source grouping without selecting saved
                 # summaries or attachment catalogs just to compute this count.
@@ -176,8 +188,7 @@ def list_messages(
             [key for key, _ in projected],
             selector={
                 "operation": "threads.messages",
-                "vendor_id": vendor_id,
-                "thread_ref": asdict(requested),
+                **_read_selector(vendor_id, requested, inbox_message),
             },
             revision={"thread": thread, "messages": projected},
             limit=limit,
@@ -186,9 +197,18 @@ def list_messages(
         return {"thread": thread, **page}
 
 
-def read_body(store: Store, vendor_id: str, requested: ThreadRef, message_id: str) -> BodyResponse:
+def read_body(
+    store: Store,
+    vendor_id: str | InboxThreadSelector,
+    requested: ThreadRef,
+    message_id: str,
+    *,
+    inbox_message: InboxMessageRef | None = None,
+) -> BodyResponse:
     with snapshot(store) as db:
-        ref, members, _ = _selected_thread(db, vendor_id, requested)
+        ref, members, _ = _selected_thread(
+            db, vendor_id, requested, inbox_message=inbox_message,
+        )
         _selected_message(members, message_id)
         return {
             "thread_ref": asdict(ref),
@@ -197,6 +217,7 @@ def read_body(store: Store, vendor_id: str, requested: ThreadRef, message_id: st
                 db,
                 message_id,
                 mailbox_identity_key=ref.mailbox_identity_key,
+                thread_followed=_follow_owner(member for _, member in members) is not None,
                 include_text=True,
             ),
         }
@@ -449,9 +470,7 @@ def _thread_title(members):
     return latest["subject"] or "No subject", order
 
 
-def _selected_thread(db, vendor_id: str, requested: ThreadRef):
-    """Resolve an IMAP alias, then validate complete live scope and relationship."""
-    vendors = _vendors(db)
+def _resolve_thread_ref(db, requested: ThreadRef) -> ThreadRef:
     ref = requested
     if ref.provider == "imap":
         seen = set()
@@ -465,10 +484,61 @@ def _selected_thread(db, vendor_id: str, requested: ThreadRef):
             if alias is None:
                 break
             ref = replace(ref, thread_key=alias[0])
-    members = _members(db, ref.provider, ref.account_id).get(ref, [])
-    if vendor_id not in vendors or not any(row["vendor_id"] == vendor_id for row, _ in members):
-        raise ThreadReadError("not_found", "Retained thread was not found")
+    return ref
+
+
+def _selected_thread(
+    db,
+    vendor_id: str | InboxThreadSelector,
+    requested: ThreadRef,
+    *,
+    inbox_message: InboxMessageRef | None = None,
+):
+    """Resolve and guard current membership inside the projection snapshot."""
+    non_vendor = isinstance(vendor_id, InboxThreadSelector)
+    if non_vendor:
+        if inbox_message is not None:
+            raise ThreadReadError("invalid_request", "Thread selectors cannot be mixed")
+        origin = vendor_id.message_ref
+        if not isinstance(origin, InboxMessageRef):
+            raise ThreadReadError("invalid_request", "A complete Inbox origin is required")
+    else:
+        if not isinstance(vendor_id, str) or not vendor_id:
+            raise ThreadReadError("invalid_request", "A vendor selector is required")
+        origin = inbox_message
+    vendors = _vendors(db)
+    ref = _resolve_thread_ref(db, requested)
+    if origin is not None:
+        origin_ref, members = _inbox_thread(db, origin)
+        if ref != origin_ref:
+            raise ThreadReadError("not_found", "Inbox message is not in the selected thread")
+        represented = {row["vendor_id"] for row, _ in members} - {None}
+        if not represented <= vendors.keys():
+            raise RuntimeError("Retained thread attribution is inconsistent")
+    else:
+        members = _members(db, ref.provider, ref.account_id).get(ref, [])
+        represented = {row["vendor_id"] for row, _ in members} - {None}
+    if non_vendor:
+        if represented:
+            raise ThreadReadError("stale_selection", "Thread context changed; resolve again")
+    elif vendor_id not in vendors or vendor_id not in represented:
+        raise ThreadReadError(
+            "stale_selection" if origin is not None else "not_found",
+            "Vendor context changed; resolve again" if origin is not None
+            else "Retained thread was not found",
+        )
     return ref, members, vendors
+
+
+def _read_selector(vendor_id, requested, inbox_message):
+    if isinstance(vendor_id, InboxThreadSelector):
+        return {"inbox_thread": {
+            "thread_ref": asdict(requested), "message_ref": asdict(vendor_id.message_ref),
+        }}
+    selector = {"vendor_id": vendor_id, "thread_ref": asdict(requested)}
+    if inbox_message is not None:
+        selector["inbox_message"] = asdict(inbox_message)
+    return selector
 
 
 def _selected_message(members, message_id):
@@ -534,17 +604,21 @@ def _copy_projection(db, message_id):
 
 def list_copies(
     store: Store,
-    vendor_id: str,
+    vendor_id: str | InboxThreadSelector,
     thread_ref: ThreadRef,
     message_id: str,
     *,
+    inbox_message: InboxMessageRef | None = None,
     copy_ref: str | None = None,
     limit: int = 25,
     cursor: str | None = None,
 ) -> CopyPage:
     with snapshot(store) as db:
-        ref, members, _ = _selected_thread(db, vendor_id, thread_ref)
+        ref, members, _ = _selected_thread(
+            db, vendor_id, thread_ref, inbox_message=inbox_message,
+        )
         _selected_message(members, message_id)
+        owner = _follow_owner(member for _, member in members)
         copies, inventories = _copy_projection(db, message_id)
         if copy_ref is None:
             rows, keys = copies, [(copy["copy_ref"],) for copy in copies]
@@ -558,15 +632,14 @@ def list_copies(
             keys,
             selector={
                 "operation": "threads.copies",
-                "vendor_id": vendor_id,
-                "thread_ref": asdict(thread_ref),
+                **_read_selector(vendor_id, thread_ref, inbox_message),
                 "message_id": message_id,
                 "copy_ref": copy_ref,
             },
             revision={
                 "resolved_ref": asdict(ref),
                 "relationship": {
-                    "owner": _follow_owner(member for _, member in members)[2],
+                    "owner": owner[2] if owner is not None else None,
                     "attribution": sorted(
                         (row["message_id"], row["vendor_id"]) for row, _ in members
                     ),

@@ -74,7 +74,9 @@ def test_metadata_projection_uses_shared_state_without_selecting_text(tmp_path, 
     ref = selection(store, vendor)
     forbid_body_reads(store, monkeypatch, text_only=True)
     with thread_reads.snapshot(store) as db:
-        assert body_state.project(db, "m", mailbox_identity_key=ref.mailbox_identity_key) == {
+        assert body_state.project(
+            db, "m", mailbox_identity_key=ref.mailbox_identity_key, thread_followed=True,
+        ) == {
             "state": "stored",
             "stored_chars": 12,
             "source_chars": 25,
@@ -125,7 +127,9 @@ def test_unresolved_attributed_and_unattributed_members_never_read_old_bodies_or
     for message in ["m", "unattributed"]:
         assert body(store, vendor, message, ref) == {"state": "mailbox_identity_unavailable"}
         with thread_reads.snapshot(store) as db:
-            assert body_state.project(db, message, mailbox_identity_key=None) == {
+            assert body_state.project(
+                db, message, mailbox_identity_key=None, thread_followed=True,
+            ) == {
                 "state": "mailbox_identity_unavailable"
             }
 
@@ -191,7 +195,7 @@ def test_body_only_barrier_precedes_unresolved_identity(tmp_path, monkeypatch):
     # before the identity branch can supply its text-free state.
     forbid_body_reads(store, monkeypatch)
     with thread_reads.snapshot(store) as db:
-        assert body_state.project(db, "m", mailbox_identity_key=None) == {
+        assert body_state.project(db, "m", mailbox_identity_key=None, thread_followed=True) == {
             "state": "removal_pending"
         }
 
