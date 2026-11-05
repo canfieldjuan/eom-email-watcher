@@ -5966,40 +5966,67 @@ def _threads_resolve(request: dict[str, object]) -> dict[str, object]:
         raise ApiError(error.code, str(error)) from error
 
 
+def _thread_read_selector(payload: dict[str, object]) -> tuple[
+    str | thread_reads.InboxThreadSelector,
+    thread_reads.ThreadRef,
+    thread_reads.InboxMessageRef | None,
+]:
+    if "inbox_thread" in payload:
+        value = payload["inbox_thread"]
+        if {"vendor_id", "thread_ref", "inbox_message"} & payload.keys():
+            raise ApiError("invalid_request", "Thread selectors cannot be mixed")
+        if not isinstance(value, dict) or set(value) != {"thread_ref", "message_ref"}:
+            raise ApiError(
+                "invalid_request", "inbox_thread requires a thread and message reference",
+            )
+        return (
+            thread_reads.InboxThreadSelector(_inbox_message_ref(value["message_ref"])),
+            _thread_ref(value["thread_ref"]),
+            None,
+        )
+    return (
+        _vendor_id(payload),
+        _thread_ref(payload.get("thread_ref")),
+        _inbox_message_ref(payload["inbox_message"]) if "inbox_message" in payload else None,
+    )
+
+
 def _threads_messages(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"vendor_id", "thread_ref", "limit", "cursor"})
-    vendor = _vendor_id(payload)
-    ref = _thread_ref(payload.get("thread_ref"))
+    payload = _payload(request, {
+        "vendor_id", "thread_ref", "inbox_message", "inbox_thread", "limit", "cursor",
+    })
+    vendor, ref, origin = _thread_read_selector(payload)
     limit = _bounded_limit(payload, default=25, maximum=100)
     store = Store(load_config(_config_path(request)).database_file)
     try:
         return thread_reads.list_messages(
-            store, vendor, ref, limit=limit, cursor=payload.get("cursor"),
+            store, vendor, ref, inbox_message=origin, limit=limit, cursor=payload.get("cursor"),
         )
     except thread_reads.ThreadReadError as error:
         raise ApiError(error.code, str(error)) from error
 
 
 def _threads_body(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"vendor_id", "thread_ref", "message_id"})
-    vendor = _vendor_id(payload)
-    ref = _thread_ref(payload.get("thread_ref"))
+    payload = _payload(request, {
+        "vendor_id", "thread_ref", "inbox_message", "inbox_thread", "message_id",
+    })
+    vendor, ref, origin = _thread_read_selector(payload)
     message = payload.get("message_id")
     if not isinstance(message, str) or not message.strip():
         raise ApiError("invalid_request", "message_id must be a non-empty string")
     store = Store(load_config(_config_path(request)).database_file)
     try:
-        return thread_reads.read_body(store, vendor, ref, message)
+        return thread_reads.read_body(store, vendor, ref, message, inbox_message=origin)
     except thread_reads.ThreadReadError as error:
         raise ApiError(error.code, str(error)) from error
 
 
 def _threads_copies(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {
-        "vendor_id", "thread_ref", "message_id", "copy_ref", "limit", "cursor",
+        "vendor_id", "thread_ref", "inbox_message", "inbox_thread",
+        "message_id", "copy_ref", "limit", "cursor",
     })
-    vendor = _vendor_id(payload)
-    ref = _thread_ref(payload.get("thread_ref"))
+    vendor, ref, origin = _thread_read_selector(payload)
     message = payload.get("message_id")
     if not isinstance(message, str) or not message.strip():
         raise ApiError("invalid_request", "message_id must be a non-empty string")
@@ -6010,7 +6037,7 @@ def _threads_copies(request: dict[str, object]) -> dict[str, object]:
     store = Store(load_config(_config_path(request)).database_file)
     try:
         return thread_reads.list_copies(
-            store, vendor, ref, message, copy_ref=copy,
+            store, vendor, ref, message, inbox_message=origin, copy_ref=copy,
             limit=limit, cursor=payload.get("cursor"),
         )
     except thread_reads.ThreadReadError as error:

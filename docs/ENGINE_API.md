@@ -75,9 +75,9 @@ envelope without changing its protocol number.
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `threads.list` | `vendor_id`; optional paired `provider`/`account_id`, `limit` (1–100), `cursor` | Retained owned/linked logical threads, newest first; no body or summary content |
 | `threads.resolve` | complete `message_ref`; optional `vendor_id` **or** candidate `limit` (1–100)/`cursor` | Resolve a canonical Inbox origin to its retained conversation; zero/one vendor resolves, several require a paged choice |
-| `threads.copies` | `vendor_id`, complete `thread_ref`, canonical `message_id`; optional `copy_ref`, `limit`, `cursor` | Retained physical/location copies with their own saved summaries, or one copy's attachment inventory metadata |
-| `threads.body` | `vendor_id`, complete `thread_ref`, canonical `message_id` | Local stored plain text and lengths, or a text-free body state |
-| `threads.messages` | `vendor_id`, complete `thread_ref`; optional `limit`, `cursor` | Oldest-first logical message headers, attribution, body-state metadata and copy counts |
+| `threads.copies` | Thread read selector (below), canonical `message_id`; optional `copy_ref`, `limit`, `cursor` | Retained physical/location copies with their own saved summaries, or one copy's attachment inventory metadata |
+| `threads.body` | Thread read selector (below), canonical `message_id` | Local stored plain text and lengths, or a text-free body state |
+| `threads.messages` | Thread read selector (below); optional `limit`, `cursor` | Oldest-first logical message headers, attribution, body-state metadata and copy counts |
 | `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
 | `inbox.clear` | `{}` | Delete all local inbox messages and message-owned state while preserving mailbox and outbound state |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
@@ -342,17 +342,57 @@ Changed candidates/ownership return `stale_cursor`, even when a former chooser h
 become zero or one vendor. Malformed/wrong-origin/wrong-limit cursors return
 `invalid_request`; validation precedes returning a different response alternative.
 
-This resolver does not authorize an unguarded child read. Guarded vendor/non-vendor
-message/body/copy selectors and host/UI wiring are subsequent implementation slices;
-this slice changes neither existing M3 read selectors nor body eligibility.
+This resolver does not authorize an unguarded child read. Every Inbox-origin child
+request must carry its origin under one of the strict alternatives below. Host/UI
+forwarding and entry wiring remain subsequent implementation slices; capture and
+body storage eligibility are unchanged.
+
+### Guarded thread read selectors
+
+`threads.messages`, `threads.body` and both `threads.copies` forms accept exactly one
+of these selectors, plus the operation's existing message/copy/paging fields:
+
+- Vendor: `{vendor_id, thread_ref, inbox_message?}`. Existing vendor browsing omits
+  `inbox_message`; Inbox-origin vendor reads always include the complete
+  `InboxMessageRef` returned by the Inbox row.
+- Non-vendor: `{inbox_thread: {thread_ref, message_ref}}`. Both nested fields are
+  required. `message_ref` is the complete Inbox origin; `vendor_id`, top-level
+  `thread_ref` and `inbox_message` must be absent, including explicit nulls.
+
+Unknown fields, partial/null nested references, mixed alternatives and null/missing
+vendor IDs in the vendor form return `invalid_request` before configuration access.
+There is no client-supplied follow flag or unguarded non-vendor selector.
+`threads.list` remains vendor-scoped and accepts neither new field.
+
+In the same query-only snapshot as each projection, the origin must still be a
+canonical RECORD-visible message in its exact provider/account/effective-identity
+scope. Its complete current derived membership must equal the requested thread's
+scoped IMAP survivor (or native thread). Missing origins, physical aliases and
+origin/thread mismatches return `not_found`; changed effective identity returns
+`stale_selection`. Missing derived data or contradictory mappings fail closed with
+sanitized `runtime_error`. After canonical promotion, refresh the Inbox reference.
+
+Guarded vendor reads require that exact vendor still be represented; its disappearance
+returns `stale_selection`, never a replacement vendor or non-vendor fallback. A
+non-vendor read requires the represented-vendor set to remain empty; gaining a vendor
+also returns `stale_selection`. Disconnected accounts remain locally readable.
+
+Every message, copy and inventory page repeats these checks. Cursors bind the entire
+selector, including origin and read mode, so they cannot move between two Inbox
+messages in the same thread or between guarded and legacy vendor entry. Context
+invalidation requires resolution again; other changed projections return
+`stale_cursor`, and selector/cursor mismatches return `invalid_request`.
 
 ### Local thread messages (M3)
 
 `threads.messages` uses the same query-only, scoped read snapshot and 25/100 page
 bounds. It returns `{thread, items, next_cursor}`. `thread` contains resolved
-`thread_ref`, `relation` (`owned` or `linked`), `owner_vendor`, required `subject`, and the fixed
+`thread_ref`, `relation` (`owned`, `linked` or `non_vendor`), `owner_vendor`, required
+`subject`, and the fixed
 `history_notice`: "History partial — only locally retained messages are shown".
 It makes no mailbox-completeness or capture claim.
+The non-vendor context has `owner_vendor: null`; vendor contexts retain their
+required current owner. This classification comes from validated visible members.
 
 `thread.subject` is the thread title: the newest visible logical message's
 subject, with the same canonical-source tie-break and "No subject" fallback as
@@ -376,14 +416,14 @@ body-only removal keeps eligible headers and projects `removal_pending`.
 Order is oldest logical received time first (the latest valid observation across
 its copies), then canonical source byte order and canonical ID as a final total
 tie-break. Invalid dates sort last and return null. The bounded versioned keyset
-cursor binds the requested vendor/ref, page limit, operation, resolved ref,
+cursor binds the complete read selector/origin, page limit, operation, resolved ref,
 relationship and ordered returned metadata, including body states and copy counts.
 A changed projection or alias returns `stale_cursor`; selector mismatch or a
 malformed cursor is `invalid_request`. Every page revalidates current membership.
 
 ### Local thread body (M3)
 
-`threads.body` validates the same complete scope, vendor relationship, IMAP alias
+`threads.body` validates the same complete scope, current read context, IMAP alias
 and canonical RECORD-visible message membership as copy reads. It returns
 `{thread_ref, message_id, body}` with the resolved ref, in one query-only SQLite
 snapshot. It never initializes storage, constructs a runtime, gates on Connect,
@@ -393,9 +433,14 @@ fetches mail, or substitutes a summary or another physical copy's body.
 lists. It checks CONTENT eligibility for every row of the logical unit before
 reading stored body or unavailable-marker data. A held body-only removal returns
 `{state: "removal_pending"}`, even after refollow. Delete/clear is already absent
-through RECORD (`not_found`). Next, unresolved effective identity returns
+through RECORD (`not_found`). Next, a validated non-vendor conversation returns
+`{state: "not_followed"}`. Its accepted label is "Body not stored (thread not followed)".
+This precedes unresolved identity and reads neither residual body bytes nor
+unavailable-marker data. It never includes text or length fields. The classification
+comes from visible attribution in the read snapshot, not a client flag or an absent
+follow-cache row. Next, unresolved effective identity in a followed thread returns
 `{state: "mailbox_identity_unavailable"}` for every visible member of the validated
-vendor-related thread, including unattributed members. Neither early state reads
+vendor-related thread, including unattributed members. These early states read no
 body or marker data. Proven legacy continuity uses the normal resolved rules.
 
 For a resolved followed canonical message, stored text returns
@@ -409,14 +454,15 @@ text or inventing another successful state. The helper's metadata-only mode
 does not select the text column.
 
 Unknown payload fields, including paging fields, and invalid selectors return
-`invalid_request`. Missing vendor/thread/canonical-message membership returns
-`not_found`. The view consumes the exact D-body/D-removal labels for these states.
+`invalid_request`. Missing legacy vendor/thread/canonical-message membership returns
+`not_found`; guarded-context changes use the errors above. The view consumes the
+exact D-body/D-removal labels for these states.
 
 ### Local thread copies (M3)
 
 `threads.copies` uses the same ungated, query-only snapshot and paging bounds.
-It rechecks the vendor's owned/linked relationship, complete scope and canonical
-message membership before reading retained summaries or inventory. A physical
+It rechecks the selected vendor/non-vendor context, origin when required, complete
+scope and canonical message membership before reading retained summaries or inventory. A physical
 duplicate ID cannot replace the canonical message ID. Delete/clear targets are
 absent through RECORD; body-only removal does not hide these retained details.
 No body, provider attachment token, local file path or attachment bytes are read
@@ -445,11 +491,11 @@ to their actual stored row's source. A source outside the logical unit is
 `not_found`; it never creates an invented copy.
 
 Copy and inventory cursor selectors are distinct. Revisions include the resolved
-ref, vendor relationship and projected summaries/inventory; changes return `stale_cursor`. Both forms
-remain local metadata reads with no action controls or retrieval.
+ref, context/attribution and projected summaries/inventory; changes return `stale_cursor`.
+Both forms remain local metadata reads with no action controls or retrieval.
 
-The remaining M3 message/body reads and typed desktop forwarding are separate
-implementation slices under the accepted M3 plan.
+Typed desktop forwarding and the current-Inbox entry remain separate implementation
+slices under the accepted Inbox-entry plan.
 
 Schema v30 (thread view M2.1) records, for every captured message, its To and Cc recipients in
 header order and the admitted folders it is in ([D-scope](THREAD_VIEW_CONTRACT.md#d-scope-in-scope-messages-and-retention):

@@ -9,6 +9,7 @@ from .mime import MAX_STORED_BODY_CHARS
 class BodyStatus(TypedDict):
     state: Literal[
         "removal_pending",
+        "not_followed",
         "mailbox_identity_unavailable",
         "pending",
         "source_gone",
@@ -36,6 +37,7 @@ def project(
     message_id: str,
     *,
     mailbox_identity_key: str | None,
+    thread_followed: bool = True,
     include_text: Literal[True],
 ) -> Body: ...
 
@@ -46,6 +48,7 @@ def project(
     message_id: str,
     *,
     mailbox_identity_key: str | None,
+    thread_followed: bool = True,
     include_text: Literal[False] = False,
 ) -> BodyStatus | StoredBodyMetadata: ...
 
@@ -55,14 +58,16 @@ def project(
     message_id: str,
     *,
     mailbox_identity_key: str | None,
+    thread_followed: bool = True,
     include_text: bool = False,
 ) -> BodyProjection:
     """Project a validated canonical member using its caller's read snapshot.
 
-    The caller first validates full thread scope, vendor relationship and RECORD
-    membership. This owner applies CONTENT to the entire logical unit before
-    either stored text or unavailable markers can be read. Lists omit text even
-    from the SQL projection; expansion uses the same state selection.
+    The caller first validates full thread scope, context and RECORD membership.
+    thread_followed comes from visible attribution in that same snapshot, never
+    a wire flag or the nullable-identity follow cache. This owner applies CONTENT
+    to the entire logical unit before follow/identity states and stored data.
+    Lists omit text even from SQL; expansion uses the same state selection.
     """
     from . import removal
     from .db import _followed_message_sql, _logical_unit
@@ -72,6 +77,8 @@ def project(
         raise RuntimeError("Retained body membership is unavailable")
     if any(not removal.CONTENT.message_available(db, row_id) for row_id in unit.rows):
         return {"state": "removal_pending"}
+    if not thread_followed:
+        return {"state": "not_followed"}
     if mailbox_identity_key is None:
         return {"state": "mailbox_identity_unavailable"}
     followed = db.execute(
