@@ -15,7 +15,7 @@ use engine::{
     HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
     NtfyDisclosureStatus, PreparedAutomationRule, ThreadBodyQuery, ThreadBodyResponse,
     ThreadCopiesQuery, ThreadCopiesResult, ThreadListQuery, ThreadMessagePage, ThreadMessagesQuery,
-    ThreadPage, Vendor, VendorDeleted, WatchedSender,
+    ThreadPage, ThreadResolveQuery, ThreadResolveResult, Vendor, VendorDeleted, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -2472,6 +2472,19 @@ async fn watchlist_remove(
 
 // Local thread reads retain the startup admission permit, with no Connect gate.
 #[tauri::command]
+async fn threads_resolve(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    query: ThreadResolveQuery,
+) -> Result<ThreadResolveResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.resolve_thread(query))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn threads_messages(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
@@ -2771,6 +2784,7 @@ pub fn run() {
             threads_list,
             threads_copies,
             threads_messages,
+            threads_resolve,
             threads_body,
             vendors_address_add,
             vendors_address_remove,

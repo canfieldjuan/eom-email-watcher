@@ -4,6 +4,8 @@ import { stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
 import test from "node:test";
 import { parseAst } from "vite";
+import { ThreadHistory } from "../src/threadHistory.ts";
+import type { ThreadViewState } from "../src/threadView.ts";
 
 const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const js = stripTypeScriptTypes(source), ast = parseAst(js);
@@ -13,7 +15,7 @@ function owner(name: string): string {
 }
 const noop = () => {};
 function harness(names: string[]) {
-  const events: string[] = [];
+  const events: string[] = [], inboxEvents: string[] = [];
   const node = () => ({ disabled: false, hidden: false, textContent: "", dataset: {},
     attributes: new Map(), setAttribute(key: string, value: string) { this.attributes.set(key, value); },
     append: noop, prepend: noop, replaceChildren: noop, addEventListener: noop,
@@ -55,10 +57,18 @@ function harness(names: string[]) {
     inboxReload: { running: false, request: async () => { events.push("inbox"); return true; } },
     loadInboxPage: async () => { events.push("append"); return true; },
   });
+  const inbox = {
+    beginMutation: () => inboxEvents.push("begin"), endMutation: async () => { inboxEvents.push("end"); },
+    refresh: async () => { inboxEvents.push("refresh"); }, invalidate: () => inboxEvents.push("invalidate"),
+    suspend: () => inboxEvents.push("suspend"), resume: async () => { inboxEvents.push("resume"); },
+    close: () => inboxEvents.push("close"),
+  };
+  context.inboxThreadState = inbox;
+  context.threadHistory = new ThreadHistory(context.threadReader.state as ThreadViewState, inbox as unknown as ThreadViewState);
   for (const name of ["inboxView", "watchlistView", "vendorsSection", "expiryLedgerView", "healthView", "settingsView",
     "inboxTab", "watchlistTab", "vendorsTab", "expiryLedgerTab", "healthTab", "settingsTab"]) context[name] = node();
   vm.runInContext(names.map(owner).join("\n"), context);
-  return { events, context };
+  return { events, inboxEvents, context };
 }
 
 test("actual delete/clear and check owners clear thread reads before writes and settle on success or error", async () => {
@@ -71,6 +81,7 @@ test("actual delete/clear and check owners clear thread reads before writes and 
       }
       await h.context[name]({ message_id: "m", subject: "Subject" });
       assert.equal(h.events[0], "begin", `${name}: ${h.events}`);
+      assert.deepEqual(h.inboxEvents, ["begin", "end"], name);
       assert.equal(h.events.filter(x => x === "begin").length, 1);
       assert.equal(h.events.filter(x => x === "end").length, 1);
       assert.ok(h.events.indexOf("end") > h.events.indexOf("write"));
@@ -104,9 +115,11 @@ test("history refresh observes current scope only and append does not disturb th
 test("actual view lifecycle resumes Vendors and suspends other or unconfigured views", () => {
   const h = harness(["showView"]);
   h.context.showView("vendors"); assert.deepEqual(h.events, ["resume"]);
+  assert.deepEqual(h.inboxEvents, ["suspend"]); h.inboxEvents.length = 0;
   assert.equal(h.context.vendorsSection.hidden, false); assert.equal(h.context.inboxView.hidden, true);
   assert.equal(h.context.vendorsTab.attributes.get("aria-pressed"), "true");
   h.events.length = 0; h.context.showView("inbox"); assert.deepEqual(h.events, ["suspend"]);
+  assert.deepEqual(h.inboxEvents, ["resume"]); h.inboxEvents.length = 0;
   assert.equal(h.context.vendorsSection.hidden, true); assert.equal(h.context.inboxView.hidden, false);
   h.events.length = 0; h.context.configurationReady = false; h.context.showView("vendors");
   assert.deepEqual(h.events, ["suspend"]);
@@ -131,6 +144,30 @@ test("actual span refresh revalidates threads and respects configuration readine
   await h.context.refreshLoadedInboxSpan(); assert.deepEqual(h.events, ["refresh", "inbox"]);
   h.events.length = 0; h.context.configurationReady = false;
   await h.context.refreshLoadedInboxSpan(); assert.deepEqual(h.events, ["inbox"]);
+});
+
+test("actual refresh commits only a complete current span and query changes close the entry before rendering", async () => {
+  for (const mode of ["current", "obsolete", "failed", "span"]) {
+    const h = harness(["runInboxRefresh"]);
+    let pages = 0;
+    h.context.inboxNextCursor = mode === "span" ? "more" : null;
+    h.context.loadInboxPage = async () => {
+      pages += 1;
+      if (pages === 2) { h.context.inboxItems.push({ message_id: "second" }); h.context.inboxNextCursor = null; }
+      return mode !== "failed";
+    };
+    const result = await h.context.runInboxRefresh({ kind: "span", target: 2 }, null, () => mode !== "obsolete");
+    assert.equal(result, mode === "current" || mode === "span");
+    assert.deepEqual(h.inboxEvents, result ? ["refresh"] : [], mode);
+    assert.equal(pages, mode === "span" ? 2 : 1);
+  }
+  const h = harness(["clearInboxPageForAccountChange"]);
+  h.context.renderInbox = () => assert.deepEqual(h.inboxEvents, ["close"]);
+  h.context.clearInboxPageForAccountChange("Changed");
+  assert.equal(h.context.inboxQueryEpoch, 1);
+  assert.deepEqual(h.inboxEvents, ["close"]);
+  const commit = owner("commitInboxQueryFromControls");
+  assert.ok(commit.indexOf("threadHistory.clearInboxSelection()") < commit.indexOf("renderInbox(inboxItems)"));
 });
 
 test("actual vendor reload closes removed selection or updates and refreshes retained selection", async () => {
@@ -160,8 +197,8 @@ test("entry is read class, lifecycle/settings hooks exist, and approved copy pre
   assert.match(source, /window\.addEventListener\("focus", \(\) => \{\s*refreshThreadHistory\(\)/);
   assert.match(source, /document\.visibilityState !== "visible"\) return;\s*refreshThreadHistory\(\)/);
   const settings = source.slice(source.indexOf('settingsForm.addEventListener("submit"'), source.indexOf('gmailLabelCatalogSelect.addEventListener'));
-  assert.ok(settings.indexOf("state.beginMutation()") < settings.indexOf('"settings_update"'));
-  assert.match(settings, /finally \{\s*void threadReader\.state\.endMutation\(\)/);
+  assert.ok(settings.indexOf("threadHistory.beginMutation()") < settings.indexOf('"settings_update"'));
+  assert.match(settings, /finally \{\s*void threadHistory\.endMutation\(\)/);
   assert.ok(source.includes("Locally retained messages from watched senders and Gmail labels appear here. Followed threads and Sent replies to vendors also appear when captured with Connect."));
   assert.ok(source.includes("Watching an address keeps messages from that sender in the Inbox. Vendor records can also capture followed threads and Sent replies while Connect is active."));
   assert.match(source, /aria-label="Recent retained messages"/);

@@ -1,6 +1,8 @@
 import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
-import { ThreadReadClient } from "./threadReads";
+import { ThreadReadClient, type InboxMessageRef } from "./threadReads";
 import { ThreadViewDom } from "./threadViewDom";
+import { ThreadViewState } from "./threadView";
+import { ThreadHistory } from "./threadHistory";
 import { mailboxPendingMessage } from "./mailboxProgress";
 import { confirmAction } from "./confirmation";
 import { calendarOutcomeNotice, latestCalendarOutcome, type CalendarWriteOutcome } from "./calendarOutcome";
@@ -158,6 +160,7 @@ interface RevealedCapabilityOutput {
 
 interface InboxItem {
   message_id: string;
+  thread_entry_ref: InboxMessageRef;
   provider: string;
   account_id: string;
   received_at: string;
@@ -898,8 +901,12 @@ const threadReader = new ThreadViewDom(requiredElement<HTMLElement>("#thread-vie
   },
 });
 
+// Slice 4 attaches this independent state to the Inbox thread region and entry action.
+const inboxThreadState = new ThreadViewState(new ThreadReadClient(invoke), () => {});
+const threadHistory = new ThreadHistory(threadReader.state, inboxThreadState);
+
 function refreshThreadHistory(): void {
-  if (configurationReady) void threadReader.state.refresh();
+  if (configurationReady) threadHistory.refresh();
 }
 
 function openVendorThreads(vendorId: string, displayName: string): void {
@@ -912,6 +919,7 @@ function openVendorThreads(vendorId: string, displayName: string): void {
 }
 
 function reconcileThreadVendor(): boolean {
+  void inboxThreadState.refresh();
   const selected = threadReader.state.vendor;
   if (!selected) return true;
   const fresh = vendorRecords.find(vendor => vendor.vendor_id === selected.vendor_id);
@@ -1213,7 +1221,7 @@ async function runMailAccountMutation<T extends { mailbox_operation_revision: nu
     checkNow.disabled = true;
   }
   mailAccountMutationsInFlight += 1;
-  threadReader.state.beginMutation();
+  threadHistory.beginMutation();
   mailOperationInFlight = true;
   wakeInboxReload();
   try {
@@ -1230,7 +1238,7 @@ async function runMailAccountMutation<T extends { mailbox_operation_revision: nu
   } finally {
     mailAccountMutationsInFlight -= 1;
     mailOperationInFlight = mailAccountMutationsInFlight > 0;
-    void threadReader.state.endMutation();
+    void threadHistory.endMutation();
     wakeInboxReload();
   }
 }
@@ -1302,8 +1310,7 @@ function showView(
   const inboxSelected = view === "inbox";
   const watchlistSelected = view === "watchlist";
   const vendorsSelected = view === "vendors";
-  if (vendorsSelected && configurationReady) void threadReader.state.resume();
-  else threadReader.state.suspend();
+  threadHistory.setView(view, configurationReady);
   const expiryLedgerSelected = view === "expiry-ledger";
   const healthSelected = view === "health";
   const settingsSelected = view === "settings";
@@ -2641,6 +2648,7 @@ function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
 }
 
 function clearInboxPageForAccountChange(message: string): void {
+  threadHistory.clearInboxSelection();
   inboxRequestGeneration += 1;
   inboxQueryEpoch += 1;
   inboxPageState = "pending";
@@ -2669,6 +2677,7 @@ function commitInboxQueryFromControls(): void {
   } else {
     inboxRequestGeneration += 1;
     inboxQueryEpoch += 1;
+    threadHistory.clearInboxSelection();
     inboxPageState = "pending";
     expandedInboxMessages.clear();
     renderInbox(inboxItems);
@@ -2733,7 +2742,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
   );
   if (!confirmed || inboxMutationInFlight()) return;
 
-  threadReader.state.beginMutation();
+  threadHistory.beginMutation();
   inboxDeletionsInFlight.add(item.message_id);
   inboxRequestGeneration += 1;
   wakeInboxReload();
@@ -2754,7 +2763,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
   } finally {
-    void threadReader.state.endMutation();
+    void threadHistory.endMutation();
     inboxDeletionsInFlight.delete(item.message_id);
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
@@ -2769,7 +2778,7 @@ async function clearInboxHistory(): Promise<void> {
   );
   if (!confirmed || inboxMutationInFlight()) return;
 
-  threadReader.state.beginMutation();
+  threadHistory.beginMutation();
   inboxClearInFlight = true;
   inboxRequestGeneration += 1;
   wakeInboxReload();
@@ -2802,7 +2811,7 @@ async function clearInboxHistory(): Promise<void> {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
   } finally {
-    void threadReader.state.endMutation();
+    void threadHistory.endMutation();
     inboxClearInFlight = false;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
@@ -2923,6 +2932,7 @@ async function runInboxRefresh(
       if (!await loadInboxPage(true, effectScope) || !current()) return false;
     }
   }
+  if (current()) void threadHistory.commitInboxSpan();
   return true;
 }
 
@@ -2932,12 +2942,12 @@ async function loadInbox(
 ): Promise<boolean> {
   // User append remains a one-shot operation on the current cursor.
   if (append) return !inboxReload.running && await loadInboxPage(true, effectScope);
-  if (mailboxEffectScopeIsCurrent(effectScope)) refreshThreadHistory();
+  if (configurationReady && mailboxEffectScopeIsCurrent(effectScope)) threadHistory.prepareInboxRefresh();
   return inboxReload.request({ kind: "first" }, effectScope);
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {
-  refreshThreadHistory();
+  if (configurationReady) threadHistory.prepareInboxRefresh();
   // Retained rows may still belong to the previous filter while its replacement loads.
   const intent: InboxRefreshIntent = inboxItemsEpoch === inboxQueryEpoch
     ? { kind: "span", target: inboxItems.length }
@@ -4377,7 +4387,7 @@ function checkResultMessage(result: CheckResult): string {
 async function runCheck(): Promise<void> {
   if (checkInFlight) return;
   checkInFlight = true;
-  threadReader.state.beginMutation();
+  threadHistory.beginMutation();
   checkNow.disabled = true;
   healthStatus.textContent = "Checking watched mail…";
   try {
@@ -4387,7 +4397,7 @@ async function runCheck(): Promise<void> {
   } catch (error) {
     await Promise.all([loadInbox(), loadHealth(errorMessage(error), "error")]);
   } finally {
-    void threadReader.state.endMutation();
+    void threadHistory.endMutation();
     checkInFlight = false;
     checkNow.disabled = !checkSupported;
   }
@@ -4655,7 +4665,7 @@ settingsForm.addEventListener("submit", (event) => {
   void (async () => {
     if (settingsInFlight) return;
     setSettingsBusy(true);
-    threadReader.state.beginMutation();
+    threadHistory.beginMutation();
     settingsStatus.textContent = "Saving settings…";
     delete settingsStatus.dataset.kind;
     try {
@@ -4685,7 +4695,7 @@ settingsForm.addEventListener("submit", (event) => {
       settingsStatus.textContent = errorMessage(error);
       settingsStatus.dataset.kind = "error";
     } finally {
-      void threadReader.state.endMutation();
+      void threadHistory.endMutation();
       setSettingsBusy(false);
     }
   })();
@@ -4738,14 +4748,14 @@ function setBusy(busy: boolean): void {
 function beginOperation(): boolean {
   if (operationInFlight) return false;
   operationInFlight = true;
-  threadReader.state.beginMutation();
+  threadHistory.beginMutation();
   setBusy(true);
   return true;
 }
 
 function finishOperation(): void {
   operationInFlight = false;
-  void threadReader.state.endMutation();
+  void threadHistory.endMutation();
   setBusy(false);
 }
 
