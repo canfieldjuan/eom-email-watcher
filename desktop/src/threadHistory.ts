@@ -6,17 +6,21 @@ export class ThreadHistory {
   private readonly inbox: ThreadViewState;
   private holds = 0;
   private inboxSpanCommitted = false;
+  private readonly onMutationChange: () => void;
 
-  constructor(vendor: ThreadViewState, inbox: ThreadViewState) {
+  constructor(vendor: ThreadViewState, inbox: ThreadViewState, onMutationChange: () => void = () => {}) {
     this.vendor = vendor;
     this.inbox = inbox;
+    this.onMutationChange = onMutationChange;
   }
+
+  get mutationHeld(): boolean { return this.holds > 0; }
 
   setView(view: string, configured: boolean): void {
     if (configured && view === "vendors") void this.vendor.resume();
     else this.vendor.suspend();
     if (configured && view === "inbox") void this.inbox.resume();
-    else this.inbox.suspend();
+    else this.inbox.close();
   }
 
   refresh(): void {
@@ -51,12 +55,14 @@ export class ThreadHistory {
     this.inboxSpanCommitted = false;
     this.vendor.beginMutation();
     this.inbox.beginMutation();
+    this.onMutationChange();
   }
 
   async endMutation(): Promise<void> {
     this.holds = Math.max(0, this.holds - 1);
     const vendor = this.vendor.endMutation();
     await this.inbox.endMutation(false);
+    this.onMutationChange();
     await Promise.all([vendor, this.refreshCommittedInbox()]);
   }
 }

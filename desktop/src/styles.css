@@ -1583,3 +1583,7 @@ select:focus {
 .thread-copy { padding: 12px 0 12px 12px; border-left: 2px solid #d7ded8; margin-top: 12px; min-width: 0; }
 .thread-copy-summary { white-space: pre-wrap; }
 .thread-view :focus-visible { outline: 3px solid #2e6b4c; outline-offset: 3px; }
+
+.inbox-open-thread { margin-top: 10px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.thread-origin { color: #245c40; font-weight: 800; }
+.thread-card[data-thread-origin="true"] { border-inline-start: 4px solid #2e6b4c; }

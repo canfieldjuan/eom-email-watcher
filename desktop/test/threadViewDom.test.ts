@@ -3,31 +3,8 @@ import test from "node:test";
 import { ThreadReadClient } from "../src/threadReads.ts";
 import { ThreadViewDom } from "../src/threadViewDom.ts";
 
-class Element {
-  tagName: string;
-  children: Element[] = [];
-  parent: Element | null = null;
-  ownerDocument: any;
-  dataset: Record<string, string> = {};
-  attributes = new Map<string, string>();
-  listeners = new Map<string, () => void>();
-  textContent = ""; className = ""; id = ""; value = ""; type = "";
-  hidden = false; disabled = false; tabIndex = 0; scrollTop = 0;
-  constructor(tag: string, doc: any) { this.tagName = tag.toUpperCase(); this.ownerDocument = doc; }
-  set innerHTML(_: string) { throw new Error("HTML sinks forbidden"); }
-  append(...children: Element[]) { for (const child of children) { child.parent = this; this.children.push(child); } }
-  replaceChildren(...children: Element[]) { for (const child of this.children) child.parent = null; this.children = []; this.append(...children); }
-  setAttribute(key: string, value: string) { this.attributes.set(key, value); }
-  addEventListener(name: string, fn: () => void) { this.listeners.set(name, fn); }
-  contains(other: Element) { return nodes(this).includes(other); }
-  querySelectorAll(selector: string) {
-    assert.equal(selector, "[data-thread-focus]"); return nodes(this).filter(n => n.dataset.threadFocus !== undefined);
-  }
-  focus() { this.ownerDocument.activeElement = this; }
-  click() { assert.equal(this.disabled, false); this.focus(); this.listeners.get("click")?.(); }
-}
-function nodes(root: Element): Element[] { return [root, ...root.children.flatMap(nodes)]; }
-function text(root: Element): string { return nodes(root).map(n => n.textContent).join("\n"); }
+import { Element, nodes, text } from "./threadDomFixture.ts";
+
 const hostile = '<img src="https://example.test/beacon" onerror="alert(1)"><script>evil()</script>';
 const ref = { provider: "imap", account_id: "retained", mailbox_identity_key: null, thread_key: "thread" };
 const vendor = { vendor_id: "vendor", display_name: `Vendor ${hostile}` };
@@ -135,4 +112,28 @@ test("failed local refresh clears headers/body and offers a scoped retry, never 
   assert.equal(text(h.root).includes(newestSubject), false);
   h.button("Retry messages");
   assert.doesNotMatch(text(h.root), /No retained messages/);
+});
+
+test("Inbox non-vendor entry renders fixed scope, filter notice and origin without a vendor account picker", async () => {
+  const doc: any = { activeElement: null, createElement: (tag: string) => new Element(tag, doc) };
+  const root = new Element("section", doc), calls: any[] = [];
+  const origin = { provider: ref.provider, account_id: ref.account_id, mailbox_identity_key: null, message_id: "canonical" };
+  const nonVendor = { ...thread, relation: "non_vendor", owner_vendor: null };
+  const ui = new ThreadViewDom(root as unknown as HTMLElement, new ThreadReadClient(async <T>(command, args) => {
+    calls.push({ command, args });
+    return (command === "threads_resolve"
+      ? { state: "resolved", message_ref: origin, context: { kind: "non_vendor", thread: nonVendor } }
+      : { thread: { ...nonVendor, subject: newestSubject, history_notice: "Partial" },
+        items: [{ ...message, body_state: { state: "not_followed" } }], next_cursor: null }) as T;
+  }), { idPrefix: "inbox-thread", accounts: () => [], onExit: () => {}, onInboxRefresh: async () => {}, onInboxRetry: async () => {} });
+  await ui.openInbox(origin, () => true);
+  assert.equal(root.hidden, false);
+  assert.match(text(root), /No vendor associated/);
+  assert.match(text(root), /Mailbox identity unavailable/);
+  assert.match(text(root), /Thread history includes other senders and messages outside these Inbox filters\./);
+  assert.match(text(root), /Opened from Inbox/);
+  assert.equal(nodes(root).filter(n => n.tagName === "SELECT").length, 0);
+  assert.ok(nodes(root).some(n => n.textContent === "Back to Inbox"));
+  assert.ok(nodes(root).every(n => !n.id || n.id.startsWith("inbox-thread-")));
+  assert.deepEqual(calls.map(c => c.command), ["threads_resolve", "threads_messages"]);
 });
