@@ -1,7 +1,7 @@
 import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
 import { ThreadReadClient, type InboxMessageRef } from "./threadReads";
 import { ThreadViewDom } from "./threadViewDom";
-import { ThreadViewState } from "./threadView";
+import { InboxThreadEntry, inboxThreadOriginKey } from "./inboxThreadEntry";
 import { ThreadHistory } from "./threadHistory";
 import { mailboxPendingMessage } from "./mailboxProgress";
 import { confirmAction } from "./confirmation";
@@ -530,13 +530,13 @@ app.innerHTML = `
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
-      <div class="inbox-columns">
+      <div id="inbox-columns" class="inbox-columns">
       <aside class="inbox-senders">
         <nav id="inbox-sender-nav" aria-label="Inbox senders"></nav>
         <p id="inbox-sender-error" class="status" role="status" hidden></p>
       </aside>
       <div class="inbox-messages">
-      <h2 id="inbox-heading">All messages</h2>
+      <h2 id="inbox-heading" tabindex="-1">All messages</h2>
       <details class="inbox-filter-panel">
         <summary>
           <span>Inbox filters</span>
@@ -616,6 +616,7 @@ app.innerHTML = `
       </div>
       </div>
       </div>
+      <section id="inbox-thread-view" hidden></section>
     </section>
 
     <section id="watchlist-view" class="view" aria-labelledby="watchlist-tab" hidden>
@@ -901,9 +902,23 @@ const threadReader = new ThreadViewDom(requiredElement<HTMLElement>("#thread-vie
   },
 });
 
-// Slice 4 attaches this independent state to the Inbox thread region and entry action.
-const inboxThreadState = new ThreadViewState(new ThreadReadClient(invoke), () => {});
-const threadHistory = new ThreadHistory(threadReader.state, inboxThreadState);
+const inboxThreadEntry = new InboxThreadEntry({
+  root: requiredElement<HTMLElement>("#inbox-thread-view"),
+  columns: requiredElement<HTMLElement>("#inbox-columns"),
+  heading: requiredElement<HTMLElement>("#inbox-heading"),
+  client: new ThreadReadClient(invoke), accounts: () => mailAccounts,
+  snapshot: () => ({
+    configured: configurationReady, visible: !inboxView.hidden,
+    blocked: inboxReloadBlocked() || threadHistory.mutationHeld,
+    queryEpoch: inboxQueryEpoch, itemsEpoch: inboxItemsEpoch, items: inboxItems,
+    scope: currentMailboxEffectScope(), spanScope: inboxThreadSpanScope,
+  }),
+  refreshInbox: refreshLoadedInboxSpan,
+  scrollElements: () => [inboxList, inboxSenderNavigation, inboxView,
+    ...(document.scrollingElement ? [document.scrollingElement] : [])],
+});
+const inboxThreadState = inboxThreadEntry.state;
+const threadHistory = new ThreadHistory(threadReader.state, inboxThreadState, refreshInboxThreadControls);
 
 function refreshThreadHistory(): void {
   if (configurationReady) threadHistory.refresh();
@@ -1084,6 +1099,8 @@ let inboxSenderNavigationError: string | null = null;
 const expandedInboxMessages = new Set<string>();
 let inboxItems: InboxItem[] = [];
 let inboxItemsEpoch: number | null = null;
+// A row can enter the reader only after its entire requested span was revalidated.
+let inboxThreadSpanScope: MailboxEffectScope | null = null;
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
 let inboxProposalExpiryTimer: number | null = null;
@@ -1326,6 +1343,7 @@ function showView(
   expiryLedgerTab.setAttribute("aria-pressed", String(expiryLedgerSelected));
   healthTab.setAttribute("aria-pressed", String(healthSelected));
   settingsTab.setAttribute("aria-pressed", String(settingsSelected));
+  if (inboxSelected) refreshInboxThreadControls();
 }
 
 function localCalendarDate(): string {
@@ -2496,7 +2514,16 @@ function renderInbox(items: InboxItem[]): void {
       else expandedInboxMessages.add(item.message_id);
       toggle.setAttribute("aria-expanded", String(!content.hidden));
     });
-    card.append(toggle, content);
+    const openThread = document.createElement("button");
+    openThread.type = "button";
+    openThread.className = "secondary-action inbox-open-thread";
+    openThread.textContent = "Open thread";
+    openThread.setAttribute("aria-label", `Open thread: ${item.subject || "No subject"}`);
+    openThread.setAttribute("aria-controls", "inbox-thread-view");
+    openThread.dataset.inboxThreadOrigin = inboxThreadOriginKey(item.thread_entry_ref);
+    openThread.disabled = !inboxThreadEntry.canOpen(item);
+    openThread.addEventListener("click", () => { void inboxThreadEntry.open(item); });
+    card.append(toggle, openThread, content);
     inboxList.append(card);
   }
   for (const key of capabilityOutputPresentations.keys()) {
@@ -2925,6 +2952,7 @@ async function runInboxRefresh(
   effectScope: MailboxEffectScope | null,
   current: () => boolean,
 ): Promise<boolean> {
+  const sourceScope = currentMailboxEffectScope(), sourceEpoch = inboxQueryEpoch;
   if (!await loadInboxPage(false, effectScope)) return false;
   if (!current()) return false;
   if (intent.kind === "span") {
@@ -2932,8 +2960,22 @@ async function runInboxRefresh(
       if (!await loadInboxPage(true, effectScope) || !current()) return false;
     }
   }
-  if (current()) void threadHistory.commitInboxSpan();
+  if (current()) {
+    inboxThreadSpanScope = sourceScope && sourceEpoch === inboxQueryEpoch && mailboxEffectScopeIsCurrent(sourceScope)
+      ? sourceScope : null;
+    inboxThreadEntry.revalidateSource();
+    refreshInboxThreadControls();
+    void threadHistory.commitInboxSpan();
+  }
   return true;
+}
+
+function refreshInboxThreadControls(): void {
+  const rows = new Map(inboxItems.map(item => [inboxThreadOriginKey(item.thread_entry_ref), item]));
+  for (const button of inboxList.querySelectorAll<HTMLButtonElement>("[data-inbox-thread-origin]")) {
+    const row = rows.get(button.dataset.inboxThreadOrigin!);
+    button.disabled = !row || !inboxThreadEntry.canOpen(row);
+  }
 }
 
 async function loadInbox(
@@ -2942,12 +2984,20 @@ async function loadInbox(
 ): Promise<boolean> {
   // User append remains a one-shot operation on the current cursor.
   if (append) return !inboxReload.running && await loadInboxPage(true, effectScope);
-  if (configurationReady && mailboxEffectScopeIsCurrent(effectScope)) threadHistory.prepareInboxRefresh();
+  if (configurationReady && mailboxEffectScopeIsCurrent(effectScope)) {
+    inboxThreadSpanScope = null;
+    refreshInboxThreadControls();
+    threadHistory.prepareInboxRefresh();
+  }
   return inboxReload.request({ kind: "first" }, effectScope);
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {
-  if (configurationReady) threadHistory.prepareInboxRefresh();
+  if (configurationReady) {
+    inboxThreadSpanScope = null;
+    refreshInboxThreadControls();
+    threadHistory.prepareInboxRefresh();
+  }
   // Retained rows may still belong to the previous filter while its replacement loads.
   const intent: InboxRefreshIntent = inboxItemsEpoch === inboxQueryEpoch
     ? { kind: "span", target: inboxItems.length }

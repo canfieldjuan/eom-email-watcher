@@ -4,6 +4,7 @@ import { stripTypeScriptTypes } from "node:module";
 import test from "node:test";
 import vm from "node:vm";
 import { parseAst } from "vite";
+import { inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
 import * as availability from "../src/connectAvailability.ts";
 import { activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult } from "../src/connectIdentity.ts";
 import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxActionState.ts";
@@ -74,12 +75,14 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
   let allowConfirmation = true;
   let invocationHold: Promise<void> | null = null;
   let replacementStatus = "completed";
-  const item = { message_id: "message-1", provider: "fixture", account_id: "fixture",
+  const opened: unknown[] = [];
+  const item = { thread_entry_ref: { provider: "fixture", account_id: "fixture", mailbox_identity_key: null, message_id: "message-1" }, message_id: "message-1", provider: "fixture", account_id: "fixture",
     sender: "sender@example.test", received_at: "2026-11-02T00:00:00Z", subject: "Synthetic invoice",
     admission: null, action_required: null, calendar_proposal: null, status: "notified",
     attachments: [{ part_id: "part-1", filename: "synthetic.pdf", byte_size: 4, media_type: "application/pdf",
       capability_results: [] as any[], automation_fires: [] }] };
   const context = vm.createContext({
+    inboxThreadOriginKey, inboxThreadEntry: { canOpen: () => true, open: (row: unknown) => opened.push(row) },
     ...availability, activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult,
     hasInboxAutomationConfirmation, inboxActionState, crypto,
     document: { createElement: (tag: string) => new Element(tag) },
@@ -122,7 +125,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
   };
   context.attachmentCapabilities.set(context.attachmentKey("message-1", "part-1"), catalog);
   render();
-  return { context, item, old, current, invocations, confirmations, render, refresh, button,
+  return { context, item, old, current, opened, invocations, confirmations, render, refresh, button,
     setCatalog: (items: typeof catalog) => { catalog = items; },
     holdInvocation: (promise: Promise<void>) => { invocationHold = promise; },
     setReplacementStatus: (status: string) => { replacementStatus = status; },
@@ -304,4 +307,15 @@ test("persisted provider errors consume stored retryability without inventing a 
     assert.ok(rendered(h.context.inboxList).includes("Stored provider reason"));
     assert.equal(h.invocations.length, 0);
   }
+});
+
+
+test("Open thread is a separate current-row action and does not invoke saved analysis actions", async () => {
+  const h = harness();
+  const button = h.button("Open thread");
+  assert.equal(button.attributes.get("aria-controls"), "inbox-thread-view");
+  assert.equal((button.dataset as any).inboxThreadOrigin, inboxThreadOriginKey(h.item.thread_entry_ref));
+  await button.click();
+  assert.deepEqual(h.opened, [h.item]); assert.deepEqual(h.invocations, []); assert.deepEqual(h.confirmations, []);
+  assert.equal(h.context.expandedInboxMessages.has(h.item.message_id), true);
 });

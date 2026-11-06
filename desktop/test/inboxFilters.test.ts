@@ -243,6 +243,7 @@ test("span refresh stops when superseded before or during append", async () => {
     for (const committed of [true, false]) {
       const run = new Function("stopAt", "committed", `
         let inboxItems = [1, 2, 3], inboxNextCursor = "next", inboxQueryEpoch = 0, calls = 0;
+        const currentMailboxEffectScope = () => ({ mutation_epoch: 0, mailbox_operation_revision: 1 });
         async function loadInboxPage() {
           calls++;
           inboxItems = calls === 1 ? [1] : [1, 2];

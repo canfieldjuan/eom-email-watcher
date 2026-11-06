@@ -6,6 +6,9 @@ import test from "node:test";
 import { parseAst } from "vite";
 import { ThreadHistory } from "../src/threadHistory.ts";
 import type { ThreadViewState } from "../src/threadView.ts";
+import { InboxThreadEntry, inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
+import { ThreadReadClient } from "../src/threadReads.ts";
+import { Element } from "./threadDomFixture.ts";
 
 const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const js = stripTypeScriptTypes(source), ast = parseAst(js);
@@ -54,6 +57,9 @@ function harness(names: string[]) {
     checkInFlight: false, healthStatus: node(), checkResultMessage: () => "Complete", loadHealth: async () => {},
     invoke: async () => { events.push("write"); return {}; },
     mailboxEffectScopeIsCurrent: () => true,
+    currentMailboxEffectScope: () => ({ mutation_epoch: 0, mailbox_operation_revision: 1 }),
+    inboxThreadSpanScope: null, refreshInboxThreadControls: noop,
+    inboxThreadEntry: { revalidateSource: noop },
     inboxReload: { running: false, request: async () => { events.push("inbox"); return true; } },
     loadInboxPage: async () => { events.push("append"); return true; },
   });
@@ -115,7 +121,7 @@ test("history refresh observes current scope only and append does not disturb th
 test("actual view lifecycle resumes Vendors and suspends other or unconfigured views", () => {
   const h = harness(["showView"]);
   h.context.showView("vendors"); assert.deepEqual(h.events, ["resume"]);
-  assert.deepEqual(h.inboxEvents, ["suspend"]); h.inboxEvents.length = 0;
+  assert.deepEqual(h.inboxEvents, ["close"]); h.inboxEvents.length = 0;
   assert.equal(h.context.vendorsSection.hidden, false); assert.equal(h.context.inboxView.hidden, true);
   assert.equal(h.context.vendorsTab.attributes.get("aria-pressed"), "true");
   h.events.length = 0; h.context.showView("inbox"); assert.deepEqual(h.events, ["suspend"]);
@@ -144,6 +150,58 @@ test("actual span refresh revalidates threads and respects configuration readine
   await h.context.refreshLoadedInboxSpan(); assert.deepEqual(h.events, ["refresh", "inbox"]);
   h.events.length = 0; h.context.configurationReady = false;
   await h.context.refreshLoadedInboxSpan(); assert.deepEqual(h.events, ["inbox"]);
+});
+
+test("actual row controls track nested mutation release and current-source eligibility", async () => {
+  const h = harness(["refreshInboxThreadControls"]);
+  const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: "identity", message_id: "m" };
+  const button = { disabled: true, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
+  const other = { disabled: false, dataset: { inboxThreadOrigin: inboxThreadOriginKey({ ...origin, account_id: "other" }) } };
+  h.context.inboxThreadOriginKey = inboxThreadOriginKey;
+  h.context.inboxItems = [{ ...origin, thread_entry_ref: origin }];
+  h.context.inboxList = { querySelectorAll: () => [button, other] };
+  let sourceCurrent = true;
+  const history = new ThreadHistory(h.context.threadReader.state, h.context.inboxThreadState, h.context.refreshInboxThreadControls);
+  h.context.inboxThreadEntry.canOpen = () => sourceCurrent && !history.mutationHeld;
+  h.context.refreshInboxThreadControls(); assert.equal(button.disabled, false); assert.equal(other.disabled, true);
+  history.beginMutation(); history.beginMutation(); assert.equal(button.disabled, true);
+  await history.endMutation(); assert.equal(button.disabled, true);
+  await history.endMutation(); assert.equal(button.disabled, false);
+  sourceCurrent = false; h.context.refreshInboxThreadControls(); assert.equal(button.disabled, true);
+});
+
+test("returning to Inbox enables current rows refreshed while hidden, without bypassing eligibility or opening a thread", async () => {
+  for (const mode of ["current", "old-query", "mailbox-changed", "unconfigured", "held"]) {
+    const h = harness(["showView", "runInboxRefresh", "refreshInboxThreadControls"]), c = h.context;
+    const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: "identity", message_id: "m" };
+    const button = { disabled: false, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
+    c.inboxThreadOriginKey = inboxThreadOriginKey;
+    c.inboxItems = [{ ...origin, thread_entry_ref: origin }];
+    c.inboxList = { querySelectorAll: () => [button] };
+    const doc: any = { activeElement: null, createElement: (tag: string) => new Element(tag, doc) };
+    const reads: string[] = [];
+    const ui = new InboxThreadEntry({ root: new Element("section", doc) as any,
+      columns: new Element("div", doc) as any, heading: new Element("h2", doc) as any,
+      client: new ThreadReadClient(async command => { reads.push(command); throw new Error("unexpected automatic read"); }),
+      accounts: () => [], refreshInbox: async () => {}, scrollElements: () => [],
+      snapshot: () => ({ configured: c.configurationReady, visible: !c.inboxView.hidden,
+        blocked: c.threadHistory.mutationHeld, queryEpoch: c.inboxQueryEpoch, itemsEpoch: c.inboxItemsEpoch,
+        items: c.inboxItems, scope: c.currentMailboxEffectScope(), spanScope: c.inboxThreadSpanScope }),
+    });
+    c.inboxThreadEntry = ui;
+    c.threadHistory = new ThreadHistory(c.threadReader.state, ui.state, c.refreshInboxThreadControls);
+    c.showView("settings");
+    await c.runInboxRefresh({ kind: "first" }, null, () => true);
+    assert.equal(button.disabled, true, "hidden refresh disables the rendered row action");
+    if (mode === "old-query") c.inboxQueryEpoch++;
+    if (mode === "mailbox-changed") c.currentMailboxEffectScope = () => ({ mutation_epoch: 0, mailbox_operation_revision: 2 });
+    if (mode === "unconfigured") c.configurationReady = false;
+    if (mode === "held") c.threadHistory.beginMutation();
+    c.showView("inbox");
+    assert.equal(button.disabled, mode !== "current", mode);
+    assert.equal(ui.state.inboxOrigin, null); assert.deepEqual(reads, [], mode);
+    assert.equal(c.inboxQueryEpoch, mode === "old-query" ? 1 : 0, "return does not change the query");
+  }
 });
 
 test("actual refresh commits only a complete current span and query changes close the entry before rendering", async () => {

@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
-const names = ['observeMailboxOperationRevision', 'observeMailboxOperationRevisionFromError',
+const names = ['currentMailboxEffectScope', 'observeMailboxOperationRevision', 'observeMailboxOperationRevisionFromError',
   'mailboxEffectScopeIsCurrent', 'mailboxEffectRequestIsCurrent', 'runMailAccountMutation',
   'selectInboxSender', 'queryFromInboxControls', 'commitInboxQueryFromControls', 'clearInboxPageForAccountChange', 'reconcileInboxAccountScope', 'inboxMutationInFlight',
   'deleteInboxItem', 'clearInboxHistory', 'inboxReloadBlocked', 'wakeInboxReload', 'runInboxRefresh', 'loadInboxPage', 'loadInbox', 'refreshLoadedInboxSpan', 'scheduleConnectQueueRefresh', 'renderHealth', 'startConfiguredDesktop', 'renderConfigAdmissionState'];
@@ -22,7 +22,8 @@ function harness() {
   const context = vm.createContext({
     threadHistory: { beginMutation: noop, endMutation: async () => {}, prepareInboxRefresh: noop,
       commitInboxSpan: async () => {}, clearInboxSelection: noop },
-    refreshThreadHistory: noop,
+    refreshThreadHistory: noop, inboxThreadSpanScope: null, refreshInboxThreadControls: noop,
+    inboxThreadEntry: { revalidateSource: noop },
     inboxItems: [{message_id:'old-row'}], inboxNextCursor: 'page-two',
     activeInboxQuery: {provider:'imap',account_id:'old',sender:null,limit:25},
     inboxItemsEpoch:0, connectQueueRefresh:null, connectQueueRefreshAgain:false,
@@ -84,6 +85,37 @@ const health={mail:{accounts:[{provider:'imap',account_id:'new',active:true,conn
  providers:[{provider:'imap',connection_available:true}]}, watchlist_count:1,
  local_model:{ok:true}, database:{ok:true,initialized:true},notifications:{enabled:false},
  polling:{enabled:false},gmail:{label_watch_configured:false},production_check_supported:true};
+
+test('thread entry span commits only after every requested page and capabilities settle', async()=>{
+  const {c}=harness(), pageTwo=deferred(), capabilities=deferred();
+  c.inboxItems=Array.from({length:50},(_,i)=>({message_id:'retained-'+i}));
+  c.inboxThreadSpanScope={mutation_epoch:0,mailbox_operation_revision:1};
+  const events=[];
+  c.inboxThreadEntry.revalidateSource=()=>events.push(['source',c.inboxItems.length,c.inboxThreadSpanScope]);
+  c.threadHistory.commitInboxSpan=async()=>events.push(['reader',c.inboxItems.length]);
+  c.invoke=async(_command,{query})=>query.cursor ? pageTwo.promise
+    : {items:Array.from({length:25},(_,i)=>({message_id:'first-'+i})),next_cursor:'second'};
+  let page=0;
+  c.loadAttachmentCapabilities=async()=>++page===2 ? capabilities.promise
+    : {capabilities:new Map(),diagnostics:new Map(),unavailable:0};
+  const loading=c.refreshLoadedInboxSpan(); await tick();
+  assert.equal(c.inboxThreadSpanScope,null); assert.equal(c.inboxItems.length,25); assert.deepEqual(events,[]);
+  pageTwo.resolve({items:Array.from({length:25},(_,i)=>({message_id:'second-'+i})),next_cursor:null}); await tick();
+  assert.equal(c.inboxItems.length,50); assert.equal(c.inboxThreadSpanScope,null); assert.deepEqual(events,[]);
+  capabilities.resolve({capabilities:new Map(),diagnostics:new Map(),unavailable:0}); await loading;
+  assert.equal(JSON.stringify(c.inboxThreadSpanScope),JSON.stringify({mutation_epoch:0,mailbox_operation_revision:1}));
+  assert.deepEqual(events.map(e=>e.slice(0,2)),[['source',50],['reader',50]]);
+});
+
+test('unscoped Inbox refresh cannot authorize a thread row across mailbox revision or account mutation changes', async()=>{
+  for(const change of [c=>c.mailboxOperationRevision++,c=>c.mailAccountMutationEpoch++,c=>c.mailboxOperationRevisionReady=false]) {
+    const {c}=harness(), page=deferred();
+    c.invoke=()=>page.promise;
+    const loading=c.loadInbox(); await tick(); change(c);
+    page.resolve({items:[{message_id:'current-looking-row'}],next_cursor:null}); await loading;
+    assert.equal(c.inboxThreadSpanScope,null,'displayed rows are not a committed thread-entry source');
+  }
+});
 
 function deferred() {
   let resolve, reject;
