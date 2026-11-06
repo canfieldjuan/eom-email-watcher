@@ -1343,6 +1343,7 @@ function showView(
   expiryLedgerTab.setAttribute("aria-pressed", String(expiryLedgerSelected));
   healthTab.setAttribute("aria-pressed", String(healthSelected));
   settingsTab.setAttribute("aria-pressed", String(settingsSelected));
+  if (inboxSelected) refreshInboxThreadControls();
 }
 
 function localCalendarDate(): string {
