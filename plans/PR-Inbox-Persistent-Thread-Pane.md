@@ -126,7 +126,10 @@ existing category/state/attachment/partial-summary/action indicators available.
   starting thresholds are 72rem for three panes and 52rem for messages plus reader,
   with approximately 16rem senders, 22rem messages and at least 28rem reading space
   where all three fit. These are layout starting values, subject to the measured
-  acceptance sizes below; changing them must preserve the stated behavior.
+  acceptance sizes below; changing them must preserve the stated behavior. Use
+  container queries, or a ResizeObserver at the existing entry owner when visibility
+  and focus need coordination. Viewport media queries alone cannot measure this
+  content-width boundary.
 - Below the three-pane threshold, put the existing sender navigation in a labelled
   **Senders** disclosure above the messages, retaining its finder, full-address
   results and current-selection context. This does not create another sender
@@ -157,7 +160,7 @@ existing category/state/attachment/partial-summary/action indicators available.
   regions, semantic headings, visible focus and polite loading/error announcements.
   Scroll regions are keyboard reachable and do not trap focus.
 
-### R4 — unchanged query, refresh, removal and action owners
+### R4 — preserve guards and restore reading after successful revalidation
 
 - Preserve exact-sender filtering, All senders semantics including non-watched
   admissions/Sent replies, account modes and the missing-Active refusal, every
@@ -167,12 +170,38 @@ existing category/state/attachment/partial-summary/action indicators available.
   owner before a new selection can render. Previous-query rows may remain visible
   with Previous results but cannot open a reader. Loading/failure must not cause
   automatic selection or clear retained rows as a workaround.
-- Same-query refresh keeps only the origin reference while invalidating its body,
-  copy and source-context display. Only a complete current loaded-span commit can
-  renew the binding and refresh it. A first page alone cannot revive an origin
-  from a later loaded page. Failure leaves a revalidation/Retry state; absence from
-  the committed loaded span is unavailable, not a deletion claim or reason to
-  auto-page/select a replacement. Preserve the current explicit Retry behavior.
+- Same-query refresh still invalidates body, copy, inventory and source-context
+  payloads immediately. Before that clear, keep only bounded presentation intent:
+  the complete origin, query/selection generation, resolved thread/context identity,
+  explicitly expanded body message IDs, previously loaded thread-span size,
+  reader/body scroll offsets and reader focus key. Retain no body/copy/summary bytes,
+  old DOM nodes or old cursors. This intent is not authorization for a read.
+- After the complete current Inbox span revalidates the **same complete origin**,
+  resolve through the existing guarded owner and require the **same retained thread
+  and read context** before restoring anything. Focus return and connect-queue
+  refresh must use the existing loaded-span owner while a reader is selected, so a
+  first page alone cannot revive or discard an origin on a later loaded page.
+  Visibility return must pass the same revalidation gate before restoration.
+- Revalidate at most the thread span the user already loaded, using fresh guarded
+  pages; do not hunt beyond that span for missing messages or fetch additional Inbox
+  pages. For each previously expanded body still present and eligible in that fresh
+  span, re-read through the existing guarded body owner. Restore its expansion only
+  from the fresh response, including a current no-text state where applicable.
+  Previously unopened bodies stay closed. Copy/inventory payloads also remain
+  cleared; their existing explicit opening controls are preserved.
+- Restore the reader and restored body's scroll offsets after fresh content renders,
+  clamped to the current extent. Keep focus on the corresponding reader control,
+  or the reader heading if it no longer exists. Do not steal focus if the user moved
+  elsewhere while refresh was pending. Successive invalidations in one overlapping
+  refresh sequence must not overwrite the original intent with the cleared view;
+  only the latest current refresh may restore, without duplicating body reads.
+- On failure, origin absence, changed origin/thread/context, query change, explicit
+  A-to-B selection, Back, tab close or mutation hold, discard restoration intent and
+  keep old content cleared. No late refresh/body completion may restore A over B.
+  Absence from the committed loaded span remains unavailable, not a deletion claim
+  or automatic replacement selection. Preserve explicit fresh-origin Retry; do not
+  resurrect bytes or silently substitute a changed thread. These continuity rules
+  apply to window focus, connect-queue and document-visibility return, not resize.
 - User Load more appends through the existing owner and does not reopen the
   selection or refresh the thread. Account identity/catalog/vendor/watchlist and
   configuration changes, tab hiding, focus/resume and nested mutation holds retain
@@ -193,27 +222,35 @@ existing category/state/attachment/partial-summary/action indicators available.
 | Stage | Change and boundary |
 | --- | --- |
 | Plan/review | This one new plan only. Review at its exact revision and obtain Juan's acceptance before application code. |
-| First vertical UI slice | `main.ts` pane wrapper/markup/source context and selected-origin rendering, `inboxThreadEntry.ts` presentation/return-scroll behavior, and Inbox-scoped `styles.css`. Deliver explicit thread opening beside messages plus usable narrow fallback together. Reuse current readers and shared lifecycle owners. |
+| First vertical UI slice | `main.ts` pane wrapper/markup/source context and selected-origin rendering, `inboxThreadEntry.ts` presentation/return-scroll behavior, Inbox-scoped `styles.css`, and `threadHistory.ts`/`threadView.ts`/`threadViewDom.ts` for bounded refresh intent and fresh guarded restoration. Preserve the single refresh/read owners; deliver explicit thread opening beside messages plus usable narrow fallback together. |
 | Verification and review | Extend actual-owner `inboxThreadEntry`, `threadIntegration`, sender-navigation and filter DOM tests; synthetic source-only browser geometry and keyboard checks. Each published UI PR goes to oversight and connector review; GitHub CI runs. Each merge needs Juan's approval for that PR. |
 | Later, separate | Moving selected-message details/actions into the reader and retiring multi-row expansion require their own owner audit and accepted plan. The nonblocking #349–350 test/cosmetic follow-ups remain tracked separately; this plan does not silently implement them. |
 
 Keep presentation decisions in the existing entry integration or a small pure
 layout helper if necessary. No standalone replacement Inbox controller is proposed.
+If the first UI diff exceeds about 1,000 lines including tests, split reviewable
+stages: bounded scroll owners with the current entry behavior first, then pane
+placement, continuity and narrow fallback. Every shipped stage must keep a working
+narrow layout; do not split by shipping a wide-only reader first.
 If inspection shows read, action or lifecycle semantics must change to make the pane
 safe, stop and amend the plan for review/acceptance rather than widening this slice.
 
 ## Explicit non-scope
 
 This proposal supersedes only the Inbox whole-view replacement on Open thread and
-Back, Inbox width/breakpoints, control placement and message/reader scroll geometry
+Back, Inbox width/breakpoints, control placement, message/reader scroll geometry
+and restoration of explicitly expanded bodies after fresh same-origin/thread reads
 of the linked older plans. It does **not** accept the deferred three-pane plan's
 selected-action migration or removal of multi-row expansion.
 
 No Python/Rust/API/schema/storage/capture/retention/body-state/dependency/CSP/workflow
 change. No new provider/model requests, body search, reply/compose, bulk actions,
-automatic paging, HTML/Markdown email renderer, remote image, attachment download,
+unbounded or unsolicited Inbox paging, HTML/Markdown email renderer, remote image, attachment download,
 watchlist-management redesign, theme rewrite or live settings/mailbox access.
-No modification or cherry-pick of the frozen `e39c32d` navigation implementation.
+The bounded revalidation of a previously user-loaded thread span is defined in R4;
+it does not introduce infinite scrolling or a search for absent origins/messages.
+No modification or cherry-pick of the frozen local, unpublished `e39c32d` navigation
+implementation; that reference is not a commit available on GitHub.
 
 ## Assumptions/blockers
 
@@ -251,18 +288,20 @@ application tests for a plan. Future implementation must prove:
 | Selection/identity | No initial read; eligible Open thread selects one complete origin; provider/account/native-ID lookalikes remain distinct. A→B and B→A late resolver, chooser, message, body, copy and inventory completions cannot repaint or focus the other origin. Same-origin activation does not duplicate reads. |
 | Full thread | Vendor/non-vendor/ambiguous-vendor cases, explicit Retry, newest-subject heading, source context vs thread subject, other-sender/filter notice, oldest-first paging, no-text/partial/Sent states, hostile text and unchanged Vendors reader. |
 | Current span | Query commit vs retained previous rows; origin on second/later loaded page; both refresh response orders; partial-span failure; source absent from current span; changed identity; Load more preserves reader and latest scroll. No automatic paging or replacement selection. |
+| Reading continuity | Real-browser window focus return, connect-queue refresh and document-visibility return with multiple explicitly expanded bodies, including one in a later user-loaded thread page. Successful same-origin/thread/context revalidation re-reads bodies through guarded owners and restores expansions, clamped reader/body scroll and reader focus. Prove both refresh response orders, repeated invalidations and refresh racing explicit A-to-B selection; failure/absence/changed identity or context stays cleared. Assert no cached bytes, duplicate reads, unopened-body expansion or focus theft after the user moves elsewhere. |
 | Controls/actions | Exact sender/full addresses/finder pinning; draft vs committed labels and account modes; Search/Enter/Apply/Reset and busy associations after moving markup; existing action/expiry/confirmation/retry/removal tests retain meaning. A's action completion while B is read cannot transfer target/state. |
 | Removal/lifecycle | Nested holds, held physical bytes, accepted/refused/deferred delete/clear, account/vendor changes, hidden tab/return and old responses. Both readers clear before mutation; no hidden body/copy DOM or late reopening. |
 | Scroll/focus | Real overflow and clamping with 220+ senders and >100 messages; preserved user scroll while reading, after re-render/append and on narrow Back. Keyboard activation/choice/Back, missing-trigger fallback, no hidden focus target or resize-induced query/read. Use a real browser, not only fake-DOM scroll assignments. |
-| Geometry | 1920×1080 and 1524×785 three panes; 1024×768 messages plus reader; 640×520 and 320 CSS px single-pane flow; 200% text/zoom and very short heights. Long addresses, subjects, filter labels, expanded rows and bodies; Filters open/closed. No horizontal document overflow or clipped controls; content count cannot grow the document indefinitely. Other tabs keep their layout. |
+| Geometry | In Chromium and WebKitGTK (the Linux webview), 1920×1080 and 1524×785 three panes; 1024×768 messages plus reader; 640×520 and 320 CSS px single-pane flow; 200% text/zoom and very short heights. Long addresses, subjects, filter labels, expanded rows and bodies; Filters open/closed. Probe content-width changes independently of viewport width. No horizontal document overflow or clipped controls; content count cannot grow the document indefinitely. Other tabs keep their layout. |
 
 Use failing-before/passing-after actual-handler tests for the presentation/scroll
 changes, then affected and full desktop tests, TypeScript `--noEmit`, whitespace
-and a cold diff audit. Synthetic browser checks use current source and mock IPC,
-with zero live profile/provider/model access. GitHub CI owns authorized native
-build/package checks. Synthetic Chromium is not native-webview proof; record any
-packaged/production-CSP qualification still needed before promotion, which remains
-a separate authorized operation.
+and a cold diff audit. Synthetic Chromium and offline static-page WebKitGTK checks
+use current source/mock IPC and no application build or live profile/provider/model
+access; report exact browser/webview versions. Exercise continuity with real browser
+scroll, not only fake-DOM assignments. GitHub CI owns authorized native build/package
+checks. Static WebKitGTK geometry is not packaged IPC/production-CSP qualification;
+record that remaining promotion gate separately, with no local build/install.
 
 ## Implementation summary
 
@@ -270,6 +309,10 @@ One documentation proposal for review grounded in merged #350. It defines the ne
 read-only pane slice, keeps existing actions in their rows and names the remaining
 separate action-migration work. Application code and the existing contracts are
 unchanged. This is proposed behavior, not a claim that a pane already exists.
+The review amendment addresses F1 (review 5810521636): fresh guarded body re-reads
+and reading-position restoration on successful same-query refresh, with explicit
+failure/race clearing. It also names content-width measurement, WebKitGTK checks,
+the large-diff split boundary and the local-only frozen commit reference.
 
 ## Cold diff audit
 
