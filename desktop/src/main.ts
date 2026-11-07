@@ -530,21 +530,6 @@ app.innerHTML = `
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
-      <div id="inbox-columns" class="inbox-columns">
-      <aside class="inbox-senders">
-        <nav id="inbox-sender-nav" aria-label="Inbox senders">
-          <label class="inbox-sender-finder">Find watched sender
-            <input id="inbox-sender-search" type="search" aria-controls="inbox-sender-results" autocomplete="off" />
-          </label>
-          <button id="inbox-sender-all" type="button" aria-pressed="true" aria-describedby="inbox-sender-help">All senders</button>
-          <p id="inbox-sender-help">All retained messages in the selected account scope.</p>
-          <div id="inbox-sender-pinned" hidden></div>
-          <div id="inbox-sender-results" role="region" aria-label="Watched sender results" tabindex="0"></div>
-          <p id="inbox-sender-empty" class="status" role="status" hidden></p>
-        </nav>
-        <p id="inbox-sender-error" class="status" role="status" hidden></p>
-      </aside>
-      <div class="inbox-messages">
       <h2 id="inbox-heading" tabindex="-1">All senders</h2>
       <div class="inbox-search-toolbar">
         <label class="inbox-keyword-label">
@@ -620,18 +605,40 @@ app.innerHTML = `
       <p id="inbox-previous-results" class="status" role="status" hidden>Previous results</p>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
       <div id="inbox-removal-statuses" aria-live="polite"></div>
+      <div id="inbox-columns" class="inbox-columns">
+      <aside id="inbox-senders-pane" class="inbox-senders">
+        <button id="inbox-senders-toggle" type="button" aria-expanded="false" aria-controls="inbox-senders-content">Senders</button>
+        <div id="inbox-senders-content">
+        <nav id="inbox-sender-nav" aria-label="Inbox senders">
+          <label class="inbox-sender-finder">Find watched sender
+            <input id="inbox-sender-search" type="search" aria-controls="inbox-sender-results" autocomplete="off" />
+          </label>
+          <button id="inbox-sender-all" type="button" aria-pressed="true" aria-describedby="inbox-sender-help">All senders</button>
+          <p id="inbox-sender-help">All retained messages in the selected account scope.</p>
+          <div id="inbox-sender-pinned" hidden></div>
+          <div id="inbox-sender-results" role="region" aria-label="Watched sender results" tabindex="0"></div>
+          <p id="inbox-sender-empty" class="status" role="status" hidden></p>
+        </nav>
+        <p id="inbox-sender-error" class="status" role="status" hidden></p>
+        </div>
+      </aside>
+      <div id="inbox-message-pane" class="inbox-messages">
       <div id="inbox-results" role="region" aria-label="Message results" tabindex="0">
         <ul id="inbox-list" class="inbox-list" aria-label="Recent retained messages"></ul>
         <div class="inbox-page-actions">
           <button id="inbox-load-more" type="button" hidden>Load more</button>
         </div>
       </div>
-      <div class="inbox-page-actions">
+      </div>
+      <section id="inbox-reading-pane" role="region" aria-label="Retained thread reading pane" tabindex="0">
+        <p id="inbox-reader-empty">Select a message to read its retained thread.</p>
+        <p id="inbox-reader-source" class="thread-history-notice" hidden></p>
+        <section id="inbox-thread-view" hidden></section>
+      </section>
+      </div>
+      <div id="inbox-history-actions" class="inbox-page-actions">
         <button id="inbox-clear" class="danger-action" type="button">Clear local history</button>
       </div>
-      </div>
-      </div>
-      <section id="inbox-thread-view" hidden></section>
     </section>
 
     <section id="watchlist-view" class="view" aria-labelledby="watchlist-tab" hidden>
@@ -919,7 +926,14 @@ const threadReader = new ThreadViewDom(requiredElement<HTMLElement>("#thread-vie
 
 const inboxThreadEntry = new InboxThreadEntry({
   root: requiredElement<HTMLElement>("#inbox-thread-view"),
-  columns: requiredElement<HTMLElement>("#inbox-columns"),
+  columns: requiredElement<HTMLElement>("#inbox-message-pane"),
+  layout: {
+    grid: requiredElement<HTMLElement>("#inbox-columns"), readerPane: requiredElement<HTMLElement>("#inbox-reading-pane"),
+    placeholder: requiredElement<HTMLElement>("#inbox-reader-empty"), source: requiredElement<HTMLElement>("#inbox-reader-source"),
+    senders: requiredElement<HTMLElement>("#inbox-senders-pane"), senderToggle: requiredElement<HTMLButtonElement>("#inbox-senders-toggle"),
+    senderContent: requiredElement<HTMLElement>("#inbox-senders-content"), footer: requiredElement<HTMLElement>("#inbox-history-actions"),
+  },
+  onSelectionChange: refreshInboxThreadControls,
   heading: requiredElement<HTMLElement>("#inbox-heading"),
   client: new ThreadReadClient(invoke), accounts: () => mailAccounts,
   snapshot: () => ({
@@ -932,8 +946,8 @@ const inboxThreadEntry = new InboxThreadEntry({
   scrollElements: () => [inboxResults, inboxSenderResults, inboxSenderNavigation, inboxView,
     ...(document.scrollingElement ? [document.scrollingElement] : [])],
 });
-const inboxThreadState = inboxThreadEntry.state;
-const threadHistory = new ThreadHistory(threadReader.state, inboxThreadState, refreshInboxThreadControls);
+const threadHistory = new ThreadHistory(threadReader.state, inboxThreadEntry, refreshInboxThreadControls,
+  () => inboxThreadEntry.selected ? refreshLoadedInboxSpan() : Promise.resolve());
 
 function refreshThreadHistory(): void {
   if (configurationReady) threadHistory.refresh();
@@ -949,7 +963,7 @@ function openVendorThreads(vendorId: string, displayName: string): void {
 }
 
 function reconcileThreadVendor(): boolean {
-  void inboxThreadState.refresh();
+  if (inboxThreadEntry.selected) void refreshLoadedInboxSpan();
   const selected = threadReader.state.vendor;
   if (!selected) return true;
   const fresh = vendorRecords.find(vendor => vendor.vendor_id === selected.vendor_id);
@@ -961,7 +975,7 @@ function reconcileThreadVendor(): boolean {
     return false;
   }
   threadReader.state.vendor = { vendor_id: fresh.vendor_id, display_name: fresh.display_name };
-  refreshThreadHistory();
+  void threadReader.state.refresh();
   return true;
 }
 const expiryLedgerView = requiredElement<HTMLElement>("#expiry-ledger-view");
@@ -1130,6 +1144,8 @@ const expandedInboxMessages = new Set<string>();
 let inboxItems: InboxItem[] = [];
 let inboxItemsEpoch: number | null = null;
 let inboxRenderedEpoch: number | null = null;
+let inboxScrollRevision = 0;
+let inboxRestoredScrollTop = 0;
 // A row can enter the reader only after its entire requested span was revalidated.
 let inboxThreadSpanScope: MailboxEffectScope | null = null;
 let inboxNextCursor: string | null = null;
@@ -1776,8 +1792,21 @@ function renderCapabilityResult(
   row.append(presentation);
 }
 
+function captureInboxScroll(): { top: number; revision: number } {
+  // Distinguish movement outside our renderer from its intermediate page clamps.
+  if (inboxResults.scrollTop !== inboxRestoredScrollTop) inboxScrollRevision++;
+  inboxRestoredScrollTop = inboxResults.scrollTop;
+  return { top: inboxRestoredScrollTop, revision: inboxScrollRevision };
+}
+
+function restoreInboxScroll(top: number): void {
+  inboxResults.scrollTop = top;
+  inboxRestoredScrollTop = inboxResults.scrollTop;
+}
+
 function renderInbox(items: InboxItem[]): void {
-  const scrollTop = inboxItemsEpoch === inboxRenderedEpoch ? inboxResults.scrollTop : 0;
+  const position = captureInboxScroll();
+  const scrollTop = inboxItemsEpoch === inboxRenderedEpoch ? position.top : 0;
   inboxRenderedEpoch = inboxItemsEpoch;
   renderInboxFilterScope();
   if (inboxProposalExpiryTimer !== null) {
@@ -1808,7 +1837,7 @@ function renderInbox(items: InboxItem[]): void {
       ? "No retained messages match these filters."
       : "No retained messages yet.";
     inboxList.append(empty);
-    inboxResults.scrollTop = scrollTop;
+    restoreInboxScroll(scrollTop);
     return;
   }
 
@@ -2557,6 +2586,7 @@ function renderInbox(items: InboxItem[]): void {
     openThread.setAttribute("aria-controls", "inbox-thread-view");
     openThread.dataset.inboxThreadOrigin = inboxThreadOriginKey(item.thread_entry_ref);
     openThread.disabled = !inboxThreadEntry.canOpen(item);
+    openThread.setAttribute("aria-pressed", String(inboxThreadEntry.isSelected(item)));
     openThread.addEventListener("click", () => { void inboxThreadEntry.open(item); });
     card.append(toggle, openThread, content);
     inboxList.append(card);
@@ -2566,7 +2596,7 @@ function renderInbox(items: InboxItem[]): void {
   }
   // Replacing rows can clamp the scroll owner while it is empty. Restore only
   // after all rows exist; the browser clamps naturally if the new span is shorter.
-  inboxResults.scrollTop = scrollTop;
+  restoreInboxScroll(scrollTop);
   if (nextProposalExpiry !== null) {
     const delay = Math.min(Math.max(nextProposalExpiry - Date.now() + 1, 0), 2_147_483_647);
     inboxProposalExpiryTimer = window.setTimeout(() => {
@@ -3084,21 +3114,31 @@ async function runInboxRefresh(
   current: () => boolean,
 ): Promise<boolean> {
   const sourceScope = currentMailboxEffectScope(), sourceEpoch = inboxQueryEpoch;
-  if (!await loadInboxPage(false, effectScope)) return false;
-  if (!current()) return false;
-  if (intent.kind === "span") {
-    while (inboxItems.length < intent.target && inboxNextCursor) {
-      if (!await loadInboxPage(true, effectScope) || !current()) return false;
+  const readerGeneration = inboxThreadEntry.refreshGeneration;
+  const position = intent.kind === "span" && inboxItemsEpoch === sourceEpoch ? captureInboxScroll() : null;
+  let committed = false;
+  try {
+    if (!await loadInboxPage(false, effectScope)) return false;
+    if (!current()) return false;
+    if (intent.kind === "span") {
+      while (inboxItems.length < intent.target && inboxNextCursor) {
+        if (!await loadInboxPage(true, effectScope) || !current()) return false;
+      }
     }
+    if (position && current() && sourceEpoch === inboxQueryEpoch
+      && captureInboxScroll().revision === position.revision) restoreInboxScroll(position.top);
+    if (current() && readerGeneration === inboxThreadEntry.refreshGeneration) {
+      inboxThreadSpanScope = sourceScope && sourceEpoch === inboxQueryEpoch && mailboxEffectScopeIsCurrent(sourceScope)
+        ? sourceScope : null;
+      inboxThreadEntry.revalidateSource();
+      refreshInboxThreadControls();
+      committed = true;
+      void threadHistory.commitInboxSpan();
+    }
+    return true;
+  } finally {
+    if (!committed) inboxThreadEntry.failRefresh(readerGeneration);
   }
-  if (current()) {
-    inboxThreadSpanScope = sourceScope && sourceEpoch === inboxQueryEpoch && mailboxEffectScopeIsCurrent(sourceScope)
-      ? sourceScope : null;
-    inboxThreadEntry.revalidateSource();
-    refreshInboxThreadControls();
-    void threadHistory.commitInboxSpan();
-  }
-  return true;
 }
 
 function refreshInboxThreadControls(): void {
@@ -3106,6 +3146,7 @@ function refreshInboxThreadControls(): void {
   for (const button of inboxList.querySelectorAll<HTMLButtonElement>("[data-inbox-thread-origin]")) {
     const row = rows.get(button.dataset.inboxThreadOrigin!);
     button.disabled = !row || !inboxThreadEntry.canOpen(row);
+    button.setAttribute("aria-pressed", String(!!row && inboxThreadEntry.isSelected(row)));
   }
 }
 
@@ -3138,7 +3179,13 @@ async function refreshLoadedInboxSpan(): Promise<void> {
 
 function scheduleConnectQueueRefresh(): void {
   connectQueueRefreshAgain = true;
-  if (connectQueueRefresh) return;
+  if (connectQueueRefresh) {
+    // Fence restoration immediately; the existing loop owns the follow-up span.
+    inboxThreadSpanScope = null;
+    threadHistory.prepareInboxRefresh(false);
+    refreshInboxThreadControls();
+    return;
+  }
   connectQueueRefresh = (async () => {
     while (connectQueueRefreshAgain) {
       connectQueueRefreshAgain = false;
@@ -5443,10 +5490,15 @@ void listen<{ attempted: number }>("watcher://connect-queue", () => {
   if (configurationReady) scheduleConnectQueueRefresh();
 });
 window.addEventListener("focus", () => {
-  refreshThreadHistory();
   if (configurationReady) {
-    void loadMailAccounts().then((loaded) => {
-      if (loaded) return loadInbox();
+    inboxThreadSpanScope = null;
+    threadHistory.prepareInboxRefresh();
+    refreshInboxThreadControls();
+    const readerGeneration = inboxThreadEntry.refreshGeneration;
+    void loadMailAccounts().then(async (loaded) => {
+      if (loaded) {
+        if (inboxThreadEntry.selected) await refreshLoadedInboxSpan(); else await loadInbox();
+      } else inboxThreadEntry.failRefresh(readerGeneration);
     });
   }
   if (!settingsView.hidden && configurationReady) {
@@ -5456,7 +5508,14 @@ window.addEventListener("focus", () => {
   }
 });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
+  if (document.visibilityState !== "visible") {
+    if (configurationReady) {
+      inboxThreadSpanScope = null;
+      threadHistory.prepareInboxRefresh(false);
+      refreshInboxThreadControls();
+    }
+    return;
+  }
   refreshThreadHistory();
   if (!settingsView.hidden && configurationReady) {
     void Promise.all([loadCalendarConsents(), loadGmailLabelState()]);

@@ -30,10 +30,11 @@ test("shell view marker starts at inbox and follows only showView", () => {
   assert.equal(source.match(/\.dataset\.view\s*=/g)?.length, 1);
 });
 
-test("wide shell applies only to inbox and expiry ledger above the phone breakpoint", () => {
+test("Inbox uses available width while Expiry Ledger keeps its existing width rule", () => {
   const wide = styles.match(/@media \(min-width: 681px\) \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(wide, "wide shell must be inside the desktop media query");
-  assert.match(wide, /^\s*\.shell\[data-view="inbox"\],\s*\.shell\[data-view="expiry-ledger"\]\s*\{\s*width: max\(80%, min\(760px, calc\(100% - 40px\)\)\);\s*\}\s*$/);
+  assert.match(wide, /^\s*\.shell\[data-view="expiry-ledger"\]\s*\{\s*width: max\(80%, min\(760px, calc\(100% - 40px\)\)\);\s*\}\s*$/);
+  assert.match(styles, /\.shell\[data-view="inbox"\] \{\s*width: calc\(100% - 32px\);/);
   assert.match(styles, /\.shell \{\s*width: min\(760px, calc\(100% - 40px\)\);/);
   assert.match(styles, /@media \(max-width: 680px\) \{\s*\.shell \{\s*width: min\(100% - 28px, 760px\);/);
 });
@@ -245,8 +246,10 @@ test("span refresh stops when superseded before or during append", async () => {
   for (const stopAt of [1, 2]) {
     for (const committed of [true, false]) {
       const run = new Function("stopAt", "committed", `
-        let inboxItems = [1, 2, 3], inboxNextCursor = "next", inboxQueryEpoch = 0, calls = 0;
+        let inboxItems = [1, 2, 3], inboxNextCursor = "next", inboxQueryEpoch = 0, inboxItemsEpoch = 0, calls = 0;
+        const captureInboxScroll = () => ({ top: 0, revision: 0 });
         const currentMailboxEffectScope = () => ({ mutation_epoch: 0, mailbox_operation_revision: 1 });
+        const inboxThreadEntry = { refreshGeneration: 0, failRefresh: () => {} };
         async function loadInboxPage() {
           calls++;
           inboxItems = calls === 1 ? [1] : [1, 2];
@@ -341,6 +344,7 @@ test("watchlist updates and failures render navigation with a responsive layout"
   assert.match(source, /function loadSenders[^]*?catch \(error\) \{\s+renderInboxSenderNavigation\(errorMessage\(error\)\)/);
   assert.match(source, /setAttribute\("aria-pressed", String\(item.selected\)\)/);
   assert.match(source, /if \(model.sender !== activeInboxQuery.sender\) selectInboxSender\(model.sender\)/);
-  assert.ok(/\.inbox-columns\s*\{[^}]*grid-template-columns: minmax\(220px, 300px\) minmax\(0, 1fr\);/.test(styles), "sender column must use minmax(220px, 300px)");
-  assert.match(styles, /@media \(max-width: 760px\)\s*\{\s*\.inbox-columns\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(source, /id="inbox-senders-toggle"[^>]*aria-controls="inbox-senders-content"/);
+  assert.match(styles, /#inbox-columns\[data-layout="wide"\][^}]*grid-template-columns:/);
+  assert.match(styles, /#inbox-columns\[data-layout="split"\][^}]*grid-template-columns:/);
 });

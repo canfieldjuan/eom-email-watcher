@@ -1,17 +1,22 @@
 import type { ThreadViewState } from "./threadView.ts";
 
+type InboxLifecycle = Pick<ThreadViewState, "resume" | "close" | "invalidate" | "refresh" | "beginMutation" | "endMutation">;
+
 /** One lifecycle dispatch for the independent Vendors and Inbox readers. */
 export class ThreadHistory {
   private readonly vendor: ThreadViewState;
-  private readonly inbox: ThreadViewState;
+  private readonly inbox: InboxLifecycle;
   private holds = 0;
   private inboxSpanCommitted = false;
   private readonly onMutationChange: () => void;
+  private readonly refreshInbox: (() => Promise<void>) | undefined;
 
-  constructor(vendor: ThreadViewState, inbox: ThreadViewState, onMutationChange: () => void = () => {}) {
+  constructor(vendor: ThreadViewState, inbox: InboxLifecycle, onMutationChange: () => void = () => {},
+    refreshInbox?: () => Promise<void>) {
     this.vendor = vendor;
     this.inbox = inbox;
     this.onMutationChange = onMutationChange;
+    this.refreshInbox = refreshInbox;
   }
 
   get mutationHeld(): boolean { return this.holds > 0; }
@@ -25,7 +30,7 @@ export class ThreadHistory {
 
   refresh(): void {
     void this.vendor.refresh();
-    void this.inbox.refresh();
+    void (this.refreshInbox ? this.refreshInbox() : this.inbox.refresh());
   }
 
   clearInboxSelection(): void {
@@ -33,10 +38,10 @@ export class ThreadHistory {
     this.inbox.close();
   }
 
-  prepareInboxRefresh(): void {
+  prepareInboxRefresh(refreshVendor = true): void {
     this.inboxSpanCommitted = false;
     this.inbox.invalidate();
-    void this.vendor.refresh();
+    if (refreshVendor) void this.vendor.refresh();
   }
 
   commitInboxSpan(): Promise<void> {
