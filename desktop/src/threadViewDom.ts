@@ -14,6 +14,12 @@ const accountKey = (account: { provider: string; account_id: string }) => JSON.s
 const dateLabel = (value: string | null) => value && Number.isFinite(Date.parse(value))
   ? new Date(value).toLocaleString() : "Date unavailable";
 
+export interface ThreadReadingPosition {
+  top: number;
+  bodies: [string, number][];
+  focus: string | null;
+}
+
 /** Plain DOM consumer of local read state. No mail/provider text enters an HTML sink. */
 export class ThreadViewDom {
   readonly state: ThreadViewState;
@@ -28,6 +34,8 @@ export class ThreadViewDom {
     onInboxChoice?: () => void;
     inboxSourceNotice?: () => string | null;
     onStateChange?: () => void;
+    scrollRoot?: HTMLElement;
+    restoring?: () => boolean;
   };
   private pendingFocus: string | null = null;
 
@@ -51,6 +59,34 @@ export class ThreadViewDom {
     return this.state.openInbox(origin, current);
   }
 
+  focusHeading(): void {
+    const target = Array.from(this.root.querySelectorAll<HTMLElement>("[data-thread-focus]"))
+      .find(element => element.dataset.threadFocus === this.focusKey("heading"));
+    target?.focus({ preventScroll: true });
+  }
+
+  readingPosition(): ThreadReadingPosition {
+    const active = this.doc.activeElement as HTMLElement | null;
+    return { top: this.options.scrollRoot?.scrollTop ?? 0,
+      bodies: Array.from(this.root.querySelectorAll<HTMLElement>("[data-thread-focus]"))
+        .filter(element => element.dataset.threadFocus?.startsWith(this.focusKey("body-text:")))
+        .map(element => [element.dataset.threadFocus!, element.scrollTop]),
+      focus: active && this.root.contains(active) ? active.dataset.threadFocus ?? this.focusKey("heading") : null };
+  }
+
+  restoreReadingPosition(position: ThreadReadingPosition, focus: boolean): void {
+    const targets = Array.from(this.root.querySelectorAll<HTMLElement>("[data-thread-focus]"));
+    for (const [key, top] of position.bodies) {
+      const body = targets.find(element => element.dataset.threadFocus === key);
+      if (body) body.scrollTop = top;
+    }
+    if (this.options.scrollRoot) this.options.scrollRoot.scrollTop = position.top;
+    if (focus) {
+      const target = targets.find(element => element.dataset.threadFocus === position.focus);
+      if (target) target.focus({ preventScroll: true }); else this.focusHeading();
+    }
+  }
+
   private id(suffix: string): string { return `${this.options.idPrefix ?? "thread"}-${suffix}`; }
   private focusKey(key: string): string { return this.options.idPrefix ? `${this.options.idPrefix}:${key}` : key; }
   private regionId(kind: string, ...keys: string[]): string {
@@ -67,6 +103,7 @@ export class ThreadViewDom {
   private button(label: string, key: string, action: () => void | Promise<void>, expanded?: boolean, controls?: string): HTMLButtonElement {
     const button = this.node("button", label, "secondary-action");
     button.type = "button";
+    button.disabled = !!this.options.restoring?.() && !["back-inbox", "refresh"].includes(key);
     button.dataset.threadFocus = this.focusKey(key);
     if (expanded !== undefined) button.setAttribute("aria-expanded", String(expanded));
     if (controls) button.setAttribute("aria-controls", controls);
@@ -124,6 +161,8 @@ export class ThreadViewDom {
   }
 
   render(): void {
+    const outerScroll = this.options.scrollRoot?.scrollTop ?? 0;
+    this.root.setAttribute("aria-busy", String(!!this.options.restoring?.()));
     const active = this.doc.activeElement as HTMLElement | null;
     const focus = active && this.root.contains(active) ? active.dataset.threadFocus : undefined;
     const scroll = new Map(Array.from(this.root.querySelectorAll<HTMLElement>("[data-thread-focus]"),
@@ -160,7 +199,8 @@ export class ThreadViewDom {
     const targets = Array.from(this.root.querySelectorAll<HTMLElement>("[data-thread-focus]"));
     for (const element of targets) element.scrollTop = scroll.get(element.dataset.threadFocus) ?? 0;
     const target = targets.find(element => element.dataset.threadFocus === (this.pendingFocus === null ? focus : this.focusKey(this.pendingFocus)));
-    if (target) { target.focus(); this.pendingFocus = null; }
+    if (this.options.scrollRoot) this.options.scrollRoot.scrollTop = outerScroll;
+    if (target) { target.focus(this.options.scrollRoot ? { preventScroll: true } : undefined); this.pendingFocus = null; }
     else if (this.pendingFocus && ["ready", "error"].includes(
       this.state.selectedThread ? this.state.messages.status : origin ? this.state.resolution.status : this.state.threads.status)
       && !(origin && this.state.resolution.value?.state === "resolved" && !this.state.selectedThread)) {
@@ -251,7 +291,7 @@ export class ThreadViewDom {
     section.append(list);
     if (state.value?.next_cursor) {
       const more = this.button("Load more messages", "more-messages", () => this.state.loadMessages(true));
-      more.disabled = state.status === "loading"; section.append(more);
+      more.disabled ||= state.status === "loading"; section.append(more);
     }
     this.root.append(section);
   }

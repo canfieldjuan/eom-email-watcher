@@ -14,7 +14,7 @@ import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxAc
 const source = stripTypeScriptTypes(readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"));
 const ast = parseAst(source);
 const names = ["attachmentKey", "capabilityOutputKey", "clearMessageOwnedUiState", "capabilityGroups",
-  "renderCapabilityResult", "renderInbox", "loadAttachmentCapabilities", "loadInboxPage",
+  "renderCapabilityResult", "captureInboxScroll", "restoreInboxScroll", "renderInbox", "loadAttachmentCapabilities", "loadInboxPage",
   "errorCode", "errorMessage", "errorRetryable"];
 const code = names.map(name => {
   const node = ast.body.find(node => node.type === "FunctionDeclaration" && node.id?.name === name);
@@ -82,7 +82,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     attachments: [{ part_id: "part-1", filename: "synthetic.pdf", byte_size: 4, media_type: "application/pdf",
       capability_results: [] as any[], automation_fires: [] }] };
   const context = vm.createContext({
-    inboxThreadOriginKey, inboxThreadEntry: { canOpen: () => true, open: (row: unknown) => opened.push(row) },
+    inboxThreadOriginKey, inboxThreadEntry: { canOpen: () => true, isSelected: () => false, open: (row: unknown) => opened.push(row) },
     ...availability, activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult,
     hasInboxAutomationConfirmation, inboxActionState, crypto,
     document: { createElement: (tag: string) => new Element(tag) },
@@ -97,6 +97,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     activeInboxQuery: { provider: "fixture", account_id: "fixture", limit: 25 },
     inboxPageState: "loaded", inboxPageStateGeneration: 0, inboxQueryEpoch: 0, inboxRequestGeneration: 0,
     inboxItemsEpoch: 0, inboxRenderedEpoch: null, inboxNextCursor: null, inboxCapabilityUnavailableCount: 0,
+    inboxScrollRevision: 0, inboxRestoredScrollTop: 0,
     mailboxEffectScopeIsCurrent: () => true, mailboxEffectRequestIsCurrent: () => true,
     refreshInboxRemovalStatuses: async () => {}, setInboxControlsBusy: () => {},
     releaseAutomationRefreshFences: () => false, automationDecisionRefreshRequired: new Map(),
