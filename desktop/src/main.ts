@@ -3127,13 +3127,13 @@ async function runInboxRefresh(
     }
     if (position && current() && sourceEpoch === inboxQueryEpoch
       && captureInboxScroll().revision === position.revision) restoreInboxScroll(position.top);
-    if (current() && readerGeneration === inboxThreadEntry.refreshGeneration) {
+    if (current()) {
       inboxThreadSpanScope = sourceScope && sourceEpoch === inboxQueryEpoch && mailboxEffectScopeIsCurrent(sourceScope)
         ? sourceScope : null;
       inboxThreadEntry.revalidateSource();
       refreshInboxThreadControls();
       committed = true;
-      void threadHistory.commitInboxSpan();
+      void threadHistory.commitInboxSpan(readerGeneration === inboxThreadEntry.refreshGeneration);
     }
     return true;
   } finally {

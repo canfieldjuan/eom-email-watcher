@@ -44,8 +44,9 @@ export class ThreadHistory {
     if (refreshVendor) void this.vendor.refresh();
   }
 
-  commitInboxSpan(): Promise<void> {
-    this.inboxSpanCommitted = true;
+  commitInboxSpan(refreshReader = true): Promise<void> {
+    // A current Inbox span remains usable when Back or a newer refresh cancels its reader.
+    this.inboxSpanCommitted = refreshReader;
     return this.refreshCommittedInbox();
   }
 

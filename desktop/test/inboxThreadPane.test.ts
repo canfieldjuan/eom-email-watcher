@@ -5,6 +5,8 @@ import { stripTypeScriptTypes } from "node:module";
 import { createContext, runInContext } from "node:vm";
 import { paneHarness, deferred } from "./inboxThreadPaneFixture.ts";
 import { nodes, text } from "./threadDomFixture.ts";
+import { ThreadHistory } from "../src/threadHistory.ts";
+import { inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 
@@ -137,22 +139,48 @@ test("a hidden document retains only intent and cannot read or restore until vis
 
 test("the actual Inbox span owner cannot restore an earlier refresh after a newer invalidation", async () => {
   const h = paneHarness(), pending = deferred(); await h.ui.open(h.rows[0]); await h.ui.state.openBody("a");
-  let restored = Promise.resolve(), commits = 0;
+  let restored = Promise.resolve(); const commits: boolean[] = [];
+  const history = new ThreadHistory({} as any, h.ui);
   const c = createContext({ inboxThreadEntry: h.ui, inboxQueryEpoch: h.snapshot.queryEpoch,
     inboxItems: h.rows, inboxNextCursor: null, currentMailboxEffectScope: () => h.snapshot.scope,
     mailboxEffectScopeIsCurrent: () => true, refreshInboxThreadControls() {},
     loadInboxPage: () => pending.promise,
-    threadHistory: { commitInboxSpan: () => { commits++; restored = h.ui.refresh(); } } });
+    threadHistory: { commitInboxSpan: (restore = true) => { commits.push(restore); restored = history.commitInboxSpan(restore); } } });
   Object.defineProperty(c, "inboxThreadSpanScope", { get: () => h.snapshot.spanScope, set: value => { h.snapshot.spanScope = value; } });
   runInContext(stripTypeScriptTypes(main.match(/async function runInboxRefresh\([\s\S]*?\n\}/)![0]), c);
   h.ui.invalidate(); h.snapshot.spanScope = null; const before = h.calls.length;
   const older = c.runInboxRefresh({ kind: "first" }, null, () => true);
   h.ui.invalidate(); pending.resolve(true); await older;
-  assert.equal(commits, 0); assert.equal(h.calls.length, before); assert.equal(h.ui.state.bodies.size, 0);
+  assert.deepEqual(commits, [false]); assert.equal(h.calls.length, before); assert.equal(h.ui.state.bodies.size, 0);
   c.loadInboxPage = async () => true;
   await c.runInboxRefresh({ kind: "first" }, null, () => true); await restored;
-  assert.equal(commits, 1); assert.equal(h.ui.state.bodies.size, 1);
+  assert.deepEqual(commits, [false, true]); assert.equal(h.ui.state.bodies.size, 1);
   assert.equal(h.calls.slice(before).filter(c => c.command === "threads_body").length, 1);
+});
+
+test("Back during a current span reload enables Open thread without restoring the cancelled reader", async () => {
+  for (const back of [false, true]) {
+    const h = paneHarness(), page = deferred(); await h.ui.open(h.rows[0]); await h.ui.state.openBody("a");
+    const history = new ThreadHistory({} as any, h.ui); let restored = Promise.resolve();
+    const c = createContext({ inboxThreadEntry: h.ui, inboxQueryEpoch: h.snapshot.queryEpoch, inboxItemsEpoch: h.snapshot.itemsEpoch,
+      inboxItems: h.rows, inboxList: h.columns, inboxThreadOriginKey, inboxNextCursor: null,
+      currentMailboxEffectScope: () => h.snapshot.scope, mailboxEffectScopeIsCurrent: () => true,
+      captureInboxScroll: () => ({ top: 0, revision: 0 }), restoreInboxScroll() {}, loadInboxPage: () => page.promise,
+      threadHistory: { commitInboxSpan: (restore = true) => { restored = history.commitInboxSpan(restore); return restored; } } });
+    Object.defineProperty(c, "inboxThreadSpanScope", { get: () => h.snapshot.spanScope, set: value => { h.snapshot.spanScope = value; } });
+    runInContext(stripTypeScriptTypes(["runInboxRefresh", "refreshInboxThreadControls"].map(name =>
+      main.match(new RegExp(`(?:async )?function ${name}\\([\\s\\S]*?\\n\\}`))![0]).join("\n")), c);
+    h.ui.invalidate(); h.snapshot.spanScope = null; c.refreshInboxThreadControls();
+    assert.ok(h.triggers.every(button => button.disabled));
+    const before = h.calls.length, refreshing = c.runInboxRefresh({ kind: "span", target: 2 }, null, () => true);
+    if (back) h.ui.back();
+    page.resolve(true); await refreshing; await restored;
+    assert.deepEqual(h.snapshot.spanScope, h.snapshot.scope);
+    assert.ok(h.triggers.every(button => !button.disabled));
+    assert.equal(h.ui.selected, !back); assert.equal(h.ui.state.bodies.size, back ? 0 : 1);
+    if (back) { assert.equal(h.calls.length, before); assert.equal(h.root.hidden, true); }
+    await h.ui.open(h.rows[1]); assert.equal(h.ui.state.inboxOrigin?.message_id, "b");
+  }
 });
 
 test("actual focus and visibility handlers route selected readers through the loaded-span owner", async () => {
