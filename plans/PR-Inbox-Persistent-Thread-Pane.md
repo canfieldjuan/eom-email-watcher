@@ -1,8 +1,12 @@
 # Inbox: keep the retained thread beside the message list
 
-Status: **local docs-only proposal; oversight review and Juan's exact-revision
+Status: **docs-only proposal for review; oversight review and Juan's exact-revision
 acceptance are pending**. This document does not authorize application code,
 another PR's merge, local builds, installation or deployment.
+
+Juan authorized submitting ready work to oversight without a separate permission
+request. This review submission does not replace his acceptance of the final
+reviewed plan or his approval to merge this PR.
 
 Baseline: `main` at `ec0909560703304821ac8fd10ab31d5260d555f3`, the verified
 PR #350 merge. PRs #343–347 delivered the Inbox thread connection; #348's
@@ -231,8 +235,8 @@ state, not that other sessions are paused. Repeat the check before implementatio
 or publication and stop on an overlapping change. Nothing here pauses or changes
 another session.
 
-Oversight/connector review, Juan's exact-revision acceptance, and any required
-publication permission remain pending. Plan acceptance is separate from merge
+Oversight/connector review and Juan's exact-revision acceptance remain pending.
+Submission for review is authorized; plan acceptance is separate from merge
 approval. GitHub CI builds/package checks remain authorized; local application
 build/package/install/deploy remain prohibited.
 
@@ -262,7 +266,7 @@ a separate authorized operation.
 
 ## Implementation summary
 
-One local documentation proposal grounded in merged #350. It defines the next
+One documentation proposal for review grounded in merged #350. It defines the next
 read-only pane slice, keeps existing actions in their rows and names the remaining
 separate action-migration work. Application code and the existing contracts are
 unchanged. This is proposed behavior, not a claim that a pane already exists.
@@ -277,7 +281,8 @@ whitespace checks validate the proposal; runtime acceptance evidence is future w
 
 ## Gap audit
 
-NOT DONE for review, acceptance or implementation. The local proposal is prepared;
-publication, exact-head oversight/connector review and Juan's acceptance remain.
-No application code, remote PR, build, install or deployment is included. Each
-implementation PR will still require its own merge approval.
+NOT DONE for review, acceptance or implementation. The proposal is ready for its
+authorized review submission; exact-head oversight/connector review and Juan's
+acceptance remain. This docs-only PR includes no application code, local build,
+install or deployment. This PR and each implementation PR require their own merge
+approval.
