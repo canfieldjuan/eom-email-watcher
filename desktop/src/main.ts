@@ -532,11 +532,20 @@ app.innerHTML = `
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
       <div id="inbox-columns" class="inbox-columns">
       <aside class="inbox-senders">
-        <nav id="inbox-sender-nav" aria-label="Inbox senders"></nav>
+        <nav id="inbox-sender-nav" aria-label="Inbox senders">
+          <label class="inbox-sender-finder">Find watched sender
+            <input id="inbox-sender-search" type="search" aria-controls="inbox-sender-results" autocomplete="off" />
+          </label>
+          <button id="inbox-sender-all" type="button" aria-pressed="true" aria-describedby="inbox-sender-help">All senders</button>
+          <p id="inbox-sender-help">All retained messages in the selected account scope.</p>
+          <div id="inbox-sender-pinned" hidden></div>
+          <div id="inbox-sender-results" role="region" aria-label="Watched sender results" tabindex="0"></div>
+          <p id="inbox-sender-empty" class="status" role="status" hidden></p>
+        </nav>
         <p id="inbox-sender-error" class="status" role="status" hidden></p>
       </aside>
       <div class="inbox-messages">
-      <h2 id="inbox-heading" tabindex="-1">All messages</h2>
+      <h2 id="inbox-heading" tabindex="-1">All senders</h2>
       <details class="inbox-filter-panel">
         <summary>
           <span>Inbox filters</span>
@@ -914,7 +923,7 @@ const inboxThreadEntry = new InboxThreadEntry({
     scope: currentMailboxEffectScope(), spanScope: inboxThreadSpanScope,
   }),
   refreshInbox: refreshLoadedInboxSpan,
-  scrollElements: () => [inboxList, inboxSenderNavigation, inboxView,
+  scrollElements: () => [inboxList, inboxSenderResults, inboxSenderNavigation, inboxView,
     ...(document.scrollingElement ? [document.scrollingElement] : [])],
 });
 const inboxThreadState = inboxThreadEntry.state;
@@ -961,6 +970,11 @@ const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const inboxRemovalStatuses = requiredElement<HTMLDivElement>("#inbox-removal-statuses");
 const inboxRemovalClient = new InboxRemovalClient(invoke, renderInboxRemovalStatuses, errorCode);
 const inboxSenderNavigation = requiredElement<HTMLElement>("#inbox-sender-nav");
+const inboxSenderSearch = requiredElement<HTMLInputElement>("#inbox-sender-search");
+const inboxSenderAll = requiredElement<HTMLButtonElement>("#inbox-sender-all");
+const inboxSenderPinned = requiredElement<HTMLElement>("#inbox-sender-pinned");
+const inboxSenderResults = requiredElement<HTMLElement>("#inbox-sender-results");
+const inboxSenderEmpty = requiredElement<HTMLElement>("#inbox-sender-empty");
 const inboxSenderError = requiredElement<HTMLParagraphElement>("#inbox-sender-error");
 const inboxHeading = requiredElement<HTMLElement>("#inbox-heading");
 const inboxFilterForm = requiredElement<HTMLFormElement>("#inbox-filter-form");
@@ -2629,15 +2643,26 @@ function inboxAccountForSelection(
 
 function renderInboxSenderNavigation(error: string | null = null): void {
   inboxSenderNavigationError = error;
-  const model = inboxSenderNav(watchedSenders, activeInboxQuery.sender, error);
+  const model = inboxSenderNav(watchedSenders, activeInboxQuery.sender, error, inboxSenderSearch.value);
+  const focusedSender = inboxSenderNavigation.contains(document.activeElement)
+    ? (document.activeElement as HTMLElement).dataset.inboxSender : undefined;
+  const scrollTop = inboxSenderResults.scrollTop;
   inboxHeading.textContent = model.heading;
-  inboxSenderError.textContent = model.error ?? "";
+  if (inboxSenderError.textContent !== (model.error ?? "")) inboxSenderError.textContent = model.error ?? "";
   inboxSenderError.hidden = model.error === null;
   inboxSenderError.dataset.kind = "error";
-  inboxSenderNavigation.replaceChildren();
-  for (const item of model.items) {
+  if (inboxSenderEmpty.textContent !== (model.emptyText ?? "")) inboxSenderEmpty.textContent = model.emptyText ?? "";
+  inboxSenderEmpty.hidden = model.emptyText === null;
+  inboxSenderAll.setAttribute("aria-pressed", String(model.sender === null));
+  inboxSenderAll.disabled = inboxMutationInFlight();
+  inboxSenderPinned.replaceChildren();
+  inboxSenderPinned.hidden = !model.items.some(item => item.pinned);
+  inboxSenderResults.replaceChildren();
+  let focusTarget: HTMLButtonElement | undefined;
+  for (const item of model.items.slice(1)) {
     const button = document.createElement("button");
     button.type = "button";
+    button.dataset.inboxSender = item.sender!;
     button.setAttribute("aria-pressed", String(item.selected));
     button.textContent = item.label;
     if (item.sender !== null && item.label !== item.sender) {
@@ -2647,8 +2672,15 @@ function renderInboxSenderNavigation(error: string | null = null): void {
     }
     button.disabled = inboxMutationInFlight();
     button.addEventListener("click", () => selectInboxSender(item.sender));
-    inboxSenderNavigation.append(button);
+    if (item.pinned) {
+      const label = document.createElement("span");
+      label.textContent = "Selected sender";
+      inboxSenderPinned.append(label, button);
+    } else inboxSenderResults.append(button);
+    if (item.sender === focusedSender) focusTarget = button;
   }
+  if (focusedSender !== undefined) (focusTarget ?? inboxSenderAll).focus({ preventScroll: true });
+  inboxSenderResults.scrollTop = scrollTop;
   if (model.sender !== activeInboxQuery.sender) selectInboxSender(model.sender);
 }
 
@@ -5244,6 +5276,11 @@ settingsTab.addEventListener("click", () => {
 autostartEnabledInput.addEventListener("change", () => {
   void updateAutostart(autostartEnabledInput.checked);
 });
+inboxSenderSearch.addEventListener("input", () => renderInboxSenderNavigation(inboxSenderNavigationError));
+inboxSenderSearch.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") event.preventDefault();
+});
+inboxSenderAll.addEventListener("click", () => selectInboxSender(null));
 inboxFilterForm.addEventListener("submit", (event) => {
   event.preventDefault();
   commitInboxQueryFromControls();
