@@ -235,9 +235,36 @@ select:focus {
   gap: 8px;
 }
 
+#inbox-sender-results {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  max-height: min(32rem, 60vh);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  padding: 2px;
+}
+
+#inbox-sender-pinned:not([hidden]) {
+  display: grid;
+  gap: 4px;
+}
+
+.inbox-sender-finder {
+  display: grid;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+
+#inbox-sender-help {
+  margin: 0;
+  color: #536158;
+  font-size: 0.78rem;
+}
+
 #inbox-sender-nav button {
   min-width: 0;
-  padding: 12px;
+  padding: 9px 10px;
   border: 1px solid #d7ded8;
   border-radius: 10px;
   color: #354239;
