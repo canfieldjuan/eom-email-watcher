@@ -230,6 +230,18 @@ select:focus {
   margin-top: 0;
 }
 
+#inbox-results {
+  max-height: min(40rem, 65vh);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  padding: 4px;
+}
+
+#inbox-results:focus-visible {
+  outline: 2px solid #2e6b4c;
+  outline-offset: 2px;
+}
+
 #inbox-sender-nav {
   display: grid;
   gap: 8px;

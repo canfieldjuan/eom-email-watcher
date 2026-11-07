@@ -620,9 +620,13 @@ app.innerHTML = `
       <p id="inbox-previous-results" class="status" role="status" hidden>Previous results</p>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
       <div id="inbox-removal-statuses" aria-live="polite"></div>
-      <ul id="inbox-list" class="inbox-list" aria-label="Recent retained messages"></ul>
+      <div id="inbox-results" role="region" aria-label="Message results" tabindex="0">
+        <ul id="inbox-list" class="inbox-list" aria-label="Recent retained messages"></ul>
+        <div class="inbox-page-actions">
+          <button id="inbox-load-more" type="button" hidden>Load more</button>
+        </div>
+      </div>
       <div class="inbox-page-actions">
-        <button id="inbox-load-more" type="button" hidden>Load more</button>
         <button id="inbox-clear" class="danger-action" type="button">Clear local history</button>
       </div>
       </div>
@@ -925,7 +929,7 @@ const inboxThreadEntry = new InboxThreadEntry({
     scope: currentMailboxEffectScope(), spanScope: inboxThreadSpanScope,
   }),
   refreshInbox: refreshLoadedInboxSpan,
-  scrollElements: () => [inboxList, inboxSenderResults, inboxSenderNavigation, inboxView,
+  scrollElements: () => [inboxResults, inboxSenderResults, inboxSenderNavigation, inboxView,
     ...(document.scrollingElement ? [document.scrollingElement] : [])],
 });
 const inboxThreadState = inboxThreadEntry.state;
@@ -968,6 +972,7 @@ const expiryLedgerTableWrap = requiredElement<HTMLDivElement>("#expiry-ledger-ta
 const expiryLedgerRows = requiredElement<HTMLTableSectionElement>("#expiry-ledger-rows");
 const coiSetup = mountCoiSetup(requiredElement<HTMLElement>("#coi-setup"), invoke, errorMessage, openConnectHealth);
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
+const inboxResults = requiredElement<HTMLElement>("#inbox-results");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const inboxRemovalStatuses = requiredElement<HTMLDivElement>("#inbox-removal-statuses");
 const inboxRemovalClient = new InboxRemovalClient(invoke, renderInboxRemovalStatuses, errorCode);
@@ -1771,6 +1776,7 @@ function renderCapabilityResult(
 }
 
 function renderInbox(items: InboxItem[]): void {
+  const scrollTop = inboxResults.scrollTop;
   renderInboxFilterScope();
   if (inboxProposalExpiryTimer !== null) {
     window.clearTimeout(inboxProposalExpiryTimer);
@@ -1800,6 +1806,7 @@ function renderInbox(items: InboxItem[]): void {
       ? "No retained messages match these filters."
       : "No retained messages yet.";
     inboxList.append(empty);
+    inboxResults.scrollTop = scrollTop;
     return;
   }
 
@@ -2555,6 +2562,9 @@ function renderInbox(items: InboxItem[]): void {
   for (const key of capabilityOutputPresentations.keys()) {
     if (!capabilityOutputPreviews.has(key)) capabilityOutputPresentations.delete(key);
   }
+  // Replacing rows can clamp the scroll owner while it is empty. Restore only
+  // after all rows exist; the browser clamps naturally if the new span is shorter.
+  inboxResults.scrollTop = scrollTop;
   if (nextProposalExpiry !== null) {
     const delay = Math.min(Math.max(nextProposalExpiry - Date.now() + 1, 0), 2_147_483_647);
     inboxProposalExpiryTimer = window.setTimeout(() => {
@@ -3033,8 +3043,8 @@ async function loadInboxPage(
     inboxItems = [...inboxItems, ...page.items.filter((item) => !known.has(item.message_id))];
   }
   inboxNextCursor = page.next_cursor;
-  inboxLoadMore.hidden = inboxNextCursor === null;
   renderInbox(inboxItems);
+  inboxLoadMore.hidden = inboxNextCursor === null;
   void refreshInboxRemovalStatuses();
   if (releaseAutomationRefreshFences(automationDecisionRefreshRequired, generation, append)) {
     renderInbox(inboxItems);

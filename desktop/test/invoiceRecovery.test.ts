@@ -86,7 +86,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     ...availability, activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult,
     hasInboxAutomationConfirmation, inboxActionState, crypto,
     document: { createElement: (tag: string) => new Element(tag) },
-    inboxItems: [item], inboxList: new Element("ul"), inboxStatus: new Element(), inboxLoadMore: new Element(),
+    inboxItems: [item], inboxList: new Element("ul"), inboxResults: { scrollTop: 0 }, inboxStatus: new Element(), inboxLoadMore: new Element(),
     inboxProposalExpiryTimer: null, expandedInboxMessages: new Set([item.message_id]),
     attachmentCapabilities: new Map(), attachmentCapabilityDiagnostics: new Map(),
     attachmentSelectionRefusals: new Map(), attachmentInvocationsInFlight: new Set(), attachmentRequestIds: new Map(),
