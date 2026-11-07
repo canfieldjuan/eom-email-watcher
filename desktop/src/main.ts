@@ -546,18 +546,17 @@ app.innerHTML = `
       </aside>
       <div class="inbox-messages">
       <h2 id="inbox-heading" tabindex="-1">All senders</h2>
-      <details class="inbox-filter-panel">
-        <summary>
-          <span>Inbox filters</span>
-          <span class="inbox-filter-summary">Sender, priority, topic and more</span>
-        </summary>
-        <form id="inbox-filter-form" class="inbox-filter-form">
+      <div class="inbox-search-toolbar">
+        <label class="inbox-keyword-label">
+          <span>Subject or summary</span>
+          <input id="inbox-keyword" name="keyword" maxlength="200" form="inbox-filter-form" />
+        </label>
+        <button class="inbox-search-submit" type="submit" form="inbox-filter-form">Search</button>
+        <details id="inbox-filter-panel" class="inbox-filter-panel">
+          <summary id="inbox-filters-toggle">Filters</summary>
+          <form id="inbox-filter-form" class="inbox-filter-form">
           <label>
-            <span>Subject or summary</span>
-            <input id="inbox-keyword" name="keyword" maxlength="200" />
-          </label>
-          <label>
-            <span>Sender</span>
+            <span>Sender contains</span>
             <input id="inbox-sender" name="sender" maxlength="320" />
           </label>
           <label>
@@ -615,7 +614,10 @@ app.innerHTML = `
             <button id="inbox-reset" class="secondary-action" type="button">Reset</button>
           </div>
         </form>
-      </details>
+        </details>
+      </div>
+      <div id="inbox-filter-scope" class="inbox-filter-scope" role="group" aria-label="Applied filters"></div>
+      <p id="inbox-previous-results" class="status" role="status" hidden>Previous results</p>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
       <div id="inbox-removal-statuses" aria-live="polite"></div>
       <ul id="inbox-list" class="inbox-list" aria-label="Recent retained messages"></ul>
@@ -978,6 +980,10 @@ const inboxSenderEmpty = requiredElement<HTMLElement>("#inbox-sender-empty");
 const inboxSenderError = requiredElement<HTMLParagraphElement>("#inbox-sender-error");
 const inboxHeading = requiredElement<HTMLElement>("#inbox-heading");
 const inboxFilterForm = requiredElement<HTMLFormElement>("#inbox-filter-form");
+const inboxFilterPanel = requiredElement<HTMLDetailsElement>("#inbox-filter-panel");
+const inboxFiltersToggle = requiredElement<HTMLElement>("#inbox-filters-toggle");
+const inboxFilterScope = requiredElement<HTMLElement>("#inbox-filter-scope");
+const inboxPreviousResults = requiredElement<HTMLElement>("#inbox-previous-results");
 const inboxKeywordInput = requiredElement<HTMLInputElement>("#inbox-keyword");
 const inboxSenderInput = requiredElement<HTMLInputElement>("#inbox-sender");
 const inboxAccountSelect = requiredElement<HTMLSelectElement>("#inbox-account");
@@ -985,6 +991,11 @@ const inboxPrioritySelect = requiredElement<HTMLSelectElement>("#inbox-priority"
 const inboxCategorySelect = requiredElement<HTMLSelectElement>("#inbox-category");
 const inboxStateSelect = requiredElement<HTMLSelectElement>("#inbox-state");
 const inboxPageSizeSelect = requiredElement<HTMLSelectElement>("#inbox-page-size");
+type InboxPredicateKey = "keyword" | "sender_query" | "priority" | "category" | "status";
+const inboxPredicateControls = {
+  keyword: inboxKeywordInput, sender_query: inboxSenderInput, priority: inboxPrioritySelect,
+  category: inboxCategorySelect, status: inboxStateSelect,
+};
 const inboxReset = requiredElement<HTMLButtonElement>("#inbox-reset");
 const inboxLoadMore = requiredElement<HTMLButtonElement>("#inbox-load-more");
 const inboxClear = requiredElement<HTMLButtonElement>("#inbox-clear");
@@ -1760,6 +1771,7 @@ function renderCapabilityResult(
 }
 
 function renderInbox(items: InboxItem[]): void {
+  renderInboxFilterScope();
   if (inboxProposalExpiryTimer !== null) {
     window.clearTimeout(inboxProposalExpiryTimer);
     inboxProposalExpiryTimer = null;
@@ -2723,13 +2735,15 @@ function clearInboxPageForAccountChange(message: string): void {
   void loadInbox();
 }
 
-function commitInboxQueryFromControls(): void {
-  const nextQuery = queryFromInboxControls();
+function commitInboxQueryFromControls(
+  nextQuery: Omit<InboxQuery, "cursor"> = queryFromInboxControls(),
+  accountSelection = inboxAccountSelect.value,
+): void {
   const accountScopeChanged =
     activeInboxQuery.provider !== nextQuery.provider ||
     activeInboxQuery.account_id !== nextQuery.account_id ||
     activeInboxQuery.sender !== nextQuery.sender;
-  activeInboxAccountSelection = inboxAccountSelect.value;
+  activeInboxAccountSelection = accountSelection;
   activeInboxQuery = nextQuery;
   if (accountScopeChanged) {
     clearInboxPageForAccountChange("Email account filter changed. Refreshing local history…");
@@ -2742,6 +2756,79 @@ function commitInboxQueryFromControls(): void {
     renderInbox(inboxItems);
     void loadInbox();
   }
+}
+
+/** Presentation of the committed request; never read draft values to label current rows. */
+function renderInboxFilterScope(): void {
+  inboxPreviousResults.hidden = inboxItems.length === 0 || inboxItemsEpoch === inboxQueryEpoch;
+  const account = mailAccounts.find(item => item.provider === activeInboxQuery.provider
+    && item.account_id === activeInboxQuery.account_id);
+  const accountName = activeInboxQuery.provider === unavailableAccountFilter.provider ? "No active account"
+    : account?.address || account?.display_name || `${activeInboxQuery.provider} · ${activeInboxQuery.account_id}`;
+  const accountLabel = activeInboxAccountSelection === "all" ? "Account: All retained accounts"
+    : activeInboxAccountSelection === "active" ? `Account: Active — ${accountName}` : `Account: ${accountName}`;
+  const names: Record<InboxPredicateKey, string> = {
+    keyword: "Search", sender_query: "Sender contains", priority: "Priority", category: "Topic", status: "Status",
+  };
+  const predicates = (Object.keys(names) as InboxPredicateKey[]).flatMap(key => {
+    const value = activeInboxQuery[key];
+    if (value === null) return [];
+    const control = inboxPredicateControls[key];
+    const label = "options" in control
+      ? Array.from(control.options).find(option => option.value === value)?.textContent ?? value : value;
+    return [{ key, text: `${names[key]}: ${label}` }];
+  });
+  const removableAccount = activeInboxAccountSelection !== "active";
+  const signature = JSON.stringify([accountLabel, removableAccount, predicates, activeInboxQuery.limit]);
+  if (inboxFilterScope.dataset.signature === signature) return;
+  const focused = inboxFilterScope.contains(document.activeElement)
+    ? (document.activeElement as HTMLElement).dataset.inboxFilterFocus : undefined;
+  inboxFilterScope.dataset.signature = signature;
+  inboxFilterScope.replaceChildren();
+  const button = (key: string, label: string, action: () => void) => {
+    const element = document.createElement("button");
+    element.type = "button"; element.className = "inbox-filter-label";
+    element.dataset.inboxFilterFocus = key;
+    element.setAttribute("form", "inbox-filter-form");
+    element.textContent = label;
+    element.disabled = inboxKeywordInput.disabled;
+    element.addEventListener("click", action);
+    inboxFilterScope.append(element);
+    return element;
+  };
+  button("account", accountLabel, () => { inboxFilterPanel.open = true; inboxAccountSelect.focus(); });
+  if (removableAccount) button("remove-account", "Remove account filter", () => removeInboxFilter("account"));
+  for (const predicate of predicates) {
+    button(predicate.key, `${predicate.text} ×`, () => removeInboxFilter(predicate.key))
+      .setAttribute("aria-label", `Remove ${predicate.text}`);
+  }
+  const size = document.createElement("span");
+  size.className = "inbox-page-size-label"; size.textContent = `${activeInboxQuery.limit} per page`;
+  inboxFilterScope.append(size);
+  if (focused !== undefined) {
+    const target = Array.from(inboxFilterScope.querySelectorAll<HTMLButtonElement>("button"))
+      .find(item => item.dataset.inboxFilterFocus === focused && !item.disabled);
+    (target ?? inboxFiltersToggle).focus({ preventScroll: true });
+  }
+}
+
+function removeInboxFilter(key: InboxPredicateKey | "account"): void {
+  if (inboxKeywordInput.disabled || inboxMutationInFlight()) return;
+  const focusKey = key === "account" ? "remove-account" : key;
+  const index = Array.from(inboxFilterScope.querySelectorAll<HTMLButtonElement>("button"))
+    .findIndex(item => item.dataset.inboxFilterFocus === focusKey);
+  const nextQuery = { ...activeInboxQuery };
+  if (key === "account") {
+    inboxAccountSelect.value = "active";
+    Object.assign(nextQuery, inboxAccountForSelection("active"));
+    commitInboxQueryFromControls(nextQuery, "active");
+  } else {
+    nextQuery[key] = null;
+    inboxPredicateControls[key].value = "";
+    commitInboxQueryFromControls(nextQuery, activeInboxAccountSelection);
+  }
+  const available = Array.from(inboxFilterScope.querySelectorAll<HTMLButtonElement>("button")).filter(item => !item.disabled);
+  (available[index] ?? inboxFiltersToggle).focus({ preventScroll: true });
 }
 
 function inboxMutationInFlight(): boolean {
@@ -3647,6 +3734,7 @@ function renderMailAccounts(data: MailAccounts): boolean {
   }
   renderInboxAccountOptions();
   const inboxScopeChanged = reconcileInboxAccountScope();
+  renderInboxFilterScope();
   mailAccountList.replaceChildren();
   mailProviderActions.replaceChildren();
 
@@ -5249,6 +5337,7 @@ vendorsViewConnect.addEventListener("click", () => {
 });
 
 renderInboxSenderNavigation();
+renderInboxFilterScope();
 setBusy(true);
 inboxTab.addEventListener("click", () => showView("inbox"));
 watchlistTab.addEventListener("click", () => showView("watchlist"));

@@ -36,7 +36,7 @@ function harness(names: string[]) {
     vendorFailure: (error: unknown) => { throw error; },
     mailAccounts: [], mailProviders: [], mailAccountCatalogRevision: 0,
     reconcileGmailLabelScope: () => false, renderInboxAccountOptions: noop,
-    reconcileInboxAccountScope: () => false, mailAccountList: node(), mailProviderActions: node(),
+    reconcileInboxAccountScope: () => false, renderInboxFilterScope: noop, mailAccountList: node(), mailProviderActions: node(),
     mailAccountDetail: () => "Account", providerFor: () => undefined,
     inboxItemsEpoch: 0, inboxQueryEpoch: 0,
     configurationReady: true, operationInFlight: false, setBusy: noop,
