@@ -96,7 +96,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     inboxReloadBlocked: () => false, renderInboxFilterScope: () => {},
     activeInboxQuery: { provider: "fixture", account_id: "fixture", limit: 25 },
     inboxPageState: "loaded", inboxPageStateGeneration: 0, inboxQueryEpoch: 0, inboxRequestGeneration: 0,
-    inboxItemsEpoch: 0, inboxNextCursor: null, inboxCapabilityUnavailableCount: 0,
+    inboxItemsEpoch: 0, inboxRenderedEpoch: null, inboxNextCursor: null, inboxCapabilityUnavailableCount: 0,
     mailboxEffectScopeIsCurrent: () => true, mailboxEffectRequestIsCurrent: () => true,
     refreshInboxRemovalStatuses: async () => {}, setInboxControlsBusy: () => {},
     releaseAutomationRefreshFences: () => false, automationDecisionRefreshRequired: new Map(),

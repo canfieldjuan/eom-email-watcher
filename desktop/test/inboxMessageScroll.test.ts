@@ -39,6 +39,7 @@ function harness() {
     renderInboxFilterScope() {}, inboxProposalExpiryTimer: null,
     capabilityOutputPreviews: new Map(), capabilityOutputViewButtons: new Map(), capabilityOutputPresentations: new Map(),
     activeInboxQuery: { provider: "imap", account_id: "retained", sender: null, limit: 25 }, inboxPageState: "loaded",
+    inboxQueryEpoch: 1, inboxItemsEpoch: 1, inboxRenderedEpoch: null,
     inboxMutationInFlight: () => false, receivedLabel: (value: string) => value, stateLabel: () => "Notified",
     hasInboxAutomationConfirmation, inboxActionState, inboxBodyTruncation, inboxThreadOriginKey,
     inboxDeletionsInFlight: new Set(), expandedInboxMessages: new Set(), inboxThreadEntry: { canOpen: () => true },
@@ -91,4 +92,19 @@ test("last Load more page preserves its bottom offset before hiding the paging c
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ command: "inbox_query", args: { query: {
     provider: "imap", account_id: "retained", sender: null, limit: 25, cursor: "120",
   } } }]);
+});
+
+test("same-query refresh keeps scroll but the committed first page of a new query starts at the top", async () => {
+  const h = harness(); h.c.inboxItems = h.rows(145); h.c.renderInbox(h.c.inboxItems);
+  h.results.scrollTop = 850;
+  h.c.invoke = async () => ({ items: h.rows(25), next_cursor: "25" });
+  assert.equal(await h.c.loadInboxPage(false, {}), true);
+  assert.equal(h.c.inboxItemsEpoch, 1); assert.equal(h.results.scrollTop, 850);
+  h.c.inboxQueryEpoch = 2;
+  h.c.renderInbox(h.c.inboxItems); // Previous results still belong to epoch 1.
+  assert.equal(h.results.scrollTop, 850);
+  assert.equal(await h.c.loadInboxPage(false, {}), true);
+  assert.equal(h.c.inboxItemsEpoch, 2); assert.equal(h.results.scrollTop, 0);
+  h.results.scrollTop = 450; h.c.renderInbox(h.c.inboxItems);
+  assert.equal(h.results.scrollTop, 450, "later renders belong to the newly committed epoch");
 });

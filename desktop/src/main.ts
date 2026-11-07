@@ -1129,6 +1129,7 @@ let inboxSenderNavigationError: string | null = null;
 const expandedInboxMessages = new Set<string>();
 let inboxItems: InboxItem[] = [];
 let inboxItemsEpoch: number | null = null;
+let inboxRenderedEpoch: number | null = null;
 // A row can enter the reader only after its entire requested span was revalidated.
 let inboxThreadSpanScope: MailboxEffectScope | null = null;
 let inboxNextCursor: string | null = null;
@@ -1776,7 +1777,8 @@ function renderCapabilityResult(
 }
 
 function renderInbox(items: InboxItem[]): void {
-  const scrollTop = inboxResults.scrollTop;
+  const scrollTop = inboxItemsEpoch === inboxRenderedEpoch ? inboxResults.scrollTop : 0;
+  inboxRenderedEpoch = inboxItemsEpoch;
   renderInboxFilterScope();
   if (inboxProposalExpiryTimer !== null) {
     window.clearTimeout(inboxProposalExpiryTimer);
