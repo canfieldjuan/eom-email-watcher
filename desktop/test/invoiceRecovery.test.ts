@@ -93,7 +93,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     capabilityOutputPresentations: new Map(), capabilityOutputPresentationsInFlight: new Set(),
     capabilityOutputPreviews: new Map(), capabilityOutputViewButtons: new Map(),
     inboxDeletionsInFlight: new Set(), inboxMutationInFlight: () => false,
-    inboxReloadBlocked: () => false,
+    inboxReloadBlocked: () => false, renderInboxFilterScope: () => {},
     activeInboxQuery: { provider: "fixture", account_id: "fixture", limit: 25 },
     inboxPageState: "loaded", inboxPageStateGeneration: 0, inboxQueryEpoch: 0, inboxRequestGeneration: 0,
     inboxItemsEpoch: 0, inboxNextCursor: null, inboxCapabilityUnavailableCount: 0,
