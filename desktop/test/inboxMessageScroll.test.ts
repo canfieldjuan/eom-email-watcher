@@ -11,6 +11,7 @@ import { Element, nodes } from "./threadDomFixture.ts";
 const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const render = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
 const loadPage = source.match(/async function loadInboxPage\([\s\S]*?\n\}/)![0];
+const refresh = source.match(/async function runInboxRefresh\([\s\S]*?\n\}/)![0];
 function harness() {
   class Node extends Element {
     get childNodes() { return this.children; }
@@ -40,9 +41,12 @@ function harness() {
     capabilityOutputPreviews: new Map(), capabilityOutputViewButtons: new Map(), capabilityOutputPresentations: new Map(),
     activeInboxQuery: { provider: "imap", account_id: "retained", sender: null, limit: 25 }, inboxPageState: "loaded",
     inboxQueryEpoch: 1, inboxItemsEpoch: 1, inboxRenderedEpoch: null,
+    inboxScrollRevision: 0, inboxRestoredScrollTop: 0,
     inboxMutationInFlight: () => false, receivedLabel: (value: string) => value, stateLabel: () => "Notified",
     hasInboxAutomationConfirmation, inboxActionState, inboxBodyTruncation, inboxThreadOriginKey,
-    inboxDeletionsInFlight: new Set(), expandedInboxMessages: new Set(), inboxThreadEntry: { canOpen: () => true },
+    inboxDeletionsInFlight: new Set(), expandedInboxMessages: new Set(), inboxThreadEntry: {
+      canOpen: () => true, isSelected: () => false, refreshGeneration: 0, revalidateSource() {}, failRefresh() {},
+    }, currentMailboxEffectScope: () => ({}), refreshInboxThreadControls() {}, threadHistory: { commitInboxSpan() {} },
     inboxLoadMore: more, inboxStatus: new Node("p", doc), inboxNextCursor: "120", inboxRequestGeneration: 1,
     mailboxEffectScopeIsCurrent: () => true, mailboxEffectRequestIsCurrent: () => true, inboxReloadBlocked: () => false,
     setInboxControlsBusy() {}, refreshInboxRemovalStatuses() {}, releaseAutomationRefreshFences: () => false,
@@ -50,7 +54,9 @@ function harness() {
     attachmentCapabilities: new Map(), attachmentCapabilityDiagnostics: new Map(),
     loadAttachmentCapabilities: async () => ({ capabilities: new Map(), diagnostics: new Map(), unavailable: 0 }),
   });
-  runInContext(stripTypeScriptTypes(render + "\n" + loadPage), c);
+  const scrollHelpers = ["captureInboxScroll", "restoreInboxScroll"].map(name =>
+    source.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`))?.[0] ?? "").join("\n");
+  runInContext(stripTypeScriptTypes(scrollHelpers + "\n" + render + "\n" + loadPage + "\n" + refresh), c);
   const rows = (count: number) => Array.from({ length: count }, (_, i) => ({ message_id: `row-${i}`,
     subject: `Subject ${i}`, sender: "sender@example.test", sender_name: "Sender", received_at: "2026-11-07T00:00:00Z",
     provider: "imap", account_id: "retained", thread_entry_ref: { provider: "imap", account_id: "retained",
@@ -107,4 +113,19 @@ test("same-query refresh keeps scroll but the committed first page of a new quer
   assert.equal(h.c.inboxItemsEpoch, 2); assert.equal(h.results.scrollTop, 0);
   h.results.scrollTop = 450; h.c.renderInbox(h.c.inboxItems);
   assert.equal(h.results.scrollTop, 450, "later renders belong to the newly committed epoch");
+});
+
+test("full-span refresh restores deep message scroll after intermediate page clamps unless the user moves it", async () => {
+  for (const mode of ["keep", "user", "shorter", "new-query"]) {
+    const h = harness(); h.c.inboxItems = h.rows(120); h.c.renderInbox(h.c.inboxItems);
+    h.results.scrollTop = 8500;
+    if (mode === "new-query") h.c.inboxQueryEpoch++;
+    h.c.invoke = async (_command: string, args: any) => {
+      const offset = Number(args.query.cursor ?? 0), count = mode === "shorter" ? 60 : 120;
+      if (offset === 25 && mode === "user") h.results.scrollTop = 650;
+      return { items: h.rows(count).slice(offset, offset + 25), next_cursor: offset + 25 < count ? String(offset + 25) : null };
+    };
+    assert.equal(await h.c.runInboxRefresh({ kind: "span", target: 120 }, null, () => true), true);
+    assert.equal(h.results.scrollTop, mode === "user" ? 650 : mode === "shorter" ? 5600 : mode === "new-query" ? 0 : 8500, mode);
+  }
 });

@@ -43,10 +43,14 @@ select:disabled {
 }
 
 @media (min-width: 681px) {
-  .shell[data-view="inbox"],
   .shell[data-view="expiry-ledger"] {
     width: max(80%, min(760px, calc(100% - 40px)));
   }
+}
+
+.shell[data-view="inbox"] {
+  width: calc(100% - 32px);
+  padding: 24px 0;
 }
 
 .shell[data-view="inbox"] .intro {
@@ -215,37 +219,66 @@ select:focus {
 
 .inbox-columns {
   display: grid;
-  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
-  align-items: start;
-  gap: 20px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 16px;
 }
 
 .inbox-senders,
-.inbox-messages {
+.inbox-messages,
+#inbox-reading-pane {
+  min-height: 0;
   min-width: 0;
   overflow-wrap: anywhere;
 }
 
-.inbox-messages > h2 {
+#inbox-heading {
   margin-top: 0;
 }
 
-#inbox-results {
+#inbox-results,
+#inbox-reading-pane {
   max-height: min(40rem, 65vh);
   overflow-y: auto;
   scrollbar-gutter: stable;
   padding: 4px;
 }
 
-#inbox-results:focus-visible {
+#inbox-results:focus-visible,
+#inbox-reading-pane:focus-visible,
+#inbox-senders-toggle:focus-visible {
   outline: 2px solid #2e6b4c;
   outline-offset: 2px;
 }
 
 #inbox-sender-nav {
-  display: grid;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   gap: 8px;
 }
+
+#inbox-columns[data-layout="wide"] {
+  grid-template-columns: minmax(13rem, .65fr) minmax(20rem, 1fr) minmax(26rem, 1.3fr);
+}
+
+#inbox-columns[data-layout="split"] {
+  grid-template-columns: minmax(18rem, 1fr) minmax(24rem, 1.2fr);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+#inbox-columns[data-layout="split"] .inbox-senders { grid-column: 1 / -1; }
+#inbox-columns[data-fit="true"] { height: var(--inbox-pane-height); }
+#inbox-columns[data-fit="true"] #inbox-results,
+#inbox-columns[data-fit="true"] #inbox-reading-pane { max-height: none; height: 100%; }
+#inbox-columns[data-layout="wide"][data-fit="true"] #inbox-senders-content,
+#inbox-columns[data-layout="wide"][data-fit="true"] #inbox-sender-nav { height: 100%; }
+#inbox-columns[data-layout="wide"][data-fit="true"] #inbox-sender-results { max-height: none; min-height: 0; }
+#inbox-columns[data-layout="split"] #inbox-sender-results { max-height: min(12rem, 30vh); }
+#inbox-reading-pane { border: 1px solid #d7ded8; border-radius: 12px; background: #fff; padding: 16px; }
+#inbox-reader-empty { color: #536158; }
+#inbox-senders-toggle { margin-bottom: 8px; padding: 8px 12px; }
+.inbox-open-thread[aria-pressed="true"] { outline: 2px solid #2e6b4c; background: #e8ede8; }
 
 #inbox-sender-results {
   display: grid;

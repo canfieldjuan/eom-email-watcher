@@ -46,6 +46,7 @@ export class ThreadReadState<T> {
   status: "idle" | "loading" | "ready" | "error" = "idle";
   value: T | null = null;
   changed = false;
+  pages = 0;
   private generation = 0;
 
   // Silent reset lets the selection owner clear all old content before notifying.
@@ -54,6 +55,7 @@ export class ThreadReadState<T> {
     this.status = "idle";
     this.value = null;
     this.changed = false;
+    this.pages = 0;
   }
 
   async read(load: () => Promise<T>, notify: () => void, merge?: (old: T, fresh: T) => T,
@@ -61,10 +63,11 @@ export class ThreadReadState<T> {
     selectionCurrent: () => boolean = () => true): Promise<void> {
     if (merge && this.status === "loading") return;
     const previous = merge ? this.value : null;
+    const previousPages = this.pages;
     const generation = ++this.generation;
     const current = () => generation === this.generation && selectionCurrent();
     this.status = "loading";
-    if (!merge) { this.value = null; this.changed = false; }
+    if (!merge) { this.value = null; this.changed = false; this.pages = 0; }
     notify();
     if (!current()) return;
     try {
@@ -84,10 +87,12 @@ export class ThreadReadState<T> {
       }
       if (!current()) return;
       this.value = previous && merge && !restarted ? merge(previous, fresh) : fresh;
+      this.pages = previous && merge && !restarted ? previousPages + 1 : 1;
       this.status = "ready";
     } catch {
       if (!current()) return;
       this.value = null;
+      this.pages = 0;
       this.status = "error";
       clearChildren();
     }
@@ -98,6 +103,13 @@ export class ThreadReadState<T> {
 type Account = { provider: string; account_id: string } | null;
 type Page = { items: unknown[]; next_cursor: string | null };
 const inventoryKey = (message: string, copy: string) => JSON.stringify([message, copy]);
+
+export interface ThreadReadingIdentity { resolution: string; messages: string }
+const contextKey = (thread: Pick<ThreadItem | NonVendorThreadItem, "thread_ref" | "relation" | "owner_vendor">, vendor: string | null) => {
+  const ref = thread.thread_ref;
+  return JSON.stringify([ref.provider, ref.account_id, ref.mailbox_identity_key, ref.thread_key,
+    vendor, thread.relation, thread.owner_vendor?.vendor_id ?? null]);
+};
 
 export class ThreadViewState {
   vendor: ThreadVendor | null = null;
@@ -144,6 +156,13 @@ export class ThreadViewState {
     return this.inbox ? { ...this.inbox.origin } : null;
   }
 
+  get readingIdentity(): ThreadReadingIdentity | null {
+    const resolved = this.resolution.value, messages = this.messages.value;
+    if (resolved?.state !== "resolved" || this.messages.status !== "ready" || !messages) return null;
+    const vendor = resolved.context.kind === "vendor" ? resolved.context.vendor.vendor_id : null;
+    return { resolution: contextKey(resolved.context.thread, vendor), messages: contextKey(messages.thread, vendor) };
+  }
+
   openInbox(origin: InboxMessageRef, current: () => boolean): Promise<void> {
     this.inbox = { origin: structuredClone(origin), current };
     this.inboxVendor = undefined;
@@ -154,7 +173,7 @@ export class ThreadViewState {
     return this.refresh();
   }
 
-  async resolveInbox(more = false): Promise<void> {
+  async resolveInbox(more = false, expected?: ThreadReadingIdentity): Promise<void> {
     const entry = this.inbox;
     if (!entry || !this.allowed()) return;
     const previous = this.resolution.value;
@@ -183,12 +202,16 @@ export class ThreadViewState {
     if (!current() || this.resolution.status !== "ready") return;
     const resolved = this.resolution.value;
     if (resolved?.state !== "resolved") return;
+    const vendorId = resolved.context.kind === "vendor" ? resolved.context.vendor.vendor_id : null;
+    if (expected && contextKey(resolved.context.thread, vendorId) !== expected.resolution) {
+      this.resolution.reset(); this.resolution.status = "error"; this.notify(); return;
+    }
     this.selectedThread = structuredClone(resolved.context.thread);
     this.vendor = resolved.context.kind === "vendor" ? { ...resolved.context.vendor } : null;
     this.messages.reset();
     this.clearChildren();
     this.notify();
-    if (current()) await this.loadMessages();
+    if (current()) await this.loadMessages(false, expected);
   }
 
   chooseVendor(vendorId: string): Promise<void> {
@@ -251,9 +274,9 @@ export class ThreadViewState {
     return refresh ? this.refresh() : Promise.resolve();
   }
 
-  refresh(): Promise<void> {
+  refresh(expected?: ThreadReadingIdentity): Promise<void> {
     this.invalidate();
-    if (this.inbox) return this.resolveInbox();
+    if (this.inbox) return this.resolveInbox(false, expected);
     return this.selectedThread ? this.loadMessages() : this.loadThreads();
   }
 
@@ -277,13 +300,13 @@ export class ThreadViewState {
   }
 
   private page<T extends Page>(state: ThreadReadState<T>, more: boolean,
-    load: (cursor: string | null) => Promise<T>, clearChildren: () => void = () => {}): Promise<void> {
+    load: (cursor: string | null) => Promise<T>, clearChildren: () => void = () => {}, restart = true): Promise<void> {
     if (!this.allowed() || (more && (!state.value?.next_cursor || state.status === "loading"))) return Promise.resolve();
     const cursor = more ? state.value!.next_cursor : null;
     if (!more) clearChildren();
     return state.read(() => this.guarded(() => load(cursor)), this.notify,
       more ? (old, fresh) => ({ ...fresh, items: [...old.items, ...fresh.items] }) : undefined,
-      cursor ? () => this.guarded(() => load(null)) : undefined, clearChildren, () => this.allowed());
+      cursor && restart ? () => this.guarded(() => load(null)) : undefined, clearChildren, () => this.allowed());
   }
 
   loadThreads(more = false): Promise<void> {
@@ -294,15 +317,18 @@ export class ThreadViewState {
     return this.page(this.threads, more, cursor => this.client.list({ ...query, cursor }));
   }
 
-  loadMessages(more = false): Promise<void> {
+  loadMessages(more = false, expected?: ThreadReadingIdentity): Promise<void> {
     if (!this.selectedThread) return Promise.resolve();
     const query = this.threadSelector(this.selectedThread.thread_ref);
     if (!query) return Promise.resolve();
     return this.page(this.messages, more, async cursor => {
       const result = await this.client.messages({ ...query, cursor });
+      if (expected && contextKey(result.thread, this.vendor?.vendor_id ?? null) !== expected.messages) {
+        throw new Error("Retained thread context changed");
+      }
       for (const message of result.items) threadBodyStateLabel(message.body_state);
       return result;
-    }, () => this.clearChildren());
+    }, () => this.clearChildren(), expected === undefined);
   }
 
   private threadSelector(thread_ref: ThreadRef): ThreadSelector | null {

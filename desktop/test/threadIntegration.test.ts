@@ -39,6 +39,7 @@ function harness(names: string[]) {
     reconcileInboxAccountScope: () => false, renderInboxFilterScope: noop, mailAccountList: node(), mailProviderActions: node(),
     mailAccountDetail: () => "Account", providerFor: () => undefined,
     inboxItemsEpoch: 0, inboxQueryEpoch: 0,
+    captureInboxScroll: () => ({ top: 0, revision: 0 }), restoreInboxScroll: noop,
     configurationReady: true, operationInFlight: false, setBusy: noop,
     inboxMutationInFlight: () => false, confirmAction: async () => true,
     inboxDeletionsInFlight: new Set(), inboxClearInFlight: false, inboxRequestGeneration: 0,
@@ -59,7 +60,7 @@ function harness(names: string[]) {
     mailboxEffectScopeIsCurrent: () => true,
     currentMailboxEffectScope: () => ({ mutation_epoch: 0, mailbox_operation_revision: 1 }),
     inboxThreadSpanScope: null, refreshInboxThreadControls: noop,
-    inboxThreadEntry: { revalidateSource: noop },
+    inboxThreadEntry: { revalidateSource: noop, isSelected: () => false, refreshGeneration: 0, failRefresh: noop },
     inboxReload: { running: false, request: async () => { events.push("inbox"); return true; } },
     loadInboxPage: async () => { events.push("append"); return true; },
   });
@@ -155,8 +156,8 @@ test("actual span refresh revalidates threads and respects configuration readine
 test("actual row controls track nested mutation release and current-source eligibility", async () => {
   const h = harness(["refreshInboxThreadControls"]);
   const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: "identity", message_id: "m" };
-  const button = { disabled: true, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
-  const other = { disabled: false, dataset: { inboxThreadOrigin: inboxThreadOriginKey({ ...origin, account_id: "other" }) } };
+  const button = { disabled: true, setAttribute: noop, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
+  const other = { disabled: false, setAttribute: noop, dataset: { inboxThreadOrigin: inboxThreadOriginKey({ ...origin, account_id: "other" }) } };
   h.context.inboxThreadOriginKey = inboxThreadOriginKey;
   h.context.inboxItems = [{ ...origin, thread_entry_ref: origin }];
   h.context.inboxList = { querySelectorAll: () => [button, other] };
@@ -174,7 +175,7 @@ test("returning to Inbox enables current rows refreshed while hidden, without by
   for (const mode of ["current", "old-query", "mailbox-changed", "unconfigured", "held"]) {
     const h = harness(["showView", "runInboxRefresh", "refreshInboxThreadControls"]), c = h.context;
     const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: "identity", message_id: "m" };
-    const button = { disabled: false, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
+    const button = { disabled: false, setAttribute: noop, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
     c.inboxThreadOriginKey = inboxThreadOriginKey;
     c.inboxItems = [{ ...origin, thread_entry_ref: origin }];
     c.inboxList = { querySelectorAll: () => [button] };
@@ -252,8 +253,8 @@ test("entry is read class, lifecycle/settings hooks exist, and approved copy pre
   const render = owner("renderVendors");
   assert.ok(render.indexOf('"View threads"') < render.indexOf("if (view.canUpdate)"));
   assert.match(render, /openVendorThreads/);
-  assert.match(source, /window\.addEventListener\("focus", \(\) => \{\s*refreshThreadHistory\(\)/);
-  assert.match(source, /document\.visibilityState !== "visible"\) return;\s*refreshThreadHistory\(\)/);
+  assert.match(source, /window\.addEventListener\("focus", \(\) => \{[\s\S]*?threadHistory\.prepareInboxRefresh\(\)/);
+  assert.match(source, /document\.visibilityState !== "visible"\) \{[\s\S]*?threadHistory\.prepareInboxRefresh\(false\);[\s\S]*?return;\s*\}\s*refreshThreadHistory\(\)/);
   const settings = source.slice(source.indexOf('settingsForm.addEventListener("submit"'), source.indexOf('gmailLabelCatalogSelect.addEventListener'));
   assert.ok(settings.indexOf("threadHistory.beginMutation()") < settings.indexOf('"settings_update"'));
   assert.match(settings, /finally \{\s*void threadHistory\.endMutation\(\)/);
