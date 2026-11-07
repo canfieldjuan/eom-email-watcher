@@ -106,9 +106,9 @@ test("navigation refresh preserves scroll and keyboard focus, including pin tran
 test("the actual thread-entry options save the bounded results region along with outer scroll owners", () => {
   const expr = source.match(/scrollElements: \(\) => (\[[\s\S]*?\]),\n\}\);/)?.[1];
   assert.ok(expr, "thread entry scroll owner callback");
-  const c = createContext({ inboxList: {}, inboxSenderResults: {}, inboxSenderNavigation: {}, inboxView: {}, document: { scrollingElement: {} } });
+  const c = createContext({ inboxResults: {}, inboxSenderResults: {}, inboxSenderNavigation: {}, inboxView: {}, document: { scrollingElement: {} } });
   const saved = runInContext(expr, c);
   assert.ok(saved.includes(c.inboxSenderResults));
-  assert.ok(saved.includes(c.inboxList)); assert.ok(saved.includes(c.document.scrollingElement));
+  assert.ok(saved.includes(c.inboxResults)); assert.ok(saved.includes(c.document.scrollingElement));
   assert.equal(new Set(saved).size, saved.length);
 });
