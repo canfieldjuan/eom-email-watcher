@@ -380,6 +380,7 @@ test("row details share one earliest-expiry timer and recompute it after the ear
   h.context.inboxItems = [
     { ...h.item, calendar_proposal: proposal(15_000) },
     { ...h.item, message_id: "earliest", calendar_proposal: proposal(5_000) },
+    { ...h.item, message_id: "later-longer", calendar_proposal: proposal(20_000) },
     { ...h.item, message_id: "expired", calendar_proposal: proposal(-1) },
     { ...h.item, message_id: "completed", calendar_proposal: proposal(1_000, "completed") },
     { ...h.item, message_id: "no-expiry", calendar_proposal: proposal(null) },
