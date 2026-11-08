@@ -253,6 +253,13 @@ def test_scheduled_gmail_check_reconciles_followed_body_without_sent_reader(tmp_
     from eom_email_watcher.mailbox import MailboxChanges, MailboxSession
     from eom_email_watcher.reconcile import ReconcilePage
 
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz is not None else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(service, "datetime", Clock)
+    monkeypatch.setattr(reconcile_state, "datetime", Clock)
     store, state, _ = followed(tmp_path)
 
     class Gmail(FakeGmail):
