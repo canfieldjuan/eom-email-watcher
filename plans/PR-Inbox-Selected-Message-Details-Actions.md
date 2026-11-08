@@ -89,7 +89,8 @@ is introduced.
 Extend the existing `InboxThreadEntry` integration to expose a typed, immutable
 selection context only for a complete, currently eligible Inbox origin. It binds
 provider, account, mailbox identity and message reference to the committed query
-epoch, current span, mailbox-operation scope and selection lifetime. A missing,
+epoch, mailbox-operation scope and selection lifetime. The current committed span
+proves eligibility; its object/render identity is not part of the lifetime. A missing,
 partial, hidden, previous-query, blocked or stale binding produces no actionable
 context. Never fall back to the active account, an index, subject, sender, native
 thread ID, or a message chosen from the thread timeline.
@@ -98,6 +99,21 @@ Use a single named current-context check at that owner. Do not make a parallel
 selection/query/lifecycle controller or scatter approximate identity checks across
 buttons. Typed context creation and that check are the strongest existing owner
 mechanism; do not replace them with string matching or permissive defaults.
+
+A pending step for A survives a same-query background refresh when the fresh
+committed snapshot still contains the same complete origin, in the same scope and
+selection lifetime, with no mutation hold. A span re-commit, new row object or
+render alone cannot cancel it. Compare complete origin and selection lifetime,
+not span identity or the [reader's refresh generation][reader-generation], which
+also changes on ordinary invalidation. Keep the reader's existing generation
+guards intact; do not use them as a pending-action cancellation token.
+
+This is a routine overlap: [scheduled checks][scheduled-refresh] and
+[Connect-queue changes][queue-refresh] refresh the Inbox while the
+[asynchronous native confirmation][confirmation] can remain open. Preserve the
+captured action target, parameters, versions and hash across this overlap; the
+unchanged backend owners still decide staleness. A newly refreshed version is not
+permission to rewrite the target or payload the user approved.
 
 The selected detail source is the eligible `InboxItem` in the committed snapshot,
 not a thread-message/copy projection. It can show existing saved details and
@@ -142,10 +158,35 @@ operation owner/native command -> target-owned outcome -> existing refresh owner
 
 - Check context before collecting input and again immediately before dispatch,
   after every intervening asynchronous parameter/confirmation step. Switching
-  A-to-B, Back, query/account change, source invalidation or a mutation hold before
-  dispatch aborts the old UI attempt. A's dialog can never authorize B. Declines
+  A-to-B, Back, query/account change, loss/change of the originating identity or
+  scope, or a mutation hold before dispatch aborts the old UI attempt. An ordinary
+  same-query refresh is not itself such a loss; apply R1's survival rule. A's
+  dialog can never authorize B. Declines
   retain their existing explicit-activation behavior; do not add confirmation
   dialogs where none exist. No calls occur merely from focus, hover or rendering.
+- If approval or parameter submission arrives while that same-query refresh is
+  already in progress, keep one pending step and await that owner's revalidation
+  outcome before dispatch. Show that the step for A is waiting and has not yet
+  been sent. Do not enqueue a second refresh, hunt for A with extra pages, start a
+  retry loop or require the user to approve again merely because of a re-render.
+  Observe the existing refresh owner's actual commit/failure outcome;
+  [`InboxReload.request()`][refresh-owner] is not a join signal: while active it
+  can queue another request and immediately return false. Repeated same-query
+  invalidations retain the same pending step; they do not create new attempts or
+  replace the originally approved target/versions.
+  After a fresh commit, unchanged eligible A dispatches exactly once with its
+  original captured target and versions. Failed revalidation, absent A, a changed
+  scope or a cancelled selection aborts visibly. If approval arrives after the
+  fresh commit, apply the same check immediately. Already-dispatched operations
+  retain the separate completion rule below.
+- Every abort after explicit approval or parameter submission must show an
+  accessible notice identifying the original message A: **not sent**, with the
+  actual reason, such as changed selection/scope, unavailable origin or failed
+  Inbox revalidation. Never use a bare return or suggest an external action was
+  sent or completed. The notice remains observable outside the selected section,
+  cannot be silently erased by the refresh that caused it, and does not steal
+  focus or appear as B's result. Dialog denial/dismissal preserves its existing
+  cancellation meaning.
 - Capture the existing typed message/part/provider/capability/job/fire/proposal
   target and versions. Do not consult the then-selected row after an await or
   substitute B's IDs into A's operation. The original native/backend admission,
@@ -174,6 +215,12 @@ on invalidation, Back, tab hiding, query/account change or mutation hold. Disabl
 or CSS-hidden old controls are insufficient. Retained previous-query list rows may
 still show their existing concise Previous results projection; they cannot open
 the new section or supply an actionable context.
+
+Clearing the actionable presentation during an ordinary same-query refresh does
+not cancel an already pending step's minimal captured target and selection-lifetime
+token. Keep no old row/detail/preview payload in that pending step. It authorizes
+no new action from stale rows and must pass R1/R3's fresh revalidation before any
+dispatch; failed or ineligible revalidation produces the visible not-sent notice.
 
 After a same-query refresh, render selected details only from the fresh committed
 row with the same complete origin. Do not preserve old analysis/attachment/result
@@ -236,6 +283,7 @@ preview DOM.
 | One surface and parity | Every current action/detail family is reachable on a selected origin, mounted once, with exact old IPC payloads and consent. Compact unselected rows retain all indicators; old row expansion/hidden action clones are gone. Exercise no attachments, one/many attachments, unavailable analysis and valid false/zero values. |
 | Identity and availability | Provider/account/mailbox/native-ID lookalikes, missing/partial context, previous-query rows and changed mailbox scope cannot target the wrong item. Valid vendor, non-vendor and unresolved/ambiguous/failed thread lookups retain eligible Inbox-owned details; no action is borrowed from another timeline message/copy. |
 | Dialog and dispatch | For every async-confirmation family: open A, pause its parameter/dialog step, select B or Back/change query/hold, then approve A; no native dispatch. The current unchanged A positive dispatches once with its original exact target. Decline and cancelled dialogs preserve existing semantics. |
+| Background refresh during a pending step | For each calendar, capability and automation confirmation/parameter path, let a scheduled-check refresh and a Connect-queue refresh land while A's step is pending. Same complete origin, scope and selection lifetime with no hold: exactly one dispatch using the original captured IDs, parameters, versions and hash, despite changed span/row objects or reader refresh generation. Absent A, changed scope, failed refresh, Back or A-to-B-to-A lifetime change: zero dispatch and an observable A-specific not-sent notice/reason after approval. Run both orders: refresh commits before approval; approval/submission arrives while refresh is in progress and is released only after its outcome. Assert waiting is visible, no duplicate call/refresh/paging, no bare-return approval loss and no A notice/focus transfer to B. |
 | In-flight outcomes | Dispatch A then select B; finish success, refusal, transport uncertainty and refresh failure in both response orders. No B result/focus/scroll mutation or duplicate A call; durable A recovery remains reachable after returning and refreshing. Include equal subjects/filenames across accounts. |
 | Writes and expiry | Calendar invitations and expired-recheck paths retain exact account/version/hash/consent. Automation stale versions and decision-refresh barriers remain enforced. Confirm/decline double clicks, remounts and selection loops cannot duplicate decisions or submit a second capability job. |
 | Removal and hidden bytes | Cancel/accept/delete/clear with nested holds and both readers open; completed/deferred/refused outcomes, old callbacks and physically retained bytes. Context/old details/preview DOM clear before dispatch, source mail remains untouched, Clear remains history-wide and B cannot inherit A's target/outcome. |
@@ -277,3 +325,8 @@ behavior accepted, implemented, merged, installed or qualified.
 [thread-dom]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/threadViewDom.ts#L267-L364
 [native]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src-tauri/src/lib.rs#L1857-L1955
 [native-calendar]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src-tauri/src/lib.rs#L2127-L2145
+[reader-generation]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/inboxThreadEntry.ts#L93-L124
+[scheduled-refresh]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L5447-L5451
+[queue-refresh]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L3180-L3196
+[confirmation]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/confirmation.ts#L7-L20
+[refresh-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/inboxReload.ts#L61-L100
