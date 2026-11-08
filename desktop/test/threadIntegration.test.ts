@@ -264,3 +264,34 @@ test("entry is read class, lifecycle/settings hooks exist, and approved copy pre
   assert.match(source, /inboxSenderEmptyText\(activeInboxQuery, activeInboxAccountSelection\)/);
   assert.doesNotMatch(source, /No watched messages/);
 });
+
+
+test("partial look-alike cannot overwrite the valid null-mailbox row in the production controls map", async () => {
+  for (const reversed of [false, true]) {
+    const h = harness(["refreshInboxThreadControls"]), c = h.context;
+    const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: null, message_id: "m" };
+    const valid = { ...origin, thread_entry_ref: origin };
+    const partial: any = { ...valid, thread_entry_ref: { ...origin } };
+    delete partial.thread_entry_ref.mailbox_identity_key;
+    c.inboxItems = reversed ? [partial, valid] : [valid, partial];
+    const button = (key: string | null) => ({ disabled: key === null, dataset: key === null ? {} : { inboxThreadOrigin: key },
+      attributes: new Map([["aria-pressed", "false"]]), setAttribute(key: string, value: string) { this.attributes.set(key, value); } });
+    const good = button(inboxThreadOriginKey(origin)), bad = button(inboxThreadOriginKey(partial.thread_entry_ref));
+    c.inboxList = { querySelectorAll: () => [good, bad].filter(b => b.dataset.inboxThreadOrigin !== undefined) };
+    c.inboxThreadOriginKey = inboxThreadOriginKey;
+    const doc: any = { activeElement: null, createElement: (tag: string) => new Element(tag, doc) };
+    const ui = new InboxThreadEntry({ root: new Element("section", doc) as any,
+      columns: new Element("div", doc) as any, heading: new Element("h2", doc) as any,
+      client: new ThreadReadClient(async () => { throw new Error("Synthetic unavailable thread"); }),
+      accounts: () => [], refreshInbox: async () => {}, scrollElements: () => [],
+      snapshot: () => ({ configured: true, visible: true, blocked: false, queryEpoch: 1, itemsEpoch: 1,
+        items: c.inboxItems, scope: { mutation_epoch: 0, mailbox_operation_revision: 1 },
+        spanScope: { mutation_epoch: 0, mailbox_operation_revision: 1 } }),
+    });
+    c.inboxThreadEntry = ui; await ui.open(valid);
+    c.refreshInboxThreadControls();
+    assert.equal(good.disabled, false, "valid row remains enabled regardless of partial-row order");
+    assert.equal(good.attributes.get("aria-pressed"), "true");
+    assert.equal(bad.disabled, true); assert.equal(bad.attributes.get("aria-pressed"), "false");
+  }
+});

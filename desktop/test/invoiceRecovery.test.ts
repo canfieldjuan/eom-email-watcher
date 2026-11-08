@@ -392,3 +392,14 @@ test("row details share one earliest-expiry timer and recompute it after the ear
   h.render(); assert.deepEqual(cleared, [1, 2]); assert.deepEqual(delays, [5_001, 15_001]);
   assert.equal(h.invocations.length, 0);
 });
+
+
+test("the production row renderer never assigns an origin dataset to an incomplete ref", () => {
+  const h = harness();
+  delete (h.item.thread_entry_ref as any).mailbox_identity_key;
+  h.context.inboxThreadEntry.canOpen = () => false;
+  h.render();
+  const open = h.button("Open thread");
+  assert.equal(open.disabled, true);
+  assert.equal(Object.hasOwn(open.dataset, "inboxThreadOrigin"), false);
+});
