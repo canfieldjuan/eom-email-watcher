@@ -322,6 +322,47 @@ test("Open thread is a separate current-row action and does not invoke saved ana
 });
 
 
+test("an older terminal job cannot erase a newer uncertain request identity during a rerender", async () => {
+  const h = harness({ code: "runtime_error", message: "Transport uncertain" });
+  h.item.attachments[0].capability_results.push({
+    protocol_version: 2, provider: h.old.provider, capability_id: "invoice.extract", capability_version: "1.0",
+    job_id: "older-terminal", status: "completed", parameters: {}, outputs: [],
+  });
+  h.render();
+  let release!: () => void;
+  h.holdInvocation(new Promise<void>(resolve => { release = resolve; }));
+  const invoking = h.button("Read invoice 1.0").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.invocations.length, 1);
+  const requestId = h.invocations[0].requestId;
+  h.render(); // Stored terminal evidence is older than the dispatched invocation.
+  release(); await invoking;
+  assert.deepEqual([...h.context.attachmentRequestIds.values()], [requestId]);
+  await h.button("Read invoice 1.0").click();
+  assert.equal(h.invocations.length, 2);
+  assert.equal(h.invocations[1].requestId, requestId, "uncertainty resumes the same request");
+});
+
+test("render reconciles only the matching terminal request and restores active identities", () => {
+  for (const status of ["completed", "failed", "cancelled", "requested", "accepted", "processing"]) {
+    for (const cached of [undefined, "stored-job", "newer-request"]) {
+      const h = harness();
+      const key = capabilityInvocationKey("message-1", "part-1", h.old.provider, h.old.capability, {});
+      if (cached !== undefined) h.context.attachmentRequestIds.set(key, cached);
+      h.item.attachments[0].capability_results.push({
+        protocol_version: 2, provider: h.old.provider, capability_id: "invoice.extract", capability_version: "1.0",
+        job_id: "stored-job", status, parameters: {}, outputs: [],
+      });
+      h.render();
+      const active = ["requested", "accepted", "processing"].includes(status);
+      assert.equal(h.context.attachmentRequestIds.get(key),
+        active ? "stored-job" : cached === "stored-job" ? undefined : cached, `${status}/${cached}`);
+      assert.equal(h.invocations.length, 0, "render never dispatches a job");
+    }
+  }
+});
+
+
 test("the production row renderer never assigns an origin dataset to an incomplete ref", () => {
   const h = harness();
   delete (h.item.thread_entry_ref as any).mailbox_identity_key;
