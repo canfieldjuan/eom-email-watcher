@@ -320,3 +320,14 @@ test("Open thread is a separate current-row action and does not invoke saved ana
   assert.deepEqual(h.opened, [h.item]); assert.deepEqual(h.invocations, []); assert.deepEqual(h.confirmations, []);
   assert.equal(h.context.expandedInboxMessages.has(h.item.message_id), true);
 });
+
+
+test("the production row renderer never assigns an origin dataset to an incomplete ref", () => {
+  const h = harness();
+  delete (h.item.thread_entry_ref as any).mailbox_identity_key;
+  h.context.inboxThreadEntry.canOpen = () => false;
+  h.render();
+  const open = h.button("Open thread");
+  assert.equal(open.disabled, true);
+  assert.equal(Object.hasOwn(open.dataset, "inboxThreadOrigin"), false);
+});

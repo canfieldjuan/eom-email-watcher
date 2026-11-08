@@ -287,3 +287,31 @@ test("pending read cannot commit when a nullable origin is replaced by a partial
   assert.equal(h.calls.length, 1, "incomplete fresh row cannot authorize the message read");
   assert.equal(h.ui.state.selectedThread, null);
 });
+
+
+test("origin keys admit only complete native tuples and keep null distinct from missing", () => {
+  assert.equal(inboxThreadOriginKey(null), null);
+  assert.equal(inboxThreadOriginKey(undefined), null);
+  assert.notEqual(inboxThreadOriginKey({ ...origin, message_id: "雪|[,]".repeat(100) }), null);
+  for (const key of ["provider", "account_id", "message_id", "mailbox_identity_key"]) {
+    for (const value of [undefined, null, "", false, 0]) {
+      const candidate = { ...origin, [key]: value } as any;
+      const expected = key === "mailbox_identity_key" && value === null;
+      assert.equal(inboxThreadOriginKey(candidate) !== null, expected, `${key}/${value}`);
+    }
+  }
+  assert.equal(inboxThreadOriginKey({ ...origin }), inboxThreadOriginKey(origin));
+  for (const key of ["provider", "account_id", "message_id", "mailbox_identity_key"]) {
+    assert.notEqual(inboxThreadOriginKey({ ...origin, [key]: "different" }), inboxThreadOriginKey(origin), key);
+  }
+});
+
+test("a partial look-alike cannot be selected beside a valid null-mailbox origin", async () => {
+  const h = harness(), nullable = { ...origin, mailbox_identity_key: null };
+  const valid = { ...row, thread_entry_ref: nullable };
+  const partial: any = { ...valid, thread_entry_ref: { ...nullable } };
+  delete partial.thread_entry_ref.mailbox_identity_key;
+  h.snapshot.items = [valid, partial]; await h.ui.open(valid);
+  assert.equal(h.ui.isSelected(valid), true);
+  assert.equal(h.ui.isSelected(partial), false);
+});
