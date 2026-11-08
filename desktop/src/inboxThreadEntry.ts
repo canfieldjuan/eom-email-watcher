@@ -225,8 +225,15 @@ export class InboxThreadEntry {
   }
 
   private row(origin: InboxMessageRef, snapshot: InboxThreadSnapshot): InboxThreadRow | undefined {
+    if (!origin || ![origin.provider, origin.account_id, origin.message_id]
+      .every(value => typeof value === "string" && value.length > 0)
+      || !(origin.mailbox_identity_key === null
+        || typeof origin.mailbox_identity_key === "string" && origin.mailbox_identity_key.length > 0)) return undefined;
     return snapshot.items.find(row => row.provider === origin.provider && row.account_id === origin.account_id
-      && row.message_id === origin.message_id && inboxThreadOriginKey(row.thread_entry_ref) === inboxThreadOriginKey(origin));
+      && row.message_id === origin.message_id && row.thread_entry_ref?.provider === origin.provider
+      && row.thread_entry_ref.account_id === origin.account_id
+      && row.thread_entry_ref.mailbox_identity_key === origin.mailbox_identity_key
+      && row.thread_entry_ref.message_id === origin.message_id);
   }
 
   canOpen(row: InboxThreadRow): boolean {
