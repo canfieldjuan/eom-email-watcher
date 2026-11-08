@@ -3369,11 +3369,19 @@ def test_completion_batches_frozen_units_without_splitting_oversized_legacy_unit
 def test_delete_request_resolves_any_retained_alias_through_frozen_unit(
     tmp_path, monkeypatch, message_id
 ):
+    from datetime import datetime
+
     from test_removal_refusal import held_runtime
     from test_thread_reconcile import seed
 
     from eom_email_watcher import engine_api, removal, source_locks
 
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz is not None else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(database, "datetime", Clock)
     store = held_runtime(tmp_path, monkeypatch)
     parameters = {"message_id": message_id}
     with store.connection() as db:
