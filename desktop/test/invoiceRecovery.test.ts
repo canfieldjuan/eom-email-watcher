@@ -7,6 +7,7 @@ import { parseAst } from "vite";
 import { inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
 import * as availability from "../src/connectAvailability.ts";
 import { activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult } from "../src/connectIdentity.ts";
+import { calendarOutcomeNotice } from "../src/calendarOutcome.ts";
 import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxActionState.ts";
 
 // Execute production owners, including their nested click callbacks. The DOM/IPC
@@ -14,7 +15,7 @@ import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxAc
 const source = stripTypeScriptTypes(readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"));
 const ast = parseAst(source);
 const names = ["attachmentKey", "capabilityOutputKey", "clearMessageOwnedUiState", "capabilityGroups",
-  "renderCapabilityResult", "captureInboxScroll", "restoreInboxScroll", "renderInbox", "loadAttachmentCapabilities", "loadInboxPage",
+  "renderCapabilityResult", "captureInboxScroll", "restoreInboxScroll", "renderInboxMessageDetails", "renderInbox", "loadAttachmentCapabilities", "loadInboxPage",
   "errorCode", "errorMessage", "errorRetryable"];
 const code = names.map(name => {
   const node = ast.body.find(node => node.type === "FunctionDeclaration" && node.id?.name === name);
@@ -84,7 +85,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
   const context = vm.createContext({
     inboxThreadOriginKey, inboxThreadEntry: { canOpen: () => true, isSelected: () => false, open: (row: unknown) => opened.push(row) },
     ...availability, activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult,
-    hasInboxAutomationConfirmation, inboxActionState, crypto,
+    hasInboxAutomationConfirmation, inboxActionState, calendarOutcomeNotice, crypto,
     document: { createElement: (tag: string) => new Element(tag) },
     inboxItems: [item], inboxList: new Element("ul"), inboxResults: { scrollTop: 0 }, inboxStatus: new Element(), inboxLoadMore: new Element(),
     inboxProposalExpiryTimer: null, expandedInboxMessages: new Set([item.message_id]),
@@ -94,7 +95,7 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     capabilityOutputPreviews: new Map(), capabilityOutputViewButtons: new Map(),
     inboxDeletionsInFlight: new Set(), inboxMutationInFlight: () => false,
     inboxReloadBlocked: () => false, renderInboxFilterScope: () => {},
-    activeInboxQuery: { provider: "fixture", account_id: "fixture", limit: 25 },
+    activeInboxQuery: { provider: "fixture", account_id: "fixture", sender: null, limit: 25 },
     inboxPageState: "loaded", inboxPageStateGeneration: 0, inboxQueryEpoch: 0, inboxRequestGeneration: 0,
     inboxItemsEpoch: 0, inboxRenderedEpoch: null, inboxNextCursor: null, inboxCapabilityUnavailableCount: 0,
     inboxScrollRevision: 0, inboxRestoredScrollTop: 0,
@@ -360,4 +361,33 @@ test("render reconciles only the matching terminal request and restores active i
       assert.equal(h.invocations.length, 0, "render never dispatches a job");
     }
   }
+});
+
+
+test("row details share one earliest-expiry timer and recompute it after the earliest row leaves", () => {
+  const h = harness(), delays: number[] = [], cleared: number[] = [];
+  const now = Date.parse("2026-11-08T07:00:00Z");
+  vm.runInContext(`Date.now = () => ${now}`, h.context);
+  h.context.window = {
+    setTimeout: (_callback: () => void, delay: number) => { delays.push(delay); return delays.length; },
+    clearTimeout: (id: number) => cleared.push(id),
+  };
+  const proposal = (offset: number | null, state = "awaiting_confirmation") => ({
+    state, status: "accepted", subject: "Synthetic meeting", attendees: [],
+    expires_at: offset === null ? null : new Date(now + offset).toISOString(),
+    account_address: "calendar@example.test", account_id: "fixture-calendar",
+  });
+  h.context.inboxItems = [
+    { ...h.item, calendar_proposal: proposal(15_000) },
+    { ...h.item, message_id: "earliest", calendar_proposal: proposal(5_000) },
+    { ...h.item, message_id: "expired", calendar_proposal: proposal(-1) },
+    { ...h.item, message_id: "completed", calendar_proposal: proposal(1_000, "completed") },
+    { ...h.item, message_id: "no-expiry", calendar_proposal: proposal(null) },
+  ];
+  h.render(); assert.deepEqual(delays, [5_001]);
+  h.context.inboxItems = h.context.inboxItems.filter((item: any) => item.message_id !== "earliest");
+  h.render(); assert.deepEqual(cleared, [1]); assert.deepEqual(delays, [5_001, 15_001]);
+  h.context.inboxItems = [];
+  h.render(); assert.deepEqual(cleared, [1, 2]); assert.deepEqual(delays, [5_001, 15_001]);
+  assert.equal(h.invocations.length, 0);
 });

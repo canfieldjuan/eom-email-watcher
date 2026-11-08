@@ -49,10 +49,12 @@ test("inbox intro is clipped while retaining its accessible heading", () => {
 
 test("expanded content keeps provenance, priority and actions without repeated row items", () => {
   const render = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
-  const expanded = render.slice(0, render.indexOf("const summary =")) + render.slice(render.indexOf("const footer ="), render.indexOf("const toggle ="));
+  const details = source.match(/function renderInboxMessageDetails\([\s\S]*?\n\}/)![0];
+  const expanded = details.slice(0, details.indexOf("const summary =")) + details.slice(details.indexOf("const footer ="), details.indexOf("return { received"));
   assert.ok(!/\.append\([^;]*\b(?:sender|senderAddress|received|subject|category|state)\b/.test(expanded), "expanded content must not append sender, address, time, subject, category or state");
-  for (const wiring of ["senderIdentity.append(sourceAccount)", "senderIdentity.append(admission)", "meta.append(senderIdentity)", "card.append(meta, summary)", "badges.append(badge)", "footer.append(badges, footerActions)", "footerActions.append(retryButton)", "footerActions.append(deleteButton)", "card.append(footer)"]) assert.ok(render.includes(wiring), wiring);
-  for (const node of ["details", "calendarProposal", "attachments"]) assert.ok(render.includes(`card.append(${node})`), node);
+  for (const wiring of ["senderIdentity.append(sourceAccount)", "senderIdentity.append(admission)", "meta.append(senderIdentity)", "card.append(meta, summary)", "badges.append(badge)", "footer.append(badges, footerActions)", "footerActions.append(retryButton)", "footerActions.append(deleteButton)", "card.append(footer)"]) assert.ok(details.includes(wiring), wiring);
+  for (const node of ["details", "calendarProposal", "attachments"]) assert.ok(details.includes(`card.append(${node})`), node);
+  assert.match(render, /renderInboxMessageDetails\(item, card, renderStartedAt\)/);
   assert.match(render, /rowBadges.append\(category, state\)/);
   assert.match(render, /toggle.append\(identity, received, rowSubject, rowBadges\)/);
 });
