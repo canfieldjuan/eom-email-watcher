@@ -22,8 +22,7 @@ function harness() {
     inboxSenderNavigationError: null, busy: false, inboxQueryEpoch: 8, inboxRequestGeneration: 10,
     activeInboxQuery: { sender: "bob@acme.com", provider: "imap", account_id: "retained", sender_query: "bob",
       keyword: "invoice", priority: "high", category: "invoice", status: "notified", limit: 50 },
-    inboxItems: [{ message_id: "old" }], inboxNextCursor: "next", inboxPageState: "loaded", inboxCapabilityUnavailableCount: 0,
-    expandedInboxMessages: new Set(["old"]), inboxLoadMore: el("button"), inboxStatus: el("p"),
+    inboxItems: [{ message_id: "old" }], inboxNextCursor: "next", inboxPageState: "loaded", inboxCapabilityUnavailableCount: 0, inboxLoadMore: el("button"), inboxStatus: el("p"),
     renders: [], calls: [], cleared: [], threadCloses: 0 });
   c.inboxSenderNavigation.append(c.inboxSenderSearch, c.inboxSenderAll, c.inboxSenderPinned, c.inboxSenderResults, c.inboxSenderEmpty);
   c.inboxMutationInFlight = () => c.busy;
@@ -31,7 +30,7 @@ function harness() {
   c.clearMessageOwnedUiState = () => c.cleared.push("all");
   c.renderInbox = items => c.renders.push(items.map(i => i.message_id));
   c.loadInbox = () => c.calls.push({ query: structuredClone(c.activeInboxQuery), ids: c.inboxItems.map(i => i.message_id),
-    epoch: c.inboxQueryEpoch, cursor: c.inboxNextCursor, expanded: [...c.expandedInboxMessages] });
+    epoch: c.inboxQueryEpoch, cursor: c.inboxNextCursor, selected: c.inboxThreadEntry?.selection?.() ?? null });
   runInContext(stripTypeScriptTypes(functions + "\n" + listeners), c);
   c.renderInboxSenderNavigation();
   return { c, doc,
@@ -45,7 +44,7 @@ test("actual finder handlers do not commit queries or close threads; matching an
   const before = JSON.stringify(c.activeInboxQuery);
   h.find("[tag]");
   assert.equal(c.inboxQueryEpoch, 8); assert.equal(c.inboxRequestGeneration, 10);
-  assert.equal(c.inboxNextCursor, "next"); assert.equal(c.expandedInboxMessages.has("old"), true);
+  assert.equal(c.inboxNextCursor, "next");
   assert.equal(JSON.stringify(c.activeInboxQuery), before); assert.equal(c.calls.length, 0); assert.equal(c.threadCloses, 0);
   assert.equal(h.doc.activeElement, c.inboxSenderSearch);
   assert.deepEqual(nodes(c.inboxSenderResults).filter(n => n.tagName === "BUTTON").map(n => n.dataset.inboxSender), [watched[2].email]);
@@ -65,7 +64,7 @@ test("exact selection and All use the existing scope-clear owner and preserve ev
   h.button("jimbob@acme.com").click();
   assert.deepEqual({ ...c.activeInboxQuery }, { ...before, sender: "jimbob@acme.com" });
   assert.equal(c.calls.length, 1); assert.equal(c.threadCloses, 1);
-  assert.equal(c.calls[0].ids.length, 0); assert.equal(c.calls[0].expanded.length, 0); assert.equal(c.calls[0].cursor, null);
+  assert.equal(c.calls[0].ids.length, 0); assert.equal(c.calls[0].selected, null); assert.equal(c.calls[0].cursor, null);
   assert.equal(c.calls[0].epoch, 9); assert.equal(h.doc.activeElement, h.button("jimbob@acme.com"));
   assert.equal(h.button("jimbob@acme.com").attributes.get("aria-pressed"), "true");
   c.inboxSenderAll.click();

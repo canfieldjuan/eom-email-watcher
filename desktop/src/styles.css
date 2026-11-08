@@ -331,7 +331,7 @@ select:focus {
   font-size: 0.78rem;
 }
 
-.inbox-row-toggle {
+.inbox-row-summary {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 9px 12px;
@@ -344,13 +344,14 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
-.inbox-row-toggle time {
+.inbox-row-summary time {
   color: #536158;
   font-size: 0.78rem;
 }
 
 .inbox-row-subject,
-.inbox-row-toggle .message-badges {
+.inbox-row-summary .message-badges,
+.inbox-row-summary .message-meta {
   grid-column: 1 / -1;
 }
 
@@ -367,8 +368,21 @@ select:focus {
   font-weight: 800;
 }
 
-.inbox-message-content {
-  margin-top: 18px;
+#inbox-selected-message {
+  min-width: 0;
+  border-bottom: 1px solid #d7ded8;
+  padding-bottom: 16px;
+  margin-bottom: 16px;
+}
+
+.inbox-message-details,
+.inbox-message-details > *,
+.inbox-message-details .attachment-list > li,
+.inbox-message-details .attachment-actions,
+.inbox-message-details .capability-provider {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {

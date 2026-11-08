@@ -37,15 +37,15 @@ function harness() {
   const replace = list.replaceChildren.bind(list);
   list.replaceChildren = (...children) => { replace(...children); results.scrollTop = offset; };
   const c = createContext({ document: doc, inboxList: list, inboxResults: results,
-    renderInboxFilterScope() {}, inboxProposalExpiryTimer: null,
+    renderSelectedInboxMessage() {}, renderInboxFilterScope() {}, inboxProposalExpiryTimer: null,
     capabilityOutputPreviews: new Map(), capabilityOutputViewButtons: new Map(), capabilityOutputPresentations: new Map(),
     activeInboxQuery: { provider: "imap", account_id: "retained", sender: null, limit: 25 }, inboxPageState: "loaded",
     inboxQueryEpoch: 1, inboxItemsEpoch: 1, inboxRenderedEpoch: null,
     inboxScrollRevision: 0, inboxRestoredScrollTop: 0,
     inboxMutationInFlight: () => false, receivedLabel: (value: string) => value, stateLabel: () => "Notified",
     hasInboxAutomationConfirmation, inboxActionState, inboxBodyTruncation, inboxThreadOriginKey,
-    inboxDeletionsInFlight: new Set(), expandedInboxMessages: new Set(), inboxThreadEntry: {
-      canOpen: () => true, isSelected: () => false, refreshGeneration: 0, revalidateSource() {}, failRefresh() {},
+    inboxDeletionsInFlight: new Set(), inboxThreadEntry: {
+      canOpen: () => true, isSelected: () => false, refreshGeneration: 0, revalidateSource() {}, failRefresh() {}, failInboxRefresh() {},
     }, currentMailboxEffectScope: () => ({}), refreshInboxThreadControls() {}, threadHistory: { commitInboxSpan() {} },
     inboxLoadMore: more, inboxStatus: new Node("p", doc), inboxNextCursor: "120", inboxRequestGeneration: 1,
     mailboxEffectScopeIsCurrent: () => true, mailboxEffectRequestIsCurrent: () => true, inboxReloadBlocked: () => false,
@@ -69,11 +69,10 @@ function harness() {
 test("actual row renderer retains the message scroll owner across append and capability rerenders", () => {
   const h = harness();
   h.c.renderInbox(h.rows(120)); h.results.scrollTop = 850;
-  h.c.expandedInboxMessages.add("row-8");
   h.c.renderInbox(h.rows(145));
   assert.equal(h.results.scrollTop, 850);
   assert.equal(h.list.children.length, 145);
-  assert.equal(nodes(h.list).find(n => n.id === "inbox-message-8")?.hidden, false);
+  assert.equal(nodes(h.list).some(n => n.className === "inbox-message-content"), false);
   h.c.renderInbox(h.rows(145)); assert.equal(h.results.scrollTop, 850);
 });
 

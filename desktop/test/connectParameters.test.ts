@@ -53,10 +53,10 @@ for (const status of [undefined, "failed", "completed", "requested", "accepted",
 
 test("production invocation caller carries the matched job status", async () => {
   const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
-  const start = source.indexOf('invokeButton.addEventListener("click", async () => {');
+  const start = source.indexOf("function runInboxCapabilityAction(");
   assert.ok(start >= 0);
-  const body = source.slice(start, source.indexOf("          } catch (error)", start));
-  const collection = body.slice(body.indexOf("            const previous ="));
+  const body = source.slice(start, source.indexOf("} catch (error)", start));
+  const collection = body.slice(body.indexOf("const previous ="));
   const run = new Function("selected", "attachment", "matchingCapabilityResult", "collectCapabilityParameters", `const capability = selected; let parameters; ${collection}; return parameters;`);
   const capability = { capability: declaration([{ name: "pin", value_type: "string", required: true, label: "Pin", description: "", fixed_value: "new" }]) };
   for (const status of ["completed", "failed", "requested", "accepted", "processing"]) {

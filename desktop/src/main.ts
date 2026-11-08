@@ -1,7 +1,7 @@
 import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
 import { ThreadReadClient, type InboxMessageRef } from "./threadReads";
 import { ThreadViewDom } from "./threadViewDom";
-import { InboxThreadEntry, inboxThreadOriginKey } from "./inboxThreadEntry";
+import { InboxThreadEntry, inboxThreadOriginKey, type InboxSelectionContext } from "./inboxThreadEntry";
 import { ThreadHistory } from "./threadHistory";
 import { mailboxPendingMessage } from "./mailboxProgress";
 import { confirmAction } from "./confirmation";
@@ -604,6 +604,7 @@ app.innerHTML = `
       <div id="inbox-filter-scope" class="inbox-filter-scope" role="group" aria-label="Applied filters"></div>
       <p id="inbox-previous-results" class="status" role="status" hidden>Previous results</p>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
+      <p id="inbox-action-notice" class="status" role="status" aria-live="polite" hidden></p>
       <div id="inbox-removal-statuses" aria-live="polite"></div>
       <div id="inbox-columns" class="inbox-columns">
       <aside id="inbox-senders-pane" class="inbox-senders">
@@ -632,7 +633,11 @@ app.innerHTML = `
       </div>
       <section id="inbox-reading-pane" role="region" aria-label="Retained thread reading pane" tabindex="0">
         <p id="inbox-reader-empty">Select a message to read its retained thread.</p>
-        <p id="inbox-reader-source" class="thread-history-notice" hidden></p>
+        <section id="inbox-selected-message" aria-labelledby="inbox-selected-message-heading" hidden>
+          <h3 id="inbox-selected-message-heading" tabindex="-1">Selected message</h3>
+          <p id="inbox-reader-source" class="thread-history-notice" hidden></p>
+          <div id="inbox-selected-message-content"></div>
+        </section>
         <section id="inbox-thread-view" hidden></section>
       </section>
       </div>
@@ -924,7 +929,7 @@ const threadReader = new ThreadViewDom(requiredElement<HTMLElement>("#thread-vie
   },
 });
 
-const inboxThreadEntry = new InboxThreadEntry({
+const inboxThreadEntry = new InboxThreadEntry<InboxItem>({
   root: requiredElement<HTMLElement>("#inbox-thread-view"),
   columns: requiredElement<HTMLElement>("#inbox-message-pane"),
   layout: {
@@ -934,6 +939,9 @@ const inboxThreadEntry = new InboxThreadEntry({
     senderContent: requiredElement<HTMLElement>("#inbox-senders-content"), footer: requiredElement<HTMLElement>("#inbox-history-actions"),
   },
   onSelectionChange: refreshInboxThreadControls,
+  onActionNotice: (context, text, kind) => {
+    const notice = inboxMessageStatus(context); notice.textContent = text; notice.dataset.kind = kind;
+  },
   heading: requiredElement<HTMLElement>("#inbox-heading"),
   client: new ThreadReadClient(invoke), accounts: () => mailAccounts,
   snapshot: () => ({
@@ -1140,7 +1148,7 @@ let inboxQueryEpoch = 0;
 let inboxPageState: "pending" | "loading" | "loaded" | "failed" = "loading";
 let inboxPageStateGeneration = 0;
 let inboxSenderNavigationError: string | null = null;
-const expandedInboxMessages = new Set<string>();
+let renderedInboxSelection: { row: InboxItem; context: InboxSelectionContext } | null = null;
 let inboxItems: InboxItem[] = [];
 let inboxItemsEpoch: number | null = null;
 let inboxRenderedEpoch: number | null = null;
@@ -1550,10 +1558,7 @@ function clearMessageOwnedUiState(messageId?: string): void {
     attachmentCapabilities,
     attachmentCapabilityDiagnostics,
     attachmentSelectionRefusals,
-    attachmentInvocationsInFlight,
-    attachmentRequestIds,
     capabilityOutputPresentations,
-    capabilityOutputPresentationsInFlight,
     capabilityOutputPreviews,
     capabilityOutputViewButtons,
   ];
@@ -1632,6 +1637,7 @@ function renderCapabilityResult(
   result: AttachmentCapabilityResult,
   messageId: string,
   partId: string,
+  context: InboxSelectionContext,
 ): void {
   if (result.summary) {
     const summary = document.createElement("div");
@@ -1696,69 +1702,19 @@ function renderCapabilityResult(
           };
           capabilityOutputViewButtons.set(outputKey, view);
           syncViewButton(view);
-          view.addEventListener("click", async () => {
-            if (capabilityOutputPresentationsInFlight.has(outputKey)) return;
-            capabilityOutputPresentationsInFlight.add(outputKey);
-            syncViewButton(view);
-            let presentationError: unknown;
-            try {
-              const outputView = await invoke<ConnectOutputView>("capability_output_present", {
-                messageId,
-                partId,
-                jobId,
-                artifactId: output.artifact_id,
-              });
-              const currentPreview = capabilityOutputPreviews.get(outputKey);
-              if (currentPreview?.isConnected) {
-                capabilityOutputPresentations.set(outputKey, outputView.presentation);
-                renderOutputPresentation(currentPreview, outputView.presentation);
-              }
-            } catch (error) {
-              presentationError = error;
-            } finally {
-              capabilityOutputPresentationsInFlight.delete(outputKey);
-              const currentButton = capabilityOutputViewButtons.get(outputKey);
-              if (currentButton) syncViewButton(currentButton);
-            }
-            if (presentationError) {
-              inboxStatus.textContent = errorMessage(presentationError);
-              inboxStatus.dataset.kind = "error";
-            } else if (capabilityOutputPreviews.get(outputKey)?.isConnected) {
-              inboxStatus.textContent = `Showing ${output.display_name}.`;
-              inboxStatus.dataset.kind = "success";
-            } else {
-              inboxStatus.textContent = `${output.display_name} is no longer in the current inbox.`;
-              inboxStatus.dataset.kind = "warning";
-            }
-          });
+          view.dataset.inboxDetailFocus = `output:${outputKey}:view`;
+          view.addEventListener("click", () => runInboxOutputAction(context, {
+            messageId, partId, jobId, artifactId: output.artifact_id, outputKey, displayName: output.display_name, kind: "view",
+          }));
           controls.append(view);
         }
         const exportButton = document.createElement("button");
         exportButton.type = "button";
         exportButton.textContent = "Safe export";
-        exportButton.addEventListener("click", async () => {
-          exportButton.disabled = true;
-          exportButton.textContent = "Exporting…";
-          try {
-            const exported = await invoke<RevealedCapabilityOutput>(
-              "capability_output_export",
-              {
-                messageId,
-                partId,
-                jobId,
-                artifactId: output.artifact_id,
-              },
-            );
-            inboxStatus.textContent = `Prepared ${exported.display_name} as ${exported.filename} and opened its export folder.`;
-            inboxStatus.dataset.kind = "success";
-          } catch (error) {
-            inboxStatus.textContent = errorMessage(error);
-            inboxStatus.dataset.kind = "error";
-          } finally {
-            exportButton.disabled = false;
-            exportButton.textContent = "Safe export";
-          }
-        });
+        exportButton.dataset.inboxDetailFocus = `output:${outputKey}:export`;
+        exportButton.addEventListener("click", () => runInboxOutputAction(context, {
+          messageId, partId, jobId, artifactId: output.artifact_id, outputKey, displayName: output.display_name, kind: "export",
+        }));
         controls.append(exportButton);
         outputRow.append(controls, preview);
       }
@@ -1804,6 +1760,789 @@ function restoreInboxScroll(top: number): void {
   inboxRestoredScrollTop = inboxResults.scrollTop;
 }
 
+function inboxMessageStatus(context: InboxSelectionContext): Pick<HTMLElement, "textContent" | "dataset"> {
+  const notice = requiredElement<HTMLElement>("#inbox-action-notice");
+  let text = "";
+  return {
+    get textContent() { return text; },
+    set textContent(value) {
+      text = value; notice.textContent = value ? `${context.label}: ${value}` : ""; notice.hidden = !value;
+    },
+    dataset: notice.dataset,
+  };
+}
+
+/** Only a current mounted control may be updated; operation state never retains its old DOM. */
+function setInboxDetailButton(context: InboxSelectionContext, key: string, disabled: boolean, text?: string): void {
+  if (inboxThreadEntry.selection()?.context !== context) return;
+  const content = requiredElement<HTMLElement>("#inbox-selected-message-content");
+  const button = Array.from(content.querySelectorAll<HTMLButtonElement>("[data-inbox-detail-focus]"))
+    .find(control => control.dataset.inboxDetailFocus === key);
+  if (button) { button.disabled = disabled; if (text !== undefined) button.textContent = text; }
+}
+
+function runInboxCalendarDecision(context: InboxSelectionContext,
+  calendarTarget: { messageId: string; proposalSha256: string; proposalVersion: number; runId: string; stateVersion: number },
+  confirmationMessage: string, decision: "confirm" | "decline"): Promise<void> {
+  const inboxStatus = inboxMessageStatus(context);
+  return inboxThreadEntry.runAction(context,
+  `calendar:${calendarTarget.runId}`, async () => {
+    const target = { ...calendarTarget, decision };
+    if (decision === "confirm" && !await confirmAction(confirmationMessage)) return null;
+    return target;
+  }, async target => {
+    setInboxDetailButton(context, "calendar:confirm", true);
+    setInboxDetailButton(context, "calendar:decline", true);
+    try {
+      const result = await invoke<CalendarDecisionResult>("calendar_proposal_decide", target);
+      await loadInbox();
+      const refreshed = inboxItems.find((row) => inboxThreadOriginKey(row.thread_entry_ref) === inboxThreadOriginKey(context.origin));
+      const notice = calendarOutcomeNotice(
+        latestCalendarOutcome(result.calendar_write_outcome, refreshed?.calendar_write_outcome),
+        "decision", result.state,
+      );
+      const statusMessage = notice.text;
+      const statusKind = notice.kind;
+      inboxStatus.textContent = statusMessage;
+      inboxStatus.dataset.kind = statusKind;
+    } catch (error) {
+      const statusMessage = errorMessage(error);
+      await loadInbox();
+      inboxStatus.textContent = statusMessage;
+      inboxStatus.dataset.kind = "error";
+    }
+  });
+}
+
+function runInboxAttachmentOpen(context: InboxSelectionContext, messageId: string, partId: string): Promise<void> {
+  const inboxStatus = inboxMessageStatus(context);
+  return inboxThreadEntry.runAction(context, `attachment:${partId}:open`,
+  () => ({ messageId, partId }), async target => {
+  setInboxDetailButton(context, `attachment:${partId}:open`, true, "Opening…");
+  try {
+    const opened = await invoke<OpenedAttachment>("attachment_open", target);
+    inboxStatus.textContent = `Opened ${opened.filename} in the default app.`;
+    inboxStatus.dataset.kind = "success";
+  } catch (error) {
+    inboxStatus.textContent = errorMessage(error);
+    inboxStatus.dataset.kind = "error";
+  } finally {
+    setInboxDetailButton(context, `attachment:${partId}:open`, false, "Open");
+  }
+});
+}
+
+type InboxCapabilityEvidence = Pick<AttachmentCapabilityResult, "protocol_version" | "provider" | "capability_id" |
+  "capability_version" | "parameters" | "status" | "required_manifest_features" | "job_id">;
+
+function runInboxCapabilityAction(context: InboxSelectionContext, input: {
+  messageId: string; partId: string; filename: string; capability: ConnectCapability; previousResults: InboxCapabilityEvidence[];
+}): Promise<void> {
+  const { messageId, partId, filename: attachmentFilename, capability, previousResults } = input;
+  const attachment = { capability_results: previousResults };
+  const controlKey = JSON.stringify(["capability", partId, capability.capability.id, capability.capability.version]);
+  const inboxStatus = inboxMessageStatus(context);
+  const operation = JSON.stringify(["capability", partId, capability.provider.app_id, capability.provider.version,
+    capability.provider.instance_id, capability.capability.id, capability.capability.version]);
+  return inboxThreadEntry.runAction(context, operation,
+    async () => {
+      let parameters: Record<string, string | number | boolean> | null;
+      try {
+        const previous = matchingCapabilityResult(attachment, capability);
+        parameters = collectCapabilityParameters(
+          capability.capability,
+          previous?.parameters,
+          undefined,
+          previous?.status,
+        );
+      } catch (error) {
+        inboxStatus.textContent = errorMessage(error);
+        inboxStatus.dataset.kind = "error";
+        return null;
+      }
+      if (parameters === null) return null;
+
+      const key = capabilityInvocationKey(
+        messageId,
+        partId,
+        capability.provider,
+        capability.capability,
+        parameters,
+        capability.acknowledged_manifest_features ?? [],
+      );
+      const active = matchingCapabilityResult(attachment, capability, parameters);
+      const requestId =
+        (activeCapabilityResult(active) ? active?.job_id : undefined) ??
+        attachmentRequestIds.get(key) ??
+        crypto.randomUUID();
+      const requiresConfirmation =
+        capability.capability.effects.external ||
+        capability.capability.effects.confirmation_required;
+      const confirmed = requiresConfirmation
+        ? await confirmAction(
+            `${capability.capability.action.label}\n${capability.capability.action.description}\n\nContinue with ${capability.provider.name}?`,
+          )
+        : false;
+      if (requiresConfirmation && !confirmed) return null;
+
+      return { key, requestId, capability, parameters, confirmed };
+    }, async target => {
+      const { key, requestId, capability, parameters, confirmed } = target;
+      attachmentRequestIds.set(key, requestId);
+      attachmentInvocationsInFlight.add(key);
+      setInboxDetailButton(context, controlKey, true, `Running ${capability.capability.action.label}…`);
+      inboxStatus.textContent = `Running ${capability.capability.action.label} for ${attachmentFilename}…`;
+      delete inboxStatus.dataset.kind;
+      let result: ConnectInvocationResult | undefined;
+      let invocationError: unknown;
+      const refusalKey = attachmentKey(messageId, partId);
+      const previousRefusal = attachmentSelectionRefusals.get(refusalKey);
+      try {
+        result = await invoke<ConnectInvocationResult>(
+          "attachment_capability_invoke",
+          {
+            requestId,
+            messageId: messageId,
+            partId: partId,
+            provider: {
+              app_id: capability.provider.app_id,
+              version: capability.provider.version,
+              instance_id: capability.provider.instance_id,
+            },
+            capability: {
+              id: capability.capability.id,
+              version: capability.capability.version,
+            },
+            parameters,
+            confirmed,
+          },
+        );
+        attachmentRequestIds.delete(key);
+        if (
+          previousRefusal?.capabilityId === capability.capability.id &&
+          attachmentSelectionRefusals.get(refusalKey) === previousRefusal
+        ) {
+          attachmentSelectionRefusals.delete(refusalKey);
+        }
+      } catch (error) {
+        invocationError = error;
+        const code = errorCode(error);
+        const recovery = capabilitySelectionRecovery(
+          code, capability.capability, errorRetryable(error),
+        );
+        // Only an authoritative refusal ends this request. Transport errors
+        // retain their identity for the existing reconciliation path.
+        if (recovery) {
+          attachmentSelectionRefusals.set(
+            refusalKey, { text: recovery, capabilityId: capability.capability.id },
+          );
+          attachmentRequestIds.delete(key);
+        }
+      } finally {
+        attachmentInvocationsInFlight.delete(key);
+      }
+      await loadInbox();
+      if (result) {
+        if (result.status === "completed") {
+          inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachmentFilename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
+          inboxStatus.dataset.kind = "success";
+        } else {
+          const state =
+            durableCapabilityStatus(
+              result,
+              capability.provider.name,
+              capability.capability.action.label,
+            ) ?? "Capability job queued";
+          inboxStatus.textContent = `${state} for ${attachmentFilename}.`;
+          inboxStatus.dataset.kind = "warning";
+        }
+      } else {
+        inboxStatus.textContent = errorMessage(invocationError);
+        inboxStatus.dataset.kind = "error";
+      }
+    });
+}
+
+async function refreshDecisionInbox(): Promise<void> {
+  const committed = await loadInbox();
+  if (!committed) throw new Error("Inbox could not refresh");
+}
+
+function runInboxAutomationRefresh(context: InboxSelectionContext, fireId: string): Promise<void> {
+  return inboxThreadEntry.runAction(context, `automation:${fireId}:refresh`, () => true, async () => {
+    const inboxStatus = inboxMessageStatus(context);
+    setInboxDetailButton(context, `automation:${fireId}:refresh`, true);
+    try {
+      await refreshDecisionInbox();
+      inboxStatus.textContent = "Inbox refreshed. Review the current automation state.";
+      inboxStatus.dataset.kind = "success";
+    } catch {
+      setInboxDetailButton(context, `automation:${fireId}:refresh`, false);
+      inboxStatus.textContent = "Inbox could not refresh. Try again before making another decision.";
+      inboxStatus.dataset.kind = "error";
+    }
+  });
+}
+
+function runInboxAutomationDecision(context: InboxSelectionContext,
+  decisionProjection: Pick<AutomationFireProjection, "fire_id" | "state" | "state_version" | "prepared_identity_sha256">,
+  confirmationText: string, decision: "confirmed" | "declined"): Promise<void> {
+  const fireId = decisionProjection.fire_id;
+  const inboxStatus = inboxMessageStatus(context);
+  return inboxThreadEntry.runAction(context,
+  `automation:${fireId}`, async () => {
+    if (automationDecisionsInFlight.has(fireId)) return null;
+    const target = { fire: { ...decisionProjection }, decision };
+    if (decision === "confirmed" && !await confirmAction(confirmationText)) return null;
+    return target;
+  }, async target => {
+    setInboxDetailButton(context, `automation:${fireId}:confirm`, true);
+    setInboxDetailButton(context, `automation:${fireId}:decline`, true);
+    const outcome = await runAutomationDecision(
+      target.fire,
+      target.decision,
+      automationDecisionsInFlight,
+      (request) => invoke<AutomationDecisionResult>("automation_fire_decide", { ...request }),
+      refreshDecisionInbox,
+    );
+    if (outcome.status === "ignored") {
+      setInboxDetailButton(context, `automation:${fireId}:confirm`, false);
+      setInboxDetailButton(context, `automation:${fireId}:decline`, false);
+      return;
+    }
+    if (!outcome.refreshed) {
+      automationDecisionRefreshRequired.set(fireId, inboxRequestGeneration);
+      setInboxDetailButton(context, `automation:${fireId}:confirm`, true);
+      setInboxDetailButton(context, `automation:${fireId}:decline`, true);
+      renderInbox(inboxItems);
+    } else {
+      renderInbox(inboxItems);
+    }
+    if (outcome.status === "rejected") {
+      inboxStatus.textContent = errorCode(outcome.error) === "stale_automation_fire"
+        ? outcome.refreshed
+          ? "Automation changed before your decision. Review the refreshed inbox before trying again."
+          : "Automation changed before your decision. Refresh Inbox before trying again."
+        : `Automation decision was not saved: ${errorMessage(outcome.error)}`;
+      inboxStatus.dataset.kind = "error";
+    } else if (outcome.result.state === "declined") {
+      inboxStatus.textContent = "Automation declined. No action was submitted.";
+      inboxStatus.dataset.kind = "success";
+    } else if (outcome.result.state === "pending_dispatch") {
+      inboxStatus.textContent = "Automation confirmation saved. The prepared action was queued for dispatch.";
+      inboxStatus.dataset.kind = "success";
+    } else {
+      inboxStatus.textContent = `Automation decision saved with state ${outcome.result.state}.`;
+      inboxStatus.dataset.kind = "warning";
+    }
+    if (!outcome.refreshed) {
+      inboxStatus.textContent += " Inbox could not refresh; use Refresh inbox before another decision.";
+      inboxStatus.dataset.kind = "error";
+    }
+  });
+}
+
+function runInboxAnalysisRetry(context: InboxSelectionContext, messageId: string, messageSubject: string): Promise<void> {
+  const inboxStatus = inboxMessageStatus(context);
+  return inboxThreadEntry.runAction(context, "analysis:retry",
+  () => ({ messageId }), async target => {
+  setInboxDetailButton(context, "analysis:retry", true, "Retrying…");
+  delete inboxStatus.dataset.kind;
+  inboxStatus.textContent = `Requeueing analysis for ${messageSubject}…`;
+  try {
+    await invoke("analysis_requeue", target);
+    await loadInbox();
+    inboxStatus.textContent = `Analysis requeued for ${messageSubject}.`;
+    inboxStatus.dataset.kind = "success";
+  } catch (error) {
+    setInboxDetailButton(context, "analysis:retry", false, "Retry analysis");
+    inboxStatus.textContent = errorMessage(error);
+    inboxStatus.dataset.kind = "error";
+  }
+});
+}
+
+function runInboxOutputAction(context: InboxSelectionContext, input: {
+  messageId: string; partId: string; jobId: string; artifactId: string; outputKey: string; displayName: string; kind: "view" | "export";
+}): Promise<void> {
+  const { messageId, partId, jobId, artifactId, outputKey, displayName, kind } = input;
+  return inboxThreadEntry.runAction(context, `output:${outputKey}:${kind}`, () => ({ messageId, partId, jobId, artifactId }), async target => {
+    const inboxStatus = inboxMessageStatus(context);
+    if (kind === "export") {
+      setInboxDetailButton(context, `output:${outputKey}:export`, true, "Exporting…");
+      try {
+        const exported = await invoke<RevealedCapabilityOutput>("capability_output_export", target);
+        inboxStatus.textContent = `Prepared ${exported.display_name} as ${exported.filename} and opened its export folder.`;
+        inboxStatus.dataset.kind = "success";
+      } catch (error) {
+        inboxStatus.textContent = errorMessage(error); inboxStatus.dataset.kind = "error";
+      } finally { setInboxDetailButton(context, `output:${outputKey}:export`, false, "Safe export"); }
+      return;
+    }
+    if (capabilityOutputPresentationsInFlight.has(outputKey)) return;
+    capabilityOutputPresentationsInFlight.add(outputKey);
+    setInboxDetailButton(context, `output:${outputKey}:view`, true, "Loading…");
+    let presentationError: unknown;
+    try {
+      const outputView = await invoke<ConnectOutputView>("capability_output_present", target);
+      if (inboxThreadEntry.selection()?.context === context) {
+        const preview = capabilityOutputPreviews.get(outputKey);
+        if (preview?.isConnected) {
+          capabilityOutputPresentations.set(outputKey, outputView.presentation);
+          renderOutputPresentation(preview, outputView.presentation);
+        }
+      }
+    } catch (error) { presentationError = error; }
+    finally {
+      capabilityOutputPresentationsInFlight.delete(outputKey);
+      // This keyed operation can finish after returning to A with a new lifetime.
+      // Release its current View button, but never transfer old preview bytes.
+      const button = capabilityOutputViewButtons.get(outputKey);
+      if (button) { button.disabled = false; button.textContent = "View"; }
+    }
+    if (presentationError) {
+      inboxStatus.textContent = errorMessage(presentationError); inboxStatus.dataset.kind = "error";
+    } else if (inboxThreadEntry.selection()?.context === context && capabilityOutputPreviews.get(outputKey)?.isConnected) {
+      inboxStatus.textContent = `Showing ${displayName}.`; inboxStatus.dataset.kind = "success";
+    } else {
+      inboxStatus.textContent = `Finished reading ${displayName}; its preview is no longer selected.`;
+      inboxStatus.dataset.kind = "warning";
+    }
+  });
+}
+
+function renderInboxMessageDetails(item: InboxItem, context: InboxSelectionContext): HTMLElement {
+  const { message_id: messageId, subject: messageSubject } = item;
+  const renderStartedAt = Date.now();
+  const content = document.createElement("div");
+  content.className = "inbox-message-details";
+  const summary = document.createElement("p");
+  summary.className = "message-summary";
+  summary.textContent = item.summary || "Local analysis has not completed yet.";
+  const truncation = inboxBodyTruncation(item);
+  const truncationNote = truncation ? document.createElement("p") : null;
+  if (truncation && truncationNote) {
+    truncationNote.className = "message-truncation-note";
+    truncationNote.textContent = truncation.note;
+  }
+
+  const details = document.createElement("div");
+  details.className = "message-details";
+  const automationStates = item.attachments.flatMap((attachment) => (attachment.automation_fires ?? []).map((fire) => fire?.state));
+  const awaitingAutomationConfirmation = hasInboxAutomationConfirmation(automationStates);
+  if (awaitingAutomationConfirmation) {
+    const confirmation = document.createElement("p");
+    confirmation.textContent = "Confirmation required. Review the attachment details below.";
+    confirmation.dataset.label = "Automation";
+    details.append(confirmation);
+  }
+  if (item.action_required !== null) {
+    const action = document.createElement("p");
+    action.textContent =
+      item.action_required === 1
+        ? item.suggested_action || "Review this message."
+        : "No action required.";
+    action.dataset.label = awaitingAutomationConfirmation ? "Email action" : "Action required";
+    details.append(action);
+  }
+  const deadlineValue = item.deadline_text || item.deadline_iso;
+  if (deadlineValue) {
+    const deadline = document.createElement("p");
+    deadline.textContent = deadlineValue;
+    deadline.dataset.label = "Deadline";
+    details.append(deadline);
+  }
+
+  let calendarProposal: HTMLElement | null = null;
+  if (item.calendar_proposal) {
+    const proposal = item.calendar_proposal;
+    calendarProposal = document.createElement("section");
+    calendarProposal.className = "calendar-proposal";
+    calendarProposal.setAttribute("aria-label", "Calendar proposal");
+    const heading = document.createElement("div");
+    heading.className = "calendar-proposal-heading";
+    const title = document.createElement("strong");
+    title.textContent = "Calendar proposal";
+    const state = document.createElement("span");
+    const hasSuggestion = proposal.status === "accepted";
+    const proposalExpiresAt = proposal.expires_at ? Date.parse(proposal.expires_at) : Number.NaN;
+    const expired = Boolean(
+      hasSuggestion && Number.isFinite(proposalExpiresAt) && proposalExpiresAt <= renderStartedAt,
+    );
+    const proposalStateLabels: Record<CalendarProposalPreview["state"], string> = {
+      awaiting_confirmation: expired ? "Expired" : "Not confirmed",
+      completed: "Created",
+      declined: "Declined",
+      failed: "Not created",
+      manual_review: "Needs review",
+      reconciling: "Reconciling",
+      unresolved: "Needs reconciliation",
+      write_authorized: "Authorized",
+      writing: "Creating event",
+    };
+    state.textContent = !hasSuggestion ? "Needs review" : proposalStateLabels[proposal.state];
+    state.dataset.expired = String(expired);
+    heading.append(title, state);
+    const subject = document.createElement("p");
+    subject.textContent = `Event title: ${proposal.subject}`;
+    const timing = document.createElement("p");
+    if (!hasSuggestion) {
+      timing.textContent = proposal.empty_reason || "No meeting time satisfied the request.";
+    } else if (proposal.start && proposal.end && proposal.timezone) {
+      try {
+        const formatter = new Intl.DateTimeFormat(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          timeZone: proposal.timezone,
+          timeZoneName: "short",
+        });
+        timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))} (${proposal.timezone}) · Exact interval: ${proposal.start} – ${proposal.end}`;
+      } catch {
+        timing.textContent = `${proposal.start} – ${proposal.end} (${proposal.timezone})`;
+      }
+    } else {
+      timing.textContent = "The calendar proposal is incomplete and needs review.";
+    }
+    const attendees = document.createElement("p");
+    attendees.textContent = proposal.attendees.length
+      ? `Attendees: ${proposal.attendees.join(", ")}`
+      : "No additional attendees";
+    const showInvitationWarning =
+      proposal.state === "awaiting_confirmation" &&
+      hasSuggestion &&
+      !expired &&
+      proposal.attendees.length > 0;
+    const invitationWarning = document.createElement("p");
+    invitationWarning.className = "calendar-proposal-invitation-warning";
+    invitationWarning.hidden = !showInvitationWarning;
+    invitationWarning.textContent = showInvitationWarning
+      ? `Creating this event will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
+      : "";
+    const calendar = document.createElement("p");
+    calendar.textContent = `Calendar owner: ${proposal.account_address || proposal.account_display_name} · Account identity: ${proposal.account_id}`;
+    const location = document.createElement("p");
+    location.textContent = "Location: Not specified";
+    const onlineMeeting = document.createElement("p");
+    onlineMeeting.textContent = "Teams link: No";
+    const note = document.createElement("p");
+    note.className = "calendar-proposal-note";
+    note.textContent = calendarOutcomeNotice(
+      item.calendar_write_outcome, "proposal", proposal.state,
+    ).text;
+    calendarProposal.append(
+      heading,
+      subject,
+      timing,
+      attendees,
+      invitationWarning,
+      calendar,
+      location,
+      onlineMeeting,
+      note,
+    );
+    if (proposal.state === "awaiting_confirmation" && hasSuggestion) {
+      const actions = document.createElement("div");
+      actions.className = "calendar-proposal-actions";
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "secondary";
+      decline.textContent = "Decline";
+      const confirm = document.createElement("button");
+      confirm.type = "button";
+      confirm.textContent = expired ? "Recheck proposal" : "Create event";
+      const calendarTarget = { messageId, proposalSha256: proposal.proposal_sha256,
+        proposalVersion: proposal.proposal_version, runId: proposal.run_id, stateVersion: proposal.state_version };
+      const invitationText = proposal.attendees.length
+        ? ` This will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.` : "";
+      const confirmationMessage = expired
+        ? `Recheck the expired proposal “${proposal.subject}” before creating it? If Email Watcher still considers it valid, this confirmation will create the event on ${proposal.account_address || proposal.account_display_name}; otherwise it will refresh the proposal without creating an event.${invitationText}`
+        : `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationText}`;
+      decline.dataset.inboxDetailFocus = "calendar:decline"; confirm.dataset.inboxDetailFocus = "calendar:confirm";
+      const decide = (decision: "confirm" | "decline"): Promise<void> =>
+        runInboxCalendarDecision(context, calendarTarget, confirmationMessage, decision);
+      decline.addEventListener("click", () => void decide("decline"));
+      confirm.addEventListener("click", () => void decide("confirm"));
+      actions.append(decline, confirm);
+      calendarProposal.append(actions);
+    }
+  }
+
+  if (!item.calendar_proposal && item.calendar_write_outcome) {
+    calendarProposal = document.createElement("section");
+    calendarProposal.className = "calendar-proposal";
+    calendarProposal.setAttribute("aria-label", "Calendar status");
+    const note = document.createElement("p");
+    note.className = "calendar-proposal-note";
+    note.textContent = calendarOutcomeNotice(item.calendar_write_outcome, "proposal").text;
+    calendarProposal.append(note);
+  }
+
+  const attachments = document.createElement("ul");
+  attachments.className = "attachment-list";
+  for (const attachment of item.attachments) {
+    const { part_id: partId, filename: attachmentFilename } = attachment;
+    const row = document.createElement("li");
+    const attachmentDetails = document.createElement("div");
+    attachmentDetails.className = "attachment-details";
+    const filename = document.createElement("strong");
+    filename.textContent = attachmentFilename;
+    const metadata = document.createElement("span");
+    const type = attachment.media_type || "Unknown type";
+    const size = new Intl.NumberFormat(undefined, {
+      style: "unit",
+      unit: "byte",
+      unitDisplay: "narrow",
+      notation: "compact",
+    }).format(attachment.byte_size);
+    metadata.textContent = `${type} · ${size}`;
+    attachmentDetails.append(filename, metadata);
+    const openButton = document.createElement("button");
+    openButton.type = "button";
+    openButton.textContent = "Open";
+    openButton.dataset.inboxDetailFocus = `attachment:${partId}:open`;
+    openButton.addEventListener("click", () => runInboxAttachmentOpen(context, messageId, partId));
+    const actions = document.createElement("div");
+    actions.className = "attachment-actions";
+    actions.append(openButton);
+
+    const diagnostic = attachmentCapabilityDiagnostics.get(
+      attachmentKey(messageId, partId),
+    );
+    if (classifyCapabilityDiagnostic(diagnostic ?? null) === "locked") {
+      const locked = document.createElement("span");
+      locked.className = "capability-locked";
+      locked.textContent = "Connect actions locked";
+      locked.title = "Activate Connect to discover compatible actions from local apps.";
+
+      const viewConnect = document.createElement("button");
+      viewConnect.type = "button";
+      viewConnect.textContent = "View Connect";
+      viewConnect.dataset.inboxDetailFocus = `attachment:${partId}:connect`;
+      viewConnect.addEventListener("click", () => {
+        if (inboxThreadEntry.checkSelection(context).status === "ready") openConnectHealth();
+      });
+      actions.append(locked, viewConnect);
+    }
+
+    for (const result of attachment.capability_results ?? []) {
+      if (result.protocol_version !== 2 || !result.provider || !result.job_id) continue;
+      const key = capabilityInvocationKey(
+        messageId,
+        partId,
+        result.provider,
+        { id: result.capability_id, version: result.capability_version },
+        result.parameters ?? {},
+        result.required_manifest_features ?? [],
+      );
+      if (activeCapabilityResult(result)) attachmentRequestIds.set(key, result.job_id);
+      else if (attachmentRequestIds.get(key) === result.job_id) attachmentRequestIds.delete(key);
+    }
+
+    for (const providers of capabilityGroups(messageId, attachment)) {
+      let selected = providers.length === 1 ? providers[0] : undefined;
+      let providerSelect: HTMLSelectElement | undefined;
+      if (providers.length > 1) {
+        providerSelect = document.createElement("select");
+        providerSelect.className = "capability-provider";
+        providerSelect.setAttribute(
+          "aria-label",
+          `Choose a provider for ${providers[0].capability.id}`,
+        );
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "Choose provider…";
+        providerSelect.append(placeholder);
+        providers.forEach((provider, index) => {
+          const option = document.createElement("option");
+          option.value = String(index);
+          option.textContent = `${provider.provider.name} (${provider.provider.version}) · ${provider.provider.instance_id.slice(0, 8)}`;
+          providerSelect?.append(option);
+        });
+        actions.append(providerSelect);
+      }
+
+      const invokeButton = document.createElement("button");
+      invokeButton.type = "button";
+      const syncButton = (): void => {
+        if (!selected) {
+          invokeButton.disabled = true;
+          invokeButton.textContent = "Choose provider";
+          invokeButton.removeAttribute("title");
+          return;
+        }
+        const existing = matchingCapabilityResult(attachment, selected);
+        const key = capabilityInvocationKey(
+          messageId,
+          partId,
+          selected.provider,
+          selected.capability,
+          existing?.parameters ?? {},
+          selected.acknowledged_manifest_features ?? [],
+        );
+        const active = activeCapabilityResult(existing);
+        const inFlight = attachmentInvocationsInFlight.has(key);
+        invokeButton.disabled = inFlight;
+        invokeButton.textContent = inFlight
+          ? `Running ${selected.capability.action.label}…`
+          : active
+            ? `Resume ${selected.capability.action.label}`
+            : selected.capability.action.label;
+        invokeButton.title = selected.capability.action.description;
+      };
+      providerSelect?.addEventListener("change", () => {
+        selected =
+          providerSelect?.value === ""
+            ? undefined
+            : providers[Number(providerSelect?.value)];
+        syncButton();
+      });
+      syncButton();
+      invokeButton.dataset.inboxDetailFocus = JSON.stringify(["capability", partId, providers[0].capability.id, providers[0].capability.version]);
+      if (providerSelect) providerSelect.dataset.inboxDetailFocus = JSON.stringify(["provider", partId, providers[0].capability.id, providers[0].capability.version]);
+      invokeButton.addEventListener("click", () => {
+        const capability = selected && structuredClone(selected);
+        if (!capability) return;
+        const previousResults = (attachment.capability_results ?? []).map(result => ({
+          protocol_version: result.protocol_version, provider: result.provider, capability_id: result.capability_id,
+          capability_version: result.capability_version, parameters: result.parameters, status: result.status,
+          required_manifest_features: result.required_manifest_features, job_id: result.job_id,
+        }));
+        return runInboxCapabilityAction(context, { messageId, partId, filename: attachmentFilename, capability,
+          previousResults: structuredClone(previousResults) });
+      });
+      actions.append(invokeButton);
+    }
+    row.append(attachmentDetails, actions);
+    const refusal = attachmentSelectionRefusals.get(
+      attachmentKey(messageId, partId),
+    );
+    if (refusal) {
+      const notice = document.createElement("p");
+      notice.className = "attachment-summary-error";
+      notice.setAttribute("role", "status");
+      notice.textContent = refusal.text;
+      row.append(notice);
+    }
+    for (const result of attachment.capability_results ?? []) {
+      renderCapabilityResult(row, result, messageId, partId, context);
+    }
+    for (const fire of attachment.automation_fires ?? []) {
+      const status = document.createElement("p");
+      status.className = "automation-outcome";
+      status.textContent = `${automationOutcomeIdentity(fire?.rule_id, fire?.rule_version)}: ${automationOutcomeStatus(fire?.state)}`;
+      row.append(status);
+      if (!fire || !canDecideAutomationFire(fire)) continue;
+      const panel = document.createElement("div");
+      panel.className = "automation-confirmation";
+      const description = document.createElement("p");
+      description.textContent = `Automation rule ${fire.rule_id} (version ${fire.rule_version}) is waiting for confirmation for ${attachmentFilename}. Confirming may run an action in another app.`;
+      const decisions = document.createElement("div");
+      decisions.className = "automation-confirmation-actions";
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "secondary";
+      decline.textContent = "Decline automation";
+      const confirm = document.createElement("button");
+      confirm.type = "button";
+      confirm.textContent = "Confirm automation";
+      const fireId = fire.fire_id;
+      const showRefreshRetry = (): void => {
+        const retryRefresh = document.createElement("button");
+        retryRefresh.type = "button";
+        retryRefresh.className = "secondary";
+        retryRefresh.textContent = "Refresh inbox";
+        retryRefresh.dataset.inboxDetailFocus = `automation:${fireId}:refresh`;
+        retryRefresh.addEventListener("click", () => runInboxAutomationRefresh(context, fireId));
+        decisions.replaceChildren(retryRefresh);
+      };
+      if (automationDecisionRefreshRequired.has(fire.fire_id)) {
+        showRefreshRetry();
+        panel.append(description, decisions);
+        row.append(panel);
+        continue;
+      }
+      if (automationDecisionsInFlight.has(fire.fire_id)) {
+        confirm.disabled = true;
+        decline.disabled = true;
+      }
+      const decisionProjection = { fire_id: fireId, state: fire.state, state_version: fire.state_version,
+        prepared_identity_sha256: fire.prepared_identity_sha256 };
+      const confirmationText = `Confirm automation rule ${fire.rule_id} for "${attachmentFilename}"? This authorizes its prepared action and may change data in another app.`;
+      decline.dataset.inboxDetailFocus = `automation:${fireId}:decline`; confirm.dataset.inboxDetailFocus = `automation:${fireId}:confirm`;
+      const decide = (decision: "confirmed" | "declined"): Promise<void> =>
+        runInboxAutomationDecision(context, decisionProjection, confirmationText, decision);
+      decline.addEventListener("click", () => void decide("declined"));
+      confirm.addEventListener("click", () => void decide("confirmed"));
+      decisions.append(decline, confirm);
+      panel.append(description, decisions);
+      row.append(panel);
+    }
+    attachments.append(row);
+  }
+
+  const footer = document.createElement("div");
+  footer.className = "message-footer";
+  const badges = document.createElement("div");
+  badges.className = "message-badges";
+  const badge = document.createElement("span");
+  badge.className = "priority-badge";
+  badge.textContent = item.priority || "Untriaged";
+  badges.append(badge);
+  const footerActions = document.createElement("div");
+  footerActions.className = "message-footer-actions";
+  footer.append(badges, footerActions);
+  if (item.status === "pending" && item.analysis_retryable === false) {
+    const retryButton = document.createElement("button");
+    retryButton.type = "button";
+    retryButton.textContent = "Retry analysis";
+    retryButton.dataset.inboxDetailFocus = "analysis:retry";
+    retryButton.addEventListener("click", () => runInboxAnalysisRetry(context, messageId, messageSubject));
+    footerActions.append(retryButton);
+  }
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "remove-button";
+  deleteButton.textContent = inboxDeletionsInFlight.has(messageId)
+    ? "Deleting…"
+    : "Delete locally";
+  deleteButton.disabled = inboxMutationInFlight();
+  deleteButton.dataset.inboxDetailFocus = "message:delete";
+  deleteButton.addEventListener("click", () => void deleteInboxItem({ message_id: messageId, subject: messageSubject }, context));
+  footerActions.append(deleteButton);
+  content.append(summary);
+  if (truncationNote) content.append(truncationNote);
+  if (details.childElementCount) content.append(details);
+  if (calendarProposal) content.append(calendarProposal);
+  if (attachments.childElementCount) content.append(attachments);
+  content.append(footer);
+  return content;
+}
+
+function renderSelectedInboxMessage(force = false): void {
+  const section = requiredElement<HTMLElement>("#inbox-selected-message");
+  const content = requiredElement<HTMLElement>("#inbox-selected-message-content");
+  const heading = requiredElement<HTMLElement>("#inbox-selected-message-heading");
+  const selected = inboxThreadEntry.selection();
+  if (!force && selected?.row === renderedInboxSelection?.row && selected?.context === renderedInboxSelection?.context) return;
+  const active = document.activeElement as HTMLElement | null;
+  const focused = !!active && content.contains(active), key = focused ? active?.dataset.inboxDetailFocus : null;
+  content.replaceChildren();
+  capabilityOutputPreviews.clear(); capabilityOutputViewButtons.clear();
+  if (!selected || selected.context !== renderedInboxSelection?.context) capabilityOutputPresentations.clear();
+  renderedInboxSelection = selected;
+  section.hidden = !selected;
+  if (!selected) return;
+  content.append(renderInboxMessageDetails(selected.row, selected.context));
+  if (focused) {
+    const target = Array.from(content.querySelectorAll<HTMLElement>("[data-inbox-detail-focus]"))
+      .find(control => control.dataset.inboxDetailFocus === key);
+    (target ?? heading).focus({ preventScroll: true });
+  }
+}
+
 function renderInbox(items: InboxItem[]): void {
   const position = captureInboxScroll();
   const scrollTop = inboxItemsEpoch === inboxRenderedEpoch ? position.top : 0;
@@ -1815,11 +2554,9 @@ function renderInbox(items: InboxItem[]): void {
   }
   const renderStartedAt = Date.now();
   let nextProposalExpiry: number | null = null;
-  capabilityOutputPreviews.clear();
-  capabilityOutputViewButtons.clear();
   inboxList.replaceChildren();
   if (items.length === 0) {
-    capabilityOutputPresentations.clear();
+    renderSelectedInboxMessage(true);
     const empty = document.createElement("li");
     empty.className = "empty-state";
     const filtered = Object.entries(activeInboxQuery).some(
@@ -1879,655 +2616,12 @@ function renderInbox(items: InboxItem[]): void {
     received.textContent = receivedLabel(item.received_at);
     meta.append(senderIdentity);
 
-    const summary = document.createElement("p");
-    summary.className = "message-summary";
-    summary.textContent = item.summary || "Local analysis has not completed yet.";
     const truncation = inboxBodyTruncation(item);
-    const truncationNote = truncation ? document.createElement("p") : null;
-    if (truncation && truncationNote) {
-      truncationNote.className = "message-truncation-note";
-      truncationNote.textContent = truncation.note;
-    }
-
-    const details = document.createElement("div");
-    details.className = "message-details";
-    const automationStates = item.attachments.flatMap((attachment) => (attachment.automation_fires ?? []).map((fire) => fire?.state));
-    const awaitingAutomationConfirmation = hasInboxAutomationConfirmation(automationStates);
-    if (awaitingAutomationConfirmation) {
-      const confirmation = document.createElement("p");
-      confirmation.textContent = "Confirmation required. Review the attachment details below.";
-      confirmation.dataset.label = "Automation";
-      details.append(confirmation);
-    }
-    if (item.action_required !== null) {
-      const action = document.createElement("p");
-      action.textContent =
-        item.action_required === 1
-          ? item.suggested_action || "Review this message."
-          : "No action required.";
-      action.dataset.label = awaitingAutomationConfirmation ? "Email action" : "Action required";
-      details.append(action);
-    }
-    const deadlineValue = item.deadline_text || item.deadline_iso;
-    if (deadlineValue) {
-      const deadline = document.createElement("p");
-      deadline.textContent = deadlineValue;
-      deadline.dataset.label = "Deadline";
-      details.append(deadline);
-    }
-
-    let calendarProposal: HTMLElement | null = null;
-    if (item.calendar_proposal) {
-      const proposal = item.calendar_proposal;
-      calendarProposal = document.createElement("section");
-      calendarProposal.className = "calendar-proposal";
-      calendarProposal.setAttribute("aria-label", "Calendar proposal");
-      const heading = document.createElement("div");
-      heading.className = "calendar-proposal-heading";
-      const title = document.createElement("strong");
-      title.textContent = "Calendar proposal";
-      const state = document.createElement("span");
-      const hasSuggestion = proposal.status === "accepted";
-      const proposalExpiresAt = proposal.expires_at ? Date.parse(proposal.expires_at) : Number.NaN;
-      const expired = Boolean(
-        hasSuggestion && Number.isFinite(proposalExpiresAt) && proposalExpiresAt <= renderStartedAt,
-      );
-      if (
-        proposal.state === "awaiting_confirmation" &&
-        hasSuggestion &&
-        proposalExpiresAt > renderStartedAt
-      ) {
-        nextProposalExpiry = Math.min(nextProposalExpiry ?? proposalExpiresAt, proposalExpiresAt);
-      }
-      const proposalStateLabels: Record<CalendarProposalPreview["state"], string> = {
-        awaiting_confirmation: expired ? "Expired" : "Not confirmed",
-        completed: "Created",
-        declined: "Declined",
-        failed: "Not created",
-        manual_review: "Needs review",
-        reconciling: "Reconciling",
-        unresolved: "Needs reconciliation",
-        write_authorized: "Authorized",
-        writing: "Creating event",
-      };
-      state.textContent = !hasSuggestion ? "Needs review" : proposalStateLabels[proposal.state];
-      state.dataset.expired = String(expired);
-      heading.append(title, state);
-      const subject = document.createElement("p");
-      subject.textContent = `Event title: ${proposal.subject}`;
-      const timing = document.createElement("p");
-      if (!hasSuggestion) {
-        timing.textContent = proposal.empty_reason || "No meeting time satisfied the request.";
-      } else if (proposal.start && proposal.end && proposal.timezone) {
-        try {
-          const formatter = new Intl.DateTimeFormat(undefined, {
-            weekday: "short",
-            month: "short",
-            day: "numeric",
-            hour: "numeric",
-            minute: "2-digit",
-            timeZone: proposal.timezone,
-            timeZoneName: "short",
-          });
-          timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))} (${proposal.timezone}) · Exact interval: ${proposal.start} – ${proposal.end}`;
-        } catch {
-          timing.textContent = `${proposal.start} – ${proposal.end} (${proposal.timezone})`;
-        }
-      } else {
-        timing.textContent = "The calendar proposal is incomplete and needs review.";
-      }
-      const attendees = document.createElement("p");
-      attendees.textContent = proposal.attendees.length
-        ? `Attendees: ${proposal.attendees.join(", ")}`
-        : "No additional attendees";
-      const showInvitationWarning =
-        proposal.state === "awaiting_confirmation" &&
-        hasSuggestion &&
-        !expired &&
-        proposal.attendees.length > 0;
-      const invitationWarning = document.createElement("p");
-      invitationWarning.className = "calendar-proposal-invitation-warning";
-      invitationWarning.hidden = !showInvitationWarning;
-      invitationWarning.textContent = showInvitationWarning
-        ? `Creating this event will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
-        : "";
-      const calendar = document.createElement("p");
-      calendar.textContent = `Calendar owner: ${proposal.account_address || proposal.account_display_name} · Account identity: ${proposal.account_id}`;
-      const location = document.createElement("p");
-      location.textContent = "Location: Not specified";
-      const onlineMeeting = document.createElement("p");
-      onlineMeeting.textContent = "Teams link: No";
-      const note = document.createElement("p");
-      note.className = "calendar-proposal-note";
-      note.textContent = calendarOutcomeNotice(
-        item.calendar_write_outcome, "proposal", proposal.state,
-      ).text;
-      calendarProposal.append(
-        heading,
-        subject,
-        timing,
-        attendees,
-        invitationWarning,
-        calendar,
-        location,
-        onlineMeeting,
-        note,
-      );
-      if (proposal.state === "awaiting_confirmation" && hasSuggestion) {
-        const actions = document.createElement("div");
-        actions.className = "calendar-proposal-actions";
-        const decline = document.createElement("button");
-        decline.type = "button";
-        decline.className = "secondary";
-        decline.textContent = "Decline";
-        const confirm = document.createElement("button");
-        confirm.type = "button";
-        confirm.textContent = expired ? "Recheck proposal" : "Create event";
-        const decide = async (decision: "confirm" | "decline"): Promise<void> => {
-          if (decision === "confirm") {
-            const invitationWarning = proposal.attendees.length
-              ? ` This will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
-              : "";
-            const confirmationMessage = expired
-              ? `Recheck the expired proposal “${proposal.subject}” before creating it? If Email Watcher still considers it valid, this confirmation will create the event on ${proposal.account_address || proposal.account_display_name}; otherwise it will refresh the proposal without creating an event.${invitationWarning}`
-              : `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationWarning}`;
-            if (
-              !await confirmAction(confirmationMessage)
-            ) {
-              return;
-            }
-          }
-          confirm.disabled = true;
-          decline.disabled = true;
-          try {
-            const result = await invoke<CalendarDecisionResult>("calendar_proposal_decide", {
-              decision,
-              messageId: item.message_id,
-              proposalSha256: proposal.proposal_sha256,
-              proposalVersion: proposal.proposal_version,
-              runId: proposal.run_id,
-              stateVersion: proposal.state_version,
-            });
-            await loadInbox();
-            const refreshed = inboxItems.find((row) => row.message_id === item.message_id);
-            const notice = calendarOutcomeNotice(
-              latestCalendarOutcome(result.calendar_write_outcome, refreshed?.calendar_write_outcome),
-              "decision", result.state,
-            );
-            const statusMessage = notice.text;
-            const statusKind = notice.kind;
-            inboxStatus.textContent = statusMessage;
-            inboxStatus.dataset.kind = statusKind;
-          } catch (error) {
-            const statusMessage = errorMessage(error);
-            await loadInbox();
-            inboxStatus.textContent = statusMessage;
-            inboxStatus.dataset.kind = "error";
-          }
-        };
-        decline.addEventListener("click", () => void decide("decline"));
-        confirm.addEventListener("click", () => void decide("confirm"));
-        actions.append(decline, confirm);
-        calendarProposal.append(actions);
-      }
-    }
-
-    if (!item.calendar_proposal && item.calendar_write_outcome) {
-      calendarProposal = document.createElement("section");
-      calendarProposal.className = "calendar-proposal";
-      calendarProposal.setAttribute("aria-label", "Calendar status");
-      const note = document.createElement("p");
-      note.className = "calendar-proposal-note";
-      note.textContent = calendarOutcomeNotice(item.calendar_write_outcome, "proposal").text;
-      calendarProposal.append(note);
-    }
-
-    const attachments = document.createElement("ul");
-    attachments.className = "attachment-list";
-    for (const attachment of item.attachments) {
-      const row = document.createElement("li");
-      const attachmentDetails = document.createElement("div");
-      attachmentDetails.className = "attachment-details";
-      const filename = document.createElement("strong");
-      filename.textContent = attachment.filename;
-      const metadata = document.createElement("span");
-      const type = attachment.media_type || "Unknown type";
-      const size = new Intl.NumberFormat(undefined, {
-        style: "unit",
-        unit: "byte",
-        unitDisplay: "narrow",
-        notation: "compact",
-      }).format(attachment.byte_size);
-      metadata.textContent = `${type} · ${size}`;
-      attachmentDetails.append(filename, metadata);
-      const openButton = document.createElement("button");
-      openButton.type = "button";
-      openButton.textContent = "Open";
-      openButton.addEventListener("click", async () => {
-        openButton.disabled = true;
-        openButton.textContent = "Opening…";
-        try {
-          const opened = await invoke<OpenedAttachment>("attachment_open", {
-            messageId: item.message_id,
-            partId: attachment.part_id,
-          });
-          inboxStatus.textContent = `Opened ${opened.filename} in the default app.`;
-          inboxStatus.dataset.kind = "success";
-        } catch (error) {
-          inboxStatus.textContent = errorMessage(error);
-          inboxStatus.dataset.kind = "error";
-        } finally {
-          openButton.disabled = false;
-          openButton.textContent = "Open";
-        }
-      });
-      const actions = document.createElement("div");
-      actions.className = "attachment-actions";
-      actions.append(openButton);
-
-      const diagnostic = attachmentCapabilityDiagnostics.get(
-        attachmentKey(item.message_id, attachment.part_id),
-      );
-      if (classifyCapabilityDiagnostic(diagnostic ?? null) === "locked") {
-        const locked = document.createElement("span");
-        locked.className = "capability-locked";
-        locked.textContent = "Connect actions locked";
-        locked.title = "Activate Connect to discover compatible actions from local apps.";
-
-        const viewConnect = document.createElement("button");
-        viewConnect.type = "button";
-        viewConnect.textContent = "View Connect";
-        viewConnect.addEventListener("click", openConnectHealth);
-        actions.append(locked, viewConnect);
-      }
-
-      for (const result of attachment.capability_results ?? []) {
-        if (result.protocol_version !== 2 || !result.provider || !result.job_id) continue;
-        const key = capabilityInvocationKey(
-          item.message_id,
-          attachment.part_id,
-          result.provider,
-          { id: result.capability_id, version: result.capability_version },
-          result.parameters ?? {},
-          result.required_manifest_features ?? [],
-        );
-        if (activeCapabilityResult(result)) attachmentRequestIds.set(key, result.job_id);
-        else attachmentRequestIds.delete(key);
-      }
-
-      for (const providers of capabilityGroups(item.message_id, attachment)) {
-        let selected = providers.length === 1 ? providers[0] : undefined;
-        let providerSelect: HTMLSelectElement | undefined;
-        if (providers.length > 1) {
-          providerSelect = document.createElement("select");
-          providerSelect.className = "capability-provider";
-          providerSelect.setAttribute(
-            "aria-label",
-            `Choose a provider for ${providers[0].capability.id}`,
-          );
-          const placeholder = document.createElement("option");
-          placeholder.value = "";
-          placeholder.textContent = "Choose provider…";
-          providerSelect.append(placeholder);
-          providers.forEach((provider, index) => {
-            const option = document.createElement("option");
-            option.value = String(index);
-            option.textContent = `${provider.provider.name} (${provider.provider.version}) · ${provider.provider.instance_id.slice(0, 8)}`;
-            providerSelect?.append(option);
-          });
-          actions.append(providerSelect);
-        }
-
-        const invokeButton = document.createElement("button");
-        invokeButton.type = "button";
-        const syncButton = (): void => {
-          if (!selected) {
-            invokeButton.disabled = true;
-            invokeButton.textContent = "Choose provider";
-            invokeButton.removeAttribute("title");
-            return;
-          }
-          const existing = matchingCapabilityResult(attachment, selected);
-          const key = capabilityInvocationKey(
-            item.message_id,
-            attachment.part_id,
-            selected.provider,
-            selected.capability,
-            existing?.parameters ?? {},
-            selected.acknowledged_manifest_features ?? [],
-          );
-          const active = activeCapabilityResult(existing);
-          const inFlight = attachmentInvocationsInFlight.has(key);
-          invokeButton.disabled = inFlight;
-          invokeButton.textContent = inFlight
-            ? `Running ${selected.capability.action.label}…`
-            : active
-              ? `Resume ${selected.capability.action.label}`
-              : selected.capability.action.label;
-          invokeButton.title = selected.capability.action.description;
-        };
-        providerSelect?.addEventListener("change", () => {
-          selected =
-            providerSelect?.value === ""
-              ? undefined
-              : providers[Number(providerSelect?.value)];
-          syncButton();
-        });
-        syncButton();
-        invokeButton.addEventListener("click", async () => {
-          const capability = selected;
-          if (!capability) return;
-          let parameters: Record<string, string | number | boolean> | null;
-          try {
-            const previous = matchingCapabilityResult(attachment, capability);
-            parameters = collectCapabilityParameters(
-              capability.capability,
-              previous?.parameters,
-              undefined,
-              previous?.status,
-            );
-          } catch (error) {
-            inboxStatus.textContent = errorMessage(error);
-            inboxStatus.dataset.kind = "error";
-            return;
-          }
-          if (parameters === null) return;
-          const requiresConfirmation =
-            capability.capability.effects.external ||
-            capability.capability.effects.confirmation_required;
-          const confirmed = requiresConfirmation
-            ? await confirmAction(
-                `${capability.capability.action.label}\n${capability.capability.action.description}\n\nContinue with ${capability.provider.name}?`,
-              )
-            : false;
-          if (requiresConfirmation && !confirmed) return;
-
-          const key = capabilityInvocationKey(
-            item.message_id,
-            attachment.part_id,
-            capability.provider,
-            capability.capability,
-            parameters,
-            capability.acknowledged_manifest_features ?? [],
-          );
-          const active = matchingCapabilityResult(attachment, capability, parameters);
-          const requestId =
-            (activeCapabilityResult(active) ? active?.job_id : undefined) ??
-            attachmentRequestIds.get(key) ??
-            crypto.randomUUID();
-          attachmentRequestIds.set(key, requestId);
-          attachmentInvocationsInFlight.add(key);
-          invokeButton.disabled = true;
-          invokeButton.textContent = `Running ${capability.capability.action.label}…`;
-          inboxStatus.textContent = `Running ${capability.capability.action.label} for ${attachment.filename}…`;
-          delete inboxStatus.dataset.kind;
-          let result: ConnectInvocationResult | undefined;
-          let invocationError: unknown;
-          const refusalKey = attachmentKey(item.message_id, attachment.part_id);
-          const previousRefusal = attachmentSelectionRefusals.get(refusalKey);
-          try {
-            result = await invoke<ConnectInvocationResult>(
-              "attachment_capability_invoke",
-              {
-                requestId,
-                messageId: item.message_id,
-                partId: attachment.part_id,
-                provider: {
-                  app_id: capability.provider.app_id,
-                  version: capability.provider.version,
-                  instance_id: capability.provider.instance_id,
-                },
-                capability: {
-                  id: capability.capability.id,
-                  version: capability.capability.version,
-                },
-                parameters,
-                confirmed,
-              },
-            );
-            attachmentRequestIds.delete(key);
-            if (
-              previousRefusal?.capabilityId === capability.capability.id &&
-              attachmentSelectionRefusals.get(refusalKey) === previousRefusal
-            ) {
-              attachmentSelectionRefusals.delete(refusalKey);
-            }
-          } catch (error) {
-            invocationError = error;
-            const code = errorCode(error);
-            const recovery = capabilitySelectionRecovery(
-              code, capability.capability, errorRetryable(error),
-            );
-            // Only an authoritative refusal ends this request. Transport errors
-            // retain their identity for the existing reconciliation path.
-            if (recovery) {
-              attachmentSelectionRefusals.set(
-                refusalKey, { text: recovery, capabilityId: capability.capability.id },
-              );
-              attachmentRequestIds.delete(key);
-            }
-          } finally {
-            attachmentInvocationsInFlight.delete(key);
-          }
-          await loadInbox();
-          if (result) {
-            if (result.status === "completed") {
-              inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachment.filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
-              inboxStatus.dataset.kind = "success";
-            } else {
-              const state =
-                durableCapabilityStatus(
-                  result,
-                  capability.provider.name,
-                  capability.capability.action.label,
-                ) ?? "Capability job queued";
-              inboxStatus.textContent = `${state} for ${attachment.filename}.`;
-              inboxStatus.dataset.kind = "warning";
-            }
-          } else {
-            inboxStatus.textContent = errorMessage(invocationError);
-            inboxStatus.dataset.kind = "error";
-          }
-        });
-        actions.append(invokeButton);
-      }
-      row.append(attachmentDetails, actions);
-      const refusal = attachmentSelectionRefusals.get(
-        attachmentKey(item.message_id, attachment.part_id),
-      );
-      if (refusal) {
-        const notice = document.createElement("p");
-        notice.className = "attachment-summary-error";
-        notice.setAttribute("role", "status");
-        notice.textContent = refusal.text;
-        row.append(notice);
-      }
-      for (const result of attachment.capability_results ?? []) {
-        renderCapabilityResult(row, result, item.message_id, attachment.part_id);
-      }
-      for (const fire of attachment.automation_fires ?? []) {
-        const status = document.createElement("p");
-        status.className = "automation-outcome";
-        status.textContent = `${automationOutcomeIdentity(fire?.rule_id, fire?.rule_version)}: ${automationOutcomeStatus(fire?.state)}`;
-        row.append(status);
-        if (!fire || !canDecideAutomationFire(fire)) continue;
-        const panel = document.createElement("div");
-        panel.className = "automation-confirmation";
-        const description = document.createElement("p");
-        description.textContent = `Automation rule ${fire.rule_id} (version ${fire.rule_version}) is waiting for confirmation for ${attachment.filename}. Confirming may run an action in another app.`;
-        const decisions = document.createElement("div");
-        decisions.className = "automation-confirmation-actions";
-        const decline = document.createElement("button");
-        decline.type = "button";
-        decline.className = "secondary";
-        decline.textContent = "Decline automation";
-        const confirm = document.createElement("button");
-        confirm.type = "button";
-        confirm.textContent = "Confirm automation";
-        const refreshDecisionInbox = async (): Promise<void> => {
-          const committed = await loadInbox();
-          if (!committed) {
-            throw new Error("Inbox could not refresh");
-          }
-        };
-        const showRefreshRetry = (): void => {
-          const retryRefresh = document.createElement("button");
-          retryRefresh.type = "button";
-          retryRefresh.className = "secondary";
-          retryRefresh.textContent = "Refresh inbox";
-          retryRefresh.addEventListener("click", async () => {
-            retryRefresh.disabled = true;
-            try {
-              await refreshDecisionInbox();
-              inboxStatus.textContent = "Inbox refreshed. Review the current automation state.";
-              inboxStatus.dataset.kind = "success";
-            } catch {
-              retryRefresh.disabled = false;
-              inboxStatus.textContent = "Inbox could not refresh. Try again before making another decision.";
-              inboxStatus.dataset.kind = "error";
-            }
-          });
-          decisions.replaceChildren(retryRefresh);
-        };
-        if (automationDecisionRefreshRequired.has(fire.fire_id)) {
-          showRefreshRetry();
-          panel.append(description, decisions);
-          row.append(panel);
-          continue;
-        }
-        if (automationDecisionsInFlight.has(fire.fire_id)) {
-          confirm.disabled = true;
-          decline.disabled = true;
-        }
-        const decide = async (decision: "confirmed" | "declined"): Promise<void> => {
-          if (automationDecisionsInFlight.has(fire.fire_id)) return;
-          if (
-            decision === "confirmed" &&
-            !await confirmAction(
-              `Confirm automation rule ${fire.rule_id} for "${attachment.filename}"? This authorizes its prepared action and may change data in another app.`,
-            )
-          ) return;
-          confirm.disabled = true;
-          decline.disabled = true;
-          const outcome = await runAutomationDecision(
-            fire,
-            decision,
-            automationDecisionsInFlight,
-            (request) => invoke<AutomationDecisionResult>("automation_fire_decide", { ...request }),
-            refreshDecisionInbox,
-          );
-          if (outcome.status === "ignored") {
-            confirm.disabled = false;
-            decline.disabled = false;
-            return;
-          }
-          if (!outcome.refreshed) {
-            automationDecisionRefreshRequired.set(fire.fire_id, inboxRequestGeneration);
-            confirm.disabled = true;
-            decline.disabled = true;
-            showRefreshRetry();
-            renderInbox(inboxItems);
-          } else {
-            renderInbox(inboxItems);
-          }
-          if (outcome.status === "rejected") {
-            inboxStatus.textContent = errorCode(outcome.error) === "stale_automation_fire"
-              ? outcome.refreshed
-                ? "Automation changed before your decision. Review the refreshed inbox before trying again."
-                : "Automation changed before your decision. Refresh Inbox before trying again."
-              : `Automation decision was not saved: ${errorMessage(outcome.error)}`;
-            inboxStatus.dataset.kind = "error";
-          } else if (outcome.result.state === "declined") {
-            inboxStatus.textContent = "Automation declined. No action was submitted.";
-            inboxStatus.dataset.kind = "success";
-          } else if (outcome.result.state === "pending_dispatch") {
-            if (!outcome.refreshed) {
-              inboxStatus.textContent = "Automation confirmation saved. The prepared action was queued for dispatch.";
-              inboxStatus.dataset.kind = "success";
-            }
-          } else {
-            inboxStatus.textContent = `Automation decision saved with state ${outcome.result.state}.`;
-            inboxStatus.dataset.kind = "warning";
-          }
-          if (!outcome.refreshed) {
-            inboxStatus.textContent += " Inbox could not refresh; use Refresh inbox before another decision.";
-            inboxStatus.dataset.kind = "error";
-          }
-        };
-        decline.addEventListener("click", () => void decide("declined"));
-        confirm.addEventListener("click", () => void decide("confirmed"));
-        decisions.append(decline, confirm);
-        panel.append(description, decisions);
-        row.append(panel);
-      }
-      attachments.append(row);
-    }
-
-    const footer = document.createElement("div");
-    footer.className = "message-footer";
-    const badges = document.createElement("div");
-    badges.className = "message-badges";
-    const badge = document.createElement("span");
-    badge.className = "priority-badge";
-    badge.textContent = item.priority || "Untriaged";
-    const category = document.createElement("span");
-    category.className = "category-badge";
-    category.textContent = (item.category || "Unclassified").replace(/_/g, " ");
-    badges.append(badge);
-    const state = document.createElement("span");
-    state.textContent = stateLabel(item);
-    const footerActions = document.createElement("div");
-    footerActions.className = "message-footer-actions";
-    footer.append(badges, footerActions);
-    if (item.status === "pending" && item.analysis_retryable === false) {
-      const retryButton = document.createElement("button");
-      retryButton.type = "button";
-      retryButton.textContent = "Retry analysis";
-      retryButton.addEventListener("click", async () => {
-        retryButton.disabled = true;
-        retryButton.textContent = "Retrying…";
-        delete inboxStatus.dataset.kind;
-        inboxStatus.textContent = `Requeueing analysis for ${item.subject}…`;
-        try {
-          await invoke("analysis_requeue", { messageId: item.message_id });
-          await loadInbox();
-          inboxStatus.textContent = `Analysis requeued for ${item.subject}.`;
-          inboxStatus.dataset.kind = "success";
-        } catch (error) {
-          retryButton.disabled = false;
-          retryButton.textContent = "Retry analysis";
-          inboxStatus.textContent = errorMessage(error);
-          inboxStatus.dataset.kind = "error";
-        }
-      });
-      footerActions.append(retryButton);
-    }
-    const deleteButton = document.createElement("button");
-    deleteButton.type = "button";
-    deleteButton.className = "remove-button";
-    deleteButton.textContent = inboxDeletionsInFlight.has(item.message_id)
-      ? "Deleting…"
-      : "Delete locally";
-    deleteButton.disabled = inboxMutationInFlight();
-    deleteButton.addEventListener("click", () => void deleteInboxItem(item));
-    footerActions.append(deleteButton);
-
-    card.append(meta, summary);
-    if (truncationNote) card.append(truncationNote);
-    if (details.childElementCount) card.append(details);
-    if (calendarProposal) card.append(calendarProposal);
-    if (attachments.childElementCount) card.append(attachments);
-    card.append(footer);
-    const content = document.createElement("div");
-    content.id = `inbox-message-${inboxList.childElementCount}`;
-    content.className = "inbox-message-content";
-    content.hidden = !expandedInboxMessages.has(item.message_id);
-    content.append(...Array.from(card.childNodes));
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "inbox-row-toggle";
-    toggle.setAttribute("aria-expanded", String(!content.hidden));
-    toggle.setAttribute("aria-controls", content.id);
+    const expiry = item.calendar_proposal?.state === "awaiting_confirmation" && item.calendar_proposal.status === "accepted"
+      ? Date.parse(item.calendar_proposal.expires_at ?? "") : Number.NaN;
+    if (expiry > renderStartedAt) nextProposalExpiry = Math.min(nextProposalExpiry ?? expiry, expiry);
+    const projection = document.createElement("div");
+    projection.className = "inbox-row-summary";
     const identity = document.createElement("span");
     identity.className = "inbox-row-sender";
     const name = document.createElement("strong");
@@ -2543,7 +2637,12 @@ function renderInbox(items: InboxItem[]): void {
     rowSubject.textContent = item.subject;
     const rowBadges = document.createElement("span");
     rowBadges.className = "message-badges";
-    rowBadges.append(category, state);
+    const priorityBadge = document.createElement("span");
+    priorityBadge.className = "priority-badge"; priorityBadge.textContent = item.priority || "Untriaged";
+    const category = document.createElement("span"); category.className = "category-badge";
+    category.textContent = (item.category || "Unclassified").replace(/_/g, " ");
+    const state = document.createElement("span"); state.textContent = stateLabel(item);
+    rowBadges.append(priorityBadge, category, state);
     if (item.attachments.length) {
       const attachmentCount = document.createElement("span");
       attachmentCount.textContent = `${item.attachments.length} attachment${item.attachments.length === 1 ? "" : "s"}`;
@@ -2555,6 +2654,7 @@ function renderInbox(items: InboxItem[]): void {
       partial.textContent = truncation.badge;
       rowBadges.append(partial);
     }
+    const automationStates = item.attachments.flatMap(attachment => (attachment.automation_fires ?? []).map(fire => fire?.state));
     const actionState = inboxActionState(
       automationStates,
       item.attachments.flatMap((attachment) => (attachment.capability_results ?? []).map((result) => result?.status)),
@@ -2571,13 +2671,7 @@ function renderInbox(items: InboxItem[]): void {
       chip.textContent = actionState;
       rowBadges.append(chip);
     }
-    toggle.append(identity, received, rowSubject, rowBadges);
-    toggle.addEventListener("click", () => {
-      content.hidden = !content.hidden;
-      if (content.hidden) expandedInboxMessages.delete(item.message_id);
-      else expandedInboxMessages.add(item.message_id);
-      toggle.setAttribute("aria-expanded", String(!content.hidden));
-    });
+    projection.append(identity, received, rowSubject, rowBadges, meta);
     const openThread = document.createElement("button");
     openThread.type = "button";
     openThread.className = "secondary-action inbox-open-thread";
@@ -2588,12 +2682,10 @@ function renderInbox(items: InboxItem[]): void {
     openThread.disabled = !inboxThreadEntry.canOpen(item);
     openThread.setAttribute("aria-pressed", String(inboxThreadEntry.isSelected(item)));
     openThread.addEventListener("click", () => { void inboxThreadEntry.open(item); });
-    card.append(toggle, openThread, content);
+    card.append(projection, openThread);
     inboxList.append(card);
   }
-  for (const key of capabilityOutputPresentations.keys()) {
-    if (!capabilityOutputPreviews.has(key)) capabilityOutputPresentations.delete(key);
-  }
+  renderSelectedInboxMessage(true);
   // Replacing rows can clamp the scroll owner while it is empty. Restore only
   // after all rows exist; the browser clamps naturally if the new span is shorter.
   restoreInboxScroll(scrollTop);
@@ -2765,7 +2857,6 @@ function clearInboxPageForAccountChange(message: string): void {
   inboxRequestGeneration += 1;
   inboxQueryEpoch += 1;
   inboxPageState = "pending";
-  expandedInboxMessages.clear();
   inboxItems = [];
   inboxNextCursor = null;
   inboxCapabilityUnavailableCount = 0;
@@ -2794,8 +2885,7 @@ function commitInboxQueryFromControls(
     inboxQueryEpoch += 1;
     threadHistory.clearInboxSelection();
     inboxPageState = "pending";
-    expandedInboxMessages.clear();
-    renderInbox(inboxItems);
+      renderInbox(inboxItems);
     void loadInbox();
   }
 }
@@ -2922,43 +3012,47 @@ function setInboxControlsBusy(busy: boolean): void {
   }
 }
 
-async function deleteInboxItem(item: InboxItem): Promise<void> {
+async function deleteInboxItem(item: Pick<InboxItem, "message_id" | "subject">, context: InboxSelectionContext): Promise<void> {
   if (inboxMutationInFlight()) return;
-  const confirmed = await confirmAction(
-    `Delete "${item.subject}" from Email Watcher's local history? ` +
-      "Its local analysis, attachment metadata, notifications, and capability results will be removed. The source email will stay in your mailbox.",
-  );
-  if (!confirmed || inboxMutationInFlight()) return;
+  return inboxThreadEntry.runAction(context, "message:delete", async () => {
+    const target = { ...item };
+    const confirmed = await confirmAction(
+      `Delete "${item.subject}" from Email Watcher's local history? ` +
+        "Its local analysis, attachment metadata, notifications, and capability results will be removed. The source email will stay in your mailbox.",
+    );
+    if (!confirmed) return null;
 
-  threadHistory.beginMutation();
-  inboxDeletionsInFlight.add(item.message_id);
-  inboxRequestGeneration += 1;
-  wakeInboxReload();
-  setInboxControlsBusy(true);
-  renderInbox(inboxItems);
-  try {
-    const result = await inboxRemovalClient.delete(item.message_id);
-    if (!result) return;
-    expandedInboxMessages.delete(item.message_id);
-    clearMessageOwnedUiState(item.message_id);
-    inboxItems = inboxItems.filter((candidate) => candidate.message_id !== item.message_id);
+    return target;
+  }, async item => {
+    const inboxStatus = inboxMessageStatus(context);
+    threadHistory.beginMutation();
+    inboxDeletionsInFlight.add(item.message_id);
+    inboxRequestGeneration += 1;
+    wakeInboxReload();
+    setInboxControlsBusy(true);
     renderInbox(inboxItems);
-    const status = inboxRemovalStatus(result);
-    inboxStatus.textContent = result.outcome === "completed"
-      ? `Deleted "${item.subject}" from local history. The source email was not changed.` : status.text;
-    inboxStatus.dataset.kind = status.kind;
-  } catch (error) {
-    inboxStatus.textContent = errorMessage(error);
-    inboxStatus.dataset.kind = "error";
-  } finally {
-    void threadHistory.endMutation();
-    inboxDeletionsInFlight.delete(item.message_id);
-    setInboxControlsBusy(false);
-    renderInbox(inboxItems);
-    void loadInbox();
-  }
+    try {
+      const result = await inboxRemovalClient.delete(item.message_id);
+      if (!result) return;
+      clearMessageOwnedUiState(item.message_id);
+      inboxItems = inboxItems.filter((candidate) => candidate.message_id !== item.message_id);
+      renderInbox(inboxItems);
+      const status = inboxRemovalStatus(result);
+      inboxStatus.textContent = result.outcome === "completed"
+        ? `Deleted "${item.subject}" from local history. The source email was not changed.` : status.text;
+      inboxStatus.dataset.kind = status.kind;
+    } catch (error) {
+      inboxStatus.textContent = errorMessage(error);
+      inboxStatus.dataset.kind = "error";
+    } finally {
+      void threadHistory.endMutation();
+      inboxDeletionsInFlight.delete(item.message_id);
+      setInboxControlsBusy(false);
+      renderInbox(inboxItems);
+      void loadInbox();
+    }
+  });
 }
-
 async function clearInboxHistory(): Promise<void> {
   if (inboxMutationInFlight()) return;
   const confirmed = await confirmAction(
@@ -2979,13 +3073,11 @@ async function clearInboxHistory(): Promise<void> {
     const retained = new Set(view.retained.map(item => item.message_id));
     for (const item of inboxItems) {
       if (!retained.has(item.message_id)) {
-        expandedInboxMessages.delete(item.message_id);
         clearMessageOwnedUiState(item.message_id);
       }
     }
     inboxItems = view.retained;
     if (result.outcome === "completed") {
-      expandedInboxMessages.clear();
       inboxPageState = "loaded";
       inboxNextCursor = null;
       inboxCapabilityUnavailableCount = 0;
@@ -3137,11 +3229,12 @@ async function runInboxRefresh(
     }
     return true;
   } finally {
-    if (!committed) inboxThreadEntry.failRefresh(readerGeneration);
+    if (!committed) inboxThreadEntry.failInboxRefresh(readerGeneration);
   }
 }
 
 function refreshInboxThreadControls(): void {
+  renderSelectedInboxMessage();
   const rows = new Map(inboxItems.map(item => [inboxThreadOriginKey(item.thread_entry_ref), item]));
   for (const button of inboxList.querySelectorAll<HTMLButtonElement>("[data-inbox-thread-origin]")) {
     const row = rows.get(button.dataset.inboxThreadOrigin!);
@@ -5498,7 +5591,7 @@ window.addEventListener("focus", () => {
     void loadMailAccounts().then(async (loaded) => {
       if (loaded) {
         if (inboxThreadEntry.selected) await refreshLoadedInboxSpan(); else await loadInbox();
-      } else inboxThreadEntry.failRefresh(readerGeneration);
+      } else inboxThreadEntry.failInboxRefresh(readerGeneration);
     });
   }
   if (!settingsView.hidden && configurationReady) {

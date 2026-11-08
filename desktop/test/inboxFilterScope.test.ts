@@ -21,7 +21,7 @@ function harness() {
     activeInboxAccountSelection: "active", activeInboxQuery: { limit: 50, provider: "imap", account_id: "one", sender: "exact@example.test",
       keyword: "committed <img>", sender_query: "contains", priority: "high", category: "invoice", status: "summarized" },
     inboxItems: [{ message_id: "retained" }], inboxQueryEpoch: 3, inboxItemsEpoch: 3, inboxRequestGeneration: 4,
-    inboxNextCursor: "next", inboxPageState: "loaded", inboxCapabilityUnavailableCount: 0, expandedInboxMessages: new Set(["retained"]),
+    inboxNextCursor: "next", inboxPageState: "loaded", inboxCapabilityUnavailableCount: 0,
     inboxLoadMore: el(), inboxStatus: el(), calls: [], closes: 0, clearMessageOwnedUiState: () => {} });
   c.inboxPredicateControls = { keyword: c.inboxKeywordInput, sender_query: c.inboxSenderInput, priority: c.inboxPrioritySelect,
     category: c.inboxCategorySelect, status: c.inboxStateSelect };

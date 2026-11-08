@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { stripTypeScriptTypes } from "node:module";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
@@ -47,14 +48,17 @@ test("inbox intro is clipped while retaining its accessible heading", () => {
   assert.match(source, /<header class="intro">[\s\S]*?<h1>Your signal inbox<\/h1>/);
 });
 
-test("expanded content keeps provenance, priority and actions without repeated row items", () => {
-  const render = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
-  const expanded = render.slice(0, render.indexOf("const summary =")) + render.slice(render.indexOf("const footer ="), render.indexOf("const toggle ="));
-  assert.ok(!/\.append\([^;]*\b(?:sender|senderAddress|received|subject|category|state)\b/.test(expanded), "expanded content must not append sender, address, time, subject, category or state");
-  for (const wiring of ["senderIdentity.append(sourceAccount)", "senderIdentity.append(admission)", "meta.append(senderIdentity)", "card.append(meta, summary)", "badges.append(badge)", "footer.append(badges, footerActions)", "footerActions.append(retryButton)", "footerActions.append(deleteButton)", "card.append(footer)"]) assert.ok(render.includes(wiring), wiring);
-  for (const node of ["details", "calendarProposal", "attachments"]) assert.ok(render.includes(`card.append(${node})`), node);
-  assert.match(render, /rowBadges.append\(category, state\)/);
-  assert.match(render, /toggle.append\(identity, received, rowSubject, rowBadges\)/);
+test("selected details retain analysis, proposal, attachments and actions while compact rows retain provenance", () => {
+  const rows = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
+  const details = source.match(/function renderInboxMessageDetails\([\s\S]*?\n\}/)![0];
+  for (const wiring of ["senderIdentity.append(sourceAccount)", "senderIdentity.append(admission)", "meta.append(senderIdentity)"])
+    assert.ok(rows.includes(wiring), wiring);
+  for (const node of ["summary", "details", "calendarProposal", "attachments", "footer"])
+    assert.ok(details.includes(`content.append(${node})`), node);
+  for (const wiring of ["footerActions.append(retryButton)", "footerActions.append(deleteButton)", "badges.append(badge)"])
+    assert.ok(details.includes(wiring), wiring);
+  assert.match(rows, /rowBadges.append\(priorityBadge, category, state\)/);
+  assert.match(rows, /projection.append\(identity, received, rowSubject, rowBadges, meta\)/);
 });
 
 test("sender selection clears the scope before requesting its first page", () => {
@@ -110,7 +114,7 @@ test("inbox first-page and clear-history success record loaded before rendering"
   assert.match(success, /if \(!append\) \{[^}]*inboxPageState = "loaded";[^}]*\} else \{[^}]*\}[\s\S]*renderInbox\(inboxItems\)/, "first-page success must record loaded before rendering");
   const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
   assert.match(clear, /const result = await inboxRemovalClient.clear\(\);\s+if \(!result\) return;\s+const view = inboxClearView\(inboxItems, result\);/);
-  assert.match(clear, /inboxItems = view.retained;\s+if \(result.outcome === "completed"\) \{\s+expandedInboxMessages.clear\(\);\s+inboxPageState = "loaded";[^}]*\}\s+renderInbox\(inboxItems\);/, "only completed history clear must clear expansion and record loaded before rendering retained rows");
+  assert.match(clear, /inboxItems = view.retained;\s+if \(result.outcome === "completed"\) \{\s+inboxPageState = "loaded";[^}]*\}\s+renderInbox\(inboxItems\);/, "only completed history clear records loaded before rendering retained rows");
 });
 
 test("clear handler hides accepted targets, preserves unaccepted state, and resets only completed state", async () => {
@@ -125,7 +129,6 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
       message: outcome === "completed" ? null : pending } : undefined;
     const observed = JSON.parse(await runInNewContext(`(async () => {
       let inboxItems = [{ message_id: "held" }, { message_id: "deleted" }];
-      const expandedInboxMessages = new Set(["held", "deleted"]);
       let inboxPageState = "failed", inboxNextCursor = "next", inboxCapabilityUnavailableCount = 3;
       let inboxClearInFlight = false, inboxRequestGeneration = 0, reloads = 0;
       const inboxLoadMore = { hidden: false }, inboxStatus = { textContent: "", dataset: {} };
@@ -135,7 +138,7 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
       const setInboxControlsBusy = () => {}, wakeInboxReload = () => {}, loadInbox = () => { reloads++; };
       const clearMessageOwnedUiState = id => cleared.push(id ?? "all");
       const renderInbox = items => renders.push({ ids: items.map(item => item.message_id),
-        state: inboxPageState, expanded: [...expandedInboxMessages] });
+        state: inboxPageState });
       const inboxRemovalClient = { clear: async () => {
         if (outcome === "error") throw { message: "Existing failure" };
         return result;
@@ -148,7 +151,6 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
     const completed = outcome === "completed";
     for (const render of observed.renders.slice(1)) {
       assert.deepEqual(render.ids, accepted ? [] : ["held", "deleted"]);
-      assert.deepEqual(render.expanded, accepted ? [] : ["held", "deleted"]);
       assert.equal(render.state, completed ? "loaded" : "failed");
     }
     assert.equal(observed.renders.length, accepted ? 3 : 2);
@@ -170,8 +172,7 @@ test("clear handler hides accepted targets, preserves unaccepted state, and rese
 });
 
 test("Delete handler clears only its accepted cached item and always reloads the shared projection", async () => {
-  const handler = source.match(/async function deleteInboxItem\([\s\S]*?\n\}/)![0]
-    .replace("(item: InboxItem): Promise<void>", "(item)");
+  const handler = stripTypeScriptTypes(source.match(/async function deleteInboxItem\([\s\S]*?\n\}/)![0]);
   for (const outcome of ["completed", "deferred", "unaccepted", "error"] as const) {
     const accepted = outcome === "completed" || outcome === "deferred";
     const result = accepted ? { request_id: "saved-key", intent_ids: ["one"], outcome,
@@ -181,13 +182,17 @@ test("Delete handler clears only its accepted cached item and always reloads the
     const observed = JSON.parse(await runInNewContext(`(async () => {
       const item = { message_id: "selected", subject: "Selected message" };
       let inboxItems = [item, { message_id: "other", subject: "Other message" }];
-      const expandedInboxMessages = new Set(["selected", "other"]), inboxDeletionsInFlight = new Set();
+      const inboxDeletionsInFlight = new Set();
       let inboxRequestGeneration = 0, reloads = 0, calls = 0;
       const inboxStatus = { textContent: "", dataset: {} }, cleared = [];
       const confirmAction = async () => true, inboxMutationInFlight = () => false;
       const threadHistory = { beginMutation() {}, async endMutation() {} };
       const setInboxControlsBusy = () => {}, renderInbox = () => {}, wakeInboxReload = () => {}, loadInbox = () => { reloads++; };
       const clearMessageOwnedUiState = id => cleared.push(id);
+      const inboxMessageStatus = () => inboxStatus;
+      const inboxThreadEntry = { runAction: async (_context, _key, prepare, dispatch) => {
+        const target = await prepare(); if (target !== null) await dispatch(target);
+      } };
       const inboxRemovalClient = { delete: async id => {
         calls++; if (id !== "selected") throw Error("Wrong item");
         if (outcome === "error") throw { message: "Existing failure" };
@@ -195,11 +200,10 @@ test("Delete handler clears only its accepted cached item and always reloads the
       } };
       ${handler}
       await deleteInboxItem(item);
-      return JSON.stringify({ ids: inboxItems.map(item => item.message_id), expanded: [...expandedInboxMessages],
+      return JSON.stringify({ ids: inboxItems.map(item => item.message_id),
         inflight: [...inboxDeletionsInFlight], reloads, inboxStatus, cleared, calls });
     })()`, { result, outcome, inboxRemovalStatus, errorMessage: (error: { message: string }) => error.message }));
     assert.deepEqual(observed.ids, accepted ? ["other"] : ["selected", "other"]);
-    assert.deepEqual(observed.expanded, observed.ids);
     assert.deepEqual(observed.cleared, accepted ? ["selected"] : []);
     assert.deepEqual(observed.inflight, []);
     assert.equal(observed.calls, 1);
@@ -230,13 +234,13 @@ test("sender and removal completion share the refresh owner", () => {
   assert.match(clearing, /finally \{\s+void threadHistory\.endMutation\(\);\s+inboxClearInFlight = false;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+void loadInbox\(\);/);
 });
 
-test("Apply and Reset carry the sender and clear query expansion", () => {
+test("Apply and Reset carry the sender and close the selected reader", () => {
   const query = source.match(/function queryFromInboxControls[\s\S]*?\n\}/)![0];
   assert.ok(query.includes("sender: activeInboxQuery.sender"), "control query retains selected sender");
   const commit = source.match(/function commitInboxQueryFromControls[\s\S]*?\n\}/)![0];
   assert.match(commit, /activeInboxQuery.sender !== nextQuery.sender/);
   assert.match(commit, /inboxQueryEpoch \+= 1/);
-  assert.match(commit, /expandedInboxMessages.clear\(\)/);
+  assert.doesNotMatch(commit, /expandedInboxMessages/);
   assert.match(source, /inboxReset.addEventListener[\s\S]*?inboxFilterForm.reset\(\);\s+commitInboxQueryFromControls\(\)/);
   assert.match(source, /inboxFilterForm.addEventListener\("submit"[\s\S]*?commitInboxQueryFromControls\(\)/);
 });
@@ -249,7 +253,7 @@ test("span refresh stops when superseded before or during append", async () => {
         let inboxItems = [1, 2, 3], inboxNextCursor = "next", inboxQueryEpoch = 0, inboxItemsEpoch = 0, calls = 0;
         const captureInboxScroll = () => ({ top: 0, revision: 0 });
         const currentMailboxEffectScope = () => ({ mutation_epoch: 0, mailbox_operation_revision: 1 });
-        const inboxThreadEntry = { refreshGeneration: 0, failRefresh: () => {} };
+        const inboxThreadEntry = { refreshGeneration: 0, failInboxRefresh: () => {} };
         async function loadInboxPage() {
           calls++;
           inboxItems = calls === 1 ? [1] : [1, 2];
@@ -266,26 +270,18 @@ test("span refresh stops when superseded before or during append", async () => {
   }
 });
 
-test("expansion survives renders and first-page reloads until query, delete, or clear", () => {
-  assert.ok(source.includes("const expandedInboxMessages = new Set<string>()"), "module-level expansion set exists");
-  const render = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
-  assert.match(render, /expandedInboxMessages.has\(item.message_id\)/);
-  assert.match(render, /setAttribute\("aria-expanded", String\(!content.hidden\)\)/);
-  assert.match(render, /setAttribute\("aria-controls", content.id\)/);
-  assert.doesNotMatch(render, /expandedInboxMessages.clear|expandedInboxMessages.*filter/);
-  const load = source.match(/async function loadInboxPage\([\s\S]*?\n\}/)![0];
-  assert.doesNotMatch(load, /expandedInboxMessages/);
-  assert.match(source, /const result = await inboxRemovalClient.delete\(item.message_id\);\s+if \(!result\) return;\s+expandedInboxMessages.delete\(item.message_id\)/);
-  const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
-  assert.match(clear, /if \(!retained.has\(item.message_id\)\) \{\s+expandedInboxMessages.delete\(item.message_id\)/);
-  assert.match(clear, /if \(result.outcome === "completed"\) \{\s+expandedInboxMessages.clear\(\)/);
+test("selected-message migration removes row expansion and mounts details only through the selection owner", () => {
+  assert.doesNotMatch(source, /expandedInboxMessages|inbox-row-toggle|inbox-message-content/);
+  const rows = source.slice(source.indexOf("function renderInbox(items:"), source.indexOf("async function loadAttachmentCapabilities("));
+  assert.doesNotMatch(rows, /renderCapabilityResult|attachment_capability_invoke|calendar_proposal_decide/);
+  assert.match(rows, /renderSelectedInboxMessage\(true\)/);
 });
 
 test("collapsed row feeds only projected states and the render clock to one chip", () => {
   const detailsStart = source.indexOf('const details = document.createElement("div");');
   const detailsEnd = source.indexOf("const deadlineValue =", detailsStart);
-  const chipStart = source.indexOf("const actionState = inboxActionState(");
-  const chipEnd = source.indexOf("toggle.append(", chipStart);
+  const chipStart = source.indexOf("const automationStates =", source.indexOf("function renderInbox(items:"));
+  const chipEnd = source.indexOf("projection.append(", chipStart);
   assert.ok(detailsStart >= 0 && detailsEnd > detailsStart && chipStart > detailsEnd && chipEnd > chipStart);
   const renderStartedAt = Date.parse("2026-10-12T12:00:00Z");
   const privateFields = { reason: "private reason", job_id: "private job", last_error: "private error" };
@@ -309,7 +305,7 @@ test("collapsed row feeds only projected states and the render clock to one chip
     let chipProposal: Record<string, unknown> | null | undefined;
     let chipClock: number | undefined;
     const chips: string[] = [];
-    runInNewContext(source.slice(detailsStart, detailsEnd) + source.slice(chipStart, chipEnd), {
+    runInNewContext("(() => {" + source.slice(detailsStart, detailsEnd) + "})(); (() => {" + source.slice(chipStart, chipEnd) + "})();", {
       item: { attachments: fixture.attachments, calendar_proposal: fixture.proposal, action_required: 0, suggested_action: "" },
       renderStartedAt,
       hasInboxAutomationConfirmation: (states: readonly unknown[]) => {
@@ -324,7 +320,7 @@ test("collapsed row feeds only projected states and the render clock to one chip
       rowBadges: { append: (node: { textContent: string }) => chips.push(node.textContent) },
     });
     assert.ok(cueStates && chipStates && chipResults);
-    assert.strictEqual(chipStates, cueStates, "cue and chip consume the same projected array");
+    assert.deepEqual(Array.from(chipStates), Array.from(cueStates), "cue and compact chip consume the same projected states");
     assert.deepEqual(Array.from(chipStates), fixture.fires);
     assert.deepEqual(Array.from(chipResults), fixture.results);
     const expectedProposal = fixture.proposal ? {
@@ -336,7 +332,7 @@ test("collapsed row feeds only projected states and the render clock to one chip
     assert.deepEqual(chips, expectedChip === null ? [] : [expectedChip]);
   }
   assert.match(source, /attachmentCount.textContent = `\$\{item.attachments.length\} attachment/);
-  assert.match(source, /content.append\(\.\.\.Array.from\(card.childNodes\)\)/);
+  assert.match(source, /content.append\(renderInboxMessageDetails\(selected.row, selected.context\)\)/);
 });
 
 test("watchlist updates and failures render navigation with a responsive layout", async () => {

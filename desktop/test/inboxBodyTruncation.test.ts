@@ -56,12 +56,12 @@ test("malformed counts never render a partial summary", async () => {
   }
 });
 
-test("the inbox renders the badge in the row and the note in the card as text", () => {
+test("the inbox renders the badge in the row and the note in selected details as text", () => {
   const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
   assert.match(source, /import \{ inboxBodyTruncation \} from "\.\/inboxBodyTruncation";/);
   assert.match(source, /const truncation = inboxBodyTruncation\(item\);/);
   assert.match(source, /truncationNote\.textContent = truncation\.note;/);
-  assert.match(source, /if \(truncationNote\) card\.append\(truncationNote\);/);
+  assert.match(source, /if \(truncationNote\) content\.append\(truncationNote\);/);
   assert.match(source, /partial\.textContent = truncation\.badge;\s*rowBadges\.append\(partial\);/);
   assert.doesNotMatch(source, /truncation\.(note|badge)[^;]*innerHTML/);
 });

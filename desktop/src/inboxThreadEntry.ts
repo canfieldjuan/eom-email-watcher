@@ -22,18 +22,27 @@ export interface InboxThreadSnapshot {
   scope: InboxThreadScope | null;
   spanScope: InboxThreadScope | null;
 }
+export interface InboxSelectionContext {
+  readonly origin: Readonly<InboxMessageRef>;
+  readonly queryEpoch: number;
+  readonly scope: Readonly<InboxThreadScope>;
+  readonly label: string;
+}
+export type InboxSelectionDecision = { status: "ready" } | { status: "waiting" }
+  | { status: "refused"; reason: string };
+type SettledSelection = Exclude<InboxSelectionDecision, { status: "waiting" }>;
 export const inboxThreadOriginKey = (ref: InboxMessageRef): string => JSON.stringify([
   ref.provider, ref.account_id, ref.mailbox_identity_key, ref.message_id,
 ]);
 const sameScope = (a: InboxThreadScope | null, b: InboxThreadScope | null): boolean => !!a && !!b
   && a.mutation_epoch === b.mutation_epoch && a.mailbox_operation_revision === b.mailbox_operation_revision;
-type Entry = { origin: InboxMessageRef; epoch: number; scope: InboxThreadScope;
+type Entry = { origin: InboxMessageRef; epoch: number; scope: InboxThreadScope; context: InboxSelectionContext;
   scroll: { element: Element; top: number; left: number }[] };
 type ReadingIntent = { origin: string; epoch: number; identity: ThreadReadingIdentity;
   count: number; pages: number; bodies: string[]; position: ThreadReadingPosition; focus: boolean };
 
 /** Binds the reader to a current retained row, never to a sender/subject or default account. */
-export class InboxThreadEntry {
+export class InboxThreadEntry<Row extends InboxThreadRow = InboxThreadRow> {
   readonly reader: ThreadViewDom;
   private entry: Entry | null = null;
   private retryGeneration = 0;
@@ -41,23 +50,28 @@ export class InboxThreadEntry {
   private sendersExpanded = false;
   private generation = 0;
   private intent: ReadingIntent | null = null;
+  private revalidating = false;
+  private readonly endedSelections = new WeakMap<InboxSelectionContext, string>();
+  private readonly pendingChecks = new Set<() => void>();
+  private readonly actionsInFlight = new Set<string>();
   private readonly options: {
     root: HTMLElement;
     columns: HTMLElement;
     heading: HTMLElement;
     client: ThreadReadClient;
     accounts: () => readonly RetainedThreadAccount[];
-    snapshot: () => InboxThreadSnapshot;
+    snapshot: () => InboxThreadSnapshot & { items: readonly Row[] };
     refreshInbox: () => Promise<void>;
     scrollElements: () => readonly Element[];
     onSelectionChange?: () => void;
+    onActionNotice?: (context: InboxSelectionContext, text: string, kind: "warning" | "error") => void;
     layout?: {
       grid: HTMLElement; readerPane: HTMLElement; placeholder: HTMLElement; source: HTMLElement;
       senders: HTMLElement; senderToggle: HTMLButtonElement; senderContent: HTMLElement; footer: HTMLElement;
     };
   };
 
-  constructor(options: InboxThreadEntry["options"]) {
+  constructor(options: InboxThreadEntry<Row>["options"]) {
     this.options = options;
     this.reader = new ThreadViewDom(options.root, options.client, {
       idPrefix: "inbox-thread", accounts: options.accounts, onExit: () => this.back(),
@@ -94,9 +108,88 @@ export class InboxThreadEntry {
   get selected(): boolean { return this.entry !== null; }
   get refreshGeneration(): number { return this.generation; }
 
+  private context(row: InboxThreadRow, snapshot: InboxThreadSnapshot): InboxSelectionContext {
+    return Object.freeze({ origin: Object.freeze({ ...row.thread_entry_ref }), queryEpoch: snapshot.queryEpoch,
+      scope: Object.freeze({ ...snapshot.scope! }),
+      label: `${row.subject || "No subject"} · ${row.sender || "Sender unavailable"} · ${row.provider} / ${row.account_id} · ${row.message_id}` });
+  }
+
+  /** The complete current Inbox row owns details, even when thread resolution fails. */
+  selection(): { context: InboxSelectionContext; row: Row } | null {
+    const entry = this.entry;
+    if (!entry || this.checkSelection(entry.context).status !== "ready") return null;
+    return { context: entry.context, row: this.row(entry.origin, this.options.snapshot())! as Row };
+  }
+
+  /** Sole admission decision for new actions and approved steps waiting on the existing refresh. */
+  checkSelection(context: InboxSelectionContext): InboxSelectionDecision {
+    const ended = this.endedSelections.get(context);
+    if (ended) return { status: "refused", reason: ended };
+    const snapshot = this.options.snapshot();
+    if (!this.entry || this.entry.context !== context) return { status: "refused", reason: "the selected message changed" };
+    if (!snapshot.visible || this.options.root.ownerDocument.visibilityState === "hidden")
+      return { status: "refused", reason: "Inbox is hidden" };
+    if (!snapshot.configured) return { status: "refused", reason: "Inbox configuration is unavailable" };
+    if (snapshot.blocked) return { status: "refused", reason: "a mailbox or removal operation is holding Inbox" };
+    if (context.queryEpoch !== snapshot.queryEpoch) return { status: "refused", reason: "the Inbox query changed" };
+    if (!sameScope(context.scope, snapshot.scope)) return { status: "refused", reason: "the mailbox scope changed" };
+    if (this.revalidating || !this.committed(snapshot)) return { status: "waiting" };
+    return this.row(context.origin, snapshot) ? { status: "ready" }
+      : { status: "refused", reason: "the originating message is unavailable in the current Inbox results" };
+  }
+
+  private settleActions(): void { for (const check of [...this.pendingChecks]) check(); }
+
+  private endSelection(reason: string): void {
+    if (this.entry) this.endedSelections.set(this.entry.context, reason);
+    this.settleActions();
+  }
+
+  /** No refresh request is made here. Full-span commit/failure wakes the same pending step. */
+  private awaitSelection(context: InboxSelectionContext): Promise<SettledSelection> {
+    return new Promise(resolve => {
+      const check = () => {
+        const decision = this.checkSelection(context);
+        if (decision.status === "waiting") return;
+        this.pendingChecks.delete(check); resolve(decision);
+      };
+      this.pendingChecks.add(check); check();
+    });
+  }
+
+  async runAction<T>(context: InboxSelectionContext, operation: string,
+    prepare: () => T | null | Promise<T | null>, dispatch: (target: T) => Promise<void>): Promise<void> {
+    const key = JSON.stringify([inboxThreadOriginKey(context.origin), operation]);
+    if (this.actionsInFlight.has(key)) return;
+    if (this.checkSelection(context).status !== "ready") return;
+    this.actionsInFlight.add(key);
+    try {
+      const target = await prepare();
+      if (target === null) return; // Denied/dismissed input has its existing cancellation meaning.
+      for (;;) {
+        const decision = this.checkSelection(context);
+        if (decision.status === "refused") {
+          this.options.onActionNotice?.(context, `Not sent: ${decision.reason}.`, "error"); return;
+        }
+        if (decision.status === "ready") {
+          this.options.onActionNotice?.(context, "Submitting the requested action…", "warning");
+          await dispatch(target); return;
+        }
+        this.options.onActionNotice?.(context, "Waiting for Inbox revalidation; not sent yet.", "warning");
+        await this.awaitSelection(context);
+      }
+    } finally { this.actionsInFlight.delete(key); }
+  }
+
   /** Preserve identifiers and positions before clearing every retained payload. */
   invalidate(): void {
     const snapshot = this.options.snapshot(), entry = this.entry, identity = this.state.readingIdentity;
+    if (entry && (snapshot.blocked || !snapshot.visible || this.options.root.ownerDocument.visibilityState === "hidden" || entry.epoch !== snapshot.queryEpoch
+      || !sameScope(entry.context.scope, snapshot.scope))) {
+      const decision = this.checkSelection(entry.context);
+      this.endSelection(decision.status === "refused" ? decision.reason : "the selected message changed");
+    }
+    this.revalidating = true;
     if (!entry || snapshot.blocked || !snapshot.visible || entry.epoch !== snapshot.queryEpoch
       || !sameScope(entry.scope, snapshot.scope)) this.intent = null;
     else if (!this.intent && identity && this.state.messages.value) {
@@ -107,6 +200,13 @@ export class InboxThreadEntry {
     }
     this.generation++;
     this.state.invalidate();
+  }
+
+  failInboxRefresh(generation: number): void {
+    if (generation !== this.generation) return;
+    this.revalidating = false;
+    this.endSelection("Inbox revalidation failed");
+    this.failRefresh(generation);
   }
 
   failRefresh(generation: number): void {
@@ -149,8 +249,14 @@ export class InboxThreadEntry {
   }
 
   resume(): Promise<void> { return this.entry ? this.options.refreshInbox() : this.state.resume(); }
-  close(): void { this.intent = null; this.generation++; this.state.close(); }
-  beginMutation(): void { this.intent = null; this.generation++; this.state.beginMutation(); }
+  close(): void {
+    this.endSelection("Inbox was hidden or closed");
+    this.intent = null; this.generation++; this.state.close();
+  }
+  beginMutation(): void {
+    this.endSelection("a mailbox or removal operation held Inbox");
+    this.intent = null; this.generation++; this.state.beginMutation();
+  }
   async endMutation(refresh = true): Promise<void> {
     await this.state.endMutation(false);
     if (refresh) await this.refresh();
@@ -205,8 +311,7 @@ export class InboxThreadEntry {
       layout.senderToggle.setAttribute("aria-expanded", String(!hideSenderContent));
       layout.readerPane.hidden = !this.entry && this.mode === "single";
       layout.placeholder.hidden = this.entry !== null;
-      const row = this.entry && this.current(this.entry) && this.state.resolution.status === "ready"
-        ? this.row(this.entry.origin, this.options.snapshot()) : null;
+      const row = this.selection()?.row;
       layout.source.textContent = row ? `Opened from Inbox: ${row.subject || "No subject"} · ${row.sender ?? "Sender unavailable"} · ${row.received_at ?? "Date unavailable"} · ${row.provider} / ${row.account_id}` : "";
       layout.source.hidden = !row;
       if (hidFocusedSender) (hideSenders ? this.options.heading : layout.senderToggle).focus({ preventScroll: true });
@@ -225,8 +330,15 @@ export class InboxThreadEntry {
   }
 
   private row(origin: InboxMessageRef, snapshot: InboxThreadSnapshot): InboxThreadRow | undefined {
+    if (!origin || ![origin.provider, origin.account_id, origin.message_id]
+      .every(value => typeof value === "string" && value.length > 0)
+      || !(origin.mailbox_identity_key === null
+        || typeof origin.mailbox_identity_key === "string" && origin.mailbox_identity_key.length > 0)) return undefined;
     return snapshot.items.find(row => row.provider === origin.provider && row.account_id === origin.account_id
-      && row.message_id === origin.message_id && inboxThreadOriginKey(row.thread_entry_ref) === inboxThreadOriginKey(origin));
+      && row.message_id === origin.message_id && row.thread_entry_ref?.provider === origin.provider
+      && row.thread_entry_ref.account_id === origin.account_id
+      && row.thread_entry_ref.mailbox_identity_key === origin.mailbox_identity_key
+      && row.thread_entry_ref.message_id === origin.message_id);
   }
 
   canOpen(row: InboxThreadRow): boolean {
@@ -243,11 +355,14 @@ export class InboxThreadEntry {
   async open(row: InboxThreadRow): Promise<void> {
     if (!this.canOpen(row)) return;
     this.retryGeneration++;
-    if (this.entry && this.isSelected(row) && this.current(this.entry)) { this.reader.focusHeading(); return; }
+    if (this.entry && this.isSelected(row) && this.current(this.entry)
+      && this.checkSelection(this.entry.context).status === "ready") { this.reader.focusHeading(); return; }
+    this.endSelection("the selected message changed");
+    this.revalidating = false;
     this.intent = null; this.generation++;
     const snapshot = this.options.snapshot();
     const entry: Entry = { origin: { ...row.thread_entry_ref }, epoch: snapshot.queryEpoch,
-      scope: { ...snapshot.scope! }, scroll: this.saveListScroll() };
+      scope: { ...snapshot.scope! }, context: this.context(row, snapshot), scroll: this.saveListScroll() };
     this.entry = entry;
     if (this.options.layout) this.options.layout.readerPane.scrollTop = 0;
     this.present();
@@ -256,15 +371,22 @@ export class InboxThreadEntry {
 
   /** Called only after the complete requested Inbox span commits, before reader refresh. */
   revalidateSource(): void {
+    this.revalidating = false;
     const entry = this.entry;
-    if (!entry) return;
+    if (!entry) { this.settleActions(); return; }
     // An old read must not become current again when the source binding is renewed.
     this.state.invalidate();
     const snapshot = this.options.snapshot();
     // A committed span can renew the binding while held; current() still forbids reads until release.
     if (this.committed(snapshot) && entry.epoch === snapshot.queryEpoch && this.row(entry.origin, snapshot)) {
+      if (!sameScope(entry.context.scope, snapshot.scope)) this.endSelection("the mailbox scope changed");
       entry.scope = { ...snapshot.scope! };
-    } else this.intent = null;
+      if (this.endedSelections.has(entry.context)) entry.context = this.context(this.row(entry.origin, snapshot)!, snapshot);
+    } else {
+      this.intent = null;
+      this.endSelection("the originating message is unavailable in the current Inbox results");
+    }
+    this.settleActions();
     this.reader.render();
   }
 
@@ -281,6 +403,7 @@ export class InboxThreadEntry {
 
   back(): void {
     const entry = this.entry;
+    this.endSelection("the selected message was closed");
     this.intent = null; this.generation++;
     this.entry = null;
     this.state.close();

@@ -48,7 +48,7 @@ test("entitlement refusal refreshes the lock and retains the engine message", ()
 test("Health and both View Connect routes open fresh Connect health", () => {
   assert.match(mainSource, /function openConnectHealth\(\): void \{\s*showView\("health"\);\s*void Promise\.all\(\[loadHealth\(\), refreshConnectStatus\(\)\]\);\s*connectHealth\.scrollIntoView/);
   assert.match(mainSource, /healthTab\.addEventListener\("click", openConnectHealth\)/);
-  assert.match(mainSource, /viewConnect\.addEventListener\("click", openConnectHealth\)/);
+  assert.match(mainSource, /viewConnect\.addEventListener\("click", \(\) => \{\s*if \(inboxThreadEntry.checkSelection\(context\).status === "ready"\) openConnectHealth\(\)/);
   assert.match(mainSource, /mountCoiSetup\([^;]*errorMessage, openConnectHealth\)/);
 });
 

@@ -17,7 +17,7 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /let inboxProposalExpiryTimer: number \| null = null/);
   assert.match(source, /window\.clearTimeout\(inboxProposalExpiryTimer\)/);
   assert.match(source, /const renderStartedAt = Date\.now\(\)/);
-  assert.match(source, /proposalExpiresAt > renderStartedAt/);
+  assert.match(source, /expiry > renderStartedAt/);
   assert.match(source, /Math\.max\(nextProposalExpiry - Date\.now\(\) \+ 1, 0\)/);
   assert.match(source, /inboxProposalExpiryTimer = window\.setTimeout/);
   assert.match(source, /renderInbox\(inboxItems\)/);
@@ -94,14 +94,14 @@ test("production calendar segment renders outcome without payload or confirmatio
   const start = source.indexOf("let calendarProposal: HTMLElement | null = null;");
   const end = source.indexOf('const attachments = document.createElement("ul");', start);
   assert.ok(start >= 0 && end > start);
-  const mount = 'if (calendarProposal) card.append(calendarProposal);';
+  const mount = 'if (calendarProposal) content.append(calendarProposal);';
   assert.ok(source.indexOf(mount, end) > end, "the calendar status must mount without a payload gate");
   const segment = stripTypeScriptTypes(source.slice(start, end) + mount + "globalThis.rendered = calendarProposal;");
   for (const outcome of [cancelled, { ...cancelled, status: "completed" }, { ...cancelled, status: "unresolved" }]) {
     const nodes: any[] = [];
     const card = { children: [] as any[], append(node: any) { this.children.push(node); } };
     const context: any = {
-      card, item: { calendar_proposal: null, calendar_write_outcome: outcome }, calendarOutcomeNotice,
+      content: card, item: { calendar_proposal: null, calendar_write_outcome: outcome }, calendarOutcomeNotice,
       document: { createElement(tag: string) {
         const node = { tag, textContent: "", children: [] as any[],
           set innerHTML(_value: string) { assert.fail("calendar status must render text"); },
@@ -131,10 +131,10 @@ test("calendar decision refresh cannot overwrite a newer durable outcome", async
   const status = { textContent: "", dataset: {} as Record<string, string> };
   let refreshed = false;
   await runInNewContext(segment, {
-    item: { message_id: "m" }, proposal: {}, decision: "confirm",
+    target: {}, context: { origin: { message_id: "m" } }, inboxThreadOriginKey: ref => ref.message_id,
     invoke: async () => ({ state: "unresolved", calendar_write_outcome: reply }),
     loadInbox: async () => { refreshed = true; },
-    inboxItems: [{ message_id: "m", calendar_write_outcome: completed }],
+    inboxItems: [{ thread_entry_ref: { message_id: "m" }, calendar_write_outcome: completed }],
     inboxStatus: status, calendarOutcomeNotice, latestCalendarOutcome,
   });
   assert.equal(refreshed, true);

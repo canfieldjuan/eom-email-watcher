@@ -71,6 +71,9 @@ test("destructive action handlers do no work while confirmation is pending or ca
     // boundary before approval makes this actual production handler throw.
     const invokeHandler = runInNewContext(`${stripTypeScriptTypes(handler)}; ${name}`, {
       confirmAction: () => { dialogs++; return pending; },
+      inboxThreadEntry: { runAction: async (_context, _key, prepare, dispatch) => {
+        const target = await prepare(); if (target !== null) await dispatch(target);
+      } },
       inboxMutationInFlight: () => false, mailOperationInFlight: false,
       calendarConsentOperationInFlight: null, vendorsBusy: () => false,
       CALENDAR_CONSENT_PROFILES: [{ profile: "write", actionLabel: "Calendar access" }],

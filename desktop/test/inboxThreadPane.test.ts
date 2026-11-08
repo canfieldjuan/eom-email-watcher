@@ -166,6 +166,7 @@ test("Back during a current span reload enables Open thread without restoring th
       inboxItems: h.rows, inboxList: h.columns, inboxThreadOriginKey, inboxNextCursor: null,
       currentMailboxEffectScope: () => h.snapshot.scope, mailboxEffectScopeIsCurrent: () => true,
       captureInboxScroll: () => ({ top: 0, revision: 0 }), restoreInboxScroll() {}, loadInboxPage: () => page.promise,
+      renderSelectedInboxMessage() {},
       threadHistory: { commitInboxSpan: (restore = true) => { restored = history.commitInboxSpan(restore); return restored; } } });
     Object.defineProperty(c, "inboxThreadSpanScope", { get: () => h.snapshot.spanScope, set: value => { h.snapshot.spanScope = value; } });
     runInContext(stripTypeScriptTypes(["runInboxRefresh", "refreshInboxThreadControls"].map(name =>
