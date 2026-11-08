@@ -2152,7 +2152,7 @@ function renderInbox(items: InboxItem[]): void {
           result.required_manifest_features ?? [],
         );
         if (activeCapabilityResult(result)) attachmentRequestIds.set(key, result.job_id);
-        else attachmentRequestIds.delete(key);
+        else if (attachmentRequestIds.get(key) === result.job_id) attachmentRequestIds.delete(key);
       }
 
       for (const providers of capabilityGroups(item.message_id, attachment)) {
