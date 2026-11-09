@@ -242,3 +242,76 @@ test("a late Retry continuation cannot overwrite a newer explicit vendor choice 
     if (supersede === "back") assert.equal(h.root.hidden, true);
   }
 });
+
+
+test("a fresh partial row cannot impersonate an origin whose mailbox identity is explicitly null", async () => {
+  const h = harness();
+  const nullable = { ...origin, mailbox_identity_key: null };
+  const valid = { ...row, thread_entry_ref: nullable };
+  h.snapshot.items = [valid];
+  assert.equal(h.ui.canOpen(valid), true, "explicit null is an admitted native identity");
+  const partial: any = { ...valid, thread_entry_ref: { ...nullable } };
+  delete partial.thread_entry_ref.mailbox_identity_key;
+  h.snapshot.items = [partial];
+  assert.equal(h.ui.canOpen(valid), false, "missing is not explicit null");
+  await h.ui.open(valid); assert.equal(h.calls.length, 0);
+});
+
+test("complete origin admission rejects partial and falsy fields without coercing native identity", () => {
+  for (const key of ["provider", "account_id", "message_id", "mailbox_identity_key"]) {
+    for (const value of [undefined, null, "", false, 0]) {
+      const h = harness();
+      const candidate: any = { ...row, thread_entry_ref: { ...origin, [key]: value } };
+      Object.assign(candidate, { provider: candidate.thread_entry_ref.provider,
+        account_id: candidate.thread_entry_ref.account_id, message_id: candidate.thread_entry_ref.message_id });
+      h.snapshot.items = [candidate];
+      assert.equal(h.ui.canOpen(candidate), key === "mailbox_identity_key" && value === null, `${key}/${value}`);
+    }
+  }
+  const h = harness(); assert.equal(h.ui.canOpen(row), true);
+});
+
+test("pending read cannot commit when a nullable origin is replaced by a partial fresh row", async () => {
+  const h = harness(), pending = deferred();
+  const nullable = { ...origin, mailbox_identity_key: null };
+  const valid = { ...row, thread_entry_ref: nullable };
+  h.snapshot.items = [valid];
+  h.respond(async (command, query) => command === "threads_resolve" ? pending.promise : h.defaultResponse(command, query));
+  const opening = h.ui.open(valid);
+  assert.equal(h.calls.length, 1);
+  const partial: any = { ...valid, thread_entry_ref: { ...nullable } };
+  delete partial.thread_entry_ref.mailbox_identity_key;
+  h.snapshot.items = [partial];
+  pending.resolve({ state: "resolved", message_ref: nullable, context: { kind: "non_vendor", thread } });
+  await opening;
+  assert.equal(h.calls.length, 1, "incomplete fresh row cannot authorize the message read");
+  assert.equal(h.ui.state.selectedThread, null);
+});
+
+
+test("origin keys admit only complete native tuples and keep null distinct from missing", () => {
+  assert.equal(inboxThreadOriginKey(null), null);
+  assert.equal(inboxThreadOriginKey(undefined), null);
+  assert.notEqual(inboxThreadOriginKey({ ...origin, message_id: "雪|[,]".repeat(100) }), null);
+  for (const key of ["provider", "account_id", "message_id", "mailbox_identity_key"]) {
+    for (const value of [undefined, null, "", false, 0]) {
+      const candidate = { ...origin, [key]: value } as any;
+      const expected = key === "mailbox_identity_key" && value === null;
+      assert.equal(inboxThreadOriginKey(candidate) !== null, expected, `${key}/${value}`);
+    }
+  }
+  assert.equal(inboxThreadOriginKey({ ...origin }), inboxThreadOriginKey(origin));
+  for (const key of ["provider", "account_id", "message_id", "mailbox_identity_key"]) {
+    assert.notEqual(inboxThreadOriginKey({ ...origin, [key]: "different" }), inboxThreadOriginKey(origin), key);
+  }
+});
+
+test("a partial look-alike cannot be selected beside a valid null-mailbox origin", async () => {
+  const h = harness(), nullable = { ...origin, mailbox_identity_key: null };
+  const valid = { ...row, thread_entry_ref: nullable };
+  const partial: any = { ...valid, thread_entry_ref: { ...nullable } };
+  delete partial.thread_entry_ref.mailbox_identity_key;
+  h.snapshot.items = [valid, partial]; await h.ui.open(valid);
+  assert.equal(h.ui.isSelected(valid), true);
+  assert.equal(h.ui.isSelected(partial), false);
+});

@@ -361,3 +361,14 @@ test("render reconciles only the matching terminal request and restores active i
     }
   }
 });
+
+
+test("the production row renderer never assigns an origin dataset to an incomplete ref", () => {
+  const h = harness();
+  delete (h.item.thread_entry_ref as any).mailbox_identity_key;
+  h.context.inboxThreadEntry.canOpen = () => false;
+  h.render();
+  const open = h.button("Open thread");
+  assert.equal(open.disabled, true);
+  assert.equal(Object.hasOwn(open.dataset, "inboxThreadOrigin"), false);
+});

@@ -22,9 +22,13 @@ export interface InboxThreadSnapshot {
   scope: InboxThreadScope | null;
   spanScope: InboxThreadScope | null;
 }
-export const inboxThreadOriginKey = (ref: InboxMessageRef): string => JSON.stringify([
-  ref.provider, ref.account_id, ref.mailbox_identity_key, ref.message_id,
-]);
+export function inboxThreadOriginKey(ref: InboxMessageRef | null | undefined): string | null {
+  if (!ref || ![ref.provider, ref.account_id, ref.message_id]
+    .every(value => typeof value === "string" && value.length > 0)
+    || !(ref.mailbox_identity_key === null
+      || typeof ref.mailbox_identity_key === "string" && ref.mailbox_identity_key.length > 0)) return null;
+  return JSON.stringify([ref.provider, ref.account_id, ref.mailbox_identity_key, ref.message_id]);
+}
 const sameScope = (a: InboxThreadScope | null, b: InboxThreadScope | null): boolean => !!a && !!b
   && a.mutation_epoch === b.mutation_epoch && a.mailbox_operation_revision === b.mailbox_operation_revision;
 type Entry = { origin: InboxMessageRef; epoch: number; scope: InboxThreadScope;
@@ -97,11 +101,12 @@ export class InboxThreadEntry {
   /** Preserve identifiers and positions before clearing every retained payload. */
   invalidate(): void {
     const snapshot = this.options.snapshot(), entry = this.entry, identity = this.state.readingIdentity;
-    if (!entry || snapshot.blocked || !snapshot.visible || entry.epoch !== snapshot.queryEpoch
+    const origin = entry ? inboxThreadOriginKey(entry.origin) : null;
+    if (!entry || origin === null || snapshot.blocked || !snapshot.visible || entry.epoch !== snapshot.queryEpoch
       || !sameScope(entry.scope, snapshot.scope)) this.intent = null;
     else if (!this.intent && identity && this.state.messages.value) {
       const position = this.reader.readingPosition();
-      this.intent = { origin: inboxThreadOriginKey(entry.origin), epoch: entry.epoch, identity,
+      this.intent = { origin, epoch: entry.epoch, identity,
         count: this.state.messages.value.items.length, pages: this.state.messages.pages,
         bodies: [...this.state.bodies.keys()], position, focus: position.focus !== null };
     }
@@ -157,7 +162,8 @@ export class InboxThreadEntry {
   }
 
   isSelected(row: InboxThreadRow): boolean {
-    return this.entry !== null && inboxThreadOriginKey(row.thread_entry_ref) === inboxThreadOriginKey(this.entry.origin);
+    const key = inboxThreadOriginKey(row.thread_entry_ref);
+    return key !== null && this.entry !== null && key === inboxThreadOriginKey(this.entry.origin);
   }
 
   private saveListScroll(): Entry["scroll"] {
@@ -225,8 +231,10 @@ export class InboxThreadEntry {
   }
 
   private row(origin: InboxMessageRef, snapshot: InboxThreadSnapshot): InboxThreadRow | undefined {
+    const key = inboxThreadOriginKey(origin);
+    if (key === null) return undefined;
     return snapshot.items.find(row => row.provider === origin.provider && row.account_id === origin.account_id
-      && row.message_id === origin.message_id && inboxThreadOriginKey(row.thread_entry_ref) === inboxThreadOriginKey(origin));
+      && row.message_id === origin.message_id && inboxThreadOriginKey(row.thread_entry_ref) === key);
   }
 
   canOpen(row: InboxThreadRow): boolean {
@@ -289,8 +297,9 @@ export class InboxThreadEntry {
     if (this.mode === "single") {
       for (const saved of entry.scroll) { saved.element.scrollTop = saved.top; saved.element.scrollLeft = saved.left; }
     }
+    const key = inboxThreadOriginKey(entry.origin);
     const trigger = Array.from(this.options.columns.querySelectorAll<HTMLButtonElement>("[data-inbox-thread-origin]"))
-      .find(button => button.dataset.inboxThreadOrigin === inboxThreadOriginKey(entry.origin) && !button.disabled);
+      .find(button => key !== null && button.dataset.inboxThreadOrigin === key && !button.disabled);
     (trigger ?? this.options.heading).focus({ preventScroll: true });
   }
 }

@@ -2584,7 +2584,8 @@ function renderInbox(items: InboxItem[]): void {
     openThread.textContent = "Open thread";
     openThread.setAttribute("aria-label", `Open thread: ${item.subject || "No subject"}`);
     openThread.setAttribute("aria-controls", "inbox-thread-view");
-    openThread.dataset.inboxThreadOrigin = inboxThreadOriginKey(item.thread_entry_ref);
+    const originKey = inboxThreadOriginKey(item.thread_entry_ref);
+    if (originKey !== null) openThread.dataset.inboxThreadOrigin = originKey;
     openThread.disabled = !inboxThreadEntry.canOpen(item);
     openThread.setAttribute("aria-pressed", String(inboxThreadEntry.isSelected(item)));
     openThread.addEventListener("click", () => { void inboxThreadEntry.open(item); });
@@ -3142,7 +3143,11 @@ async function runInboxRefresh(
 }
 
 function refreshInboxThreadControls(): void {
-  const rows = new Map(inboxItems.map(item => [inboxThreadOriginKey(item.thread_entry_ref), item]));
+  const rows = new Map<string, InboxItem>();
+  for (const item of inboxItems) {
+    const key = inboxThreadOriginKey(item.thread_entry_ref);
+    if (key !== null) rows.set(key, item);
+  }
   for (const button of inboxList.querySelectorAll<HTMLButtonElement>("[data-inbox-thread-origin]")) {
     const row = rows.get(button.dataset.inboxThreadOrigin!);
     button.disabled = !row || !inboxThreadEntry.canOpen(row);
