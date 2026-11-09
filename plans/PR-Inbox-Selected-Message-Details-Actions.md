@@ -1,23 +1,157 @@
-# Inbox: selected-message details and actions in the reading pane
+# Email Watcher UX: stable header, Filters and message activation
 
-Status: **contract-only proposal; exact-head oversight review and Juan's acceptance
-are pending**. Preparing this proposal is authorized. Application changes, this
-plan's merge, local application builds, packaging, installation and promotion are
-not authorized by it. Implementation requires separate direction after acceptance.
+Status: **contract-only UX amendment proposal; exact-head oversight review and
+Juan's acceptance of this revision are pending**. The selected-message plan was
+accepted in PR #354; that accepted revision remains the authority until this
+amendment is accepted. Preparing this amendment is authorized; its merge and
+application implementation are held. Implementation requires separate direction
+after exact-revision acceptance. No local application build, packaging,
+installation or promotion is authorized here.
 
-Baseline: `main` at `dc39c48d959ccbcf55a49c8905175295a112a419`, the PR #353
+Amendment source base: `main` at `e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e`,
+the verified PR #358 merge. Its complete tree equals qualified extraction head
+`1e342c271ab2da70d255e9fedc97ee94c7397e70`. The details renderer is now extracted;
+the selected-message controls/lifetime migration below remains unimplemented.
+
+Original plan baseline: `main` at `dc39c48d959ccbcf55a49c8905175295a112a419`, the PR #353
 merge. Its tree equals reviewed head `8be37008dddf2ad077f9cd91048888a2cdbb1291`.
 PR #352 is merged as `8c9913562bd6d0908e647ef43188bdd7f1b59164`.
 Both reviewed heads and the final merge have four successful CI jobs; both PRs have
 oversight PASS, clean connector reviews and no unresolved threads. These are source
 qualification facts, not evidence of installation.
 
-The [persistent-pane plan](PR-Inbox-Persistent-Thread-Pane.md) deliberately deferred
-this product change. This proposal changes where the selected Inbox message's
-existing controls appear; it does not approve the whole older
+The [persistent-pane plan](PR-Inbox-Persistent-Thread-Pane.md) deferred the
+selected-message control migration subsequently accepted in PR #354. This amendment
+adds the bounded header/Filters/activation choices in R0 to that existing target;
+it does not approve the whole older
 [three-pane proposal](PR-Inbox-Three-Pane-Reading.md).
 
-## Owner audit and retained baseline
+## UX amendment: scope, precedence and current owners
+
+Juan directly confirmed preparation of one contract-only amendment covering the
+common header, stable Filters geometry and primary-row retained-chain activation.
+That direction is not acceptance of the unwritten implementation or this revision.
+The proposed experience and R0 below replace only these presentation choices;
+R1-R4's identity, confirmation, refresh, outcome and removal rules remain required.
+
+If this exact revision is accepted, these replacements take precedence over the
+named older clauses. Those older documents remain historical records; they are
+not parallel instructions to keep an obsolete interaction.
+
+| Earlier choice | Proposed replacement and limit |
+| --- | --- |
+| This plan's separate Open thread step / no whole-row activation, and Navigation/Filters §3's Open thread alongside expansion | One semantic primary-row activation opens the eligible retained chain through the existing entry owner. Replace the redundant Open thread control and row expansion only with the usable selected-message replacement defined here. |
+| Persistent-pane R2 allows expanded Filters to consume pane height / cause outer scrolling | Filters becomes an anchored, viewport-bounded panel outside layout flow. Toggling it alone preserves the underlying document extent, pane geometry and scroll, including when the base layout already needs accessible outer scrolling. |
+| Persistent-pane R3 and Navigation/Filters focus return names the old Open thread button | Back returns to the initiating eligible primary-row target, or the existing visible heading fallback; no automatic paging or selection. |
+| This plan excludes unrelated tab redesign; the shared tabs inherit each view's shell/intro geometry | Only the common header/navigation presentation changes across views. Page content widths, routes, admission and view-specific behavior stay unchanged. |
+
+Current source owners at the amendment base:
+
+| Owner | Confirmed controlling factor |
+| --- | --- |
+| [main.ts:516][current-header] and [styles.css:39][current-shell] | Shared navigation sits after the intro inside the view-dependent shell. Inbox width/padding and visually hidden intro differ from other views; the header must be separated from those content containers, not patched with per-view offsets. |
+| [main.ts:540][current-filters], [inboxThreadEntry.ts:178][current-fit] and [:192][current-measure] | Filters is in-flow; its height moves the grid top used to calculate available height. The fitted multi-pane layout requires at least 240px; the [existing CSS height fallback][current-pane-fallback] can then increase the outer extent. Moving only a child or hiding overflow does not fix this owner chain. |
+| [main.ts:2582][current-row] and [inboxThreadEntry.ts:233][current-entry] | The primary button expands row details while a sibling Open thread calls the guarded entry owner. Route the replacement target through the same admitted origin/current-span/scope owner; create no second selection or resolver. |
+| [main.ts:1807][current-details] | PR #358 supplies the existing details renderer. Reuse its body, handlers and scalar timer handoff; do not re-extract, copy or move controls into shared thread-message cards. |
+
+### Input inventory and differences from recorded work
+
+The following private durable aliases were copied and hashed for review. They are
+source-only reference inputs, not qualification of the proposed behavior.
+
+| Alias | SHA256 / recorded scope |
+| --- | --- |
+| `ux-direction-input` | `81244af43c06c159db9a4288a3be17a77040ded71ee35d6a5b5f66ffe779adb1`; stable Filters and row activation proposal. |
+| `navigation-direction-input` | `6b7b2709a0efd0470f2b94608f5557c0eaada4f147537adeefe7f070af0fc71b`; compact common header proposal. |
+| `prior-filter-probe` | `819dbf1323c30970317679f9d26f992de2e71eab81b980c9ae6a84d301058f13`; Playwright Python, Chromium cache build 1228, loopback synthetic fixture, closed/open/closed-again at 1920x1080, 1524x785, 1440x900, 1280x720 and 1024x768. No model/prompt/provider calls. |
+| `prior-filter-measurements` | `3a06d2420195d918463c3bebf8cc6632b25d6df12cc355c2216fbfc11d105df3`; the provided capture records document height 785 to 1242 at 1524x785 on opening Filters, with fitted layout changing to fallback; all recorded native-call counters are zero. Not rerun here. |
+| `ux-amendment-input-inventory` | `4cb64f616c7bb02a132960b0293f8f26b81f529f54cc63fb5ac52156b0f9ba04`; binds those inputs and screenshots, settings and limits. |
+
+The supplied probe does not seal a semantic browser version, source revision or
+server/fixture bundle. Its recorded dimensions identify the reported problem;
+they are not a fresh browser run, installed-product evidence or a qualified UI to
+port. Before reusing a harness for implementation, pin/hash its actual source,
+fixtures, browser/runtime versions, viewport/text/zoom settings and results.
+No model, prompt or capacity experiment is part of this UI work.
+
+Differences from that recorded baseline are deliberate and exhaustively scoped:
+shared navigation no longer inherits view-specific content geometry; Filters no
+longer changes flow geometry; the primary row opens its retained-chain context
+instead of expanding details before a separate Open thread action. The previously
+accepted single selected-message details surface remains the target, with its
+existing action semantics unchanged. No new layout implementation is claimed.
+
+## R0 — common header, stable Filters and primary activation
+
+### R0a — one compact, persistent common header
+
+- All existing destinations keep their labels, order, selected-state accessibility,
+  keyboard activation, disabled/admission behavior and existing view-switch effects.
+  Use one header independent of each page's width, intro and scroll container.
+- At the same viewport, text size and zoom, switching views preserves the header's
+  top/left anchor, dimensions and gutters, including after content has scrolled.
+  Keep navigation visible during content scrolling. Content may retain its current
+  appropriate width; do not widen Settings or change the Inbox's selection owners.
+- Use compact text navigation with ordinary/medium label weight, a restrained
+  current-view underline/marker and clear hover/focus states. Remove the large
+  generic introductory banner from the shared header; retain accessible application
+  identity and meaningful page titles/help in their content areas. Do not add a
+  large decorative container, hide labels or replace destinations with icons.
+- Narrow windows may wrap navigation consistently across views. Keep every
+  destination readable and reachable at enlarged text/zoom; no hamburger, auto-hide,
+  tiny targets, clipping or overlap with the focused content below it.
+
+### R0b — Filters does not resize or scroll the underlying workspace
+
+- Place the existing filter form in one labelled, modeless panel anchored to
+  Filters and outside the workspace's layout flow. Finalize its position and the
+  Inbox height calculation against the common header, not hard-coded per-view
+  offsets. Opening/closing alone changes neither outer document extent nor pane
+  bounds, selected origin, sender/message/reader scroll or visible row set.
+- This invariant also holds on narrow/short/enlarged-text layouts: if the closed
+  base layout legitimately needs outer scrolling, toggling Filters preserves that
+  range and underlying positions. Constrain the panel to the available viewport
+  with its own accessible scrolling; never clip fields or mask a sizing defect
+  with document overflow suppression. The panel must not obstruct navigation or
+  leave focused controls under the header.
+- Preserve all fields, bounds, native form associations, draft/applied distinction,
+  explicit Apply/Search/Reset, account/sender scope, busy rules and applied labels.
+  Closing never silently applies, resets or discards a draft. Toggling starts no
+  query, body read, analysis or other native operation.
+- Filters/Close and Escape can dismiss the panel; Escape/Close returns focus to
+  Filters. Pointer and keyboard access to every field remain usable, with no focus
+  trap. A form action or text selection cannot also activate a message row.
+
+### R0c — primary row opens its retained chain, once
+
+- Give each eligible message one semantic primary-row control, covering its
+  normal sender/subject/metadata hit area. Pointer activation and native Enter/Space
+  equivalence select that exact origin and enter its retained-chain context through
+  `InboxThreadEntry` and the admitted-origin key. Replace the separate Open thread
+  step once this target and the selected-message surface are usable.
+- Keep cards as neutral containers and native actions/links/disclosures as separate
+  controls. No button contains other buttons, no controls-bearing listbox, and no
+  card-wide bubbling handler that turns an action, text selection or drag into a
+  thread open. Keyboard activation dispatches once, not once per key/click handler.
+- Preserve visible focus and selected state; invalid, partial, previous-query,
+  blocked or stale origins cannot select/read through this route. No automatic
+  first selection, hover activation or selection from background refresh.
+- Re-activating the same current origin preserves ready/pending reading state and
+  performs no duplicate resolver/message/body read. It does not create a new
+  selection lifetime or cancel a pending confirmation/parameter step. Existing
+  explicit Retry remains the route for failed fresh-origin resolution. Back closes/clears through the same
+  owner and restores the initiating eligible target with existing scroll rules and
+  heading fallback; resizing does not reopen or refetch the chain.
+- Whole retained chain means the existing eligible retained conversation context,
+  with its existing pagination and zero/one/many resolution, explicit ambiguous
+  chooser, no-match/unavailable/partial-history/no-text states and source-account
+  fencing. Do not fetch missing provider history, infer a vendor or eagerly load
+  every page/body. A clicked message is not the sole timeline entry by definition.
+- Keep the origin's eligible selected-message details/actions available under R1
+  while chain resolution is loading, ambiguous or failed. Timeline success cannot
+  authorize another message's actions; selecting/opening never executes them.
+
+## Original owner audit and retained baseline
 
 The present separation is intentional, not an unfixed defect in #353. Opening a
 thread keeps the message list beside the reader, but saved analysis, attachments
@@ -58,9 +192,9 @@ not represent an old geometry result as proof of this new surface.
 
 - Keep compact message rows with full sender/address access, subject, received
   time, existing priority/category/state and action/attachment/truncation cues.
-  Keep explicit **Open thread** and its selected-state semantics. There is no
-  automatic first selection, selection on hover or new whole-row click action.
-- After Open thread, place a labelled **Selected message** section at the top of
+  The primary-row control opens its retained-chain context under R0c; keep its
+  selected state and no automatic/hover selection.
+- After primary-row activation, place a labelled **Selected message** section at the top of
   the existing Inbox reading wrapper. It shows that originating message's saved
   analysis, action/deadline, calendar information, attachments, existing results
   and controls in their current relative order. Keep its source subject, sender,
@@ -78,7 +212,8 @@ not represent an old geometry result as proof of this new surface.
   returns to Messages with the current scroll/focus rules. The same selected
   section remains reachable in single-pane narrow mode. **Clear local history**
   and durable removal notices remain outside the reader and retain their
-  history-wide meaning. The Vendors view is unchanged.
+  history-wide meaning. Vendors content/read behavior is unchanged; it uses the
+  same common header as the other views.
 
 These are proposed product choices, not a claim that the current app already has
 this behavior. No new provider verb, bulk action, compose/reply or message search
@@ -230,7 +365,8 @@ existing fresh same-thread/context reads. A missing origin stays unavailable,
 without a deletion claim, automatic replacement selection or extra paging.
 
 Do not couple Inbox span commit to reader restoration again: Back during refresh
-must still commit current rows with `refreshReader=false`, leaving Open enabled.
+must still commit current rows with `refreshReader=false`, leaving eligible
+primary-row activation enabled.
 Keep the generation/identity/page/count/post-body-read checks proved in #353.
 
 Begin the existing nested mutation hold before a removal dispatch and clear both
@@ -250,7 +386,8 @@ expanded controls wrap without horizontal document overflow or clipped controls.
 Keep Search/Filters/applied scope, sender navigation, Load more and message scroll
 behavior. List rows retain enough current state to identify a message requiring
 attention without running its action. Preserve explicit opening, no initial read,
-Back, selected-state semantics, short-height/200% fallback and keyboard reachability.
+Back, selected-state semantics, short-height/200% accessibility fallback and
+keyboard reachability, with R0b's Filters geometry invariant at every size.
 Focus follows explicit user actions; background completion and resizing cannot
 steal it. Preserve the corresponding control across a current selected-section
 render, falling back to its heading if the control disappears. Hidden/closed
@@ -262,14 +399,22 @@ preview DOM.
 1. This PR changes only this proposal. Oversight reviews its exact head; Juan must
    accept that revision and separately authorize implementation. Green CI is not
    plan acceptance or permission to merge this proposal.
-2. In a separate implementation PR, introduce the single guarded details renderer
-   by extracting the real row controls. Prove parity of existing payloads,
-   confirmations, eligibility, request identities and outcomes before moving the
-   surface or changing row expansion. No copied alternative implementation.
-3. Move the one instance into the selected-message section and retire redundant
-   Inbox expanded-row details/state together. Every reviewable stage must retain
-   a usable narrow flow and access to all existing action families. Do not ship a
-   wide-only stage or temporarily drop calendar/automation/deletion controls.
+2. PR #358 has completed the unchanged renderer extraction. Reuse that production
+   owner and the admitted-origin/request-ID fixes now on main. Prove payload,
+   consent, eligibility, request-identity and outcome parity before relocation;
+   do not create a copied alternative implementation.
+3. After acceptance and separate implementation direction, deliver the common
+   header first as an independently reviewed stage, including all-view stability
+   and Inbox available-height proof. Finalize Filters geometry against that header.
+   Then deliver the Inbox interaction: stable Filters, primary-row activation and
+   the single selected-message surface, with R1-R5's lifecycle/action guards.
+   Move the existing renderer instance and retire redundant expanded-row details
+   and expansion state together. Keep every stage usable at narrow widths with
+   all action families reachable; never ship a wide-only or action-dropping stage.
+   If the combined implementation would exceed about 1,000 lines including tests,
+   use stacked header/Inbox PRs with explicit dependencies. Further mechanical
+   guard stages may land with old presentation intact; do not remove Open thread
+   before the replacement works or duplicate action surfaces during the split.
 4. Require actual-handler regressions, the affected tests and full desktop suite,
    typechecking, cold diff and gap audits, source-only browser evidence, exact-head
    oversight/connector review and green CI. Each implementation merge requires
@@ -280,6 +425,9 @@ preview DOM.
 
 | Boundary | Evidence that must falsify a broken implementation |
 | --- | --- |
+| Common header | Compare header bounds across all existing views at fixed viewport/text/zoom, different content heights and previous scroll. Same anchor/dimensions/order; all labels, keyboard/focus/current/disabled/admission behavior and normal view effects preserved. Narrow wrapping, scrolling and enlarged text leave every destination reachable. |
+| Stable Filters | At 1920x1080, 1524x785, 1440x900, 1280x720, 1024x768, 640x520, 320 CSS px, short height and 200% text/zoom, repeat closed/open/closed with unchanged data. Measure equal outer extent, pane bounds and underlying sender/message/reader offsets; preserve selection/drafts/row set and zero extra native calls. Exercise both fitted and already-scrollable base layouts, every field, Apply/Reset/Search, keyboard/Escape/Close and focus return. |
+| Primary-row activation | Actual production owner: pointer and Enter/Space open one correct complete origin; no Open thread second step, initial/hover read, duplicate pending/ready same-origin read, or action on opening. Same-origin reactivation preserves the pending approval/lifetime. Action/link/disclosure/text-selection/drag/form activation does not open a row. Invalid/mixed/stale origins refuse; ambiguity/no-match/partial history/paging and eligible Inbox details remain truthful. Back restores exact target or visible fallback without paging. |
 | One surface and parity | Every current action/detail family is reachable on a selected origin, mounted once, with exact old IPC payloads and consent. Compact unselected rows retain all indicators; old row expansion/hidden action clones are gone. Exercise no attachments, one/many attachments, unavailable analysis and valid false/zero values. |
 | Identity and availability | Provider/account/mailbox/native-ID lookalikes, missing/partial context, previous-query rows and changed mailbox scope cannot target the wrong item. Valid vendor, non-vendor and unresolved/ambiguous/failed thread lookups retain eligible Inbox-owned details; no action is borrowed from another timeline message/copy. |
 | Dialog and dispatch | For every async-confirmation family: open A, pause its parameter/dialog step, select B or Back/change query/hold, then approve A; no native dispatch. The current unchanged A positive dispatches once with its original exact target. Decline and cancelled dialogs preserve existing semantics. |
@@ -288,7 +436,7 @@ preview DOM.
 | Writes and expiry | Calendar invitations and expired-recheck paths retain exact account/version/hash/consent. Automation stale versions and decision-refresh barriers remain enforced. Confirm/decline double clicks, remounts and selection loops cannot duplicate decisions or submit a second capability job. |
 | Removal and hidden bytes | Cancel/accept/delete/clear with nested holds and both readers open; completed/deferred/refused outcomes, old callbacks and physically retained bytes. Context/old details/preview DOM clear before dispatch, source mail remains untouched, Clear remains history-wide and B cannot inherit A's target/outcome. |
 | Refresh and prior regressions | Current span commits after Back independently of reader cancellation. Repeated invalidations, origin on a later loaded page, stale cursors, body failures, A-to-B/B-to-A late completions and the #353 replay/page/count guards retain their meaning. Fresh row state replaces old details without stale controls. |
-| Real browser | Chromium and WebKitGTK: 1920x1080, 1524x785, 1024x768, 640x520, 320 CSS px, short heights and 200% text/zoom; long details, open Filters and populated actions. Exercise actual scroll/focus, explicit Open/Back, same-origin re-render, action completion while focus is elsewhere and content-width changes independent of viewport width. No fake-DOM-only geometry claim. |
+| Real browser | Chromium and WebKitGTK: 1920x1080, 1524x785, 1024x768, 640x520, 320 CSS px, short heights and 200% text/zoom; long details, open Filters and populated actions. Exercise actual scroll/focus, primary-row activation/Back, same-origin re-render, action completion while focus is elsewhere and content-width changes independent of viewport width. No fake-DOM-only geometry claim. |
 
 Use the existing fixture/native mocks, not the installed application. Record exact
 browser versions and harness hashes. Run real production handler/renderer wiring
@@ -303,8 +451,11 @@ not qualify packaged IPC or production CSP; keep that promotion gap explicit.
 No reply/compose, action on arbitrary historical thread messages, new provider or
 API, HTML/Markdown rendering, bulk action, schema/storage/capture/retention change,
 new query/lifecycle controller, dependency, native admission change or unrelated
-tab redesign. Do not fold in #349-350's nonblocking test/cosmetic follow-ups, the
-Windows descriptor flake, the model work or frozen attachment-contract work.
+view/content redesign. The common header presentation in R0a is the only cross-view
+change; page routes, content widths and view-specific behavior remain unchanged.
+Do not fold in #349-350's nonblocking test/cosmetic follow-ups, the
+[Windows descriptor follow-up #360](https://github.com/canfieldjuan/eom-email-watcher/issues/360),
+model work or frozen attachment-contract work.
 Human LCS gap/promotion records remain held; this UI proposal writes none.
 
 For this docs-only PR, check baseline/merge trees, owner citations and relative
@@ -330,3 +481,13 @@ behavior accepted, implemented, merged, installed or qualified.
 [queue-refresh]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L3180-L3196
 [confirmation]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/confirmation.ts#L7-L20
 [refresh-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/inboxReload.ts#L61-L100
+
+[current-header]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/main.ts#L516
+[current-shell]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/styles.css#L39
+[current-filters]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/main.ts#L540
+[current-fit]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/inboxThreadEntry.ts#L178
+[current-measure]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/inboxThreadEntry.ts#L192
+[current-row]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/main.ts#L2582
+[current-entry]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/inboxThreadEntry.ts#L233
+[current-details]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/main.ts#L1807
+[current-pane-fallback]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/styles.css#L241
