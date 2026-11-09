@@ -9,7 +9,8 @@ import { inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
 import { Element, nodes } from "./threadDomFixture.ts";
 
 const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-const render = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
+const render = source.match(/function renderInboxMessageDetails\([\s\S]*?\n\}/)![0]
+  + "\n" + source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
 const loadPage = source.match(/async function loadInboxPage\([\s\S]*?\n\}/)![0];
 const refresh = source.match(/async function runInboxRefresh\([\s\S]*?\n\}/)![0];
 function harness() {

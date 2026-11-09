@@ -1804,53 +1804,8 @@ function restoreInboxScroll(top: number): void {
   inboxRestoredScrollTop = inboxResults.scrollTop;
 }
 
-function renderInbox(items: InboxItem[]): void {
-  const position = captureInboxScroll();
-  const scrollTop = inboxItemsEpoch === inboxRenderedEpoch ? position.top : 0;
-  inboxRenderedEpoch = inboxItemsEpoch;
-  renderInboxFilterScope();
-  if (inboxProposalExpiryTimer !== null) {
-    window.clearTimeout(inboxProposalExpiryTimer);
-    inboxProposalExpiryTimer = null;
-  }
-  const renderStartedAt = Date.now();
-  let nextProposalExpiry: number | null = null;
-  capabilityOutputPreviews.clear();
-  capabilityOutputViewButtons.clear();
-  inboxList.replaceChildren();
-  if (items.length === 0) {
-    capabilityOutputPresentations.clear();
-    const empty = document.createElement("li");
-    empty.className = "empty-state";
-    const filtered = Object.entries(activeInboxQuery).some(
-      ([key, value]) => key !== "limit" && value !== null,
-    );
-    empty.textContent = inboxPageState === "pending"
-      ? "Messages not loaded yet."
-      : inboxPageState === "loading"
-      ? "Loading messages…"
-      : inboxPageState === "failed"
-      ? "Messages could not be loaded."
-      : activeInboxQuery.sender !== null
-      ? inboxSenderEmptyText(activeInboxQuery, activeInboxAccountSelection)
-      : filtered
-      ? "No retained messages match these filters."
-      : "No retained messages yet.";
-    inboxList.append(empty);
-    restoreInboxScroll(scrollTop);
-    return;
-  }
-
-  for (const item of items) {
-    const card = document.createElement("li");
-    card.className = "inbox-card";
-    card.inert = inboxMutationInFlight();
-    if (card.inert) card.setAttribute("aria-busy", "true");
-    const priority = item.priority?.toLowerCase() ?? "untriaged";
-    card.dataset.priority = ["urgent", "high", "normal", "low"].includes(priority)
-      ? priority
-      : "untriaged";
-
+function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderStartedAt: number) {
+    let nextProposalExpiry: number | null = null;
     const meta = document.createElement("div");
     meta.className = "message-meta";
     const senderIdentity = document.createElement("div");
@@ -2518,6 +2473,59 @@ function renderInbox(items: InboxItem[]): void {
     if (calendarProposal) card.append(calendarProposal);
     if (attachments.childElementCount) card.append(attachments);
     card.append(footer);
+    return { received, category, state, truncation, automationStates, nextProposalExpiry };
+}
+
+function renderInbox(items: InboxItem[]): void {
+  const position = captureInboxScroll();
+  const scrollTop = inboxItemsEpoch === inboxRenderedEpoch ? position.top : 0;
+  inboxRenderedEpoch = inboxItemsEpoch;
+  renderInboxFilterScope();
+  if (inboxProposalExpiryTimer !== null) {
+    window.clearTimeout(inboxProposalExpiryTimer);
+    inboxProposalExpiryTimer = null;
+  }
+  const renderStartedAt = Date.now();
+  let nextProposalExpiry: number | null = null;
+  capabilityOutputPreviews.clear();
+  capabilityOutputViewButtons.clear();
+  inboxList.replaceChildren();
+  if (items.length === 0) {
+    capabilityOutputPresentations.clear();
+    const empty = document.createElement("li");
+    empty.className = "empty-state";
+    const filtered = Object.entries(activeInboxQuery).some(
+      ([key, value]) => key !== "limit" && value !== null,
+    );
+    empty.textContent = inboxPageState === "pending"
+      ? "Messages not loaded yet."
+      : inboxPageState === "loading"
+      ? "Loading messages…"
+      : inboxPageState === "failed"
+      ? "Messages could not be loaded."
+      : activeInboxQuery.sender !== null
+      ? inboxSenderEmptyText(activeInboxQuery, activeInboxAccountSelection)
+      : filtered
+      ? "No retained messages match these filters."
+      : "No retained messages yet.";
+    inboxList.append(empty);
+    restoreInboxScroll(scrollTop);
+    return;
+  }
+
+  for (const item of items) {
+    const card = document.createElement("li");
+    card.className = "inbox-card";
+    card.inert = inboxMutationInFlight();
+    if (card.inert) card.setAttribute("aria-busy", "true");
+    const priority = item.priority?.toLowerCase() ?? "untriaged";
+    card.dataset.priority = ["urgent", "high", "normal", "low"].includes(priority)
+      ? priority
+      : "untriaged";
+
+    const { received, category, state, truncation, automationStates, nextProposalExpiry: rowExpiry } =
+      renderInboxMessageDetails(item, card, renderStartedAt);
+    if (rowExpiry !== null) nextProposalExpiry = Math.min(nextProposalExpiry ?? rowExpiry, rowExpiry);
     const content = document.createElement("div");
     content.id = `inbox-message-${inboxList.childElementCount}`;
     content.className = "inbox-message-content";
