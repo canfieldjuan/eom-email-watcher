@@ -1,4 +1,4 @@
-use super::{present_nullable, Engine, EngineError, InboxMessageRef, ThreadRef};
+use super::{Engine, EngineError, InboxMessageRef, ThreadRef, present_nullable};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
@@ -227,7 +227,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!(
