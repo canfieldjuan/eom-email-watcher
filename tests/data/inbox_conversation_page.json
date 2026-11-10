@@ -1,0 +1,57 @@
+{
+  "kind": "inbox_conversations_v1",
+  "items": [
+    {
+      "thread_ref": {
+        "provider": "gmail",
+        "account_id": "mailbox",
+        "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "thread_key": "native"
+      },
+      "latest": {
+        "message_ref": {
+          "provider": "gmail",
+          "account_id": "mailbox",
+          "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "message_id": "newest"
+        },
+        "subject": "Quote",
+        "sender": "newest@example.test",
+        "sender_name": null,
+        "received_at": "2026-10-11T12:00:00+00:00"
+      },
+      "matching_message_ref": {
+        "provider": "gmail",
+        "account_id": "mailbox",
+        "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "message_id": "newest"
+      },
+      "senders": [
+        {
+          "address": "newest@example.test",
+          "name": null
+        },
+        {
+          "address": "older@example.test",
+          "name": null
+        }
+      ],
+      "counts": {
+        "messages": 2,
+        "matching_messages": 2,
+        "pending_messages": 2,
+        "analysis_errors": 0,
+        "action_required": 0,
+        "attachments": 0,
+        "truncated_messages": 0,
+        "unknown_truncation_messages": 2
+      }
+    }
+  ],
+  "next_cursor": "eyJsYXN0IjoiMWU1ZmQ2YTZhMTdjYjJiMzFhOTFhNjgxZDIzYThlZWIxOTUzYmIzYjJjZmQ2NDVmNDZlYmE3MzAzNDIxNmRhMiIsInJldmlzaW9uIjoiODVjZDJjYWY4ZjQwZWMyN2MxYmFlM2QxY2IwODE4YjAwMWQ2MGUyMDc5YjExZDdiN2JlNzdkNDBmYWM3Y2Q2OCIsInNlbGVjdG9yIjoiZWY5M2MzOTdkMTYzNTVjYWQyYzllMDEzNjBlNmU4NDA5OGJjZTA4YmIyM2NjZWNkZmM2MzA2NGI4YjVhOGQ1YyIsInZlcnNpb24iOjF9",
+  "totals": {
+    "conversations": 2,
+    "messages": 3,
+    "matching_messages": 3
+  }
+}
