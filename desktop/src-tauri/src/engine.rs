@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
 
+#[path = "engine/inbox_conversations.rs"]
+mod inbox_conversations;
+pub use inbox_conversations::{InboxConversationPage, InboxConversationQuery};
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]

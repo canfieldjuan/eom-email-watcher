@@ -12,10 +12,11 @@ use engine::{
     ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView,
     ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
     GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
-    HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, PreparedAutomationRule, ThreadBodyQuery, ThreadBodyResponse,
-    ThreadCopiesQuery, ThreadCopiesResult, ThreadListQuery, ThreadMessagePage, ThreadMessagesQuery,
-    ThreadPage, ThreadResolveQuery, ThreadResolveResult, Vendor, VendorDeleted, WatchedSender,
+    HealthStatus, InboxConversationPage, InboxConversationQuery, InboxPage, InboxQuery,
+    MailAccountResult, MailAccounts, MailServerConnection, NtfyDisclosureStatus,
+    PreparedAutomationRule, ThreadBodyQuery, ThreadBodyResponse, ThreadCopiesQuery,
+    ThreadCopiesResult, ThreadListQuery, ThreadMessagePage, ThreadMessagesQuery, ThreadPage,
+    ThreadResolveQuery, ThreadResolveResult, Vendor, VendorDeleted, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -1612,6 +1613,19 @@ async fn config_ntfy_disclosure_acknowledge(
 }
 
 #[tauri::command]
+async fn inbox_conversations_query(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    query: InboxConversationQuery,
+) -> Result<InboxConversationPage, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.query_inbox_conversations(query))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn inbox_query(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
@@ -2770,6 +2784,7 @@ pub fn run() {
             inbox_clear,
             inbox_delete,
             inbox_query,
+            inbox_conversations_query,
             inbox_removal_prepare,
             inbox_removal_saved,
             inbox_removal_status,
