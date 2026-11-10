@@ -3867,6 +3867,51 @@ def _reparent_logical_sources(db: sqlite3.Connection, old: str, new: str) -> Non
     )
 
 
+def _inbox_filter_predicates(
+    *,
+    sender=None,
+    sender_query=None,
+    priority=None,
+    category=None,
+    status=None,
+    keyword=None,
+    provider=None,
+    account_id=None,
+) -> tuple[list[str], list[object]]:
+    """One member must satisfy every predicate, for flat and conversation reads."""
+    clauses, parameters = [], []
+    for column, value in (("sender", sender), ("provider", provider), ("account_id", account_id)):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            parameters.append(value)
+    for value, columns in (
+        (sender_query, ("sender", "sender_name")),
+        (keyword, ("subject", "summary")),
+    ):
+        if value is not None:
+            clauses.append(
+                "("
+                + " OR ".join(
+                    f"instr(casefold(COALESCE({column}, '')), ?) > 0" for column in columns
+                )
+                + ")"
+            )
+            parameters.extend([value.casefold()] * len(columns))
+    for column, value, unknown in (
+        ("priority", priority, "untriaged"),
+        ("category", category, "unclassified"),
+    ):
+        if value == unknown:
+            clauses.append(f"{column} IS NULL")
+        elif value is not None:
+            clauses.append(f"{column} = ?")
+            parameters.append(value)
+    if status is not None:
+        clauses.append("status = ?")
+        parameters.append(status)
+    return clauses, parameters
+
+
 def _effective_message_identity_sql(alias: str) -> str:
     """Logical scope without changing stored source identity or authorization."""
     return f"""COALESCE({alias}.mailbox_identity_key, (
@@ -14372,41 +14417,18 @@ class Store:
         if cursor is not None:
             clauses.append("(received_at < ? OR (received_at = ? AND message_id < ?))")
             parameters.extend((cursor[0], cursor[0], cursor[1]))
-        if sender is not None:
-            clauses.append("sender = ?")
-            parameters.append(sender)
-        if sender_query is not None:
-            folded_sender = sender_query.casefold()
-            clauses.append(
-                "(instr(casefold(sender), ?) > 0 "
-                "OR instr(casefold(COALESCE(sender_name, '')), ?) > 0)"
-            )
-            parameters.extend((folded_sender, folded_sender))
-        if priority == "untriaged":
-            clauses.append("priority IS NULL")
-        elif priority is not None:
-            clauses.append("priority = ?")
-            parameters.append(priority)
-        if category == "unclassified":
-            clauses.append("category IS NULL")
-        elif category is not None:
-            clauses.append("category = ?")
-            parameters.append(category)
-        if status is not None:
-            clauses.append("status = ?")
-            parameters.append(status)
-        if keyword is not None:
-            folded_keyword = keyword.casefold()
-            clauses.append(
-                "(instr(casefold(subject), ?) > 0 OR instr(casefold(COALESCE(summary, '')), ?) > 0)"
-            )
-            parameters.extend((folded_keyword, folded_keyword))
-        if provider is not None:
-            clauses.append("provider = ?")
-            parameters.append(provider)
-        if account_id is not None:
-            clauses.append("account_id = ?")
-            parameters.append(account_id)
+        predicates, values = _inbox_filter_predicates(
+            sender=sender,
+            sender_query=sender_query,
+            priority=priority,
+            category=category,
+            status=status,
+            keyword=keyword,
+            provider=provider,
+            account_id=account_id,
+        )
+        clauses.extend(predicates)
+        parameters.extend(values)
 
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         parameters.append(limit + 1)

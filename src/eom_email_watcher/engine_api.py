@@ -29,8 +29,9 @@ from connect_automate.locking import (
 )
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
+from pydantic import ValidationError
 
-from . import deployment, private_storage, removal, source_locks, thread_reads
+from . import deployment, inbox_conversations, private_storage, removal, source_locks, thread_reads
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -125,6 +126,7 @@ from .imap import (
     load_credentials,
     write_credentials,
 )
+from .inbox_conversations import INBOX_CATEGORIES, INBOX_PRIORITIES, INBOX_STATUSES
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -188,19 +190,6 @@ MAX_REQUEST_BYTES = 1_000_000
 MAX_NATIVE_TEXT_OUTPUT_BYTES = 256 * 1024
 MAX_INBOX_CURSOR_BYTES = 1024
 MAX_CALENDAR_EVENTS_RESPONSE_BYTES = 16 * 1024 * 1024
-INBOX_PRIORITIES = frozenset({"urgent", "high", "normal", "low", "untriaged"})
-INBOX_CATEGORIES = frozenset(
-    {
-        "invoice",
-        "scheduling",
-        "customer_request",
-        "automated_notice",
-        "informational",
-        "other",
-        "unclassified",
-    }
-)
-INBOX_STATUSES = frozenset({"pending", "analyzed", "summarized", "skipped"})
 REQUEST_FIELDS = frozenset(
     {"protocol", "operation", "config_path", "payload", "admission_token"}
 )
@@ -2593,6 +2582,19 @@ def _recent(request: dict[str, object]) -> dict[str, object]:
     rows = _runtime(request).store.recent(limit)
     _hide_locked_automation_previews(rows)
     return {"items": rows}
+
+
+def _query_inbox_conversations(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, set(inbox_conversations.Query.model_fields))
+    try:
+        query = inbox_conversations.Query.model_validate(payload)
+    except ValidationError as error:
+        raise ApiError("invalid_request", "Invalid Inbox conversation query") from error
+    store = Store(load_config(_config_path(request)).database_file)
+    try:
+        return inbox_conversations.query(store, query)
+    except thread_reads.ThreadReadError as error:
+        raise ApiError(error.code, str(error)) from error
 
 
 def _query_inbox(request: dict[str, object]) -> dict[str, object]:
@@ -6580,6 +6582,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "inbox.removal.prepare": _inbox_removal_prepare,
     "inbox.removal.status": _inbox_removal_status,
     "inbox.query": _query_inbox,
+    "inbox.conversations.query": _query_inbox_conversations,
     "inbox.recent": _recent,
     "mail.accounts.activate": _mail_account_activate,
     "mail.accounts.connect": _mail_account_connect,
