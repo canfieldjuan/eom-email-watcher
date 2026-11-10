@@ -1,332 +1,395 @@
-# Inbox: selected-message details and actions in the reading pane
+# Email Watcher UX: conversations, one reader and per-email extras
 
-Status: **contract-only proposal; exact-head oversight review and Juan's acceptance
-are pending**. Preparing this proposal is authorized. Application changes, this
-plan's merge, local application builds, packaging, installation and promotion are
-not authorized by it. Implementation requires separate direction after acceptance.
+Status: **revised contract-only proposal; exact-head oversight and Juan's
+acceptance of this revision are pending**. The earlier PR #361 head `a55f075`
+is superseded, including its PASS/green-CI result. Do not accept or merge that
+older product definition. The operator directly confirmed **Revise the contract
+only** for the conversation model below. No application implementation or live
+change is authorized. Proposal merge is held for exact-revision acceptance;
+implementation requires separate direction after acceptance.
 
-Baseline: `main` at `dc39c48d959ccbcf55a49c8905175295a112a419`, the PR #353
-merge. Its tree equals reviewed head `8be37008dddf2ad077f9cd91048888a2cdbb1291`.
-PR #352 is merged as `8c9913562bd6d0908e647ef43188bdd7f1b59164`.
-Both reviewed heads and the final merge have four successful CI jobs; both PRs have
-oversight PASS, clean connector reviews and no unresolved threads. These are source
-qualification facts, not evidence of installation.
+Source baseline: merged `main` at
+`e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e` (PR #358), including the existing
+Inbox details renderer, admitted-origin owner and request-ID fixes. These are
+implementation prerequisites, not proof of the new conversation UX.
 
-The [persistent-pane plan](PR-Inbox-Persistent-Thread-Pane.md) deliberately deferred
-this product change. This proposal changes where the selected Inbox message's
-existing controls appear; it does not approve the whole older
-[three-pane proposal](PR-Inbox-Three-Pane-Reading.md).
+## Product model and explicit supersession
 
-## Owner audit and retained baseline
+The Inbox lists **conversations**, not one row per member email. An individual
+email is a conversation of one. Several independent emails from the same sender
+stay separate; each actual chain occupies exactly one row. Opening either kind
+uses the same far-right reading pane. Within it, newest emails appear first and
+**Load older messages** appends older pages. Each eligible Inbox email shows its
+own saved details/actions inside its message card; there is no separate thread
+viewer, row expansion or top Selected-message section.
 
-The present separation is intentional, not an unfixed defect in #353. Opening a
-thread keeps the message list beside the reader, but saved analysis, attachments
-and actionable controls still belong to expanded message rows. The single reader
-renders the retained thread and its body/copy/inventory controls instead.
-
-| Current owner at the baseline | Confirmed responsibility; consequence for this proposal |
+| Superseded choice | Replacement and authority |
 | --- | --- |
-| [main.ts:1807-1917][rows] | `renderInbox` owns row metadata, saved summary, truncation disclosure, suggested action and deadline. Reuse this projection rather than deriving analysis from thread text. |
-| [main.ts:1919-2082][calendar] | Calendar projection, exact proposal versions/hash, invitation warning, confirmation and refresh/outcome handling. Preserve all of them. |
-| [main.ts:2085-2464][attachments] | Attachment metadata/Open, provider choice, capability parameters and consent, invocation/request IDs, structured refusal recovery, output controls and automation decisions. Move this presentation through one owner, not a copied second set of handlers. |
-| [main.ts:2482-2529][row-actions] | Explicit Retry analysis, Delete locally, and independent row-details expansion. Retire the Inbox multi-row expansion surface only after its replacement is usable. |
-| [main.ts:927-950][integration] and [inboxThreadEntry.ts:18-35,194-240][entry] | Complete Inbox-origin identity, committed query/span and mailbox-operation scope select the reader. The current compact source label additionally waits for successful resolution. The new selected-message projection must use the eligible Inbox row, independently of thread-resolution success. |
-| [main.ts:1241-1265][lifecycle], [main.ts:2876-2990][removal] and [threadHistory.ts:36-72][history] | Mailbox request fences, deletion/clear barriers, both readers' mutation holds, and refresh dispatch. Keep these as the lifecycle owners. |
-| [main.ts:1548-1575,1630-1685][outputs] | Message/part/job/artifact keyed UI state, result rendering and output previews. A detached or hidden details surface must not retain preview DOM. Durable job/request bookkeeping remains distinct from presentation bytes. |
-| [threadViewDom.ts:267-364][thread-dom] | Full retained thread, explicit body/copy/inventory reads and paging; the Vendors reader uses the same renderer. Do not turn every thread message into an actionable Inbox row. |
-| [lib.rs:1857-1955][native] and [lib.rs:2127-2145][native-calendar] | Existing native admission and message/attachment/proposal command boundaries remain authoritative. UI selection is not a replacement for native admission or backend version checks. |
+| PR #354's per-message list, separate Open thread and single Selected-message binding/surface | One conversation row and one reader; independent per-message bindings and extras. Existing mutation targets and safety rules apply to each email, never to a representative or whole conversation. |
+| Earlier navigation/pane plans preserve expansion/Open thread and return focus to that button | One semantic primary conversation-row target; Back restores that eligible target or the visible heading fallback. No automatic selection/paging. |
+| Expanded Filters may change pane height or outer scrolling | R0b: a viewport-bounded modeless panel outside flow; underlying geometry/scroll stays stable. |
+| View-dependent shell/intro controls the shared tabs | R0a: one compact persistent common header; all existing routes, admission and page-content widths remain. |
+| THREAD_VIEW_CONTRACT.md's oldest-first message presentation | Its amended **Thread view (desktop)** section owns one newest-first order and older-page contract for Inbox and Vendors, with the existing strict binding/stale rules. |
 
-Existing regression owners to reuse include `inboxThreadPane.test.ts`,
-`inboxThreadContinuityRaces.test.ts`, `inboxThreadEntry.test.ts`,
-`threadIntegration.test.ts`, `inboxMessageScroll.test.ts`,
-`inboxActionState.test.ts`, `inboxRemovalLifecycle.test.ts`,
-`automationDecision.test.ts`, `calendarConsent.test.ts`,
-`calendarProposal.test.ts` and `threadViewDom.test.ts` under `desktop/test/`.
-The #353 delta review reports 359 desktop tests, clean typechecking and a
-17-mutant killing sweep at its exact head. Those existing tests are baseline
-evidence; they do not prove the new presentation or action transitions.
+These proposed replacements take precedence only after exact acceptance. R0a and
+R0b are unchanged from the earlier proposal, including the directly confirmed
+sticky header. The former UI-only scope restriction is explicitly widened for
+future read projections/wire models and shared ordering; it is not a hidden
+backend change inside a presentation patch.
 
-There is no separately validated implementation of this new migration to port.
-The earlier source-only browser packet (alias `inbox-persistent-pane`) belongs to
-the other coding chat; its bytes, hashes and browser versions have not been
-independently inventoried here. Before reusing that harness for
-implementation qualification, obtain and hash its scripts, fixtures, settings,
-versions and results. Reuse proven fixtures and read/lifecycle regressions; do
-not represent an old geometry result as proof of this new surface.
+## Current owners and recorded inputs
 
-## Proposed experience
+| Owner at the source baseline | Confirmed role / required future change |
+| --- | --- |
+| [db.py:14356][inbox-query], [engine_api.py:2598][query-api], [lib.rs:1615][query-host], [main.ts:161][query-types] | Inbox currently filters/pages individual message rows. Grouping, page units and per-member action projections require an authoritative read-model change with matching strict Python/Rust/TS wire definitions. Frontend deduplication of a flat page is insufficient. |
+| [thread_reads.py:334][members] and [D-identity][identity] | Existing scoped conversation identity and membership remain authoritative; do not group by sender, subject or a frontend-invented key. |
+| [thread_reads.py:129][message-pages] and [:236][cursor-owner] | Shared messages are currently ascending; the same projection/cursor owner must implement the newly proposed order and identify that order in cursor binding. Do not add an Inbox-only reverse sort. |
+| [threadViewDom.ts:293][reader-page] | One existing message-list renderer/page control serves both entries. Change the shared control to Load older messages; do not create another reader for single emails. |
+| [main.ts:1807][details-owner] | Reuse the existing details/handler renderer through a per-message Inbox adaptor, one instance for each eligible loaded canonical email. Never substitute a thread body for its Inbox action projection. |
+| [threadHistory.ts:24][view-owner] | Leaving Inbox closes its reader today. R3/R4 explicitly decide pending-before-dispatch and already-dispatched outcomes across that boundary. |
+| [main.ts:516][header-owner], [styles.css:39][shell-owner], [inboxThreadEntry.ts:178][layout-owner] | Shared-header placement and flow-sensitive pane measurement remain the header/Filters owners audited in the previous proposal. |
 
-- Keep compact message rows with full sender/address access, subject, received
-  time, existing priority/category/state and action/attachment/truncation cues.
-  Keep explicit **Open thread** and its selected-state semantics. There is no
-  automatic first selection, selection on hover or new whole-row click action.
-- After Open thread, place a labelled **Selected message** section at the top of
-  the existing Inbox reading wrapper. It shows that originating message's saved
-  analysis, action/deadline, calendar information, attachments, existing results
-  and controls in their current relative order. Keep its source subject, sender,
-  received time and account distinct from the thread's newest-subject heading.
-- The existing retained-thread timeline follows in the same reading wrapper.
-  Preserve its history-outside-filters notice, resolution/chooser, linked-owner,
-  partial/Sent/no-text states, explicit body/copy/inventory expansion and paging.
-  Its other messages do not acquire the selected origin's action controls.
-- Remove Inbox row-details expansion and its duplicate detailed/action DOM when
-  this replacement lands. Saved summary/details are available in the selected
-  section, not simultaneously mounted in expanded rows. Keep concise list cues
-  so selecting a message is not required to discover a pending confirmation or
-  failed action. Do not silently drop any existing indicator.
-- Back clears the selected section and thread to the existing placeholder and
-  returns to Messages with the current scroll/focus rules. The same selected
-  section remains reachable in single-pane narrow mode. **Clear local history**
-  and durable removal notices remain outside the reader and retain their
-  history-wide meaning. The Vendors view is unchanged.
+There is no validated implementation of the new conversation list/per-email
+extras to port. The existing renderer and lifecycle tests are prerequisites to
+reuse, not proof of the new view model. The copied source-only Filters inputs
+remain problem evidence: `ux-amendment-input-inventory` SHA256
+`4cb64f616c7bb02a132960b0293f8f26b81f529f54cc63fb5ac52156b0f9ba04`
+binds the proposals, probe, raw geometry and screenshots. Its semantic browser
+version/source/server bundle were not sealed; no measurements were rerun here.
+Re-pin/hash actual harness, fixtures, browser/runtime versions, settings and
+results before implementation qualification. No model/prompt work or live calls.
 
-These are proposed product choices, not a claim that the current app already has
-this behavior. No new provider verb, bulk action, compose/reply or message search
-is introduced.
+The direct conversation direction is retained as `conversation-direction` SHA256
+`0b53357da497aefbb72e07bf704a44cbf1ee6421ba35e36692cd106c02b338e9`. Deliberate differences from current code are exhaustive:
+conversation projection/counting, unified single/many viewer with per-email
+extras, shared newest-first/older pagination, and the header/Filters presentation
+below. Capture, retention, attribution and identity derivation do not change.
 
-## R1 — one selected-message binding, one details renderer
+## R0 — stable workspace and conversation entry
 
-Extend the existing `InboxThreadEntry` integration to expose a typed, immutable
-selection context only for a complete, currently eligible Inbox origin. It binds
-provider, account, mailbox identity and message reference to the committed query
-epoch, mailbox-operation scope and selection lifetime. The current committed span
-proves eligibility; its object/render identity is not part of the lifetime. A missing,
-partial, hidden, previous-query, blocked or stale binding produces no actionable
-context. Never fall back to the active account, an index, subject, sender, native
-thread ID, or a message chosen from the thread timeline.
+### R0a — one compact, persistent common header
 
-Use a single named current-context check at that owner. Do not make a parallel
-selection/query/lifecycle controller or scatter approximate identity checks across
-buttons. Typed context creation and that check are the strongest existing owner
-mechanism; do not replace them with string matching or permissive defaults.
+- All existing destinations keep their labels, order, selected-state accessibility,
+  keyboard activation, disabled/admission behavior and existing view-switch effects.
+  Use one header independent of each page's width, intro and scroll container.
+- At the same viewport, text size and zoom, switching views preserves the header's
+  top/left anchor, dimensions and gutters, including after content has scrolled.
+  Keep navigation visible during content scrolling. Content may retain its current
+  appropriate width; do not widen Settings or change the Inbox's selection owners.
+- Use compact text navigation with ordinary/medium label weight, a restrained
+  current-view underline/marker and clear hover/focus states. Remove the large
+  generic introductory banner from the shared header; retain accessible application
+  identity and meaningful page titles/help in their content areas. Do not add a
+  large decorative container, hide labels or replace destinations with icons.
+- Narrow windows may wrap navigation consistently across views. Keep every
+  destination readable and reachable at enlarged text/zoom; no hamburger, auto-hide,
+  tiny targets, clipping or overlap with the focused content below it.
 
-A pending step for A survives a same-query background refresh when the fresh
-committed snapshot still contains the same complete origin, in the same scope and
-selection lifetime, with no mutation hold. A span re-commit, new row object or
-render alone cannot cancel it. Compare complete origin and selection lifetime,
-not span identity or the [reader's refresh generation][reader-generation], which
-also changes on ordinary invalidation. Keep the reader's existing generation
-guards intact; do not use them as a pending-action cancellation token.
+### R0b — Filters does not resize or scroll the underlying workspace
 
-This is a routine overlap: [scheduled checks][scheduled-refresh] and
-[Connect-queue changes][queue-refresh] refresh the Inbox while the
-[asynchronous native confirmation][confirmation] can remain open. Preserve the
-captured action target, parameters, versions and hash across this overlap; the
-unchanged backend owners still decide staleness. A newly refreshed version is not
-permission to rewrite the target or payload the user approved.
+- Place the existing filter form in one labelled, modeless panel anchored to
+  Filters and outside the workspace's layout flow. Finalize its position and the
+  Inbox height calculation against the common header, not hard-coded per-view
+  offsets. Opening/closing alone changes neither outer document extent nor pane
+  bounds, selected origin, sender/message/reader scroll or visible row set.
+- This invariant also holds on narrow/short/enlarged-text layouts: if the closed
+  base layout legitimately needs outer scrolling, toggling Filters preserves that
+  range and underlying positions. Constrain the panel to the available viewport
+  with its own accessible scrolling; never clip fields or mask a sizing defect
+  with document overflow suppression. The panel must not obstruct navigation or
+  leave focused controls under the header.
+- Preserve all fields, bounds, native form associations, draft/applied distinction,
+  explicit Apply/Search/Reset, account/sender scope, busy rules and applied labels.
+  Closing never silently applies, resets or discards a draft. Toggling starts no
+  query, body read, analysis or other native operation.
+- Filters/Close and Escape can dismiss the panel; Escape/Close returns focus to
+  Filters. Pointer and keyboard access to every field remain usable, with no focus
+  trap. A form action or text selection cannot also activate a message row.
 
-The selected detail source is the eligible `InboxItem` in the committed snapshot,
-not a thread-message/copy projection. It can show existing saved details and
-currently eligible actions while thread resolution is loading, ambiguous,
-unavailable or failed; no body or vendor read is authorization for those actions.
-Conversely, a successfully resolved old thread cannot revive an ineligible Inbox
-origin. The current source-label resolution dependency must be adjusted at the
-same integration owner, not bypassed with a second source label.
+### R0c — one row per scoped conversation
 
-Extract the current row's detailed rendering/handlers into one Inbox-specific
-renderer/adaptor, in `main.ts` or a small `inboxMessageDetails.ts` module. Give it
-the current context and existing operation/state dependencies. Compact rows no
-longer mount these controls. Keep `ThreadViewDom`'s shared message cards read-only;
-do not duplicate the renderer inside that class or copy handlers into the pane.
-Remove redundant Inbox expansion state and cleanup paths once no reader uses
-them. Preserve message/attachment/job keyed operational state through that move.
+- Use the existing full conversation identity from [D-identity][identity]: provider,
+  account, effective mailbox identity and thread key. Null identity remains its
+  own bucket, never a wildcard. Preserve canonical copies/aliases and IMAP component
+  resolution; singleton and missing-provider-thread-ID cases use that existing
+  owner. Different chains from the same sender/vendor never combine.
+- The authoritative Inbox query groups before applying the conversation page
+  limit. No one-row-per-member duplicates, no frontend-only grouping of loaded
+  message pages, and no split conversation on a page boundary. Row keys, selection,
+  list paging/Load more and every count describing this Inbox list count
+  conversations. A separately labelled member count counts canonical emails;
+  storage/Health totals retain their existing message units.
+- Apply account/identity/admission/removal scope first. A conversation matches when
+  at least one eligible Inbox member satisfies **all** active member predicates
+  together, including exact sender and keyword/category/priority/status. Do not
+  satisfy different predicates using different members or unadmitted context.
+  Keep existing predicate meanings, All senders, drafts/Apply and account rules.
+- Under a watched sender, show a matching conversation once when that sender has
+  an eligible matching member. A mixed-sender conversation can appear once under
+  each represented watched sender; All senders still shows it only once. Filtering
+  by a non-newest member must not suppress the conversation or change its identity.
+- Order conversation rows by newest eligible retained activity, with deterministic
+  canonical tie-breaking. The row's title/activity may reflect a newer visible
+  member than the one matching the filters; show that distinction truthfully.
+  Keep subject/time/source-account and full sender/address access; do not hide
+  addresses behind permanent ellipsis or imply a mixed chain has one sender.
+  Use only members allowed by current thread visibility; no other sender's chain.
+- Aggregate existing member indicators truthfully (pending/failed/action/attachment/
+  truncation cues, with counts or mixed state where needed), without executing
+  anything. Do not present a representative member's single value as the whole
+  conversation's value or add a conversation-wide mutation. Preserve existing
+  expiry/refresh owners and the minimum-expiry scalar handoff, not one timer per
+  message or automatic paging to discover pending work.
+- List cursors must bind the actual conversation order/key, complete query/scope
+  and relevant projection revision. Reject old flat-message cursors and stale or
+  mismatched group positions. Revalidate membership/identity in the query snapshot;
+  never merge different scopes or repair an invalid cursor with a client offset.
 
-## R2 — preserve every action's target, prerequisites and effects
+### R0d — one far-right reader for one or many emails
+
+- Give each eligible conversation one semantic primary-row control. Pointer and
+  native Enter/Space activate the exact current conversation once in the existing
+  right-hand reading pane. A single email uses the same path/renderer as a chain.
+  Remove the separate Open thread control, row expansion and top Selected-message
+  section only when this coherent replacement is usable at every width.
+- Keep cards neutral and actions/links/disclosures separate. No nested buttons,
+  controls-bearing listbox or card-wide bubbling that opens a conversation when
+  clicking an action, selecting text, dragging or using a form control. No initial,
+  hover or background-refresh selection; stale/partial/blocked rows remain inert.
+- Same-current-conversation reactivation preserves ready/pending reading state,
+  loaded pages, scroll and pending action lifetimes, without duplicate reads.
+  Existing explicit Retry remains the failure recovery path. Back closes/clears
+  through the same owner and returns to the initiating eligible conversation row
+  or visible heading fallback, preserving the latest list scroll without paging.
+- Use one shared message-reader/order/paging owner for Inbox and Vendors, with
+  distinct scoped entry contexts. Inbox supplies the guarded per-email action
+  adaptor under R1; Vendors retains its read-only action boundary. No alternate
+  per-entry sort or separate singleton/thread UI. Preserve resolution/explicit
+  ambiguous chooser, partial-history/Sent/no-text states, body/copy/inventory
+  controls, textContent-only rendering and existing read/removal fences.
+- [The shared thread contract][thread-view] owns newest-first message ordering,
+  deterministic ties/unknown dates, initial newest page and Load older messages.
+  No eager full history/body load, provider fetch or search for an older matching
+  member. A list match on an old member still opens the newest page; that member's
+  card/extras appear only after its older page is explicitly loaded.
+
+## R1 — conversation lifetime and independent per-message bindings
+
+Conversation selection is the exact scoped conversation plus committed query and
+operation scope, not the row representative's identity or lifetime. Its owner
+must rederive current eligible membership in one snapshot. If the read protocol
+carries an origin message as an admission anchor, renew it only from a fresh
+committed projection of this same conversation. Removing/changing the displayed
+representative does not itself select another conversation. No cached, arbitrary
+or stale thread reference authorizes a read.
+
+For every loaded canonical email, create a typed immutable action context only
+from its **own** current Inbox record/action projection, complete native origin,
+conversation membership, operation scope and conversation/member lifetime. A
+thread message/copy projection is not action admission. A valid member may have
+extras even when a different member matched the list filters; show that it is
+retained conversation context rather than a matching Inbox result. Account and
+identity scope never widen. Missing/unavailable body content alone does not
+suppress an otherwise current Inbox email's extras. Physical/Sent-context copies and other members with
+no independently eligible Inbox action projection are content-only. Direction
+alone neither grants nor substitutes for that record.
+
+Mount the PR #358 renderer inside each eligible loaded email's card, exactly once
+per canonical message, with that typed context and its existing dependencies.
+Each email owns its analysis, deadline, attachments/results, calendar, automation,
+Retry and Delete locally controls. There is no shared top action block, borrowed
+member payload, hidden duplicate renderer or per-conversation batch action. The
+shared reader may expose one guarded Inbox-specific adaptor/slot; do not copy
+handlers or create a second selection/query/refresh controller.
+
+Use one named current-context check at the existing integration owner. Invalid,
+missing, old-query, removed, held or foreign member bindings produce no actionable
+context. No fallback to active account, sender, subject, array index, row seed or
+currently focused email. Native/backend admission and version/CAS remain final.
+
+A same-query refresh may preserve a pending step's minimal captured target and
+lifetime when fresh membership still proves the same conversation and that same
+email in the same scope with no hold. New row/card objects, page rendering or
+reader refresh generation alone do not cancel it; no old payload/DOM is retained
+as permission. Failed revalidation, changed conversation/scope/lifetime or lost
+member eligibility aborts it visibly under R3. Another member's eligibility never
+revives it.
+
+## R2 — unchanged per-email targets, prerequisites and effects
 
 | Existing control family | Required unchanged command/effect and target |
 | --- | --- |
-| Retry analysis | Existing eligibility and explicit `analysis_requeue` for the captured origin's message ID; no retry on selection, render or refresh. |
+| Retry analysis | Existing eligibility and explicit `analysis_requeue` for that email's captured origin message ID; no retry on selection, render or refresh. |
 | Attachment Open | Existing `attachment_open` with that message ID and retained attachment part ID; default-app opening only after explicit activation. |
-| Connect actions / Resume | Existing selected provider tuple, capability/version, parameter collection/validation, manifest features, confirmation requirement and `attachment_capability_invoke` payload. Keep original job reconciliation/request-ID rules and structured refusal/reselection behavior. No silent provider substitution or duplicate job. |
+| Connect actions / Resume | The message's explicitly selected provider tuple, capability/version, parameter collection/validation, manifest features, confirmation requirement and `attachment_capability_invoke` payload. Keep original job reconciliation/request-ID rules and structured refusal/reselection behavior. No silent provider substitution or duplicate job. |
 | Capability outputs | Existing message/part/job/artifact binding for presentation, preview and opening/export controls. No automatic preview, broader file access, changed output limit or hidden retained preview. |
 | Automation confirmation/decline | Existing fire identity, prepared rule/version/state evidence, consent text and `runAutomationDecision` owner. Preserve the refresh-required barrier after a failed decision refresh and all truthful queued/completed/refused outcomes. |
 | Calendar create/recheck/decline | Existing message ID, run ID, state/proposal versions and proposal hash, account identity, expiry behavior, invitation warning and confirmation. Preserve the distinction between a saved decision and a completed external write. |
 | Delete locally | Existing `deleteInboxItem` and `InboxRemovalClient`, exact origin message ID, local-only confirmation, dual-reader hold and durable completed/deferred/refused results. Selection never broadens deletion to a thread, vendor, sender or account. |
 
-The UI entry is new; no native IPC signature, API, schema, admission, entitlement,
-version/CAS rule or backend target resolution changes in this slice. Preserve
-empty/false/zero values where the existing contract admits them; do not invent
-defaults for missing identity, version, parameter or permission fields. If an
-existing boundary cannot support the migration safely, stop for a plan amendment
-rather than extending the backend under a presentation change.
+Every table entry applies to the initiating email, never to the row's newest,
+matching or focused member. Preserve admitted false/zero/empty parameter values;
+do not manufacture identity, version, permission or provider defaults.
+Only the read projection/wire/order surfaces listed below change. Existing
+mutating command payloads, native admission, consent, versions/CAS and operation
+owners do not change; selecting/opening/scrolling runs none of these actions.
 
-## R3 — confirmation and completion belong to the original message
+## R3 — pending steps and outcomes belong to one email
 
-For each operation, trace: current selection -> captured minimal operation target
--> parameter/confirmation awaits, if any -> current-context check -> existing
-operation owner/native command -> target-owned outcome -> existing refresh owner.
+Trace every operation: eligible per-email context -> captured minimal exact
+message/part/provider/capability/job/fire/proposal target and versions -> existing
+parameter/confirmation awaits -> same-owner current-context check -> existing
+native operation -> target-owned outcome and guarded refresh.
 
-- Check context before collecting input and again immediately before dispatch,
-  after every intervening asynchronous parameter/confirmation step. Switching
-  A-to-B, Back, query/account change, loss/change of the originating identity or
-  scope, or a mutation hold before dispatch aborts the old UI attempt. An ordinary
-  same-query refresh is not itself such a loss; apply R1's survival rule. A's
-  dialog can never authorize B. Declines
-  retain their existing explicit-activation behavior; do not add confirmation
-  dialogs where none exist. No calls occur merely from focus, hover or rendering.
-- If approval or parameter submission arrives while that same-query refresh is
-  already in progress, keep one pending step and await that owner's revalidation
-  outcome before dispatch. Show that the step for A is waiting and has not yet
-  been sent. Do not enqueue a second refresh, hunt for A with extra pages, start a
-  retry loop or require the user to approve again merely because of a re-render.
-  Observe the existing refresh owner's actual commit/failure outcome;
-  [`InboxReload.request()`][refresh-owner] is not a join signal: while active it
-  can queue another request and immediately return false. Repeated same-query
-  invalidations retain the same pending step; they do not create new attempts or
-  replace the originally approved target/versions.
-  After a fresh commit, unchanged eligible A dispatches exactly once with its
-  original captured target and versions. Failed revalidation, absent A, a changed
-  scope or a cancelled selection aborts visibly. If approval arrives after the
-  fresh commit, apply the same check immediately. Already-dispatched operations
-  retain the separate completion rule below.
-- Every abort after explicit approval or parameter submission must show an
-  accessible notice identifying the original message A: **not sent**, with the
-  actual reason, such as changed selection/scope, unavailable origin or failed
-  Inbox revalidation. Never use a bare return or suggest an external action was
-  sent or completed. The notice remains observable outside the selected section,
-  cannot be silently erased by the refresh that caused it, and does not steal
-  focus or appear as B's result. Dialog denial/dismissal preserves its existing
-  cancellation meaning.
-- Capture the existing typed message/part/provider/capability/job/fire/proposal
-  target and versions. Do not consult the then-selected row after an await or
-  substitute B's IDs into A's operation. The original native/backend admission,
-  consent and version checks still decide whether the operation is allowed.
-- Once a command has actually been dispatched, selection change alone does not
-  cancel, repeat or falsify that operation. Keep its minimal target and existing
-  in-flight/request bookkeeping until its real outcome is reconciled. Do not keep
-  an entire old `InboxItem`, old details DOM or preview bytes as operation state.
-- A completion may update A's normal stored/keyed state and trigger the existing
-  guarded Inbox refresh. It cannot insert A's result, error, loading state, focus
-  or scroll into B's selected section. Any global notice about A must identify A
-  truthfully rather than implying the currently selected B was acted on. Preserve
-  B's continuity only through #353's existing fresh-span/read guards.
-- Use existing per-operation in-flight guards across the whole UI lifetime. Moving
-  or remounting the section, selecting A again or a duplicate click must not issue
-  a second decision/job. An error refreshing the Inbox is not proof that the
-  underlying external action failed; preserve its existing recovery barrier.
-  Preserve the existing distinction between resuming an active job and a new,
-  explicitly requested invocation after terminal completion; do not add a blanket
-  ban on legitimate repeat actions.
+- Check before collecting input and immediately before dispatch after every await.
+  A's approval can only dispatch A's original target/parameters/versions/hash, once.
+  Clicking/focusing/expanding B in the same current conversation does not retarget
+  A or create another message-selection owner; A may proceed only if A's binding
+  remains current. Never consult a then-focused or representative email after an
+  await. Decline/dismissal keeps its existing semantics; no new consent dialogs.
+- A-to-another-conversation, Back, changed query/account/scope, member removal,
+  mutation hold or tab/view hiding before dispatch invalidates that UI attempt.
+  Returning to the same conversation/tab does not revive its old lifetime. Same
+  conversation reactivation and fresh same-query projection alone do not cancel
+  A; preserve R1's survival rule and its exact captured payload.
+- If approval arrives during same-query refresh, retain one minimal pending step
+  and await the existing refresh owner's actual commit/failure outcome. Show A
+  waiting/not sent. InboxReload.request is not a join signal. Do not queue another
+  refresh, auto-page to find A, retry-loop or demand reapproval due only to render.
+  On fresh unchanged membership, dispatch once; on failure/lost eligibility abort.
+- After explicit approval/submission, every abort yields a persistent accessible
+  **not sent** notice naming A and the real reason, outside hidden/removed cards.
+  It survives the causal refresh, remains observable across a tab change, does not
+  appear as B's result and does not steal focus. No bare-return approval loss.
+- Once dispatch occurred, conversation change, tab hide or card unmount alone does
+  not cancel/repeat/falsify it. Keep only minimal target/request bookkeeping until
+  the real result is reconciled; no whole old InboxItem, old DOM or preview bytes.
+  A completion may update A's keyed state and request the existing guarded refresh;
+  it cannot place A's status/result/focus/scroll in B or a different conversation.
+- Preserve per-operation in-flight/request-ID guards across remount/selection/page
+  changes. Duplicate activation cannot issue another decision/job. Preserve the
+  distinction between resuming an active job and a legitimate explicit new action
+  after a terminal result. A refresh failure is not proof an external write failed;
+  preserve the current decision-refresh and uncertainty/recovery barriers.
 
-## R4 — invalidate presentation without weakening the reader or removal barriers
+## R4 — invalidation, bounded restoration and message-only removal
 
-Clear selected detail/preview DOM and the actionable selection context immediately
-on invalidation, Back, tab hiding, query/account change or mutation hold. Disabled
-or CSS-hidden old controls are insufficient. Retained previous-query list rows may
-still show their existing concise Previous results projection; they cannot open
-the new section or supply an actionable context.
+On invalidation, query/account/conversation change, Back, tab hiding or mutation
+hold, immediately clear old body/copy/inventory/details/preview DOM and actionable
+contexts. CSS-hidden or disabled stale controls are insufficient. Previous-query
+conversation rows may retain a concise Previous results projection but cannot
+supply reads/actions. Leaving Inbox follows the existing view owner and closes
+its reader; a same-view navigation click is not a new lifetime.
 
-Clearing the actionable presentation during an ordinary same-query refresh does
-not cancel an already pending step's minimal captured target and selection-lifetime
-token. Keep no old row/detail/preview payload in that pending step. It authorizes
-no new action from stale rows and must pass R1/R3's fresh revalidation before any
-dispatch; failed or ineligible revalidation produces the visible not-sent notice.
+For same-query refresh, retain only bounded user reading intent and minimal
+pending targets/lifetime tokens, not old member payloads, cursors, DOM or bytes.
+Revalidate the fresh conversation and each relevant member before restoring from
+fresh projections. Keep the existing page/count/post-body-read guards and bounded
+replay of the user's already loaded span; never page to find a match, removed
+representative or hidden action target. Back during refresh still permits current
+list commit independently of reader restoration. Resizing causes no reopening or
+new query, and background completion does not steal focus.
 
-After a same-query refresh, render selected details only from the fresh committed
-row with the same complete origin. Do not preserve old analysis/attachment/result
-payloads in #353's bounded reading intent. Old body/copy/inventory bytes and
-capability-preview DOM remain cleared; body restoration still requires the
-existing fresh same-thread/context reads. A missing origin stays unavailable,
-without a deletion claim, automatic replacement selection or extra paging.
-
-Do not couple Inbox span commit to reader restoration again: Back during refresh
-must still commit current rows with `refreshReader=false`, leaving Open enabled.
-Keep the generation/identity/page/count/post-body-read checks proved in #353.
-
-Begin the existing nested mutation hold before a removal dispatch and clear both
-Inbox and Vendors reader payloads as today. Ending one nested hold cannot revive
-the section or reader while another remains. Deferred/refused removals stay
-truthful; physical retention does not authorize showing held bytes. Preserve
-explicit Retry and the existing refresh scheduler; introduce no competing loop.
+Begin the existing nested mutation hold before removal; clear both Inbox and
+Vendors reader payloads. Ending one hold cannot restore anything while another
+remains. Delete locally targets only the initiating canonical email and its
+existing logical-unit/copy scope. It never deletes the conversation, another
+member, all mail from a sender or an account. Removing a representative can renew
+only the same conversation through a fresh eligible member after revalidation.
+The conversation remains while other members are retained; its row remains only
+if the current Inbox query still matches a remaining eligible member. Otherwise
+clear the out-of-query selection truthfully, without saying the whole conversation
+was deleted. Last-member removal, deferred/refused removal and retained held bytes
+must remain distinct. Clear local history keeps its history-wide scope outside
+the reader; selected conversation/filter must never narrow it.
 
 ## R5 — bounded layout, keyboard and information parity
 
-Keep the existing content-width-driven wide/split/single modes and their scroll
-owners. Selected details and the timeline use the same bounded reading wrapper;
-do not add a per-message details scroll box. Preserve the existing body-text
-scroll protection. Long summaries, attachment names, results, addresses and
-expanded controls wrap without horizontal document overflow or clipped controls.
+Keep content-width-driven wide/split/single presentation and the existing scroll
+owners. One right reading wrapper holds the loaded conversation, with per-email
+extras and existing body-text scroll protection; no separate message-details
+scroll boxes. Narrow mode still exposes the same viewer with usable Back. Long
+text/addresses/names/results wrap without horizontal page overflow or clipping.
 
-Keep Search/Filters/applied scope, sender navigation, Load more and message scroll
-behavior. List rows retain enough current state to identify a message requiring
-attention without running its action. Preserve explicit opening, no initial read,
-Back, selected-state semantics, short-height/200% fallback and keyboard reachability.
-Focus follows explicit user actions; background completion and resizing cannot
-steal it. Preserve the corresponding control across a current selected-section
-render, falling back to its heading if the control disappears. Hidden/closed
-sections are absent from keyboard and accessibility navigation and hold no old
-preview DOM.
+Preserve list cues, sender navigation, Search/applied scope/Load more and truthful
+mixed/partial/no-match states. Focus follows explicit row/actions, stays with a
+corresponding per-email control after current renders, and falls back to its
+message/reader heading when absent. Hidden regions are absent from keyboard and
+accessibility navigation. R0a/R0b govern header and Filters geometry; do not use
+outer overflow suppression to meet a screenshot.
 
-## Implementation order and acceptance gates
+## Required future change surface and non-scope
 
-1. This PR changes only this proposal. Oversight reviews its exact head; Juan must
-   accept that revision and separately authorize implementation. Green CI is not
-   plan acceptance or permission to merge this proposal.
-2. In a separate implementation PR, introduce the single guarded details renderer
-   by extracting the real row controls. Prove parity of existing payloads,
-   confirmations, eligibility, request identities and outcomes before moving the
-   surface or changing row expansion. No copied alternative implementation.
-3. Move the one instance into the selected-message section and retire redundant
-   Inbox expanded-row details/state together. Every reviewable stage must retain
-   a usable narrow flow and access to all existing action families. Do not ship a
-   wide-only stage or temporarily drop calendar/automation/deletion controls.
-4. Require actual-handler regressions, the affected tests and full desktop suite,
-   typechecking, cold diff and gap audits, source-only browser evidence, exact-head
-   oversight/connector review and green CI. Each implementation merge requires
-   Juan's approval for that PR. Local application build/package/install/promotion
-   remains a separate decision; no live profile, mailbox, provider or model calls.
+After exact acceptance and separate implementation authorization, permitted owners
+are the existing Inbox query/read projection in db.py/engine_api.py and matching
+Rust/TS read wire/decoders; shared thread_reads message order/cursor; existing
+entry/history/refresh integration; one message-reader adaptor and PR #358 details
+renderer; header/Filters/main markup/styles and affected tests. Define explicit
+closed conversation/member projections, required complete selectors and order
+identity at those boundaries. Missing/old flat-message shapes fail closed; no
+client guessing/grouping or permissive legacy fallback. Mutating native commands
+remain unchanged.
 
-## Required verification for implementation — not results of this proposal
+No new provider verb, reply/compose, automatic action/analysis/body fetching,
+identity derivation, capture/retention/attribution rule, storage schema migration,
+CSP/dependency/workflow/model change or action authority on arbitrary historical
+context. A non-Inbox member has no extras merely because another member does.
+Vendors uses the same reader/order while retaining its read-only action entry.
+If new persistent state, identity rules or mutation APIs are necessary, stop for
+another contract amendment rather than widening this one silently. Windows issue
+#360 and other unrelated work remain separate. No live app/config/timer/mailbox,
+local application build/package/install/promotion or human LCS records here.
 
-| Boundary | Evidence that must falsify a broken implementation |
+## Staging and acceptance gates
+
+1. This PR changes only this plan and the marked selector/desktop-view clauses in
+   THREAD_VIEW_CONTRACT.md. New exact-head oversight/connector/CI and Juan's exact
+   acceptance are required. Green CI or an older PASS is not permission to merge.
+2. Implementation requires separate direction. Header first, including all-view
+   geometry and Inbox height proof. Then the authoritative conversation projection
+   plus unified reader/per-message extras with the preserved safety guards.
+3. Use stacked reviewable implementation PRs if the combined diff exceeds about
+   1,000 lines including tests. Typed projection/guard stages may land with old UI
+   intact; switch the list/viewer coherently only when all controls and narrow flow
+   work. No duplicate rows/actions, wide-only stage or temporarily dropped family.
+4. Each implementation PR requires actual-owner regressions, affected/full desktop
+   checks, relevant Python/Rust/read-wire checks, type/lint/format, cold/gap audit,
+   Chromium/WebKit source-only evidence, exact-head independent review/CI and Juan's
+   PR-specific merge approval. Build/install/promotion stays a separate decision.
+
+## Required verification — future proof, not results of this document
+
+| Boundary | Both sides that must be proven |
 | --- | --- |
-| One surface and parity | Every current action/detail family is reachable on a selected origin, mounted once, with exact old IPC payloads and consent. Compact unselected rows retain all indicators; old row expansion/hidden action clones are gone. Exercise no attachments, one/many attachments, unavailable analysis and valid false/zero values. |
-| Identity and availability | Provider/account/mailbox/native-ID lookalikes, missing/partial context, previous-query rows and changed mailbox scope cannot target the wrong item. Valid vendor, non-vendor and unresolved/ambiguous/failed thread lookups retain eligible Inbox-owned details; no action is borrowed from another timeline message/copy. |
-| Dialog and dispatch | For every async-confirmation family: open A, pause its parameter/dialog step, select B or Back/change query/hold, then approve A; no native dispatch. The current unchanged A positive dispatches once with its original exact target. Decline and cancelled dialogs preserve existing semantics. |
-| Background refresh during a pending step | For each calendar, capability and automation confirmation/parameter path, let a scheduled-check refresh and a Connect-queue refresh land while A's step is pending. Same complete origin, scope and selection lifetime with no hold: exactly one dispatch using the original captured IDs, parameters, versions and hash, despite changed span/row objects or reader refresh generation. Absent A, changed scope, failed refresh, Back or A-to-B-to-A lifetime change: zero dispatch and an observable A-specific not-sent notice/reason after approval. Run both orders: refresh commits before approval; approval/submission arrives while refresh is in progress and is released only after its outcome. Assert waiting is visible, no duplicate call/refresh/paging, no bare-return approval loss and no A notice/focus transfer to B. |
-| In-flight outcomes | Dispatch A then select B; finish success, refusal, transport uncertainty and refresh failure in both response orders. No B result/focus/scroll mutation or duplicate A call; durable A recovery remains reachable after returning and refreshing. Include equal subjects/filenames across accounts. |
-| Writes and expiry | Calendar invitations and expired-recheck paths retain exact account/version/hash/consent. Automation stale versions and decision-refresh barriers remain enforced. Confirm/decline double clicks, remounts and selection loops cannot duplicate decisions or submit a second capability job. |
-| Removal and hidden bytes | Cancel/accept/delete/clear with nested holds and both readers open; completed/deferred/refused outcomes, old callbacks and physically retained bytes. Context/old details/preview DOM clear before dispatch, source mail remains untouched, Clear remains history-wide and B cannot inherit A's target/outcome. |
-| Refresh and prior regressions | Current span commits after Back independently of reader cancellation. Repeated invalidations, origin on a later loaded page, stale cursors, body failures, A-to-B/B-to-A late completions and the #353 replay/page/count guards retain their meaning. Fresh row state replaces old details without stale controls. |
-| Real browser | Chromium and WebKitGTK: 1920x1080, 1524x785, 1024x768, 640x520, 320 CSS px, short heights and 200% text/zoom; long details, open Filters and populated actions. Exercise actual scroll/focus, explicit Open/Back, same-origin re-render, action completion while focus is elsewhere and content-width changes independent of viewport width. No fake-DOM-only geometry claim. |
+| Header/Filters | All views at fixed viewport/text/zoom/scroll keep header bounds and reachable labels. Repeated Filters closed/open/closed preserves outer extent, pane bounds, sender/message/reader scroll, selection/drafts and zero extra reads, including already-scrollable/short layouts. Preserve every field, busy/admission state, Apply/Search/Reset/Escape/Close and focus. |
+| Conversation identity | Singleton, one multi-member thread, several unrelated chains from one sender/vendor, mixed senders, equal subjects/native IDs across accounts/identities, aliases/copies and IMAP merges. One row per scoped conversation, no duplication across list-page boundaries. Never group by sender/subject. |
+| Filtering/counts | Non-newest-member match; all predicates on the same eligible member versus cross-member false positives; watched-sender views and All; only-context/no-Inbox match refuses. Counts/page limits describe conversations after grouping, independently of member totals. Correct singleton, empty and last/representative-member removal. |
+| Reader/paging | Inbox and Vendors use the same newest-first order, canonical ties and unknown-date placement. Exact page boundary, complete older append without gaps/duplicates on valid cursors, no old-page load without the explicit click. Concurrent arrivals exercise snapshot order versus stale rejection and explicit restart under the shared contract; old-order/wrong-scope/invalid/stale cursors refuse. An older matching member never causes automatic paging. |
+| Per-email extras | Two admitted members A/B each show their own payloads and controls once. A's approval/completion cannot target or decorate B in the same conversation. Context/Sent copies without a current independent Inbox projection are content-only; an eligible record is not inferred from direction or body. No top Selected-message block or copied handler. |
+| Pending/visibility | Pause every async action for A; focus/read B in the same conversation, repeat same-row activation, refresh before/during approval, switch conversation/Back/query/account, remove A and hide/show tabs. Unchanged A survives allowed refresh; changed/hidden context refuses with A-specific not-sent notice. Run tab hide both before dispatch (no command) and after dispatch (one real outcome, no hidden/wrong card/focus). Returning cannot revive cancelled lifetimes. |
+| Actions/removal | Preserve exact IDs/provider/parameters/versions/hash/consent, stale-CAS and decision-refresh recovery, duplicate-click guards, uncertainty/resume versus legitimate repeat. Nested holds clear both readers; removing one email keeps other members and correct filtered-row eligibility. Clear remains global and no provider mail is mutated. |
+| Browser/accessibility | Actual production owners/IPC mocks in Chromium and WebKit at 1920x1080,1524x785,1440x900,1280x720,1024x768,640x520,320 CSS px, short heights and 200% text/zoom. Pointer/Enter/Space opens once; actions/links/disclosures/text selection/drag/form controls do not open a row. Same-origin no duplicate read/lifetime reset; Back exact target/fallback; body/copy/preview byte clearing and scroll/focus parity. |
 
-Use the existing fixture/native mocks, not the installed application. Record exact
-browser versions and harness hashes. Run real production handler/renderer wiring
-with controlled IPC, not tests that reimplement the proposed current-context rule.
-Use fail-before/pass-after proof for any defect found while extracting handlers,
-and per-clause mutants for the selection, post-await and outcome guards. Equivalent
-survivors need a concrete dominance explanation. Browser/static-webview results do
-not qualify packaged IPC or production CSP; keep that promotion gap explicit.
+Reuse existing fixtures, not a duplicate rule in tests or the installed app. Record
+exact source/harness/browser versions/settings and all warnings. Add fail-before/
+pass-after and negative/mutation proof for new guards or defects; explain any
+equivalent survivor. Source-only browser evidence is not packaged IPC/CSP or
+installed-product qualification. For this documentation PR run only document
+checks, including the existing Thread contract seam checker, not application
+behavior suites. Proposal complete is not accepted/implemented/merged/installed.
 
-## Non-scope and proposal validation
-
-No reply/compose, action on arbitrary historical thread messages, new provider or
-API, HTML/Markdown rendering, bulk action, schema/storage/capture/retention change,
-new query/lifecycle controller, dependency, native admission change or unrelated
-tab redesign. Do not fold in #349-350's nonblocking test/cosmetic follow-ups, the
-Windows descriptor flake, the model work or frozen attachment-contract work.
-Human LCS gap/promotion records remain held; this UI proposal writes none.
-
-For this docs-only PR, check baseline/merge trees, owner citations and relative
-links, open-work overlap, the single-file diff and whitespace. Do not run or claim
-new application tests for a contract document. Proposal complete does not mean
-behavior accepted, implemented, merged, installed or qualified.
-
-[rows]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L1807-L1917
-[calendar]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L1919-L2082
-[attachments]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L2085-L2464
-[row-actions]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L2482-L2529
-[integration]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L927-L950
-[entry]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/inboxThreadEntry.ts#L18-L240
-[lifecycle]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L1241-L1265
-[removal]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L2876-L2990
-[history]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/threadHistory.ts#L36-L72
-[outputs]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L1548-L1685
-[thread-dom]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/threadViewDom.ts#L267-L364
-[native]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src-tauri/src/lib.rs#L1857-L1955
-[native-calendar]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src-tauri/src/lib.rs#L2127-L2145
-[reader-generation]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/inboxThreadEntry.ts#L93-L124
-[scheduled-refresh]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L5447-L5451
-[queue-refresh]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/main.ts#L3180-L3196
-[confirmation]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/confirmation.ts#L7-L20
-[refresh-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/dc39c48d959ccbcf55a49c8905175295a112a419/desktop/src/inboxReload.ts#L61-L100
+[identity]: ../docs/THREAD_VIEW_CONTRACT.md#d-identity-message-identity-direction-and-thread-keys
+[thread-view]: ../docs/THREAD_VIEW_CONTRACT.md#thread-view-desktop
+[inbox-query]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/src/eom_email_watcher/db.py#L14356
+[query-api]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/src/eom_email_watcher/engine_api.py#L2598
+[query-host]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src-tauri/src/lib.rs#L1615
+[query-types]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/main.ts#L161
+[members]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/src/eom_email_watcher/thread_reads.py#L334
+[message-pages]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/src/eom_email_watcher/thread_reads.py#L129
+[cursor-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/src/eom_email_watcher/thread_reads.py#L236
+[reader-page]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/threadViewDom.ts#L293
+[details-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/main.ts#L1807
+[view-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/threadHistory.ts#L24
+[header-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/main.ts#L516
+[shell-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/styles.css#L39
+[layout-owner]: https://github.com/canfieldjuan/eom-email-watcher/blob/e7e5e0ba9d4a6fc13a3266b06f16a8a09ce66e6e/desktop/src/inboxThreadEntry.ts#L178
