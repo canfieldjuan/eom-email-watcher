@@ -97,6 +97,47 @@ Two code facts follow from this:
 `landlock(7)` gives ABI 1 as Linux 5.13, ABI 2 as 5.19 and ABI 3 as 6.2. Those kernels were
 not tested here.
 
+### SQLite temporary files
+
+`sqlite_tempdir.py` confines a child the same way, then makes SQLite spill a temporary table
+and a sort to disk: 20,000 rows of 1,000 bytes with a 512 KiB page cache. Python 3.13.11,
+SQLite 3.51.0.
+
+| Case | Result |
+|---|---|
+| Control: `TMPDIR` inside the root when the process starts | ok |
+| Control: `TMPDIR` set in-process before `import sqlite3` | ok |
+| `TMPDIR` set after `import sqlite3`, before any connection | `unable to open database file` |
+| `TMPDIR` set after a first connection | `unable to open database file` |
+| `TMPDIR` never pointed inside the root | `unable to open database file` |
+| `TMPDIR` unchanged, `PRAGMA temp_store = MEMORY` on the connection | ok |
+
+SQLite's temp directory is fixed by the time `import sqlite3` returns. Pointing `TMPDIR` at a
+private directory afterwards does not reach it. `cli.py:18` imports `db`, which imports
+`sqlite3` (`db.py:10`), so the module is loaded before `cli.main` runs and before any
+confinement placed there. Without the SQLite clause in R5, a confined run fails as soon as
+SQLite needs a temporary file, for example a sort or temporary table larger than its cache.
+
+### Write-site inventory
+
+A syntax-tree scan listed every call under `src/eom_email_watcher` to a write-class API: file
+opens for writing, renames, links, directory and temp-file creation, deletes, permission
+changes, locks and `sqlite3.connect`. String and datetime `replace` calls were discarded, and
+`benchmark.py` was excluded because it cannot run inside `check` or `send-hours`.
+
+By the target expression at each remaining site, every write lands beneath the configuration
+file's directory, a token file's directory or the database's directory, or sits in a
+Windows-only path. The exception is the default-temp file in admission (`deployment.py:362`),
+which R5 covers. The only SQLite connection site is `Store.connection` (`db.py:6425`).
+
+In the pinned `connect-automate` dependency, the disk writers are entitlement installation,
+reached only from the desktop operation `connect.entitlement.install` (`engine_api.py:6566`),
+and an automation store this repository does not use.
+
+Limits: sites were classified by their target expression, not by tracing every caller, and
+third-party libraries other than `connect-automate` were not read. The settling trace in the
+verification plan remains the authority.
+
 ## Required behavior
 
 ### R1 — which executions are confined
@@ -168,6 +209,12 @@ and Python's `tempfile` point at it for the run and its children. It is removed 
 ends, on success and on error. A later run removes directories left by dead runs and never
 one that belongs to a live run.
 
+SQLite's temporary storage obeys the same boundary. Its temp directory is fixed before
+confinement can run (measured above), so `Store.connection` (`db.py:6421-6430`), the one
+connection owner, sets `PRAGMA temp_store = MEMORY` on every connection it opens in a
+confined process, beside the pragmas it already sets. Connections in an unconfined process
+are unchanged.
+
 ### R6 — nothing else changes
 
 On a host where the scheduled path already writes only inside the roots, stdout, exit status,
@@ -219,12 +266,27 @@ available to an unprivileged user service on this platform | justified`.
 - The input class Landlock misses is listed under "Not refused" above, with a test on each
   side in the verification plan.
 
+SQLite temporary storage: `mechanism: PRAGMA temp_store = MEMORY at the single connection
+owner, in confined processes | the strongest available at that owner | justified`.
+
+- Confining before `sqlite3` is loaded, with `TMPDIR` set first, would work only for the
+  frozen dispatcher (`deployment.py:994-1014`), which imports `cli` lazily. The source console
+  script `eom-mail-watch = "eom_email_watcher.cli:main"` (`pyproject.toml:21`) loads `sqlite3`
+  while importing `cli`, before any product code runs. Any future earlier import would also
+  undo it.
+- `PRAGMA temp_store_directory` is deprecated by SQLite.
+- Allowing writes to `/tmp` or `/var/tmp` would reopen the shared temp directories that the
+  units meant to hide with `PrivateTmp=yes`.
+- The cost is memory: temporary tables and sorts of a confined run stay in RAM.
+
 ## Required change surface and single owner
 
 - New `src/eom_email_watcher/confinement.py`: the only owner of the roots, the ruleset, the
   R3 key list, the private temp directory and the R4 errors.
 - `src/eom_email_watcher/cli.py`: one call, in `main`, for scheduled commands only. No other
   call site.
+- `src/eom_email_watcher/db.py`: in `Store.connection`, the SQLite clause of R5, asking the
+  confinement owner whether the process is confined. No other connection site exists.
 - New tests. Four test files call `cli.main` or a scheduled body in-process
   (`tests/test_cli.py`, `tests/test_outbound.py`, `tests/test_engine_api.py`,
   `tests/test_ntfy_disclosure_migration.py`). The implementation must keep those from
@@ -266,7 +328,11 @@ Fail-first at the base. Every confined step runs in a separate process.
    access. No environment variable or flag changes the result.
 6. **R5.** Two overlapping runs keep separate directories. A directory left by a killed run
    is removed by the next one. A live run's directory survives another run starting.
-7. **R6.** `git diff --stat <base> -- systemd` is empty, the engine's unit payload hashes are
+7. **SQLite temp.** In a confined process, a spill through `Store.connection` (a temporary
+   table and a sort larger than the page cache) succeeds. Removing the pragma makes the same
+   run fail with `unable to open database file`. A connection in an unconfined process keeps
+   SQLite's default `temp_store`.
+8. **R6.** `git diff --stat <base> -- systemd` is empty, the engine's unit payload hashes are
    unchanged, and `uv run pytest` and `uv run ruff check .` pass.
 
 Settling evidence, on a host with `kernel.apparmor_restrict_unprivileged_userns=1`:
@@ -290,3 +356,13 @@ Local folder `codex-evidence/eom-email-watcher/363-scheduled-confinement-contrac
 - `reproduction-host.json`: `9e791e4412c70d988960f71ed19b735e0bc98323b3482430dd1e2ceecf6d666b`
 - `reproduction-userns.json`: `dde40ee8dc02bb171012a455eaea31285a00230d85ccf0812d78f0c535d2615f`
 - `reproduction-userns-default-label.json`: `aacec800804938eaf0c055bb620a429d318bb98c48443a611d4d6fd7054e3e72`
+- `sqlite_tempdir.py`: `91e885cab82130113b5fd7372333231af8fe801ba0b9446c14bfeb5d9058df84`
+- `sqlite-tempdir.json`: `027a962242f91d8728d6976e93d87b306863a9ba543ba9912da6101406766b88`
+
+## Revision log
+
+- `dacf251`: first proposal.
+- Revision 2: a confined run cannot create SQLite temporary files, because SQLite fixes its
+  temp directory when `sqlite3` is imported (measured). Adds the SQLite clause to R5, its
+  mechanism, the `db.py` change surface, verification item 7, the write-site inventory and two
+  evidence files. No requirement was removed or weakened.
