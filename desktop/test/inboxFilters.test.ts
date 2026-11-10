@@ -39,13 +39,8 @@ test("Inbox uses available width while Expiry Ledger keeps its existing width ru
   assert.match(styles, /@media \(max-width: 680px\) \{\s*\.shell \{\s*width: min\(100% - 28px, 760px\);/);
 });
 
-test("inbox intro is clipped while retaining its accessible heading", () => {
-  const intro = styles.match(/\.shell\[data-view="inbox"\] \.intro \{([^}]+)\}/)?.[1];
-  assert.ok(intro, "inbox intro must have a view-keyed visually-hidden rule");
-  for (const declaration of ["position: absolute;", "width: 1px;", "height: 1px;", "overflow: hidden;", "clip: rect(0 0 0 0);", "white-space: nowrap;"]) assert.ok(intro.includes(declaration), declaration);
-  assert.doesNotMatch(intro, /display:\s*none|visibility:\s*hidden/);
-  assert.match(source, /<header class="intro">[\s\S]*?<h1>Your signal inbox<\/h1>/);
-});
+// Accepted R0a replaces the clipped, view-dependent intro. Its shared-header
+// replacement is exercised against real layout by scripts/prove_common_header.mjs.
 
 test("expanded content keeps provenance, priority and actions without repeated row items", () => {
   const render = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];

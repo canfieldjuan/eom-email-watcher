@@ -1,4 +1,5 @@
 import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
+import { observeCommonHeader } from "./commonHeader";
 import { ThreadReadClient, type InboxMessageRef } from "./threadReads";
 import { ThreadViewDom } from "./threadViewDom";
 import { InboxThreadEntry, inboxThreadOriginKey } from "./inboxThreadEntry";
@@ -513,13 +514,9 @@ function requiredElement<T extends Element>(selector: string): T {
 const app = requiredElement<HTMLElement>("#app");
 
 app.innerHTML = `
-  <div class="shell" data-view="inbox">
-    <header class="intro">
-      <p class="eyebrow">Local email watcher</p>
-      <h1>Your signal inbox</h1>
-      <p class="lede">Locally retained messages from watched senders and Gmail labels appear here. Followed threads and Sent replies to vendors also appear when captured with Connect.</p>
-    </header>
-
+  <header class="app-header">
+    <div class="app-header-inner">
+    <h1 class="app-name">Local email watcher</h1>
     <nav class="view-tabs" aria-label="Watcher views">
       <button id="inbox-tab" type="button" aria-controls="inbox-view" aria-pressed="true">Inbox</button>
       <button id="watchlist-tab" type="button" aria-controls="watchlist-view" aria-pressed="false">Watchlist</button>
@@ -528,9 +525,13 @@ app.innerHTML = `
       <button id="health-tab" type="button" aria-controls="health-view" aria-pressed="false">Health</button>
       <button id="settings-tab" type="button" aria-controls="settings-view" aria-pressed="false">Settings</button>
     </nav>
+    </div>
+  </header>
 
-    <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
+  <div class="shell" data-view="inbox">
+    <section id="inbox-view" class="view" aria-labelledby="inbox-tab" aria-describedby="inbox-help">
       <h2 id="inbox-heading" tabindex="-1">All senders</h2>
+      <p id="inbox-help" class="view-lede">Locally retained messages from watched senders and Gmail labels appear here. Followed threads and Sent replies to vendors also appear when captured with Connect.</p>
       <div class="inbox-search-toolbar">
         <label class="inbox-keyword-label">
           <span>Subject or summary</span>
@@ -895,6 +896,8 @@ app.innerHTML = `
     </section>
   </div>
 `;
+
+observeCommonHeader(requiredElement<HTMLElement>(".app-header"));
 
 const inboxTab = requiredElement<HTMLButtonElement>("#inbox-tab");
 const watchlistTab = requiredElement<HTMLButtonElement>("#watchlist-tab");
