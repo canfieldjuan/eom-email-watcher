@@ -2620,7 +2620,6 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
         if not isinstance(sender, str) or not sender.strip():
             raise ApiError("invalid_request", "sender must be a non-empty string")
         try:
-            exact_sender_selector_id(sender)
             sender = normalize_validated_address(sender)
         except ValueError as exc:
             raise ApiError("invalid_request", str(exc)) from exc

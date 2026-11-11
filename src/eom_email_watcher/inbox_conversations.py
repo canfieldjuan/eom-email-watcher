@@ -8,7 +8,7 @@ from typing import Annotated, Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import thread_reads
-from .config import exact_sender_selector_id, normalize_validated_address
+from .config import normalize_validated_address
 from .db import Store, _inbox_filter_predicates
 from .mime import body_was_truncated
 
@@ -54,10 +54,7 @@ class Query(Closed):
     @field_validator("sender")
     @classmethod
     def exact_sender(cls, value):
-        if value is not None:
-            exact_sender_selector_id(value)
-            return normalize_validated_address(value)
-        return None
+        return normalize_validated_address(value) if value is not None else None
 
 
 class ThreadRef(Closed):
