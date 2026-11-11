@@ -5,6 +5,7 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from test_thread_reconcile import NOW, seed, state_store
 
 from eom_email_watcher import engine_api
 from eom_email_watcher import inbox_conversations as projection
+from eom_email_watcher.mime import AttachmentDescriptor
 
 
 def api(store, tmp_path, monkeypatch):
@@ -76,20 +78,36 @@ def test_predicates_and_cues_keep_member_units_and_full_sender_labels(tmp_path, 
             "WHERE message_id='a'"
         )
         db.execute(
-            "UPDATE messages SET priority='low',last_error='Synthetic failure',"
+            "UPDATE messages SET priority='low',last_error='Synthetic failure',action_required=0,"
             "analysis_body_chars=7,analysis_body_source_chars=7 WHERE message_id='b'"
         )
+    store.replace_attachments(
+        "b",
+        (
+            AttachmentDescriptor("1", "attach-1", "quote.pdf", "application/pdf", 10, 0),
+            AttachmentDescriptor("2", "attach-2", "terms.pdf", "application/pdf", 20, 1),
+        ),
+    )
     call = api(store, tmp_path, monkeypatch)
-    row = call(sender="a@example.com", keyword="100%", category="invoice", priority="high")["data"][
-        "items"
-    ][0]
+    result = call(
+        provider=" gmail ",
+        account_id=" mailbox ",
+        sender=" A@EXAMPLE.COM ",
+        sender_query=" First ",
+        keyword=" 100% ",
+        category="invoice",
+        priority="high",
+    )
+    assert result["ok"], result
+    assert len(result["data"]["items"]) == 1
+    row = result["data"]["items"][0]
     assert row["counts"] == {
         "messages": 2,
         "matching_messages": 1,
         "pending_messages": 2,
         "analysis_errors": 1,
         "action_required": 1,
-        "attachments": 0,
+        "attachments": 2,
         "truncated_messages": 1,
         "unknown_truncation_messages": 0,
     }
@@ -146,6 +164,30 @@ def test_query_snapshot_does_not_mix_a_concurrent_arrival(tmp_path, monkeypatch)
     assert len(store.query_inbox(limit=25)[0]) == 3
     monkeypatch.setattr(projection.thread_reads, "_members", original)
     assert call(limit=1, cursor=page["next_cursor"])["error"]["code"] == "stale_cursor"
+
+
+def test_cursor_tracks_filter_membership_when_only_summary_changes(tmp_path, monkeypatch):
+    store, _ = state_store(tmp_path)
+    for message_id in ("a", "b", "c"):
+        seed(store, message_id, thread_id=message_id)
+    with store.connection() as db:
+        db.execute("UPDATE messages SET summary='Invoice' WHERE message_id IN ('a', 'b')")
+    call = api(store, tmp_path, monkeypatch)
+    first = call(limit=1, keyword="invoice")["data"]
+    cursor = first["next_cursor"]
+    assert first["totals"]["conversations"] == 2
+    assert cursor is not None
+
+    with store.connection() as db:
+        db.execute("UPDATE messages SET summary='Unrelated' WHERE message_id='c'")
+    assert call(limit=1, keyword="invoice", cursor=cursor)["ok"]
+
+    with store.connection() as db:
+        db.execute("UPDATE messages SET summary='Invoice' WHERE message_id='c'")
+    stale = call(limit=1, keyword="invoice", cursor=cursor)
+    assert not stale["ok"], stale
+    assert stale["error"]["code"] == "stale_cursor"
+    assert call(limit=1, keyword="invoice")["data"]["totals"]["conversations"] == 3
 
 
 def test_scope_null_identity_singletons_and_missing_derived_refuse(tmp_path, monkeypatch):
@@ -260,6 +302,106 @@ def test_response_schema_rejects_legacy_partial_unknown_counts_and_cross_scope(
     assert schema["properties"]["limit"]["maximum"] == 100
 
 
+@pytest.fixture
+def response_page():
+    return json.loads((Path(__file__).parent / "data/inbox_conversation_page.json").read_text())
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "matching_messages",
+        "pending_messages",
+        "analysis_errors",
+        "action_required",
+    ],
+)
+def test_counts_bound_each_member_count_to_conversation_size(response_page, field):
+    counts = response_page["items"][0]["counts"]
+    counts.update(truncated_messages=0, unknown_truncation_messages=0)
+    counts[field] = counts["messages"]
+    assert getattr(projection.Counts.model_validate(counts), field) == counts["messages"]
+    counts[field] += 1
+    with pytest.raises(ValidationError, match="member count exceeds conversation size"):
+        projection.Counts.model_validate(counts)
+
+
+def test_counts_reject_overlapping_truncation_categories(response_page):
+    counts = response_page["items"][0]["counts"]
+    counts.update(truncated_messages=1, unknown_truncation_messages=1)
+    assert projection.Counts.model_validate(counts).messages == 2
+    counts["unknown_truncation_messages"] = 2
+    with pytest.raises(ValidationError, match="truncation counts overlap"):
+        projection.Counts.model_validate(counts)
+
+
+@pytest.fixture
+def two_conversation_page(response_page):
+    other = deepcopy(response_page["items"][0])
+    other["thread_ref"]["thread_key"] = "other"
+    other["latest"]["message_ref"]["message_id"] = "other-newest"
+    other["matching_message_ref"]["message_id"] = "other-newest"
+    response_page["items"].append(other)
+    response_page["totals"] = {"conversations": 2, "messages": 4, "matching_messages": 4}
+    response_page["next_cursor"] = None
+    return response_page
+
+
+def test_page_rejects_duplicate_conversations_with_consistent_totals(two_conversation_page):
+    page = two_conversation_page
+    assert len(projection.Page.model_validate(page).items) == 2
+    page["items"][1]["thread_ref"] = deepcopy(page["items"][0]["thread_ref"])
+    with pytest.raises(ValidationError, match="duplicate conversation"):
+        projection.Page.model_validate(page)
+
+
+@pytest.mark.parametrize(
+    ("conversations", "matching", "messages"),
+    [(2, 1, 3), (1, 3, 2), (0, 1, 1)],
+    ids=["conversations-above-matches", "matches-above-messages", "zero-conversations"],
+)
+def test_page_rejects_inconsistent_totals(response_page, conversations, matching, messages):
+    page = response_page
+    page.update(items=[], next_cursor=None)
+    page["totals"] = {"conversations": 1, "matching_messages": 2, "messages": 3}
+    assert projection.Page.model_validate(page).totals.messages == 3
+    page["totals"] = {
+        "conversations": conversations,
+        "matching_messages": matching,
+        "messages": messages,
+    }
+    with pytest.raises(ValidationError, match="inconsistent totals"):
+        projection.Page.model_validate(page)
+
+
+@pytest.mark.parametrize(
+    ("matches_per_row", "field", "smaller_total"),
+    [(2, "conversations", 1), (1, "messages", 3), (2, "matching_messages", 3)],
+    ids=["conversation-count", "message-count", "matching-count"],
+)
+def test_page_rejects_totals_below_returned_rows(
+    two_conversation_page, matches_per_row, field, smaller_total
+):
+    page = two_conversation_page
+    for row in page["items"]:
+        row["counts"]["matching_messages"] = matches_per_row
+    page["totals"]["matching_messages"] = 2 * matches_per_row
+    assert len(projection.Page.model_validate(page).items) == 2
+    page["totals"][field] = smaller_total
+    with pytest.raises(ValidationError, match="page exceeds totals"):
+        projection.Page.model_validate(page)
+
+
+def test_page_rejects_cursor_when_no_rows_are_returned(response_page):
+    page = response_page
+    cursor = page["next_cursor"]
+    page.update(items=[], next_cursor=None)
+    assert projection.Page.model_validate(page).next_cursor is None
+    page["next_cursor"] = cursor
+    with pytest.raises(ValidationError, match="page exceeds totals"):
+        projection.Page.model_validate(page)
+
+
 def test_latest_activity_uses_canonical_source_ties_and_unknown_dates_last(tmp_path):
     store, _ = state_store(tmp_path)
     seed(store, "b", thread_id="same", received_at=NOW.isoformat())
@@ -273,13 +415,30 @@ def test_latest_activity_uses_canonical_source_ties_and_unknown_dates_last(tmp_p
     assert page["items"][1]["latest"]["received_at"] is None
 
 
-def test_real_projection_matches_the_shared_python_rust_typescript_fixture(tmp_path):
+def test_latest_activity_uses_newer_coalesced_source_time(tmp_path):
+    store, _ = state_store(tmp_path)
+    older = (NOW - timedelta(days=2)).isoformat()
+    newer = NOW.isoformat()
+    rfc_id = "same@example.test"
+    seed(store, "canonical", rfc_message_id=rfc_id, received_at=older)
+    original = projection.query(store, projection.Query())["items"][0]["latest"]
+    assert original["received_at"] == older
+
+    seed(store, "copy", rfc_message_id=rfc_id, received_at=newer)
+    assert store.message_source("canonical").received_at == older
+    page = projection.query(store, projection.Query())
+    assert page["totals"]["messages"] == 1
+    latest = page["items"][0]["latest"]
+    assert latest["message_ref"]["message_id"] == "canonical"
+    assert latest["received_at"] == newer
+
+
+def test_real_projection_matches_the_shared_python_rust_typescript_fixture(tmp_path, response_page):
     store, _ = state_store(tmp_path)
     seed(store, "older", sender="older@example.test")
     seed(store, "newest", sender="newest@example.test", received_at=NOW.isoformat())
     seed(store, "separate", thread_id="fixture-separate")
-    expected = json.loads((Path(__file__).parent / "data/inbox_conversation_page.json").read_text())
-    assert projection.query(store, projection.Query(limit=1)) == expected
+    assert projection.query(store, projection.Query(limit=1)) == response_page
 
 
 def test_same_native_key_stays_separate_across_accounts_providers_and_replacements(tmp_path):
@@ -321,6 +480,26 @@ def test_imap_component_merge_stales_old_page_and_copies_count_once(tmp_path):
     page = projection.query(store, projection.Query(limit=1))
     assert page["totals"] == {"conversations": 1, "messages": 3, "matching_messages": 3}
     assert page["next_cursor"] is None
+
+
+def test_returned_page_rejects_retained_message_with_retired_imap_key(tmp_path):
+    store, _ = state_store(tmp_path, provider="imap")
+    seed(store, "old", provider="imap", thread_id=None, rfc_message_id="old@example.test")
+    seed(store, "survivor", provider="imap", thread_id=None, rfc_message_id="survivor@example.test")
+    query = projection.Query()
+    page = projection.query(store, query)
+    keys = {
+        row["latest"]["message_ref"]["message_id"]: row["thread_ref"]["thread_key"]
+        for row in page["items"]
+    }
+    assert set(keys) == {"old", "survivor"}
+    with store.connection() as db:
+        db.execute(
+            "INSERT INTO thread_key_aliases(old_key, survivor_key) VALUES (?, ?)",
+            (keys["old"], keys["survivor"]),
+        )
+    with pytest.raises(RuntimeError, match="Retained thread mapping is inconsistent"):
+        projection.query(store, query)
 
 
 def test_physical_context_and_removal_holds_never_match_or_read_bodies(tmp_path, monkeypatch):
