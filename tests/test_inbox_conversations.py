@@ -178,30 +178,45 @@ def test_scope_null_identity_singletons_and_missing_derived_refuse(tmp_path, mon
 
 
 @pytest.mark.parametrize(
-    "fields",
-    [{"limit": value} for value in [0, -1, 101, False, "", "2", None]]
+    ("fields", "valid"),
+    [pytest.param({"limit": 2}, True, id="valid-integer-limit")]
     + [
-        {"keyword": " "},
-        {"sender_query": "x" * 321},
-        {"keyword": "x" * 201},
-        {"priority": "wrong"},
-        {"status": False},
-        {"cursor": ""},
-        {"cursor": "x" * 4097},
-        {"thread_key": "unexpected"},
-        {"account_id": " "},
-        {"sender": "not-an-address"},
+        (fields, False)
+        for fields in (
+            [{"limit": value} for value in [0, -1, 101, False, "", "2", None]]
+            + [
+                {"keyword": " "},
+                {"sender_query": "x" * 321},
+                {"keyword": "x" * 201},
+                {"priority": "wrong"},
+                {"status": False},
+                {"cursor": ""},
+                {"cursor": "x" * 4097},
+                {"thread_key": "unexpected"},
+                {"account_id": " "},
+                {"sender": "not-an-address"},
+            ]
+        )
     ],
 )
-def test_invalid_query_is_rejected_before_config_or_database_read(tmp_path, monkeypatch, fields):
-    def forbidden(*args):
-        raise AssertionError("must validate before reading config/database")
+def test_query_validates_before_config_or_database_read(tmp_path, monkeypatch, fields, valid):
+    store, _ = state_store(tmp_path)
+    call = api(store, tmp_path, monkeypatch)
+    load_config = engine_api.load_config
+    config_reads = []
 
-    monkeypatch.setattr(engine_api, "load_config", forbidden)
-    result = engine_api._response(
-        {"protocol": 1, "operation": "inbox.conversations.query", "payload": fields}
-    )
-    assert result["error"]["code"] == "invalid_request"
+    def record_config_read(path):
+        config_reads.append(path)
+        return load_config(path)
+
+    monkeypatch.setattr(engine_api, "load_config", record_config_read)
+    result = call(**fields)
+    assert config_reads == ([tmp_path / "config.toml"] if valid else [])
+    assert result["ok"] is valid, result
+    if valid:
+        assert result["data"]["kind"] == "inbox_conversations_v1"
+    else:
+        assert result["error"]["code"] == "invalid_request"
 
 
 def test_response_schema_rejects_legacy_partial_unknown_counts_and_cross_scope(
