@@ -7,7 +7,7 @@ Base: `5b86ee362fe4012168db79a035a90ca84ca361cd`.
 
 ## Operator acceptance
 
-Pending. Acceptance must answer three decisions; each is user-visible behavior.
+Pending. Acceptance must answer four decisions; each is user-visible behavior.
 
 - **D1 — no bypass.** A Linux host that cannot enforce R2 does not run scheduled commands at
   all (R4). That includes kernels before 6.2 and hosts with Landlock disabled. Mail intake
@@ -20,6 +20,15 @@ Pending. Acceptance must answer three decisions; each is user-visible behavior.
   Closing that needs a mount namespace, which a user service cannot build under the Ubuntu
   restriction; the alternative is a root-installed system service, a different deployment
   model.
+- **D4 — requests to user services are outside the guarantee.** A confined process can still
+  talk to the systemd user manager and the session bus (measured below). Code running inside it
+  could ask the manager to start a transient unit, which runs outside the boundary with the
+  account's full write access. R2 therefore stops a defect that misdirects the process's own
+  writes, not one that gains code execution in it. Closing this needs a confined process tree
+  that uses no user-service socket: admission's manager query (`deployment.py:346-350`, reached
+  from every `Store.connection`) and desktop notifications (`notifications.py:58-62`) would move
+  out of it, and then socket use would be blocked. That is a product restructuring this
+  contract does not choose.
 
 ## Root cause
 
@@ -80,7 +89,10 @@ Not refused, and therefore not claimed by this contract:
 - writing through a descriptor opened before confinement;
 - writing through a hard link that already existed inside the root before confinement;
 - a thread that existed before confinement: the main thread got `EACCES`, the earlier thread
-  wrote outside.
+  wrote outside;
+- requests to unconfined user services over the session bus or the user manager's API, which
+  can start processes or write files outside the domain (D4; measured under "Requests to user
+  services" below).
 
 Restriction without `no_new_privs` is rejected by the kernel (`EPERM`).
 
@@ -96,6 +108,34 @@ Two code facts follow from this:
 
 `landlock(7)` gives ABI 1 as Linux 5.13, ABI 2 as 5.19 and ABI 3 as 6.2. Those kernels were
 not tested here.
+
+### Requests to user services
+
+`ipc_probe.py` runs each case in an unconfined child (the control) and in a child confined with
+the same ruleset as `reproduction.py`, in the same three conditions as the reproduction. It only
+reads a manager property and calls `GetId` on the session bus; it never asks the manager to
+start, stop or change anything. No transient unit was started to prove the consequence.
+
+| Case | Unconfined | Confined |
+|---|---|---|
+| Write outside the root | ok | `EACCES` |
+| Child shell writes outside the root | ok | refused |
+| Write inside the root | ok | ok |
+| Connect to the session bus socket | ok | ok |
+| `systemctl --user show --property=Version` | ok | ok |
+| `busctl --user call` to `org.freedesktop.DBus` `GetId` | ok | ok |
+
+All three conditions gave these results, including the `unprivileged_userns (enforce)` label.
+The probe also connected directly to the manager's private socket; that connection was refused
+(`ECONNREFUSED`) in the unconfined control too, so it says nothing about confinement, and
+`systemctl --user` reached the manager regardless. Oversight's independent read-only probe on
+this host (PR review `5843823011`) got the same result for the manager query and a bus call.
+
+The write rights this ruleset handles do not cover connecting to an existing socket (fourth
+row), and the confined tree needs the manager anyway. Admission asks it for the unit graph on
+every connection: `database_admission` (`deployment.py:848`) calls `_verify_description`
+(`:861`, `:868`), which calls `_observe_graph` (`:820`), then `_manager_snapshot` (`:812`), then
+`_manager_output` (`:579`), which runs `systemctl --user show` (`:346-350`).
 
 ### SQLite temporary files
 
@@ -170,6 +210,9 @@ directory entries only beneath these roots:
 a directory, symlink, FIFO, socket or device node. Outside the roots the kernel refuses each
 of these. Reading files, executing files and network access are not restricted.
 
+A process that the user manager or a session-bus service starts at the confined process's
+request is not one the confined process started, and is outside this boundary (D4).
+
 The roots do not depend on the configuration file's contents, so editing the configuration
 cannot widen them. A `--config` path elsewhere is still read, but its directory does not
 become a write root.
@@ -211,14 +254,18 @@ one that belongs to a live run.
 
 SQLite's temporary storage obeys the same boundary. Its temp directory is fixed before
 confinement can run (measured above), so `Store.connection` (`db.py:6421-6430`), the one
-connection owner, sets `PRAGMA temp_store = MEMORY` on every connection it opens in a
-confined process, beside the pragmas it already sets. Connections in an unconfined process
-are unchanged.
+connection owner, sets `PRAGMA temp_store = MEMORY` on every connection it opens, beside the
+pragmas it already sets. The setting does not depend on whether the process is confined, so
+the desktop engine and the scheduled commands use one SQLite behavior, and a connection
+opened before confinement cannot reintroduce the failure.
 
 ### R6 — nothing else changes
 
 On a host where the scheduled path already writes only inside the roots, stdout, exit status,
 locks, admission, schedule, network destinations and stored results are unchanged.
+
+The one change outside confined processes is R5's SQLite clause: every process that opens the
+database, the desktop engine included, keeps SQLite temporary tables and sorts in memory.
 
 `systemd/` stays byte-identical in the implementation PR. The engine's shipped unit payload
 therefore does not change and installed admission is unaffected.
@@ -226,7 +273,9 @@ therefore does not change and installed admission is unaffected.
 ### R7 — claims match the guarantee
 
 The README (`README.md:409` says "sandbox") and any other product text describe R2 and the
-limits listed under "Not refused" above, and nothing stronger.
+limits listed under "Not refused" above, and nothing stronger. In particular, no text says the
+boundary holds against code running inside the scheduled process: D4 lets such code reach
+unconfined user services.
 
 ### R8 — the units stop declaring what is not enforced (deferred)
 
@@ -265,9 +314,12 @@ available to an unprivileged user service on this platform | justified`.
   product.
 - The input class Landlock misses is listed under "Not refused" above, with a test on each
   side in the verification plan.
+- Requests to user services (D4) are not something a stronger mechanism at this owner closes.
+  The confined tree needs the manager for admission, so closing them needs the restructuring
+  described in D4.
 
-SQLite temporary storage: `mechanism: PRAGMA temp_store = MEMORY at the single connection
-owner, in confined processes | the strongest available at that owner | justified`.
+SQLite temporary storage: `mechanism: PRAGMA temp_store = MEMORY on every connection, at the
+single connection owner | the strongest available at that owner | justified`.
 
 - Confining before `sqlite3` is loaded, with `TMPDIR` set first, would work only for the
   frozen dispatcher (`deployment.py:994-1014`), which imports `cli` lazily. The source console
@@ -277,7 +329,16 @@ owner, in confined processes | the strongest available at that owner | justified
 - `PRAGMA temp_store_directory` is deprecated by SQLite.
 - Allowing writes to `/tmp` or `/var/tmp` would reopen the shared temp directories that the
   units meant to hide with `PrivateTmp=yes`.
-- The cost is memory: temporary tables and sorts of a confined run stay in RAM.
+- Setting it only in confined processes would make `db` ask the confinement owner a
+  process-wide question, test a different SQLite behavior from the desktop's, and fail again
+  if a connection were ever opened before confinement. Setting it on every connection has none
+  of these.
+- The cost is memory, in every process that opens the database: temporary tables and sorts stay
+  in RAM. The base uses temporary tables of message and account keys on normal paths
+  (`db.py:6039-6046`, `body_state.py:285`, `reconcile_state.py:109`), and migrations build
+  indexes (`removal.py:212-238`), which sort. No plain `VACUUM` exists; `VACUUM INTO`
+  (`thread_migration.py:131`) writes its target directly. The live database on the development
+  host is about 3 MB.
 
 ## Required change surface and single owner
 
@@ -285,8 +346,8 @@ owner, in confined processes | the strongest available at that owner | justified
   R3 key list, the private temp directory and the R4 errors.
 - `src/eom_email_watcher/cli.py`: one call, in `main`, for scheduled commands only. No other
   call site.
-- `src/eom_email_watcher/db.py`: in `Store.connection`, the SQLite clause of R5, asking the
-  confinement owner whether the process is confined. No other connection site exists.
+- `src/eom_email_watcher/db.py`: in `Store.connection`, the SQLite clause of R5, on every
+  connection, with no dependency on the confinement owner. No other connection site exists.
 - New tests. Four test files call `cli.main` or a scheduled body in-process
   (`tests/test_cli.py`, `tests/test_outbound.py`, `tests/test_engine_api.py`,
   `tests/test_ntfy_disclosure_migration.py`). The implementation must keep those from
@@ -315,8 +376,10 @@ Fail-first at the base. Every confined step runs in a separate process.
    from the reproduction is refused and each inside-root operation succeeds. Boundary cases:
    the root directory itself, a sibling sharing its name prefix, a symlink out, a move in
    each direction, a hard link in, `truncate(2)`, and a child process.
-2. **Limits stated, not hidden.** The four "Not refused" cases are asserted as they are, so a
-   kernel change that closes one shows up as a test change, not as a silent claim.
+2. **Limits stated, not hidden.** The five "Not refused" cases are asserted as they are, so a
+   kernel change that closes one shows up as a test change, not as a silent claim. For D4, a
+   confined child reads a manager property and makes a session-bus method call, and both
+   succeed. The test never asks the manager to start or change anything.
 3. **Reachability in the shipped entry.** The real scheduled entry runs as a separate process
    against local stand-in mailbox and model servers. A child process the body starts observes
    refusal outside the roots and success inside. Removing the single confinement call makes
@@ -330,8 +393,8 @@ Fail-first at the base. Every confined step runs in a separate process.
    is removed by the next one. A live run's directory survives another run starting.
 7. **SQLite temp.** In a confined process, a spill through `Store.connection` (a temporary
    table and a sort larger than the page cache) succeeds. Removing the pragma makes the same
-   run fail with `unable to open database file`. A connection in an unconfined process keeps
-   SQLite's default `temp_store`.
+   run fail with `unable to open database file`. Every connection `Store.connection` opens,
+   in a confined or an unconfined process, reports `temp_store` as `2` (memory).
 8. **R6.** `git diff --stat <base> -- systemd` is empty, the engine's unit payload hashes are
    unchanged, and `uv run pytest` and `uv run ruff check .` pass.
 
@@ -345,6 +408,8 @@ Settling evidence, on a host with `kernel.apparmor_restrict_unprivileged_userns=
 - A syscall trace of that run lists every refused write-class call. A refusal on the
   product's own path blocks. A refusal inside a helper program is listed with its effect on
   the helper's result.
+- The same trace lists every connection the confined tree makes to the user manager or the
+  session bus (`systemctl`, `notify-send`), so D4 is observed on the real path.
 - If the trace shows the scheduled path needs a root this contract does not name, the
   implementation stops and this contract is amended first.
 
@@ -358,11 +423,24 @@ Local folder `codex-evidence/eom-email-watcher/363-scheduled-confinement-contrac
 - `reproduction-userns-default-label.json`: `aacec800804938eaf0c055bb620a429d318bb98c48443a611d4d6fd7054e3e72`
 - `sqlite_tempdir.py`: `91e885cab82130113b5fd7372333231af8fe801ba0b9446c14bfeb5d9058df84`
 - `sqlite-tempdir.json`: `027a962242f91d8728d6976e93d87b306863a9ba543ba9912da6101406766b88`
+- `ipc_probe.py`: `9d07857fad9b46c5eadce4b4f3344e872096ed302cab73ad227a1be65e0d8a7f`
+- `ipc-probe-host.json`: `adf3b73697ceda7588ab1350237ca2e0610f2251237a8f11f3730ccc242d7e58`
+- `ipc-probe-userns.json`: `44242f403872e82a118fb3219a738056c39bbf01342119641a680afdafb0f592`
+- `ipc-probe-userns-default-label.json`: `f451140677b5b5c0cd812228ebdcd1ee2dac60672d9cf2e7237d2d897648b3f0`
 
 ## Revision log
 
 - `dacf251`: first proposal.
-- Revision 2: a confined run cannot create SQLite temporary files, because SQLite fixes its
-  temp directory when `sqlite3` is imported (measured). Adds the SQLite clause to R5, its
-  mechanism, the `db.py` change surface, verification item 7, the write-site inventory and two
-  evidence files. No requirement was removed or weakened.
+- `42a3fdf`, revision 2: a confined run cannot create SQLite temporary files, because SQLite
+  fixes its temp directory when `sqlite3` is imported (measured). Adds the SQLite clause to R5,
+  its mechanism, the `db.py` change surface, verification item 7, the write-site inventory and
+  two evidence files. No requirement was removed or weakened.
+- Revision 3, from oversight's PR review `5843823011`:
+  - New limit and decision D4: a confined process can still ask unconfined user services for
+    work. It is now in "Not refused", R2, R7, the mechanism, verification item 2 and the
+    settling trace, with a measured probe and four evidence files.
+  - `temp_store = MEMORY` now applies to every connection, not only confined ones (oversight's
+    recommendation). This removes the `db` dependency on the confinement owner, adds the
+    memory cost to R6, and replaces item 7's third assertion.
+  - No requirement was removed or weakened. D4 states an existing limit; it does not narrow
+    what R2 refuses.
