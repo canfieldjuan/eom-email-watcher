@@ -1684,24 +1684,66 @@ def test_inbox_query_exact_sender_pages_and_normalizes(
     assert response["data"]["items"] == []
 
 
-def test_inbox_query_exact_sender_admission_boundaries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("operation", ["inbox.query", "inbox.conversations.query"])
+def test_inbox_query_can_filter_retained_mail_for_legacy_sender(
+    tmp_path: Path, operation: str
 ) -> None:
     config_path = tmp_path / "config.toml"
-    write_config(config_path)
-    runtime = load_runtime(config_path)
-    patch_runtime(monkeypatch, runtime)
-    address = f"{'A' * 493}@EXAMPLE.COM"
-    _add_test_message(runtime.store, message_id="long", thread_id=None,
-                      sender=address.lower(), sender_name=None, subject="Long sender",
-                      received_at="2026-08-31T12:00:00+00:00")
-    accepted = engine_api._response(request(config_path, "inbox.query", {"sender": address}))
-    assert accepted["ok"] is True, accepted
-    assert [item["message_id"] for item in accepted["data"]["items"]] == ["long"]
-    absent = engine_api._response(request(config_path, "inbox.query"))
-    assert engine_api._response(request(config_path, "inbox.query", {"sender": None})) == absent
-    for sender in ["", " ", 0, False, [], {}, "not-an-address", f"{'A' * 494}@EXAMPLE.COM"]:
-        rejected = engine_api._response(request(config_path, "inbox.query", {"sender": sender}))
+    at_limit = f"{'é' * 246}a@example.com"
+    legacy = f"{'é' * 246}ab@example.com"
+    write_config(
+        config_path,
+        include_senders=False,
+        extra_settings=f'[[senders]]\nemail = "{legacy}"',
+    )
+    listed = engine_api._response(request(config_path, "watchlist.list"))
+    assert listed["data"]["items"] == [
+        {"email": legacy, "name": None, "admission_active": False}
+    ]
+
+    store = load_runtime(config_path).store
+    identity = _bind_test_mailbox(store, DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+    _, label = store.add_gmail_label_selector(
+        DEFAULT_MAIL_ACCOUNT_ID, identity, "Label_123", "Invoices", 0
+    )
+    received_at = "2026-08-31T12:00:00+00:00"
+    admission = AdmissionProvenance(
+        kind="gmail_user_label",
+        selector_id=label.selector_id,
+        display_name=label.selected_display_name,
+        mailbox_identity_key=identity,
+        admitted_at=received_at,
+    )
+    for message_id, sender in (("at-limit", at_limit), ("legacy", legacy)):
+        assert _add_test_message(
+            store,
+            message_id=message_id,
+            thread_id=None,
+            sender=sender,
+            sender_name=None,
+            subject="Retained invoice",
+            received_at=received_at,
+            admission=admission,
+        )
+
+    for sender in (at_limit, legacy):
+        accepted = engine_api._response(
+            request(config_path, operation, {"sender": f" {sender.upper()} "})
+        )
+        assert accepted["ok"] is True, accepted
+        (item,) = accepted["data"]["items"]
+        header = item["latest"] if operation == "inbox.conversations.query" else item
+        assert header["sender"] == sender
+
+    absent = engine_api._response(request(config_path, operation))
+    assert len(absent["data"]["items"]) == 2
+    assert engine_api._response(request(config_path, operation, {"sender": None})) == absent
+    other_account = engine_api._response(
+        request(config_path, operation, {"sender": legacy, "account_id": "other"})
+    )
+    assert other_account["data"]["items"] == []
+    for sender in ["", " ", 0, False, [], {}, "not-an-address"]:
+        rejected = engine_api._response(request(config_path, operation, {"sender": sender}))
         assert rejected["ok"] is False, sender
         assert rejected["error"]["code"] == "invalid_request", sender
         assert "data" not in rejected
