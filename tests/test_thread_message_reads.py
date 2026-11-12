@@ -1,5 +1,7 @@
 """M3 message pages retain logical scope, order and body-state boundaries."""
 
+import base64
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -44,9 +46,9 @@ def test_owned_linked_direction_attribution_and_copy_count_are_real_derived_meta
         "subject": "Quote",
         "history_notice": "History partial — only locally retained messages are shown",
     }
-    assert [item["message_id"] for item in page["items"]] == ["m", "reply", "unattributed"]
-    first, reply, unattributed = page["items"]
-    assert first == {
+    assert [item["message_id"] for item in page["items"]] == ["unattributed", "reply", "m"]
+    unattributed, reply, oldest = page["items"]
+    assert oldest == {
         "message_id": "m",
         "subject": "Quote",
         "direction": "inbound",
@@ -149,7 +151,8 @@ def test_body_state_metadata_uses_the_membership_snapshot(tmp_path, monkeypatch)
     first = messages(store, vendor, ref)
     assert all(item["body_state"] == {"state": "pending"} for item in first["items"])
     second = messages(store, vendor, ref)
-    assert second["items"][1]["body_state"] == {
+    assert second["items"][0]["message_id"] == "second"
+    assert second["items"][0]["body_state"] == {
         "state": "stored",
         "stored_chars": 8,
         "source_chars": 8,
@@ -162,7 +165,9 @@ def test_pages_cover_equal_times_invalid_dates_and_logical_max_time_without_repe
         seed(store, f"row-{number:03}", received_at=NOW.isoformat())
     seed(store, "later-copy", received_at=(NOW + timedelta(days=1)).isoformat())
     with store.connection() as db:
-        db.execute("UPDATE messages SET received_at='invalid' WHERE message_id='row-000'")
+        db.execute(
+            "UPDATE messages SET received_at='invalid' WHERE message_id IN ('row-000', 'row-104')"
+        )
         db.execute("UPDATE messages SET logical_of='m' WHERE message_id='later-copy'")
     found, cursor = [], None
     while True:
@@ -172,13 +177,40 @@ def test_pages_cover_equal_times_invalid_dates_and_logical_max_time_without_repe
         if cursor is None:
             break
         assert len(cursor) <= 4096
-    assert [row["message_id"] for row in found] == [f"row-{n:03}" for n in range(1, 105)] + [
-        "m",
-        "row-000",
-    ]
+    assert [row["message_id"] for row in found] == (
+        ["m"] + [f"row-{n:03}" for n in range(1, 104)] + ["row-000", "row-104"]
+    )
     assert len(found) == len({row["message_id"] for row in found}) == 106
-    assert found[-2]["received_at"] == (NOW + timedelta(days=1)).isoformat()
-    assert found[-1]["received_at"] is None
+    assert found[0]["received_at"] == (NOW + timedelta(days=1)).isoformat()
+    assert [row["received_at"] for row in found[-2:]] == [None, None]
+
+
+def test_message_cursor_refuses_the_previous_order_binding(tmp_path):
+    store, _, vendor = followed(tmp_path)
+    seed(store, "second")
+    ref = selection(store, vendor)
+    first = messages(store, vendor, ref, limit=1)
+    cursor = first["next_cursor"]
+    assert messages(store, vendor, ref, limit=1, cursor=cursor)["next_cursor"] is None
+
+    # Change only the selector digest so the prior ordering identity cannot
+    # be rejected incidentally by a changed revision or position.
+    token = json.loads(base64.urlsafe_b64decode(cursor))
+    token["selector"] = thread_reads._digest(
+        {
+            "operation": "threads.messages",
+            "vendor_id": vendor,
+            "thread_ref": asdict(ref),
+            "limit": 1,
+            "ordering": 1,
+        }
+    )
+    old_order = base64.urlsafe_b64encode(json.dumps(token).encode()).decode()
+    with pytest.raises(
+        thread_reads.ThreadReadError, match="does not match this selection"
+    ) as error:
+        messages(store, vendor, ref, limit=1, cursor=old_order)
+    assert error.value.code == "invalid_request"
 
 
 @pytest.mark.parametrize("change", ["body", "header", "attribution", "copy", "removal"])

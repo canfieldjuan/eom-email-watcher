@@ -290,7 +290,7 @@ export class ThreadViewDom {
     for (const message of state.value?.items ?? []) list.append(this.messageCard(message));
     section.append(list);
     if (state.value?.next_cursor) {
-      const more = this.button("Load more messages", "more-messages", () => this.state.loadMessages(true));
+      const more = this.button("Load older messages", "more-messages", () => this.state.loadMessages(true));
       more.disabled ||= state.status === "loading"; section.append(more);
     }
     this.root.append(section);
