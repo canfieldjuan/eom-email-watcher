@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from eom_email_watcher.benchmark import (
     _require_disjoint_input_outputs,
     _require_local_output,
     _score,
+    _validation_boundary,
     _write_json,
     build_blind_review,
     load_corpus,
@@ -727,3 +729,22 @@ def test_validation_boundary_is_included_in_public_result() -> None:
         "results": [{"id": "reject-action-without-suggestion", "passed": True}],
     }
     assert datetime.now(UTC).tzinfo is UTC
+
+
+def test_frozen_corpora_are_unchanged_and_their_validation_boundaries_pass() -> None:
+    root = Path(__file__).parents[1] / "benchmarks"
+    expected = {
+        "email-analysis-v1.json": (
+            "b64c74f44478a776f328b3e471cf66e57e27dfacf23ec6018b0ecb52dc44ccb6"
+        ),
+        "email-obligation-v1.json": (
+            "f6abe7c55e405f03ffc9afbe54b9b191e74d6e1af4d4a0a833b503811d738e56"
+        ),
+    }
+    for name, digest in expected.items():
+        encoded = (root / name).read_bytes()
+        assert hashlib.sha256(encoded).hexdigest() == digest
+        corpus = BenchmarkCorpus.model_validate_json(encoded)
+        boundary = _validation_boundary(corpus.validation_cases)
+        assert boundary["cases"] == len(corpus.validation_cases) > 0
+        assert boundary["failed"] == 0
