@@ -29,7 +29,7 @@ from connect_automate.locking import (
 )
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
-from pydantic import ValidationError
+from pydantic import StrictBool, TypeAdapter, ValidationError
 
 from . import deployment, inbox_conversations, private_storage, removal, source_locks, thread_reads
 from .automation.rules import (
@@ -5995,16 +5995,33 @@ def _thread_read_selector(payload: dict[str, object]) -> tuple[
 def _threads_messages(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {
         "vendor_id", "thread_ref", "inbox_message", "inbox_thread", "limit", "cursor",
+        "include_inbox_actions",
     })
     vendor, ref, origin = _thread_read_selector(payload)
     limit = _bounded_limit(payload, default=25, maximum=100)
+    include_inbox_actions = False
+    if "include_inbox_actions" in payload:
+        try:
+            include_inbox_actions = TypeAdapter(StrictBool).validate_python(
+                payload["include_inbox_actions"]
+            )
+        except ValidationError as error:
+            raise ApiError(
+                "invalid_request", "include_inbox_actions must be true or false"
+            ) from error
     store = Store(load_config(_config_path(request)).database_file)
     try:
-        return thread_reads.list_messages(
+        page = thread_reads.list_messages(
             store, vendor, ref, inbox_message=origin, limit=limit, cursor=payload.get("cursor"),
+            include_inbox_actions=include_inbox_actions,
         )
     except thread_reads.ThreadReadError as error:
         raise ApiError(error.code, str(error)) from error
+    if include_inbox_actions:
+        records = [record for item in page["items"] if (record := item["inbox_action"]) is not None]
+        if records:
+            _hide_locked_automation_previews(records)
+    return page
 
 
 def _threads_body(request: dict[str, object]) -> dict[str, object]:

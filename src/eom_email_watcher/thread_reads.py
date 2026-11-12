@@ -9,7 +9,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from . import body_state
 from .db import (
@@ -118,6 +118,7 @@ class MessageItem(TypedDict):
     received_at: str | None
     body_state: body_state.BodyStatus | body_state.StoredBodyMetadata
     copy_count: int
+    inbox_action: NotRequired[dict[str, object] | None]
 
 
 class MessagePage(TypedDict):
@@ -134,7 +135,12 @@ def list_messages(
     inbox_message: InboxMessageRef | None = None,
     limit: int = 25,
     cursor: str | None = None,
+    include_inbox_actions: bool = False,
 ) -> MessagePage:
+    if include_inbox_actions and not (
+        isinstance(vendor_id, InboxThreadSelector) or inbox_message is not None
+    ):
+        raise ThreadReadError("invalid_request", "Inbox action data requires an Inbox origin")
     with snapshot(store) as db:
         ref, members, vendors = _selected_thread(
             db, vendor_id, requested, inbox_message=inbox_message,
@@ -190,6 +196,17 @@ def list_messages(
             cursor=cursor,
             ordering="newest_first",
         )
+        if include_inbox_actions:
+            records = store.inbox_records_for_thread_page(
+                db,
+                provider=ref.provider,
+                account_id=ref.account_id,
+                mailbox_identity_key=ref.mailbox_identity_key,
+                thread_key=ref.thread_key,
+                message_ids=[item["message_id"] for item in page["items"]],
+            )
+            for item in page["items"]:
+                item["inbox_action"] = records.get(item["message_id"])
         return {"thread": thread, **page}
 
 

@@ -3921,6 +3921,18 @@ def _effective_message_identity_sql(alias: str) -> str:
     ))"""
 
 
+_INBOX_ITEM_SELECT = f"""SELECT message_id, provider, account_id, received_at,
+    {_effective_message_identity_sql("m")} AS thread_entry_identity,
+    sender, sender_name, subject, status,
+    analysis_at, category, priority, summary, action_required, suggested_action,
+    deadline_text, deadline_iso, confidence, attempts, next_retry_at,
+    fallback_notified_at, notified_at, last_error, analysis_retryable,
+    analysis_error_code, analysis_retry_after_seconds,
+    analysis_body_chars, analysis_body_source_chars,
+    admission_kind, admission_selector_id, admission_display_name, admitted_at
+    FROM logical_messages AS m"""
+
+
 def _followed_message_sql(alias: str, follow: str = "f") -> str:
     """D-derived's followed membership, shared by body and transition owners."""
     return f"""{follow}.provider={alias}.provider AND {follow}.account_id={alias}.account_id
@@ -14434,17 +14446,7 @@ class Store:
         parameters.append(limit + 1)
         with self.connection() as db:
             rows = db.execute(
-                f"""SELECT message_id, provider, account_id, received_at,
-                {_effective_message_identity_sql("m")} AS thread_entry_identity,
-                sender, sender_name, subject, status,
-                analysis_at, category, priority, summary, action_required, suggested_action,
-                deadline_text, deadline_iso, confidence, attempts, next_retry_at,
-                fallback_notified_at, notified_at, last_error, analysis_retryable,
-                analysis_error_code, analysis_retry_after_seconds,
-                analysis_body_chars, analysis_body_source_chars,
-                admission_kind, admission_selector_id, admission_display_name, admitted_at
-                FROM logical_messages AS m{where}
-                ORDER BY received_at DESC, message_id DESC LIMIT ?""",
+                _INBOX_ITEM_SELECT + f"{where} ORDER BY received_at DESC, message_id DESC LIMIT ?",
                 parameters,
             ).fetchall()
             has_more = len(rows) > limit
@@ -14455,6 +14457,30 @@ class Store:
             last = page_rows[-1]
             next_cursor = (str(last["received_at"]), str(last["message_id"]))
         return items, next_cursor
+
+    def inbox_records_for_thread_page(
+        self,
+        db: sqlite3.Connection,
+        *,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str | None,
+        thread_key: str,
+        message_ids: Sequence[str],
+    ) -> dict[str, dict[str, object]]:
+        """Project existing Inbox records using the thread reader's snapshot."""
+        if not message_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in message_ids)
+        rows = db.execute(
+            _INBOX_ITEM_SELECT
+            + f"""
+            WHERE m.provider = ? AND m.account_id = ? AND m.thread_key = ?
+            AND {_effective_message_identity_sql("m")} IS ?
+            AND m.message_id IN ({placeholders})""",
+            (provider, account_id, thread_key, mailbox_identity_key, *message_ids),
+        ).fetchall()
+        return {str(item["message_id"]): item for item in self._hydrate_inbox_rows(db, rows)}
 
     def _hydrate_inbox_rows(
         self, db: sqlite3.Connection, rows: list[sqlite3.Row]
