@@ -13,24 +13,38 @@ from eom_email_watcher import body_state, thread_reads
 
 
 @pytest.mark.parametrize("subject", ["Newest visible subject", ""])
-def test_title_uses_newest_visible_tie_winner_outside_first_page(tmp_path, subject):
+def test_title_uses_canonical_source_tie_winner_on_every_page(tmp_path, subject):
     store, _, vendor = followed(tmp_path)
-    for source, title in [("z-new", "Losing tie"), ("a-new", subject)]:
-        seed(store, source, subject=title, received_at=NOW.isoformat())
+    for message_id, source_id, title in (
+        ("a-local", "z-source", "Losing tie"),
+        ("z-local", "a-source", subject),
+    ):
+        seed(
+            store,
+            message_id,
+            provider_message_id=source_id,
+            subject=title,
+            received_at=NOW.isoformat(),
+        )
     seed(store, "invalid-date", subject="Invalid date cannot win")
     with store.connection() as db:
         db.execute("UPDATE messages SET received_at='invalid' WHERE message_id='invalid-date'")
     expected = subject or "No subject"
     listing = thread_reads.list_threads(store, vendor)["items"][0]
-    first = messages(store, vendor, limit=1)
-    assert listing["subject"] == first["thread"]["subject"] == expected
-    assert first["items"][0]["message_id"] == "m"
-    assert first["items"][0]["subject"] == "Quote" != expected
-    cursor = first["next_cursor"]
-    while cursor:
+    assert listing["subject"] == expected
+    cursor = None
+    for message_id, page_subject in (
+        ("z-local", subject),
+        ("a-local", "Losing tie"),
+        ("m", "Quote"),
+        ("invalid-date", "Invalid date cannot win"),
+    ):
         page = messages(store, vendor, limit=1, cursor=cursor)
+        (item,) = page["items"]
+        assert (item["message_id"], item["subject"]) == (message_id, page_subject)
         assert page["thread"]["subject"] == expected
         cursor = page["next_cursor"]
+    assert cursor is None
 
 
 def test_all_invalid_dates_use_the_same_canonical_source_title_tie(tmp_path):
@@ -120,9 +134,11 @@ def test_title_and_headers_share_one_snapshot_across_concurrent_commit(tmp_path,
 
     monkeypatch.setattr(body_state, "project", commit_during_projection)
     first = messages(store, vendor)
-    assert first["thread"]["subject"] == first["items"][-1]["subject"] == "Before commit"
+    assert first["items"][0]["message_id"] == "newest"
+    assert first["thread"]["subject"] == first["items"][0]["subject"] == "Before commit"
     second = messages(store, vendor)
-    assert second["thread"]["subject"] == second["items"][-1]["subject"] == "After commit"
+    assert second["items"][0]["message_id"] == "newest"
+    assert second["thread"]["subject"] == second["items"][0]["subject"] == "After commit"
 
 
 def test_title_context_itself_participates_in_cursor_revision(tmp_path, monkeypatch):
