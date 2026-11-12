@@ -69,6 +69,174 @@ def unfollow(store, vendor):
         store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
 
 
+@pytest.mark.parametrize("vendor", [False, True])
+def test_action_records_belong_to_loaded_canonical_inbox_members(tmp_path, monkeypatch, vendor):
+    store, selector = setup_context(tmp_path, vendor=vendor)
+    seed(store, "newer", subject="Second email", received_at=NOW.isoformat())
+    seed(store, "sent-copy", locations=frozenset({"sent"}))
+    with store.connection() as db:
+        db.execute("UPDATE messages SET logical_of='m' WHERE message_id='sent-copy'")
+        db.executemany(
+            "UPDATE messages SET summary=?, action_required=? WHERE message_id=?",
+            [
+                ("First analysis", 0, "m"),
+                ("Second analysis", 1, "newer"),
+                ("Copy-only analysis", 1, "sent-copy"),
+            ],
+        )
+    store.replace_attachments("m", [attachment("first-part")])
+    store.replace_attachments("newer", [attachment("second-part")])
+    expected = {row["message_id"]: row for row in store.query_inbox(limit=25)[0]}
+    assert set(expected) == {"m", "newer"}
+    hydrate = store._hydrate_inbox_rows
+    hydrated = []
+
+    def record_hydration(db, rows):
+        assert db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 1
+        hydrated.append([row["message_id"] for row in rows])
+        return hydrate(db, rows)
+
+    monkeypatch.setattr(store, "_hydrate_inbox_rows", record_hydration)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    forbid_body_reads(store, monkeypatch, text_only=True)
+    call = api(store, tmp_path, monkeypatch)
+    plain = success(call("threads.messages", selector, limit=1))
+    assert all("inbox_action" not in item for item in plain["items"])
+    explicit_plain = call("threads.messages", selector, limit=1, include_inbox_actions=False)
+    assert success(explicit_plain) == plain
+    assert hydrated == []
+
+    first = success(call("threads.messages", selector, limit=1, include_inbox_actions=True))
+    second = success(
+        call(
+            "threads.messages", selector,
+            limit=1, cursor=first["next_cursor"], include_inbox_actions=True,
+        )
+    )
+    assert second["next_cursor"] is None
+    assert hydrated == [["newer"], ["m"]]
+    for page, message_id in [(first, "newer"), (second, "m")]:
+        (item,) = page["items"]
+        assert item["message_id"] == message_id
+        assert item["inbox_action"] == expected[message_id]
+        assert item["inbox_action"]["thread_entry_ref"] == origin(message_id)
+        assert item["body_state"]["state"] != "stored"
+
+    combined = success(call("threads.messages", selector, limit=2, include_inbox_actions=True))
+    assert [item["inbox_action"] for item in combined["items"]] == [
+        expected["newer"], expected["m"],
+    ]
+    assert sorted(hydrated[-1]) == ["m", "newer"]
+
+    copy_page = success(call("threads.copies", selector, message_id="m"))
+    assert any(item["copy_ref"] == "sent-copy" for item in copy_page["items"])
+    assert all("inbox_action" not in item for item in copy_page["items"])
+    copied_origin = deepcopy(selector)
+    source_ref(copied_origin)["message_id"] = "sent-copy"
+    error(call("threads.messages", copied_origin, include_inbox_actions=True), "not_found")
+    wrong_identity = deepcopy(selector)
+    source_ref(wrong_identity)["mailbox_identity_key"] = "a" * 64
+    error(call("threads.messages", wrong_identity, include_inbox_actions=True), "stale_selection")
+
+
+def test_inbox_actions_use_the_membership_snapshot_across_a_write(tmp_path, monkeypatch):
+    store, selector = setup_context(tmp_path, vendor=False)
+    with store.connection() as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("UPDATE messages SET summary='Before commit' WHERE message_id='m'")
+    project = body_state.project
+
+    def project_after_write(db, *args, **kwargs):
+        monkeypatch.setattr(body_state, "project", project)
+        with store.connection() as writer:
+            writer.execute("UPDATE messages SET summary='After commit' WHERE message_id='m'")
+        return project(db, *args, **kwargs)
+
+    monkeypatch.setattr(body_state, "project", project_after_write)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    call = api(store, tmp_path, monkeypatch)
+    first = success(call("threads.messages", selector, include_inbox_actions=True))
+    assert first["items"][0]["inbox_action"]["summary"] == "Before commit"
+    fresh = success(call("threads.messages", selector, include_inbox_actions=True))
+    assert fresh["items"][0]["inbox_action"]["summary"] == "After commit"
+
+
+def test_inbox_actions_exclude_a_held_record_without_losing_its_neighbor(tmp_path, monkeypatch):
+    from test_removal_refusal import held_runtime
+
+    store = held_runtime(tmp_path, monkeypatch, small=True)
+    origins = {
+        row["message_id"]: row["thread_entry_ref"] for row in store.query_inbox(limit=25)[0]
+    }
+    resolved = thread_reads.resolve_inbox(store, thread_reads.InboxMessageRef(**origins["small"]))
+    context = resolved["context"]
+    selector = {
+        "vendor_id": context["vendor"]["vendor_id"],
+        "thread_ref": context["thread"]["thread_ref"],
+        "inbox_message": origins["small"],
+    }
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    call = api(store, tmp_path, monkeypatch)
+    before = success(call("threads.messages", selector, include_inbox_actions=True))
+    assert {item["inbox_action"]["message_id"] for item in before["items"]} == {"m", "small"}
+    result = local_removal(store, "request_removal", "delete", {"message_id": "m"})
+    assert result.data()["outcome"] == "deferred"
+    with store.connection() as db:
+        assert db.execute("SELECT 1 FROM messages WHERE message_id='m'").fetchone()
+
+    after = success(call("threads.messages", selector, include_inbox_actions=True))
+    (item,) = after["items"]
+    assert item["message_id"] == item["inbox_action"]["message_id"] == "small"
+    held_origin = {**selector, "inbox_message": origins["m"]}
+    error(call("threads.messages", held_origin, include_inbox_actions=True), "not_found")
+
+
+def test_inbox_actions_require_inbox_origin_and_strict_opt_in(tmp_path, monkeypatch):
+    store, selector = setup_context(tmp_path, vendor=True)
+    vendor_only = {key: value for key, value in selector.items() if key != "inbox_message"}
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    call = api(store, tmp_path, monkeypatch)
+    assert "inbox_action" not in success(call("threads.messages", vendor_only))["items"][0]
+    error(call("threads.messages", vendor_only, include_inbox_actions=True), "invalid_request")
+
+    def forbidden(*_args):
+        pytest.fail("Malformed opt-in reached configuration")
+
+    monkeypatch.setattr(engine_api, "load_config", forbidden)
+    for malformed in (None, 0, 1, "", "true", [], {}):
+        response = call("threads.messages", selector, include_inbox_actions=malformed)
+        error(response, "invalid_request")
+        assert "include_inbox_actions" in response["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("entitled", "state", "shown"),
+    [
+        (True, "awaiting_confirmation", True),
+        (False, "awaiting_confirmation", False),
+        (False, "writing", True),
+    ],
+)
+def test_inbox_action_preview_reuses_existing_redaction(
+    tmp_path, monkeypatch, entitled, state, shown
+):
+    store, selector = setup_context(tmp_path, vendor=False)
+    hydrate = store._hydrate_inbox_rows
+    proposal = {"run_id": "test-run", "state": state}
+
+    def hydrate_with_preview(db, rows):
+        records = hydrate(db, rows)
+        records[0]["calendar_proposal"] = proposal
+        return records
+
+    monkeypatch.setattr(store, "_hydrate_inbox_rows", hydrate_with_preview)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: entitled)
+    call = api(store, tmp_path, monkeypatch)
+    page = success(call("threads.messages", selector, include_inbox_actions=True))
+    assert page["items"][0]["inbox_action"]["calendar_proposal"] == (proposal if shown else None)
+
+
 @pytest.mark.parametrize("entry", ["inbox", "vendors"])
 def test_newest_message_page_uses_one_snapshot_and_restarts_after_arrival(
     tmp_path, monkeypatch, entry
@@ -336,9 +504,16 @@ def test_guarded_unresolved_vendor_keeps_existing_identity_state(tmp_path, monke
     selector = {"vendor_id": vendor, "thread_ref": ref, "inbox_message": message}
     original_connection = store.connection
     forbid_body_reads(store, monkeypatch)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     call = api(store, tmp_path, monkeypatch)
     assert all(item["body_state"] == {"state": "mailbox_identity_unavailable"}
                for item in success(call("threads.messages", selector))["items"])
+    page = success(call("threads.messages", selector, include_inbox_actions=True))
+    assert {item["message_id"] for item in page["items"]} == {"m", "unattributed"}
+    for item in page["items"]:
+        assert item["inbox_action"]["thread_entry_ref"] == origin(
+            item["message_id"], mailbox_identity_key=None,
+        )
     for target in ["m", "unattributed"]:
         assert success(call("threads.body", selector, message_id=target))["body"] == {
             "state": "mailbox_identity_unavailable",
