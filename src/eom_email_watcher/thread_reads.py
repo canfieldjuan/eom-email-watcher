@@ -151,15 +151,10 @@ def list_messages(
         }
         projected = []
         for row, member in members:
-            epoch, source, _ = member
+            epoch = member[0]
             unit = _logical_unit(db, row["message_id"])
             assert unit is not None
-            key = (
-                not math.isfinite(epoch),
-                epoch if math.isfinite(epoch) else 0,
-                source,
-                row["message_id"],
-            )
+            key = (*_newest(member), row["message_id"])
             item: MessageItem = {
                 "message_id": row["message_id"],
                 "subject": row["subject"],
@@ -193,6 +188,7 @@ def list_messages(
             revision={"thread": thread, "messages": projected},
             limit=limit,
             cursor=cursor,
+            ordering="newest_first",
         )
         return {"thread": thread, **page}
 
@@ -273,6 +269,7 @@ def _page(
     revision: object,
     limit: int,
     cursor: object,
+    ordering: Literal[1, "newest_first"] = 1,
 ) -> dict:
     """A bounded keyset token binds the actual last tuple, never a trusted offset.
 
@@ -282,7 +279,7 @@ def _page(
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ThreadReadError("invalid_request", "limit must be an integer between 1 and 100")
     decoded = _cursor(cursor)
-    binding = _digest({**selector, "limit": limit, "ordering": 1})
+    binding = _digest({**selector, "limit": limit, "ordering": ordering})
     version = _digest(revision)
     after = 0
     if decoded is not None:

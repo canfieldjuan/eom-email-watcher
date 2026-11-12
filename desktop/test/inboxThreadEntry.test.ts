@@ -196,15 +196,15 @@ test("paged chooser shows owned/linked scope; lost explicit choice errors until 
   assert.match(text(h.root), /Choose a vendor/); assert.equal(h.ui.state.selectedThread, null);
 });
 
-test("origin marker follows explicit thread paging and independent readers have unique region/focus IDs", async () => {
+test("origin marker follows explicit older paging and independent readers have unique region/focus IDs", async () => {
   const h = harness();
   h.respond(async (command, query) => command === "threads_messages"
-    ? { thread, items: [query.cursor ? message : { ...message, message_id: "earlier" }], next_cursor: query.cursor ? null : "next" }
+    ? { thread, items: [query.cursor ? message : { ...message, message_id: "newer" }], next_cursor: query.cursor ? null : "next" }
     : h.defaultResponse(command, query));
   await h.ui.open(row); assert.match(text(h.root), /not on the loaded thread pages yet/);
-  assert.equal(h.calls.length, 2); h.button("Load more messages").click(); await tick();
+  assert.equal(h.calls.length, 2); h.button("Load older messages").click(); await tick();
   assert.match(text(h.root), /Opened from Inbox/); assert.doesNotMatch(text(h.root), /not on the loaded/);
-  assert.deepEqual(h.ui.state.messages.value!.items.map(x => x.message_id), ["earlier", "seed"]);
+  assert.deepEqual(h.ui.state.messages.value!.items.map(x => x.message_id), ["newer", "seed"]);
   const vendorRoot = new Element("section", h.doc);
   const vendorUi = new ThreadViewDom(vendorRoot as any, new ThreadReadClient(async <T>(command) => (command === "threads_list"
     ? { items: [{ ...thread, relation: "owned", owner_vendor: vendor }], next_cursor: null }

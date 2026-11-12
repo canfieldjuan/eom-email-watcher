@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import asdict, replace
+from datetime import timedelta
 
 import pytest
 from conftest import local_removal
@@ -66,6 +67,37 @@ def thread_ref(selector):
 def unfollow(store, vendor):
     with removal.operation_scope(store.path) as operation:
         store.remove_vendor_address(vendor, "vendor@example.com", operation=operation)
+
+
+@pytest.mark.parametrize("entry", ["inbox", "vendors"])
+def test_newest_message_page_uses_one_snapshot_and_restarts_after_arrival(
+    tmp_path, monkeypatch, entry
+):
+    store, selector = setup_context(tmp_path, vendor=entry == "vendors")
+    if entry == "vendors":
+        del selector["inbox_message"]
+    seed(store, "second", received_at=NOW.isoformat())
+    with store.connection() as db:
+        db.execute("PRAGMA journal_mode=WAL")
+    project = body_state.project
+
+    def project_after_arrival(db, *args, **kwargs):
+        monkeypatch.setattr(body_state, "project", project)
+        seed(store, "arrived", received_at=(NOW + timedelta(days=1)).isoformat())
+        return project(db, *args, **kwargs)
+
+    monkeypatch.setattr(body_state, "project", project_after_arrival)
+    call = api(store, tmp_path, monkeypatch)
+    first = success(call("threads.messages", selector, limit=1))
+    assert [item["message_id"] for item in first["items"]] == ["second"]
+    error(call("threads.messages", selector, limit=1, cursor=first["next_cursor"]), "stale_cursor")
+
+    cursor = None
+    for expected in ("arrived", "second", "m"):
+        page = success(call("threads.messages", selector, limit=1, cursor=cursor))
+        assert [item["message_id"] for item in page["items"]] == [expected]
+        cursor = page["next_cursor"]
+    assert cursor is None
 
 
 @pytest.mark.parametrize("vendor", [False, True])
@@ -387,7 +419,7 @@ def test_every_paged_read_binds_origin_and_context(
     key = "message_id" if operation == "threads.messages" else (
         "part_id" if "copy_ref" in fields else "copy_ref"
     )
-    expected = ["m", "reply"] if key == "message_id" else (
+    expected = ["reply", "m"] if key == "message_id" else (
         ["one", "two"] if key == "part_id" else ["copy", "m"]
     )
     assert [item[key] for page in [first, second] for item in page["items"]] == expected
