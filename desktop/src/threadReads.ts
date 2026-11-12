@@ -1,5 +1,7 @@
 // M3 retained local reads. Python owns visibility/selector semantics; the host
 // strictly decodes these shapes. Identity null is an explicit legacy bucket.
+import type { InboxItem } from "./inboxItem.ts";
+
 export interface ThreadRef {
   provider: string;
   account_id: string;
@@ -37,7 +39,15 @@ export type ThreadInventoryQuery = ThreadMessageSelector & { copy_ref: string };
 
 export type ThreadCopiesQuery = ThreadCopyQuery | ThreadInventoryQuery;
 
-export type ThreadMessagesQuery = ThreadSelector & ThreadPaging;
+export type InboxActionMessagesQuery = ThreadSelector & ThreadPaging & {
+  include_inbox_actions: true;
+} & ({ inbox_thread: NonNullable<ThreadSelector["inbox_thread"]> } | {
+  inbox_message: InboxMessageRef;
+});
+
+export type ThreadMessagesQuery = (ThreadSelector & ThreadPaging & {
+  include_inbox_actions?: false;
+}) | InboxActionMessagesQuery;
 
 export type ThreadBodyQuery = ThreadSelector & { message_id: string };
 
@@ -142,6 +152,10 @@ export interface ThreadMessagePage {
   next_cursor: string | null;
 }
 
+export interface InboxActionMessagePage extends ThreadMessagePage {
+  items: (ThreadMessage & { inbox_action: InboxItem | null })[];
+}
+
 export interface ThreadBodyResponse {
   thread_ref: ThreadRef;
   message_id: string;
@@ -166,6 +180,8 @@ export class ThreadReadClient {
     return this.invoke<ThreadResolveResult>("threads_resolve", { query });
   }
 
+  messages(query: InboxActionMessagesQuery): Promise<InboxActionMessagePage>;
+  messages(query: ThreadMessagesQuery): Promise<ThreadMessagePage>;
   messages(query: ThreadMessagesQuery): Promise<ThreadMessagePage> {
     return this.invoke<ThreadMessagePage>("threads_messages", { query });
   }

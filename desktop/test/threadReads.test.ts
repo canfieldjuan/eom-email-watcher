@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { ThreadReadClient } from "../src/threadReads.ts";
-import type { ThreadListQuery, ThreadCopiesQuery, ThreadReadInvoke } from "../src/threadReads.ts";
+import type { InboxActionMessagesQuery, ThreadListQuery, ThreadCopiesQuery, ThreadReadInvoke } from "../src/threadReads.ts";
 
 const ref = {
   provider: "imap", account_id: "retained-account",
@@ -134,6 +134,37 @@ test("message and body errors propagate once without narrowing invalid runtime s
   }
 });
 
+test("action message requests preserve both Inbox selectors and each producer record", async () => {
+  const fixture = JSON.parse(readFileSync(
+    new URL("../../tests/data/inbox_thread_action_page.json", import.meta.url), "utf8",
+  ));
+  const query: InboxActionMessagesQuery = fixture.query;
+  const guardedVendor = fixture.query;
+  const nonVendor: InboxActionMessagesQuery = {
+    inbox_thread: { thread_ref: guardedVendor.thread_ref, message_ref: guardedVendor.inbox_message },
+    include_inbox_actions: true,
+    limit: guardedVendor.limit,
+  };
+  for (const request of [query, nonVendor]) {
+    const calls: unknown[] = [];
+    const client = new ThreadReadClient(async <T>(command: string, args: Record<string, unknown>) => {
+      calls.push(structuredClone({ command, args }));
+      return fixture.action_page as T;
+    });
+    const result = await client.messages(request);
+    assert.deepEqual(calls, [{ command: "threads_messages", args: { query: request } }]);
+    const [sent, inbox] = result.items;
+    assert.equal(sent.direction, "outbound");
+    assert.equal(sent.inbox_action?.admission?.kind, "sent_to_vendor");
+    assert.equal(sent.inbox_action?.thread_entry_ref.message_id, sent.message_id);
+    assert.equal(sent.inbox_action?.attachments[0].part_id, "second-part");
+    assert.equal(inbox.direction, "inbound");
+    assert.equal(inbox.inbox_action?.thread_entry_ref.message_id, inbox.message_id);
+    assert.equal(inbox.inbox_action?.attachments[0].part_id, "first-part");
+    assert.equal(inbox.inbox_action?.action_required, 0);
+  }
+});
+
 test("TypeScript requires complete selectors and closed message/body/copy shapes", () => {
   const directory = mkdtempSync(join(tmpdir(), "thread-types-"));
   try {
@@ -203,6 +234,24 @@ const guarded = { ...base, inbox_message: origin };
 client.messages(guarded); client.body(guarded); client.copies(guarded);
 const inbox = { inbox_thread: { thread_ref: ref, message_ref: origin } };
 client.messages(inbox); client.body({ ...inbox, message_id: "target" });
+const inboxActions = client.messages({ ...inbox, include_inbox_actions: true });
+const vendorActions = client.messages({ ...guarded, include_inbox_actions: true });
+inboxActions.then(page => {
+  const record = page.items[0].inbox_action;
+  const part: string | null = record === null ? null : record.attachments[0].part_id;
+  const identity: string | null = record === null ? null : record.thread_entry_ref.mailbox_identity_key;
+});
+vendorActions.then(page => {
+  const record = page.items[0].inbox_action;
+  const localId: string | null = record === null ? null : record.message_id;
+});
+client.messages({ vendor_id: "vendor", thread_ref: ref, include_inbox_actions: false });
+// @ts-expect-error vendor-only reads cannot opt in to Inbox data
+client.messages({ vendor_id: "vendor", thread_ref: ref, include_inbox_actions: true });
+// @ts-expect-error opted-in reads use a boolean, without coercion
+client.messages({ ...inbox, include_inbox_actions: "true" });
+// @ts-expect-error this flag only applies to the message page
+client.body({ ...inbox, message_id: "target", include_inbox_actions: true });
 const inboxCopies: typeof copies = client.copies({ ...inbox, message_id: "target" });
 const inboxInventory: typeof inventory = client.copies({ ...inbox, message_id: "target", copy_ref: "copy" });
 const nonVendor: ThreadContext = { ...context, relation: "non_vendor", owner_vendor: null };

@@ -1,0 +1,255 @@
+{
+  "query": {
+    "vendor_id": "11111111-1111-4111-8111-111111111111",
+    "thread_ref": {
+      "provider": "gmail",
+      "account_id": "mailbox",
+      "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "thread_key": "native"
+    },
+    "inbox_message": {
+      "provider": "gmail",
+      "account_id": "mailbox",
+      "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "message_id": "m"
+    },
+    "include_inbox_actions": true,
+    "limit": 2
+  },
+  "action_page": {
+    "thread": {
+      "thread_ref": {
+        "provider": "gmail",
+        "account_id": "mailbox",
+        "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "thread_key": "native"
+      },
+      "relation": "owned",
+      "owner_vendor": {
+        "vendor_id": "11111111-1111-4111-8111-111111111111",
+        "display_name": "Synthetic vendor"
+      },
+      "subject": "Canonical Sent email",
+      "history_notice": "History partial \u2014 only locally retained messages are shown"
+    },
+    "items": [
+      {
+        "message_id": "newer",
+        "subject": "Canonical Sent email",
+        "direction": "outbound",
+        "sender": "owner@example.com",
+        "sender_name": null,
+        "attributed_vendor": {
+          "vendor_id": "11111111-1111-4111-8111-111111111111",
+          "display_name": "Synthetic vendor"
+        },
+        "received_at": "2026-10-11T12:00:00+00:00",
+        "body_state": {
+          "state": "pending"
+        },
+        "copy_count": 2,
+        "inbox_action": {
+          "message_id": "newer",
+          "provider": "gmail",
+          "account_id": "mailbox",
+          "received_at": "2026-10-11T12:00:00+00:00",
+          "sender": "owner@example.com",
+          "sender_name": null,
+          "subject": "Canonical Sent email",
+          "status": "pending",
+          "analysis_at": null,
+          "category": null,
+          "priority": null,
+          "summary": "Second analysis",
+          "action_required": 1,
+          "suggested_action": null,
+          "deadline_text": null,
+          "deadline_iso": null,
+          "confidence": null,
+          "attempts": 0,
+          "next_retry_at": null,
+          "fallback_notified_at": null,
+          "notified_at": null,
+          "last_error": null,
+          "analysis_retryable": null,
+          "analysis_error_code": null,
+          "analysis_retry_after_seconds": null,
+          "thread_entry_ref": {
+            "provider": "gmail",
+            "account_id": "mailbox",
+            "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "message_id": "newer"
+          },
+          "body_analyzed_chars": null,
+          "body_source_chars": null,
+          "body_truncated": null,
+          "admission": {
+            "kind": "sent_to_vendor",
+            "selector_id": "vendor-recipient:ff9c8750d0b6f7b9eef7d963d834178cf3f70d30ade220f74b094c0fbddea1f6",
+            "display_name": "Synthetic vendor",
+            "admitted_at": "2026-10-11T12:00:00+00:00"
+          },
+          "attachments": [
+            {
+              "part_id": "second-part",
+              "attachment_id": "private-provider-token",
+              "filename": "second-part.pdf",
+              "media_type": "application/pdf",
+              "byte_size": 12
+            }
+          ],
+          "calendar_proposal": null,
+          "calendar_write_outcome": null
+        }
+      },
+      {
+        "message_id": "m",
+        "subject": "First email",
+        "direction": "inbound",
+        "sender": "vendor@example.com",
+        "sender_name": null,
+        "attributed_vendor": {
+          "vendor_id": "11111111-1111-4111-8111-111111111111",
+          "display_name": "Synthetic vendor"
+        },
+        "received_at": "2026-10-09T12:00:00+00:00",
+        "body_state": {
+          "state": "pending"
+        },
+        "copy_count": 1,
+        "inbox_action": {
+          "message_id": "m",
+          "provider": "gmail",
+          "account_id": "mailbox",
+          "received_at": "2026-10-09T12:00:00+00:00",
+          "sender": "vendor@example.com",
+          "sender_name": null,
+          "subject": "First email",
+          "status": "pending",
+          "analysis_at": null,
+          "category": null,
+          "priority": null,
+          "summary": "First analysis",
+          "action_required": 0,
+          "suggested_action": null,
+          "deadline_text": null,
+          "deadline_iso": null,
+          "confidence": null,
+          "attempts": 0,
+          "next_retry_at": null,
+          "fallback_notified_at": null,
+          "notified_at": null,
+          "last_error": null,
+          "analysis_retryable": null,
+          "analysis_error_code": null,
+          "analysis_retry_after_seconds": null,
+          "thread_entry_ref": {
+            "provider": "gmail",
+            "account_id": "mailbox",
+            "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "message_id": "m"
+          },
+          "body_analyzed_chars": null,
+          "body_source_chars": null,
+          "body_truncated": null,
+          "admission": {
+            "kind": "exact_sender",
+            "selector_id": "sender:vendor@example.com",
+            "display_name": null,
+            "admitted_at": "2026-10-11T12:00:00+00:00"
+          },
+          "attachments": [
+            {
+              "part_id": "first-part",
+              "attachment_id": "private-provider-token",
+              "filename": "first-part.pdf",
+              "media_type": "application/pdf",
+              "byte_size": 12
+            }
+          ],
+          "calendar_proposal": null,
+          "calendar_write_outcome": null
+        }
+      }
+    ],
+    "next_cursor": null
+  },
+  "plain_page": {
+    "thread": {
+      "thread_ref": {
+        "provider": "gmail",
+        "account_id": "mailbox",
+        "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "thread_key": "native"
+      },
+      "relation": "owned",
+      "owner_vendor": {
+        "vendor_id": "11111111-1111-4111-8111-111111111111",
+        "display_name": "Synthetic vendor"
+      },
+      "subject": "Canonical Sent email",
+      "history_notice": "History partial \u2014 only locally retained messages are shown"
+    },
+    "items": [
+      {
+        "message_id": "newer",
+        "subject": "Canonical Sent email",
+        "direction": "outbound",
+        "sender": "owner@example.com",
+        "sender_name": null,
+        "attributed_vendor": {
+          "vendor_id": "11111111-1111-4111-8111-111111111111",
+          "display_name": "Synthetic vendor"
+        },
+        "received_at": "2026-10-11T12:00:00+00:00",
+        "body_state": {
+          "state": "pending"
+        },
+        "copy_count": 2
+      },
+      {
+        "message_id": "m",
+        "subject": "First email",
+        "direction": "inbound",
+        "sender": "vendor@example.com",
+        "sender_name": null,
+        "attributed_vendor": {
+          "vendor_id": "11111111-1111-4111-8111-111111111111",
+          "display_name": "Synthetic vendor"
+        },
+        "received_at": "2026-10-09T12:00:00+00:00",
+        "body_state": {
+          "state": "pending"
+        },
+        "copy_count": 1
+      }
+    ],
+    "next_cursor": null
+  },
+  "copies": {
+    "thread_ref": {
+      "provider": "gmail",
+      "account_id": "mailbox",
+      "mailbox_identity_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "thread_key": "native"
+    },
+    "message_id": "newer",
+    "items": [
+      {
+        "copy_ref": "newer",
+        "locations": [
+          "sent"
+        ],
+        "summary": "Second analysis",
+        "attachment_count": 1
+      },
+      {
+        "copy_ref": "sent-copy",
+        "locations": [],
+        "summary": "Copy-only analysis",
+        "attachment_count": 0
+      }
+    ],
+    "next_cursor": null
+  }
+}
