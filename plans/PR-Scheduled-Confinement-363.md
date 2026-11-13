@@ -1,13 +1,24 @@
 # Scheduled commands confine their own writes — #363
 
-Status: **PROPOSED CONTRACT — not accepted. Implementation is not authorized by this
-document.** No production code, test, unit file, package or installation change in this PR.
+Status: accepted contract only. No production code, test, unit file, package or installation
+change in this PR.
 
 Base: `5b86ee362fe4012168db79a035a90ca84ca361cd`.
 
 ## Operator acceptance
 
-Pending. Acceptance must answer four decisions; each is user-visible behavior.
+Juan accepted the reviewed contract at `3a3261ad914d78e524684b2dda59da9f727c50d7` in the coding
+chat on 2026-11-12, verbatim: “Accept D1–D4”. That answers the four decisions below as written.
+Oversight's delta PR review `5852718474` passed that commit (mailbox `7f53f6a8`), and the Codex
+review of it completed with no findings.
+
+Merge this PR as contract-only after CI, then implement R1–R7 in a separate PR on the merged
+contract, starting with fail-first regressions. That PR carries oversight's non-blocking notes:
+R4 counts kernel tasks (`/proc/self/task`), not Python threads; confinement checks the
+open-descriptor inventory (`/proc/self/fd`); R5 decides a live run by a lock the run holds, not
+by PID. R8 waits for #341. Issue #363 stays open until R8 lands.
+
+The accepted decisions, each user-visible behavior:
 
 - **D1 — no bypass.** A Linux host that cannot enforce R2 does not run scheduled commands at
   all (R4). That includes kernels before 6.2 and hosts with Landlock disabled. Mail intake
@@ -444,3 +455,5 @@ Local folder `codex-evidence/eom-email-watcher/363-scheduled-confinement-contrac
     memory cost to R6, and replaces item 7's third assertion.
   - No requirement was removed or weakened. D4 states an existing limit; it does not narrow
     what R2 refuses.
+- Acceptance: Juan accepted `3a3261a` with D1–D4 as written (2026-11-12). This entry records
+  that; no requirement or decision text changed.
