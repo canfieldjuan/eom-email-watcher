@@ -5,11 +5,11 @@ import { createContext, runInContext } from "node:vm";
 import test from "node:test";
 import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxActionState.ts";
 import { inboxBodyTruncation } from "../src/inboxBodyTruncation.ts";
-import { inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
+import { inboxThreadOriginKey, inboxConversationKey } from "../src/inboxThreadEntry.ts";
 import { Element, nodes } from "./threadDomFixture.ts";
 
 const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-const render = source.match(/function renderInboxMessageDetails\([\s\S]*?\n\}/)![0]
+const render = source.match(/function inboxConversationRow\([\s\S]*?\n\}/)![0]
   + "\n" + source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
 const loadPage = source.match(/async function loadInboxPage\([\s\S]*?\n\}/)![0];
 const refresh = source.match(/async function runInboxRefresh\([\s\S]*?\n\}/)![0];
@@ -44,7 +44,7 @@ function harness() {
     inboxQueryEpoch: 1, inboxItemsEpoch: 1, inboxRenderedEpoch: null,
     inboxScrollRevision: 0, inboxRestoredScrollTop: 0,
     inboxMutationInFlight: () => false, receivedLabel: (value: string) => value, stateLabel: () => "Notified",
-    hasInboxAutomationConfirmation, inboxActionState, inboxBodyTruncation, inboxThreadOriginKey,
+    hasInboxAutomationConfirmation, inboxActionState, inboxBodyTruncation, inboxThreadOriginKey, inboxConversationKey, inboxTotals:null,
     inboxDeletionsInFlight: new Set(), expandedInboxMessages: new Set(), inboxThreadEntry: {
       canOpen: () => true, isSelected: () => false, refreshGeneration: 0, revalidateSource() {}, failRefresh() {},
     }, currentMailboxEffectScope: () => ({}), refreshInboxThreadControls() {}, threadHistory: { commitInboxSpan() {} },
@@ -57,24 +57,25 @@ function harness() {
   });
   const scrollHelpers = ["captureInboxScroll", "restoreInboxScroll"].map(name =>
     source.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`))?.[0] ?? "").join("\n");
+  c.inboxConversationClient = { query: query => c.invoke("inbox_conversations_query", { query }) };
   runInContext(stripTypeScriptTypes(scrollHelpers + "\n" + render + "\n" + loadPage + "\n" + refresh), c);
-  const rows = (count: number) => Array.from({ length: count }, (_, i) => ({ message_id: `row-${i}`,
-    subject: `Subject ${i}`, sender: "sender@example.test", sender_name: "Sender", received_at: "2026-11-07T00:00:00Z",
-    provider: "imap", account_id: "retained", thread_entry_ref: { provider: "imap", account_id: "retained",
-      mailbox_identity_key: "mailbox", message_id: `row-${i}` }, status: "notified", priority: "normal",
-    summary: "Retained analysis", attachments: [], admission: null, action_required: null, calendar_proposal: null,
-  }));
+  const rows = (count: number) => Array.from({ length: count }, (_, i) => {
+    const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: "mailbox", message_id: "row-" + i };
+    const {message_id, ...scope} = origin;
+    return { thread_ref:{...scope,thread_key:message_id}, matching_message_ref:origin,
+      latest:{message_ref:origin, subject:"Subject " + i, sender:"sender@example.test", sender_name:"Sender", received_at:"2026-11-07T00:00:00Z"},
+      senders:[{address:"sender@example.test",name:"Sender"}], counts:{messages:1,matching_messages:1} };
+  });
   return { c, list, results, rows, more };
 }
 
-test("actual row renderer retains the message scroll owner across append and capability rerenders", () => {
+test("actual row renderer retains the message scroll owner across append and rerenders", () => {
   const h = harness();
   h.c.renderInbox(h.rows(120)); h.results.scrollTop = 850;
-  h.c.expandedInboxMessages.add("row-8");
   h.c.renderInbox(h.rows(145));
   assert.equal(h.results.scrollTop, 850);
   assert.equal(h.list.children.length, 145);
-  assert.equal(nodes(h.list).find(n => n.id === "inbox-message-8")?.hidden, false);
+  assert.equal(nodes(h.list.children[8]).filter(n => n.tagName === "BUTTON").length, 1);
   h.c.renderInbox(h.rows(145)); assert.equal(h.results.scrollTop, 850);
 });
 
@@ -82,7 +83,7 @@ test("actual row renderer lets the browser clamp shorter and empty results", () 
   const h = harness(); h.c.renderInbox(h.rows(120)); h.results.scrollTop = 850;
   h.c.renderInbox(h.rows(7)); assert.equal(h.results.scrollTop, 300);
   h.c.renderInbox([]); assert.equal(h.results.scrollTop, 0);
-  assert.equal(h.list.children[0].textContent, "No retained messages match these filters.");
+  assert.equal(h.list.children[0].textContent, "No retained conversations match these filters.");
 });
 
 test("last Load more page preserves its bottom offset before hiding the paging control", async () => {
@@ -96,7 +97,7 @@ test("last Load more page preserves its bottom offset before hiding the paging c
   assert.equal(await h.c.loadInboxPage(true, {}), true);
   assert.equal(h.results.scrollTop, before);
   assert.equal(h.list.children.length, 145); assert.equal(h.more.hidden, true);
-  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ command: "inbox_query", args: { query: {
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ command: "inbox_conversations_query", args: { query: {
     provider: "imap", account_id: "retained", sender: null, limit: 25, cursor: "120",
   } } }]);
 });

@@ -2,7 +2,8 @@ import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
 import { observeCommonHeader } from "./commonHeader";
 import { ThreadReadClient } from "./threadReads";
 import { ThreadViewDom } from "./threadViewDom";
-import { InboxThreadEntry, inboxThreadOriginKey } from "./inboxThreadEntry";
+import { InboxThreadEntry, inboxConversationKey, type InboxActionContext, type InboxThreadRow } from "./inboxThreadEntry";
+import { InboxConversationClient, type InboxConversation, type InboxConversationPage, type InboxConversationQuery } from "./inboxConversations";
 import { ThreadHistory } from "./threadHistory";
 import { mailboxPendingMessage } from "./mailboxProgress";
 import { confirmAction } from "./confirmation";
@@ -34,7 +35,7 @@ import { automationOutcomeIdentity, automationOutcomeStatus } from "./automation
 import { hasInboxAutomationConfirmation, inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
 import {
-  InboxRemovalClient, inboxClearView, inboxRemovalStatus, inboxRemovalRecordStatus,
+  InboxRemovalClient, inboxClearStatus, inboxRemovalStatus, inboxRemovalRecordStatus,
   type InboxRemovalRecord,
 } from "./inboxRemoval";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
@@ -126,15 +127,10 @@ interface InboxQuery {
   account_id: string | null;
   sender: string | null;
   sender_query: string | null;
-  priority: string | null;
-  category: string | null;
-  status: string | null;
+  priority: NonNullable<InboxConversationQuery["priority"]> | null;
+  category: NonNullable<InboxConversationQuery["category"]> | null;
+  status: NonNullable<InboxConversationQuery["status"]> | null;
   keyword: string | null;
-}
-
-interface InboxPage {
-  items: InboxItem[];
-  next_cursor: string | null;
 }
 
 interface CertificateExpiryLedgerRow {
@@ -408,6 +404,7 @@ app.innerHTML = `
   </header>
 
   <div class="shell" data-view="inbox">
+    <div id="inbox-action-notices" class="status" aria-live="polite" aria-atomic="false"></div>
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab" aria-describedby="inbox-help">
       <h2 id="inbox-heading" tabindex="-1">All senders</h2>
       <p id="inbox-help" class="view-lede">Locally retained messages from watched senders and Gmail labels appear here. Followed threads and Sent replies to vendors also appear when captured with Connect.</p>
@@ -503,15 +500,15 @@ app.innerHTML = `
         </div>
       </aside>
       <div id="inbox-message-pane" class="inbox-messages">
-      <div id="inbox-results" role="region" aria-label="Message results" tabindex="0">
-        <ul id="inbox-list" class="inbox-list" aria-label="Recent retained messages"></ul>
+      <div id="inbox-results" role="region" aria-label="Conversation results" tabindex="0">
+        <ul id="inbox-list" class="inbox-list" aria-label="Recent retained conversations"></ul>
         <div class="inbox-page-actions">
           <button id="inbox-load-more" type="button" hidden>Load more</button>
         </div>
       </div>
       </div>
       <section id="inbox-reading-pane" role="region" aria-label="Retained thread reading pane" tabindex="0">
-        <p id="inbox-reader-empty">Select a message to read its retained thread.</p>
+        <p id="inbox-reader-empty">Select a conversation to read its retained messages.</p>
         <p id="inbox-reader-source" class="thread-history-notice" hidden></p>
         <section id="inbox-thread-view" hidden></section>
       </section>
@@ -816,20 +813,24 @@ const inboxThreadEntry = new InboxThreadEntry({
     senderContent: requiredElement<HTMLElement>("#inbox-senders-content"), footer: requiredElement<HTMLElement>("#inbox-history-actions"),
   },
   onSelectionChange: refreshInboxThreadControls,
+  renderAction: renderInboxReaderAction,
+  actionNotSent: (subject, reason) => showInboxActionNotice(subject, reason, "warning"),
+  beforeRender: beginInboxActionRender,
+  afterRender: finishInboxActionRender,
   heading: requiredElement<HTMLElement>("#inbox-heading"),
   client: new ThreadReadClient(invoke), accounts: () => mailAccounts,
   snapshot: () => ({
     configured: configurationReady, visible: !inboxView.hidden,
     blocked: inboxReloadBlocked() || threadHistory.mutationHeld,
-    queryEpoch: inboxQueryEpoch, itemsEpoch: inboxItemsEpoch, items: inboxItems,
+    queryEpoch: inboxQueryEpoch, itemsEpoch: inboxItemsEpoch, items: inboxItems.map(inboxConversationRow),
     scope: currentMailboxEffectScope(), spanScope: inboxThreadSpanScope,
   }),
-  refreshInbox: refreshLoadedInboxSpan,
+  refreshInbox: async () => { await refreshLoadedInboxSpan(); },
   scrollElements: () => [inboxResults, inboxSenderResults, inboxSenderNavigation, inboxView,
     ...(document.scrollingElement ? [document.scrollingElement] : [])],
 });
 const threadHistory = new ThreadHistory(threadReader.state, inboxThreadEntry, refreshInboxThreadControls,
-  () => inboxThreadEntry.selected ? refreshLoadedInboxSpan() : Promise.resolve());
+  async () => { if (inboxThreadEntry.selected) await refreshLoadedInboxSpan(); });
 
 function refreshThreadHistory(): void {
   if (configurationReady) threadHistory.refresh();
@@ -870,6 +871,8 @@ const coiSetup = mountCoiSetup(requiredElement<HTMLElement>("#coi-setup"), invok
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxResults = requiredElement<HTMLElement>("#inbox-results");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
+const inboxActionNotices = requiredElement<HTMLElement>("#inbox-action-notices");
+const inboxConversationClient = new InboxConversationClient(invoke);
 const inboxRemovalStatuses = requiredElement<HTMLDivElement>("#inbox-removal-statuses");
 const inboxRemovalClient = new InboxRemovalClient(invoke, renderInboxRemovalStatuses, errorCode);
 const inboxSenderNavigation = requiredElement<HTMLElement>("#inbox-sender-nav");
@@ -1014,7 +1017,7 @@ const attachmentSelectionRefusals = new Map<string, { text: string; capabilityId
 const attachmentInvocationsInFlight = new Set<string>();
 const attachmentRequestIds = new Map<string, string>();
 const capabilityOutputPresentations = new Map<string, ConnectOutputPresentation>();
-const capabilityOutputPresentationsInFlight = new Set<string>();
+const capabilityOutputPresentationsInFlight = new Map<string, symbol>();
 const capabilityOutputPreviews = new Map<string, HTMLDivElement>();
 const capabilityOutputViewButtons = new Map<string, HTMLButtonElement>();
 let inboxRequestGeneration = 0;
@@ -1022,8 +1025,17 @@ let inboxQueryEpoch = 0;
 let inboxPageState: "pending" | "loading" | "loaded" | "failed" = "loading";
 let inboxPageStateGeneration = 0;
 let inboxSenderNavigationError: string | null = null;
-const expandedInboxMessages = new Set<string>();
-let inboxItems: InboxItem[] = [];
+let inboxItems: InboxConversation[] = [];
+let inboxTotals: InboxConversationPage["totals"] | null = null;
+const inboxReaderActionsInFlight = new Set<string>();
+type ReaderAttachmentRequest = {
+  key: string; messageId: string; partId: string; context: InboxActionContext;
+};
+const readerAttachmentDiscovery = new Map<string, ReaderAttachmentRequest>();
+const readerAttachmentQueue: ReaderAttachmentRequest[] = [];
+let readerAttachmentRequests = 0;
+const readerAttachmentKeys = new Set<string>();
+let inboxRenderProposalExpiry: number | null = null;
 let inboxItemsEpoch: number | null = null;
 let inboxRenderedEpoch: number | null = null;
 let inboxScrollRevision = 0;
@@ -1031,7 +1043,6 @@ let inboxRestoredScrollTop = 0;
 // A row can enter the reader only after its entire requested span was revalidated.
 let inboxThreadSpanScope: MailboxEffectScope | null = null;
 let inboxNextCursor: string | null = null;
-let inboxCapabilityUnavailableCount = 0;
 let inboxProposalExpiryTimer: number | null = null;
 let connectQueueRefresh: Promise<void> | null = null;
 let connectQueueRefreshAgain = false;
@@ -1252,11 +1263,13 @@ function scheduledCheckFailureMessage(event: ScheduledCheckEvent): string {
 function showView(
   view: "inbox" | "watchlist" | "vendors" | "expiry-ledger" | "health" | "settings",
 ): void {
-  requiredElement<HTMLElement>(".shell").dataset.view = view;
+  const shell = requiredElement<HTMLElement>(".shell");
+  const sameInbox = configurationReady && view === "inbox" && shell.dataset.view === view && !inboxView.hidden;
+  shell.dataset.view = view;
   const inboxSelected = view === "inbox";
   const watchlistSelected = view === "watchlist";
   const vendorsSelected = view === "vendors";
-  threadHistory.setView(view, configurationReady);
+  if (!sameInbox) threadHistory.setView(view, configurationReady);
   const expiryLedgerSelected = view === "expiry-ledger";
   const healthSelected = view === "health";
   const settingsSelected = view === "settings";
@@ -1432,10 +1445,7 @@ function clearMessageOwnedUiState(messageId?: string): void {
     attachmentCapabilities,
     attachmentCapabilityDiagnostics,
     attachmentSelectionRefusals,
-    attachmentInvocationsInFlight,
-    attachmentRequestIds,
     capabilityOutputPresentations,
-    capabilityOutputPresentationsInFlight,
     capabilityOutputPreviews,
     capabilityOutputViewButtons,
   ];
@@ -1514,7 +1524,9 @@ function renderCapabilityResult(
   result: AttachmentCapabilityResult,
   messageId: string,
   partId: string,
+  context: InboxActionContext,
 ): void {
+  const report = (text: string, kind: string) => showInboxActionNotice(context.subject, text, kind);
   if (result.summary) {
     const summary = document.createElement("div");
     summary.className = "attachment-summary";
@@ -1571,6 +1583,7 @@ function renderCapabilityResult(
         ) {
           const view = document.createElement("button");
           view.type = "button";
+          view.dataset.inboxAction = "view:" + outputKey;
           const syncViewButton = (button: HTMLButtonElement): void => {
             const loading = capabilityOutputPresentationsInFlight.has(outputKey);
             button.disabled = loading;
@@ -1579,8 +1592,9 @@ function renderCapabilityResult(
           capabilityOutputViewButtons.set(outputKey, view);
           syncViewButton(view);
           view.addEventListener("click", async () => {
-            if (capabilityOutputPresentationsInFlight.has(outputKey)) return;
-            capabilityOutputPresentationsInFlight.add(outputKey);
+            if (!context.current() || capabilityOutputPresentationsInFlight.has(outputKey)) return;
+            const request = Symbol();
+            capabilityOutputPresentationsInFlight.set(outputKey, request);
             syncViewButton(view);
             let presentationError: unknown;
             try {
@@ -1591,56 +1605,51 @@ function renderCapabilityResult(
                 artifactId: output.artifact_id,
               });
               const currentPreview = capabilityOutputPreviews.get(outputKey);
-              if (currentPreview?.isConnected) {
+              if (capabilityOutputPresentationsInFlight.get(outputKey) === request
+                && context.current() && currentPreview?.isConnected) {
                 capabilityOutputPresentations.set(outputKey, outputView.presentation);
                 renderOutputPresentation(currentPreview, outputView.presentation);
               }
             } catch (error) {
               presentationError = error;
             } finally {
-              capabilityOutputPresentationsInFlight.delete(outputKey);
-              const currentButton = capabilityOutputViewButtons.get(outputKey);
-              if (currentButton) syncViewButton(currentButton);
+              if (capabilityOutputPresentationsInFlight.get(outputKey) === request) {
+                capabilityOutputPresentationsInFlight.delete(outputKey);
+                const currentButton = capabilityOutputViewButtons.get(outputKey);
+                if (currentButton) syncViewButton(currentButton);
+              }
             }
-            if (presentationError) {
-              inboxStatus.textContent = errorMessage(presentationError);
-              inboxStatus.dataset.kind = "error";
-            } else if (capabilityOutputPreviews.get(outputKey)?.isConnected) {
-              inboxStatus.textContent = `Showing ${output.display_name}.`;
-              inboxStatus.dataset.kind = "success";
-            } else {
-              inboxStatus.textContent = `${output.display_name} is no longer in the current inbox.`;
-              inboxStatus.dataset.kind = "warning";
-            }
+            if (presentationError) report(errorMessage(presentationError), "error");
+            else if (!context.current()) report(`${output.display_name} is no longer in the current reader.`, "warning");
           });
           controls.append(view);
         }
         const exportButton = document.createElement("button");
         exportButton.type = "button";
+        exportButton.dataset.inboxAction = "export:" + outputKey;
         exportButton.textContent = "Safe export";
-        exportButton.addEventListener("click", async () => {
-          exportButton.disabled = true;
-          exportButton.textContent = "Exporting…";
-          try {
-            const exported = await invoke<RevealedCapabilityOutput>(
-              "capability_output_export",
-              {
-                messageId,
-                partId,
-                jobId,
-                artifactId: output.artifact_id,
-              },
-            );
-            inboxStatus.textContent = `Prepared ${exported.display_name} as ${exported.filename} and opened its export folder.`;
-            inboxStatus.dataset.kind = "success";
-          } catch (error) {
-            inboxStatus.textContent = errorMessage(error);
-            inboxStatus.dataset.kind = "error";
-          } finally {
-            exportButton.disabled = false;
-            exportButton.textContent = "Safe export";
-          }
-        });
+        exportButton.addEventListener("click", () => void performInboxReaderAction(
+          context, JSON.stringify(["export", outputKey]), async () => {
+            exportButton.disabled = true;
+            exportButton.textContent = "Exporting…";
+            try {
+              const exported = await invoke<RevealedCapabilityOutput>(
+                "capability_output_export",
+                {
+                  messageId,
+                  partId,
+                  jobId,
+                  artifactId: output.artifact_id,
+                },
+              );
+              report(`Prepared ${exported.display_name} as ${exported.filename} and opened its export folder.`, "success");
+            } catch (error) {
+              report(errorMessage(error), "error");
+            } finally {
+              exportButton.disabled = false;
+              exportButton.textContent = "Safe export";
+            }
+        }));
         controls.append(exportButton);
         outputRow.append(controls, preview);
       }
@@ -1686,7 +1695,97 @@ function restoreInboxScroll(top: number): void {
   inboxRestoredScrollTop = inboxResults.scrollTop;
 }
 
-function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderStartedAt: number) {
+function showInboxActionNotice(subject: string, text: string, kind: string): void {
+  const notice = document.createElement("p");
+  notice.dataset.kind = kind;
+  notice.textContent = (subject || "No subject") + " · " + text;
+  inboxActionNotices.append(notice);
+}
+
+function beginInboxActionRender(): void {
+  capabilityOutputPreviews.clear();
+  capabilityOutputViewButtons.clear();
+  readerAttachmentKeys.clear();
+  inboxRenderProposalExpiry = null;
+  if (inboxProposalExpiryTimer !== null) window.clearTimeout(inboxProposalExpiryTimer);
+  inboxProposalExpiryTimer = null;
+}
+
+function finishInboxActionRender(): void {
+  for (const store of [capabilityOutputPresentations, capabilityOutputPresentationsInFlight]) {
+    for (const key of store.keys()) if (!capabilityOutputPreviews.has(key)) store.delete(key);
+  }
+  for (const [key] of readerAttachmentDiscovery) {
+    if (!readerAttachmentKeys.has(key)) {
+      readerAttachmentDiscovery.delete(key);
+      attachmentCapabilities.delete(key);
+      attachmentCapabilityDiagnostics.delete(key);
+    }
+  }
+  loadReaderAttachmentCapabilities();
+  if (inboxRenderProposalExpiry !== null) {
+    inboxProposalExpiryTimer = window.setTimeout(() => inboxThreadEntry.reader.render(),
+      Math.min(Math.max(inboxRenderProposalExpiry - Date.now() + 1, 0), 2_147_483_647));
+  }
+}
+
+function renderInboxReaderAction(row: HTMLElement, item: InboxItem, context: InboxActionContext): void {
+  const extras = document.createElement("div");
+  extras.className = "inbox-message-extras";
+  const renderStartedAt = Date.now();
+  const expiry = renderInboxMessageDetails(item, extras, renderStartedAt, context);
+  for (const control of extras.querySelectorAll<HTMLElement>("[data-inbox-action]")) {
+    control.dataset.threadFocus = "inbox-action:" + JSON.stringify([context.messageId, control.dataset.inboxAction]);
+  }
+  if (expiry !== null) inboxRenderProposalExpiry = Math.min(inboxRenderProposalExpiry ?? expiry, expiry);
+  row.append(extras);
+  for (const attachment of item.attachments) {
+    const partId = attachment.part_id, messageId = context.messageId;
+    const key = attachmentKey(messageId, partId);
+    readerAttachmentKeys.add(key);
+    if (readerAttachmentDiscovery.has(key)) continue;
+    const request = { key, messageId, partId, context };
+    readerAttachmentDiscovery.set(key, request);
+    readerAttachmentQueue.push(request);
+  }
+}
+
+function loadReaderAttachmentCapabilities(): void {
+  while (readerAttachmentRequests < 4 && readerAttachmentQueue.length > 0) {
+    const request = readerAttachmentQueue.shift()!;
+    const { key, messageId, partId, context } = request;
+    const current = () => readerAttachmentDiscovery.get(key) === request && context.current();
+    if (!current()) continue;
+    readerAttachmentRequests++;
+    void invoke<ConnectCapabilities>("attachment_capabilities", { messageId, partId }).then(result => {
+      if (!current()) return;
+      attachmentCapabilities.set(key, result.items);
+      if (result.diagnostic) attachmentCapabilityDiagnostics.set(key, result.diagnostic.code);
+      inboxThreadEntry.reader.render();
+    }, () => {
+      if (!current()) return;
+      attachmentCapabilityDiagnostics.set(key, "provider_unavailable");
+      inboxThreadEntry.reader.render();
+    }).finally(() => {
+      readerAttachmentRequests--;
+      loadReaderAttachmentCapabilities();
+    });
+  }
+}
+
+async function performInboxReaderAction(
+  context: InboxActionContext, operation: string, run: () => Promise<void>,
+): Promise<void> {
+  if (!context.current() || inboxReaderActionsInFlight.has(operation)) return;
+  inboxReaderActionsInFlight.add(operation);
+  try { await run(); }
+  finally { inboxReaderActionsInFlight.delete(operation); }
+}
+
+function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderStartedAt: number, context: InboxActionContext): number | null {
+    const report = (text: string, kind: string) => showInboxActionNotice(context.subject, text, kind);
+    const { messageId } = context;
+    const refresh = () => refreshLoadedInboxSpan();
     let nextProposalExpiry: number | null = null;
     const meta = document.createElement("div");
     meta.className = "message-meta";
@@ -1711,9 +1810,6 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
       admission.textContent = inboxAdmissionLabel(item.admission.kind, item.admission.display_name, item.sender);
       senderIdentity.append(admission);
     }
-    const received = document.createElement("time");
-    received.dateTime = item.received_at;
-    received.textContent = receivedLabel(item.received_at);
     meta.append(senderIdentity);
 
     const summary = document.createElement("p");
@@ -1857,51 +1953,49 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
         decline.type = "button";
         decline.className = "secondary";
         decline.textContent = "Decline";
+        decline.dataset.inboxAction = "calendar-decline:" + proposal.run_id;
         const confirm = document.createElement("button");
         confirm.type = "button";
         confirm.textContent = expired ? "Recheck proposal" : "Create event";
-        const decide = async (decision: "confirm" | "decline"): Promise<void> => {
-          if (decision === "confirm") {
-            const invitationWarning = proposal.attendees.length
-              ? ` This will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
-              : "";
-            const confirmationMessage = expired
-              ? `Recheck the expired proposal “${proposal.subject}” before creating it? If Email Watcher still considers it valid, this confirmation will create the event on ${proposal.account_address || proposal.account_display_name}; otherwise it will refresh the proposal without creating an event.${invitationWarning}`
-              : `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationWarning}`;
-            if (
-              !await confirmAction(confirmationMessage)
-            ) {
-              return;
-            }
-          }
-          confirm.disabled = true;
-          decline.disabled = true;
-          try {
-            const result = await invoke<CalendarDecisionResult>("calendar_proposal_decide", {
-              decision,
-              messageId: item.message_id,
-              proposalSha256: proposal.proposal_sha256,
-              proposalVersion: proposal.proposal_version,
-              runId: proposal.run_id,
-              stateVersion: proposal.state_version,
-            });
-            await loadInbox();
-            const refreshed = inboxItems.find((row) => row.message_id === item.message_id);
-            const notice = calendarOutcomeNotice(
-              latestCalendarOutcome(result.calendar_write_outcome, refreshed?.calendar_write_outcome),
-              "decision", result.state,
-            );
-            const statusMessage = notice.text;
-            const statusKind = notice.kind;
-            inboxStatus.textContent = statusMessage;
-            inboxStatus.dataset.kind = statusKind;
-          } catch (error) {
-            const statusMessage = errorMessage(error);
-            await loadInbox();
-            inboxStatus.textContent = statusMessage;
-            inboxStatus.dataset.kind = "error";
-          }
+        confirm.dataset.inboxAction = "calendar-confirm:" + proposal.run_id;
+        const target = {
+          messageId, proposalSha256: proposal.proposal_sha256, proposalVersion: proposal.proposal_version,
+          runId: proposal.run_id, stateVersion: proposal.state_version,
         };
+        const decide = (decision: "confirm" | "decline"): Promise<void> => performInboxReaderAction(
+          context, JSON.stringify(["calendar", messageId, target.runId]), async () => {
+            if (decision === "confirm") {
+              const invitationWarning = proposal.attendees.length
+                ? ` This will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
+                : "";
+              const confirmationMessage = expired
+                ? `Recheck the expired proposal “${proposal.subject}” before creating it? If Email Watcher still considers it valid, this confirmation will create the event on ${proposal.account_address || proposal.account_display_name}; otherwise it will refresh the proposal without creating an event.${invitationWarning}`
+                : `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationWarning}`;
+              if (
+                !await confirmAction(confirmationMessage)
+              ) {
+                return;
+              }
+            }
+            if (!await context.afterApproval() || !context.current()) return;
+            confirm.disabled = true;
+            decline.disabled = true;
+            try {
+              const result = await invoke<CalendarDecisionResult>("calendar_proposal_decide", { ...target, decision });
+              await refresh();
+              const refreshed = context.current() ? inboxThreadEntry.state.messages.value?.items
+                .find(row => row.message_id === messageId)?.inbox_action : null;
+              const notice = calendarOutcomeNotice(
+                latestCalendarOutcome(result.calendar_write_outcome, refreshed?.calendar_write_outcome),
+                "decision", result.state,
+              );
+              report(notice.text, notice.kind);
+            } catch (error) {
+              const statusMessage = errorMessage(error);
+              await refresh();
+              report(statusMessage, "error");
+            }
+          });
         decline.addEventListener("click", () => void decide("decline"));
         confirm.addEventListener("click", () => void decide("confirm"));
         actions.append(decline, confirm);
@@ -1940,30 +2034,30 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
       const openButton = document.createElement("button");
       openButton.type = "button";
       openButton.textContent = "Open";
-      openButton.addEventListener("click", async () => {
-        openButton.disabled = true;
-        openButton.textContent = "Opening…";
-        try {
-          const opened = await invoke<OpenedAttachment>("attachment_open", {
-            messageId: item.message_id,
-            partId: attachment.part_id,
-          });
-          inboxStatus.textContent = `Opened ${opened.filename} in the default app.`;
-          inboxStatus.dataset.kind = "success";
-        } catch (error) {
-          inboxStatus.textContent = errorMessage(error);
-          inboxStatus.dataset.kind = "error";
-        } finally {
-          openButton.disabled = false;
-          openButton.textContent = "Open";
-        }
-      });
+      openButton.dataset.inboxAction = "open:" + attachment.part_id;
+      openButton.addEventListener("click", () => void performInboxReaderAction(
+        context, JSON.stringify(["open", messageId, attachment.part_id]), async () => {
+          openButton.disabled = true;
+          openButton.textContent = "Opening…";
+          try {
+            const opened = await invoke<OpenedAttachment>("attachment_open", {
+              messageId,
+              partId: attachment.part_id,
+            });
+            report(`Opened ${opened.filename} in the default app.`, "success");
+          } catch (error) {
+            report(errorMessage(error), "error");
+          } finally {
+            openButton.disabled = false;
+            openButton.textContent = "Open";
+          }
+      }));
       const actions = document.createElement("div");
       actions.className = "attachment-actions";
       actions.append(openButton);
 
       const diagnostic = attachmentCapabilityDiagnostics.get(
-        attachmentKey(item.message_id, attachment.part_id),
+        attachmentKey(messageId, attachment.part_id),
       );
       if (classifyCapabilityDiagnostic(diagnostic ?? null) === "locked") {
         const locked = document.createElement("span");
@@ -1981,7 +2075,7 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
       for (const result of attachment.capability_results ?? []) {
         if (result.protocol_version !== 2 || !result.provider || !result.job_id) continue;
         const key = capabilityInvocationKey(
-          item.message_id,
+          messageId,
           attachment.part_id,
           result.provider,
           { id: result.capability_id, version: result.capability_version },
@@ -1992,7 +2086,7 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
         else if (attachmentRequestIds.get(key) === result.job_id) attachmentRequestIds.delete(key);
       }
 
-      for (const providers of capabilityGroups(item.message_id, attachment)) {
+      for (const providers of capabilityGroups(messageId, attachment)) {
         let selected = providers.length === 1 ? providers[0] : undefined;
         let providerSelect: HTMLSelectElement | undefined;
         if (providers.length > 1) {
@@ -2017,6 +2111,9 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
 
         const invokeButton = document.createElement("button");
         invokeButton.type = "button";
+        const controlKey = JSON.stringify([attachment.part_id, providers[0].capability.id, providers[0].capability.version]);
+        invokeButton.dataset.inboxAction = "capability:" + controlKey;
+        if (providerSelect) providerSelect.dataset.inboxAction = "provider:" + controlKey;
         const syncButton = (): void => {
           if (!selected) {
             invokeButton.disabled = true;
@@ -2026,7 +2123,7 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
           }
           const existing = matchingCapabilityResult(attachment, selected);
           const key = capabilityInvocationKey(
-            item.message_id,
+            messageId,
             attachment.part_id,
             selected.provider,
             selected.capability,
@@ -2053,7 +2150,7 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
         syncButton();
         invokeButton.addEventListener("click", async () => {
           const capability = selected;
-          if (!capability) return;
+          if (!capability || !context.current()) return;
           let parameters: Record<string, string | number | boolean> | null;
           try {
             const previous = matchingCapabilityResult(attachment, capability);
@@ -2064,23 +2161,15 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
               previous?.status,
             );
           } catch (error) {
-            inboxStatus.textContent = errorMessage(error);
-            inboxStatus.dataset.kind = "error";
+            report(errorMessage(error), "error");
             return;
           }
           if (parameters === null) return;
           const requiresConfirmation =
             capability.capability.effects.external ||
             capability.capability.effects.confirmation_required;
-          const confirmed = requiresConfirmation
-            ? await confirmAction(
-                `${capability.capability.action.label}\n${capability.capability.action.description}\n\nContinue with ${capability.provider.name}?`,
-              )
-            : false;
-          if (requiresConfirmation && !confirmed) return;
-
           const key = capabilityInvocationKey(
-            item.message_id,
+            messageId,
             attachment.part_id,
             capability.provider,
             capability.capability,
@@ -2088,89 +2177,91 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
             capability.acknowledged_manifest_features ?? [],
           );
           const active = matchingCapabilityResult(attachment, capability, parameters);
-          const requestId =
-            (activeCapabilityResult(active) ? active?.job_id : undefined) ??
-            attachmentRequestIds.get(key) ??
-            crypto.randomUUID();
-          attachmentRequestIds.set(key, requestId);
-          attachmentInvocationsInFlight.add(key);
-          invokeButton.disabled = true;
-          invokeButton.textContent = `Running ${capability.capability.action.label}…`;
-          inboxStatus.textContent = `Running ${capability.capability.action.label} for ${attachment.filename}…`;
-          delete inboxStatus.dataset.kind;
-          let result: ConnectInvocationResult | undefined;
-          let invocationError: unknown;
-          const refusalKey = attachmentKey(item.message_id, attachment.part_id);
-          const previousRefusal = attachmentSelectionRefusals.get(refusalKey);
-          try {
-            result = await invoke<ConnectInvocationResult>(
-              "attachment_capability_invoke",
-              {
-                requestId,
-                messageId: item.message_id,
-                partId: attachment.part_id,
-                provider: {
-                  app_id: capability.provider.app_id,
-                  version: capability.provider.version,
-                  instance_id: capability.provider.instance_id,
+          const activeRequestId = activeCapabilityResult(active) ? active?.job_id : undefined;
+          const { part_id: partId, filename } = attachment;
+          await performInboxReaderAction(context, key, async () => {
+            const confirmed = requiresConfirmation
+              ? await confirmAction(
+                  `${capability.capability.action.label}\n${capability.capability.action.description}\n\nContinue with ${capability.provider.name}?`,
+                )
+              : false;
+            if ((requiresConfirmation && !confirmed) || !await context.afterApproval() || !context.current()) return;
+            const requestId = activeRequestId ?? attachmentRequestIds.get(key) ?? crypto.randomUUID();
+            attachmentRequestIds.set(key, requestId);
+            attachmentInvocationsInFlight.add(key);
+            invokeButton.disabled = true;
+            invokeButton.textContent = `Running ${capability.capability.action.label}…`;
+            let result: ConnectInvocationResult | undefined;
+            let invocationError: unknown;
+            const refusalKey = attachmentKey(messageId, partId);
+            const previousRefusal = attachmentSelectionRefusals.get(refusalKey);
+            try {
+              result = await invoke<ConnectInvocationResult>(
+                "attachment_capability_invoke",
+                {
+                  requestId,
+                  messageId,
+                  partId: partId,
+                  provider: {
+                    app_id: capability.provider.app_id,
+                    version: capability.provider.version,
+                    instance_id: capability.provider.instance_id,
+                  },
+                  capability: {
+                    id: capability.capability.id,
+                    version: capability.capability.version,
+                  },
+                  parameters,
+                  confirmed,
                 },
-                capability: {
-                  id: capability.capability.id,
-                  version: capability.capability.version,
-                },
-                parameters,
-                confirmed,
-              },
-            );
-            attachmentRequestIds.delete(key);
-            if (
-              previousRefusal?.capabilityId === capability.capability.id &&
-              attachmentSelectionRefusals.get(refusalKey) === previousRefusal
-            ) {
-              attachmentSelectionRefusals.delete(refusalKey);
-            }
-          } catch (error) {
-            invocationError = error;
-            const code = errorCode(error);
-            const recovery = capabilitySelectionRecovery(
-              code, capability.capability, errorRetryable(error),
-            );
-            // Only an authoritative refusal ends this request. Transport errors
-            // retain their identity for the existing reconciliation path.
-            if (recovery) {
-              attachmentSelectionRefusals.set(
-                refusalKey, { text: recovery, capabilityId: capability.capability.id },
               );
               attachmentRequestIds.delete(key);
+              if (
+                previousRefusal?.capabilityId === capability.capability.id &&
+                attachmentSelectionRefusals.get(refusalKey) === previousRefusal
+              ) {
+                attachmentSelectionRefusals.delete(refusalKey);
+              }
+            } catch (error) {
+              invocationError = error;
+              const code = errorCode(error);
+              const recovery = capabilitySelectionRecovery(
+                code, capability.capability, errorRetryable(error),
+              );
+              // Only an authoritative refusal ends this request. Transport errors
+              // retain their identity for the existing reconciliation path.
+              if (recovery) {
+                attachmentSelectionRefusals.set(
+                  refusalKey, { text: recovery, capabilityId: capability.capability.id },
+                );
+                attachmentRequestIds.delete(key);
+              }
+            } finally {
+              attachmentInvocationsInFlight.delete(key);
             }
-          } finally {
-            attachmentInvocationsInFlight.delete(key);
-          }
-          await loadInbox();
-          if (result) {
-            if (result.status === "completed") {
-              inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachment.filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
-              inboxStatus.dataset.kind = "success";
+            await refresh();
+            if (result) {
+              if (result.status === "completed") {
+                report(`${capability.capability.action.label} completed for ${filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`, "success");
+              } else {
+                const state =
+                  durableCapabilityStatus(
+                    result,
+                    capability.provider.name,
+                    capability.capability.action.label,
+                  ) ?? "Capability job queued";
+                report(`${state} for ${filename}.`, "warning");
+              }
             } else {
-              const state =
-                durableCapabilityStatus(
-                  result,
-                  capability.provider.name,
-                  capability.capability.action.label,
-                ) ?? "Capability job queued";
-              inboxStatus.textContent = `${state} for ${attachment.filename}.`;
-              inboxStatus.dataset.kind = "warning";
+              report(errorMessage(invocationError), "error");
             }
-          } else {
-            inboxStatus.textContent = errorMessage(invocationError);
-            inboxStatus.dataset.kind = "error";
-          }
+          });
         });
         actions.append(invokeButton);
       }
       row.append(attachmentDetails, actions);
       const refusal = attachmentSelectionRefusals.get(
-        attachmentKey(item.message_id, attachment.part_id),
+        attachmentKey(messageId, attachment.part_id),
       );
       if (refusal) {
         const notice = document.createElement("p");
@@ -2180,7 +2271,7 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
         row.append(notice);
       }
       for (const result of attachment.capability_results ?? []) {
-        renderCapabilityResult(row, result, item.message_id, attachment.part_id);
+        renderCapabilityResult(row, result, messageId, attachment.part_id, context);
       }
       for (const fire of attachment.automation_fires ?? []) {
         const status = document.createElement("p");
@@ -2201,8 +2292,10 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
         const confirm = document.createElement("button");
         confirm.type = "button";
         confirm.textContent = "Confirm automation";
+        confirm.dataset.inboxAction = "automation-confirm:" + fire.fire_id;
+        decline.dataset.inboxAction = "automation-decline:" + fire.fire_id;
         const refreshDecisionInbox = async (): Promise<void> => {
-          const committed = await loadInbox();
+          const committed = await refresh();
           if (!committed) {
             throw new Error("Inbox could not refresh");
           }
@@ -2212,16 +2305,16 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
           retryRefresh.type = "button";
           retryRefresh.className = "secondary";
           retryRefresh.textContent = "Refresh inbox";
+          retryRefresh.dataset.inboxAction = "automation-refresh:" + fire.fire_id;
           retryRefresh.addEventListener("click", async () => {
+            if (!context.current()) return;
             retryRefresh.disabled = true;
             try {
               await refreshDecisionInbox();
-              inboxStatus.textContent = "Inbox refreshed. Review the current automation state.";
-              inboxStatus.dataset.kind = "success";
+              report("Inbox refreshed. Review the current automation state.", "success");
             } catch {
               retryRefresh.disabled = false;
-              inboxStatus.textContent = "Inbox could not refresh. Try again before making another decision.";
-              inboxStatus.dataset.kind = "error";
+              report("Inbox could not refresh. Try again before making another decision.", "error");
             }
           });
           decisions.replaceChildren(retryRefresh);
@@ -2236,61 +2329,52 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
           confirm.disabled = true;
           decline.disabled = true;
         }
-        const decide = async (decision: "confirmed" | "declined"): Promise<void> => {
-          if (automationDecisionsInFlight.has(fire.fire_id)) return;
-          if (
-            decision === "confirmed" &&
-            !await confirmAction(
-              `Confirm automation rule ${fire.rule_id} for "${attachment.filename}"? This authorizes its prepared action and may change data in another app.`,
-            )
-          ) return;
-          confirm.disabled = true;
-          decline.disabled = true;
-          const outcome = await runAutomationDecision(
-            fire,
-            decision,
-            automationDecisionsInFlight,
-            (request) => invoke<AutomationDecisionResult>("automation_fire_decide", { ...request }),
-            refreshDecisionInbox,
-          );
-          if (outcome.status === "ignored") {
-            confirm.disabled = false;
-            decline.disabled = false;
-            return;
-          }
-          if (!outcome.refreshed) {
-            automationDecisionRefreshRequired.set(fire.fire_id, inboxRequestGeneration);
+        const decide = (decision: "confirmed" | "declined"): Promise<void> => performInboxReaderAction(
+          context, JSON.stringify(["automation", fire.fire_id]), async () => {
+            if (automationDecisionsInFlight.has(fire.fire_id) || automationDecisionRefreshRequired.has(fire.fire_id)) return;
+            if (
+              decision === "confirmed" &&
+              !await confirmAction(
+                `Confirm automation rule ${fire.rule_id} for "${attachment.filename}"? This authorizes its prepared action and may change data in another app.`,
+              )
+            ) return;
+            if (!await context.afterApproval() || !context.current()) return;
             confirm.disabled = true;
             decline.disabled = true;
-            showRefreshRetry();
-            renderInbox(inboxItems);
-          } else {
-            renderInbox(inboxItems);
-          }
-          if (outcome.status === "rejected") {
-            inboxStatus.textContent = errorCode(outcome.error) === "stale_automation_fire"
-              ? outcome.refreshed
-                ? "Automation changed before your decision. Review the refreshed inbox before trying again."
-                : "Automation changed before your decision. Refresh Inbox before trying again."
-              : `Automation decision was not saved: ${errorMessage(outcome.error)}`;
-            inboxStatus.dataset.kind = "error";
-          } else if (outcome.result.state === "declined") {
-            inboxStatus.textContent = "Automation declined. No action was submitted.";
-            inboxStatus.dataset.kind = "success";
-          } else if (outcome.result.state === "pending_dispatch") {
-            if (!outcome.refreshed) {
-              inboxStatus.textContent = "Automation confirmation saved. The prepared action was queued for dispatch.";
-              inboxStatus.dataset.kind = "success";
+            const outcome = await runAutomationDecision(
+              fire,
+              decision,
+              automationDecisionsInFlight,
+              (request) => invoke<AutomationDecisionResult>("automation_fire_decide", { ...request }),
+              refreshDecisionInbox,
+            );
+            if (outcome.status === "ignored") {
+              confirm.disabled = false;
+              decline.disabled = false;
+              return;
             }
-          } else {
-            inboxStatus.textContent = `Automation decision saved with state ${outcome.result.state}.`;
-            inboxStatus.dataset.kind = "warning";
-          }
-          if (!outcome.refreshed) {
-            inboxStatus.textContent += " Inbox could not refresh; use Refresh inbox before another decision.";
-            inboxStatus.dataset.kind = "error";
-          }
-        };
+            if (!outcome.refreshed) {
+              automationDecisionRefreshRequired.set(fire.fire_id, inboxRequestGeneration);
+            }
+            if (context.current()) inboxThreadEntry.reader.render();
+            const warning = outcome.refreshed ? "" : " Inbox could not refresh; use Refresh inbox before another decision.";
+            if (outcome.status === "rejected") {
+              const message = errorCode(outcome.error) === "stale_automation_fire"
+                ? outcome.refreshed
+                  ? "Automation changed before your decision. Review the refreshed inbox before trying again."
+                  : "Automation changed before your decision. Refresh Inbox before trying again."
+                : `Automation decision was not saved: ${errorMessage(outcome.error)}`;
+              report(message + warning, "error");
+            } else if (outcome.result.state === "declined") {
+              report("Automation declined. No action was submitted." + warning, outcome.refreshed ? "success" : "error");
+            } else if (outcome.result.state === "pending_dispatch") {
+              if (!outcome.refreshed) {
+                report("Automation confirmation saved. The prepared action was queued for dispatch." + warning, "error");
+              }
+            } else {
+              report(`Automation decision saved with state ${outcome.result.state}.` + warning, outcome.refreshed ? "warning" : "error");
+            }
+        });
         decline.addEventListener("click", () => void decide("declined"));
         confirm.addEventListener("click", () => void decide("confirmed"));
         decisions.append(decline, confirm);
@@ -2310,9 +2394,21 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
     const category = document.createElement("span");
     category.className = "category-badge";
     category.textContent = (item.category || "Unclassified").replace(/_/g, " ");
-    badges.append(badge);
+    badges.append(badge, category);
     const state = document.createElement("span");
     state.textContent = stateLabel(item);
+    badges.append(state);
+    const actionState = inboxActionState(
+      automationStates,
+      item.attachments.flatMap(attachment => (attachment.capability_results ?? []).map(result => result?.status)),
+      item.calendar_proposal, renderStartedAt,
+    );
+    if (actionState !== null) {
+      const chip = document.createElement("span");
+      chip.className = "inbox-action-state";
+      chip.textContent = actionState;
+      badges.append(chip);
+    }
     const footerActions = document.createElement("div");
     footerActions.className = "message-footer-actions";
     footer.append(badges, footerActions);
@@ -2320,33 +2416,32 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
       const retryButton = document.createElement("button");
       retryButton.type = "button";
       retryButton.textContent = "Retry analysis";
-      retryButton.addEventListener("click", async () => {
-        retryButton.disabled = true;
-        retryButton.textContent = "Retrying…";
-        delete inboxStatus.dataset.kind;
-        inboxStatus.textContent = `Requeueing analysis for ${item.subject}…`;
-        try {
-          await invoke("analysis_requeue", { messageId: item.message_id });
-          await loadInbox();
-          inboxStatus.textContent = `Analysis requeued for ${item.subject}.`;
-          inboxStatus.dataset.kind = "success";
-        } catch (error) {
-          retryButton.disabled = false;
-          retryButton.textContent = "Retry analysis";
-          inboxStatus.textContent = errorMessage(error);
-          inboxStatus.dataset.kind = "error";
-        }
-      });
+      retryButton.dataset.inboxAction = "analysis";
+      retryButton.addEventListener("click", () => void performInboxReaderAction(
+        context, JSON.stringify(["analysis", messageId]), async () => {
+          retryButton.disabled = true;
+          retryButton.textContent = "Retrying…";
+          try {
+            await invoke("analysis_requeue", { messageId });
+            await refresh();
+            report("Analysis requeued.", "success");
+          } catch (error) {
+            retryButton.disabled = false;
+            retryButton.textContent = "Retry analysis";
+            report(errorMessage(error), "error");
+          }
+      }));
       footerActions.append(retryButton);
     }
     const deleteButton = document.createElement("button");
     deleteButton.type = "button";
     deleteButton.className = "remove-button";
-    deleteButton.textContent = inboxDeletionsInFlight.has(item.message_id)
+    deleteButton.dataset.inboxAction = "delete";
+    deleteButton.textContent = inboxDeletionsInFlight.has(messageId)
       ? "Deleting…"
       : "Delete locally";
     deleteButton.disabled = inboxMutationInFlight();
-    deleteButton.addEventListener("click", () => void deleteInboxItem(item));
+    deleteButton.addEventListener("click", () => void deleteInboxItem(context));
     footerActions.append(deleteButton);
 
     card.append(meta, summary);
@@ -2355,193 +2450,92 @@ function renderInboxMessageDetails(item: InboxItem, card: HTMLElement, renderSta
     if (calendarProposal) card.append(calendarProposal);
     if (attachments.childElementCount) card.append(attachments);
     card.append(footer);
-    return { received, category, state, truncation, automationStates, nextProposalExpiry };
+    return nextProposalExpiry;
 }
 
-function renderInbox(items: InboxItem[]): void {
+function inboxConversationRow(item: InboxConversation): InboxThreadRow {
+  return { ...item.matching_message_ref, thread_entry_ref: item.matching_message_ref, thread_ref: item.thread_ref,
+    subject: item.latest.subject, sender: item.latest.sender, received_at: item.latest.received_at };
+}
+
+function renderInbox(items: InboxConversation[]): void {
   const position = captureInboxScroll();
   const scrollTop = inboxItemsEpoch === inboxRenderedEpoch ? position.top : 0;
+  const focused = document.activeElement as HTMLElement | null;
+  const focusKey = focused && inboxList.contains(focused) ? focused.dataset.inboxThreadOrigin : undefined;
   inboxRenderedEpoch = inboxItemsEpoch;
   renderInboxFilterScope();
-  if (inboxProposalExpiryTimer !== null) {
-    window.clearTimeout(inboxProposalExpiryTimer);
-    inboxProposalExpiryTimer = null;
-  }
-  const renderStartedAt = Date.now();
-  let nextProposalExpiry: number | null = null;
-  capabilityOutputPreviews.clear();
-  capabilityOutputViewButtons.clear();
   inboxList.replaceChildren();
   if (items.length === 0) {
-    capabilityOutputPresentations.clear();
     const empty = document.createElement("li");
     empty.className = "empty-state";
-    const filtered = Object.entries(activeInboxQuery).some(
-      ([key, value]) => key !== "limit" && value !== null,
-    );
-    empty.textContent = inboxPageState === "pending"
-      ? "Messages not loaded yet."
-      : inboxPageState === "loading"
-      ? "Loading messages…"
-      : inboxPageState === "failed"
-      ? "Messages could not be loaded."
-      : activeInboxQuery.sender !== null
-      ? inboxSenderEmptyText(activeInboxQuery, activeInboxAccountSelection)
-      : filtered
-      ? "No retained messages match these filters."
-      : "No retained messages yet.";
+    const filtered = Object.entries(activeInboxQuery).some(([key, value]) => key !== "limit" && value !== null);
+    empty.textContent = inboxPageState === "pending" ? "Conversations not loaded yet."
+      : inboxPageState === "loading" ? "Loading conversations…"
+      : inboxPageState === "failed" ? "Conversations could not be loaded."
+      : activeInboxQuery.sender !== null ? inboxSenderEmptyText(activeInboxQuery, activeInboxAccountSelection)
+      : filtered ? "No retained conversations match these filters." : "No retained conversations yet.";
     inboxList.append(empty);
-    restoreInboxScroll(scrollTop);
-    return;
   }
-
+  let nextFocus: HTMLElement | undefined;
   for (const item of items) {
     const card = document.createElement("li");
     card.className = "inbox-card";
-    card.inert = inboxMutationInFlight();
-    if (card.inert) card.setAttribute("aria-busy", "true");
-    const priority = item.priority?.toLowerCase() ?? "untriaged";
-    card.dataset.priority = ["urgent", "high", "normal", "low"].includes(priority)
-      ? priority
-      : "untriaged";
-
-    const { received, category, state, truncation, automationStates, nextProposalExpiry: rowExpiry } =
-      renderInboxMessageDetails(item, card, renderStartedAt);
-    if (rowExpiry !== null) nextProposalExpiry = Math.min(nextProposalExpiry ?? rowExpiry, rowExpiry);
-    const content = document.createElement("div");
-    content.id = `inbox-message-${inboxList.childElementCount}`;
-    content.className = "inbox-message-content";
-    content.hidden = !expandedInboxMessages.has(item.message_id);
-    content.append(...Array.from(card.childNodes));
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "inbox-row-toggle";
-    toggle.setAttribute("aria-expanded", String(!content.hidden));
-    toggle.setAttribute("aria-controls", content.id);
+    const row = inboxConversationRow(item);
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "inbox-row-toggle";
+    trigger.setAttribute("aria-controls", "inbox-thread-view");
+    trigger.dataset.inboxThreadOrigin = inboxConversationKey(item.thread_ref);
+    trigger.disabled = !inboxThreadEntry.canOpen(row);
+    trigger.setAttribute("aria-pressed", String(inboxThreadEntry.isSelected(row)));
+    trigger.addEventListener("click", () => void inboxThreadEntry.open(row));
     const identity = document.createElement("span");
     identity.className = "inbox-row-sender";
     const name = document.createElement("strong");
-    name.textContent = item.sender_name || item.sender;
+    name.textContent = item.latest.sender_name || item.latest.sender;
     identity.append(name);
-    if (item.sender_name) {
+    if (item.latest.sender_name) {
       const address = document.createElement("span");
-      address.textContent = item.sender;
+      address.textContent = item.latest.sender;
       identity.append(address);
     }
-    const rowSubject = document.createElement("span");
-    rowSubject.className = "inbox-row-subject";
-    rowSubject.textContent = item.subject;
-    const rowBadges = document.createElement("span");
-    rowBadges.className = "message-badges";
-    rowBadges.append(category, state);
-    if (item.attachments.length) {
-      const attachmentCount = document.createElement("span");
-      attachmentCount.textContent = `${item.attachments.length} attachment${item.attachments.length === 1 ? "" : "s"}`;
-      rowBadges.append(attachmentCount);
+    const time = document.createElement("time");
+    if (item.latest.received_at !== null) time.dateTime = item.latest.received_at;
+    time.textContent = item.latest.received_at ? receivedLabel(item.latest.received_at) : "Date unavailable";
+    const subject = document.createElement("span");
+    subject.className = "inbox-row-subject";
+    subject.textContent = item.latest.subject || "No subject";
+    const badges = document.createElement("span");
+    badges.className = "message-badges";
+    const counts = item.counts;
+    const labels = [
+      counts.messages === 1 ? "1 email" : counts.messages + " emails",
+      counts.matching_messages < counts.messages ? counts.matching_messages + " match" : "",
+      item.senders.length > 1 ? item.senders.length + " senders" : "",
+      counts.action_required ? counts.action_required + " need action" : "",
+      counts.pending_messages ? counts.pending_messages + " pending analysis" : "",
+      counts.analysis_errors ? counts.analysis_errors + " analysis issue" + (counts.analysis_errors === 1 ? "" : "s") : "",
+      counts.attachments ? counts.attachments + " attachment" + (counts.attachments === 1 ? "" : "s") : "",
+      counts.truncated_messages ? "Partial analysis" : "",
+    ];
+    for (const text of labels.filter(Boolean)) {
+      const badge = document.createElement("span"); badge.textContent = text; badges.append(badge);
     }
-    if (truncation) {
-      const partial = document.createElement("span");
-      partial.className = "inbox-partial-summary";
-      partial.textContent = truncation.badge;
-      rowBadges.append(partial);
+    if (activeInboxQuery.provider === null && activeInboxQuery.account_id === null) {
+      const { provider, account_id } = item.thread_ref;
+      const account = mailAccounts.find(candidate => candidate.provider === provider && candidate.account_id === account_id);
+      const mailbox = document.createElement("span");
+      mailbox.textContent = account?.address || account?.display_name || provider + " / " + account_id;
+      badges.append(mailbox);
     }
-    const actionState = inboxActionState(
-      automationStates,
-      item.attachments.flatMap((attachment) => (attachment.capability_results ?? []).map((result) => result?.status)),
-      item.calendar_proposal ? {
-        state: item.calendar_proposal.state,
-        status: item.calendar_proposal.status,
-        expires_at: item.calendar_proposal.expires_at,
-      } : null,
-      renderStartedAt,
-    );
-    if (actionState !== null) {
-      const chip = document.createElement("span");
-      chip.className = "inbox-action-state";
-      chip.textContent = actionState;
-      rowBadges.append(chip);
-    }
-    toggle.append(identity, received, rowSubject, rowBadges);
-    toggle.addEventListener("click", () => {
-      content.hidden = !content.hidden;
-      if (content.hidden) expandedInboxMessages.delete(item.message_id);
-      else expandedInboxMessages.add(item.message_id);
-      toggle.setAttribute("aria-expanded", String(!content.hidden));
-    });
-    const openThread = document.createElement("button");
-    openThread.type = "button";
-    openThread.className = "secondary-action inbox-open-thread";
-    openThread.textContent = "Open thread";
-    openThread.setAttribute("aria-label", `Open thread: ${item.subject || "No subject"}`);
-    openThread.setAttribute("aria-controls", "inbox-thread-view");
-    const originKey = inboxThreadOriginKey(item.thread_entry_ref);
-    if (originKey !== null) openThread.dataset.inboxThreadOrigin = originKey;
-    openThread.disabled = !inboxThreadEntry.canOpen(item);
-    openThread.setAttribute("aria-pressed", String(inboxThreadEntry.isSelected(item)));
-    openThread.addEventListener("click", () => { void inboxThreadEntry.open(item); });
-    card.append(toggle, openThread, content);
+    trigger.append(identity, time, subject, badges);
+    card.append(trigger);
     inboxList.append(card);
+    if (trigger.dataset.inboxThreadOrigin === focusKey) nextFocus = trigger;
   }
-  for (const key of capabilityOutputPresentations.keys()) {
-    if (!capabilityOutputPreviews.has(key)) capabilityOutputPresentations.delete(key);
-  }
-  // Replacing rows can clamp the scroll owner while it is empty. Restore only
-  // after all rows exist; the browser clamps naturally if the new span is shorter.
   restoreInboxScroll(scrollTop);
-  if (nextProposalExpiry !== null) {
-    const delay = Math.min(Math.max(nextProposalExpiry - Date.now() + 1, 0), 2_147_483_647);
-    inboxProposalExpiryTimer = window.setTimeout(() => {
-      inboxProposalExpiryTimer = null;
-      renderInbox(inboxItems);
-    }, delay);
-  }
-}
-
-async function loadAttachmentCapabilities(
-  items: InboxItem[],
-): Promise<{
-  capabilities: Map<string, ConnectCapability[]>;
-  diagnostics: Map<string, string>;
-  unavailable: number;
-}> {
-  const attachments = items.flatMap((item) =>
-    item.attachments.map((attachment) => ({
-      attachment,
-      messageId: item.message_id,
-    })),
-  );
-  const capabilities = new Map<string, ConnectCapability[]>();
-  const diagnostics = new Map<string, string>();
-  const discoveries: PromiseSettledResult<ConnectCapabilities>[] = [];
-  const batchSize = 4;
-  for (let offset = 0; offset < attachments.length; offset += batchSize) {
-    const batch = attachments.slice(offset, offset + batchSize);
-    discoveries.push(
-      ...(await Promise.allSettled(
-        batch.map(({ attachment, messageId }) =>
-          invoke<ConnectCapabilities>("attachment_capabilities", {
-            messageId,
-            partId: attachment.part_id,
-          }),
-        ),
-      )),
-    );
-  }
-  let unavailable = 0;
-  discoveries.forEach((discovery, index) => {
-    const target = attachments[index];
-    const key = attachmentKey(target.messageId, target.attachment.part_id);
-    if (discovery.status === "fulfilled") {
-      capabilities.set(key, discovery.value.items);
-      const diagnostic = discovery.value.diagnostic?.code ?? null;
-      if (diagnostic !== null) diagnostics.set(key, diagnostic);
-      if (classifyCapabilityDiagnostic(diagnostic) === "unavailable") unavailable += 1;
-    } else {
-      capabilities.set(key, []);
-      unavailable += 1;
-    }
-  });
-  return { capabilities, diagnostics, unavailable };
+  if (focusKey !== undefined) (nextFocus ?? requiredElement<HTMLElement>("#inbox-heading")).focus({ preventScroll: true });
 }
 
 function optionalFilterValue(value: string): string | null {
@@ -2644,9 +2638,9 @@ function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
     account_id: account.account_id,
     sender: activeInboxQuery.sender,
     sender_query: optionalFilterValue(inboxSenderInput.value),
-    priority: optionalFilterValue(inboxPrioritySelect.value),
-    category: optionalFilterValue(inboxCategorySelect.value),
-    status: optionalFilterValue(inboxStateSelect.value),
+    priority: optionalFilterValue(inboxPrioritySelect.value) as InboxQuery["priority"],
+    category: optionalFilterValue(inboxCategorySelect.value) as InboxQuery["category"],
+    status: optionalFilterValue(inboxStateSelect.value) as InboxQuery["status"],
     keyword: optionalFilterValue(inboxKeywordInput.value),
   };
 }
@@ -2656,10 +2650,9 @@ function clearInboxPageForAccountChange(message: string): void {
   inboxRequestGeneration += 1;
   inboxQueryEpoch += 1;
   inboxPageState = "pending";
-  expandedInboxMessages.clear();
   inboxItems = [];
+  inboxTotals = null;
   inboxNextCursor = null;
-  inboxCapabilityUnavailableCount = 0;
   clearMessageOwnedUiState();
   inboxLoadMore.hidden = true;
   renderInbox(inboxItems);
@@ -2685,7 +2678,6 @@ function commitInboxQueryFromControls(
     inboxQueryEpoch += 1;
     threadHistory.clearInboxSelection();
     inboxPageState = "pending";
-    expandedInboxMessages.clear();
     renderInbox(inboxItems);
     void loadInbox();
   }
@@ -2813,41 +2805,37 @@ function setInboxControlsBusy(busy: boolean): void {
   }
 }
 
-async function deleteInboxItem(item: InboxItem): Promise<void> {
-  if (inboxMutationInFlight()) return;
-  const confirmed = await confirmAction(
-    `Delete "${item.subject}" from Email Watcher's local history? ` +
-      "Its local analysis, attachment metadata, notifications, and capability results will be removed. The source email will stay in your mailbox.",
-  );
-  if (!confirmed || inboxMutationInFlight()) return;
+function deleteInboxItem(context: InboxActionContext): Promise<void> {
+  const { messageId, subject } = context;
+  return performInboxReaderAction(context, JSON.stringify(["delete", messageId]), async () => {
+    if (inboxMutationInFlight()) return;
+    const confirmed = await confirmAction(
+      `Delete "${subject}" from Email Watcher's local history? ` +
+        "Its local analysis, attachment metadata, notifications, and capability results will be removed. The source email will stay in your mailbox.",
+    );
+    if (!confirmed || !await context.afterApproval() || !context.current()) return;
 
-  threadHistory.beginMutation();
-  inboxDeletionsInFlight.add(item.message_id);
-  inboxRequestGeneration += 1;
-  wakeInboxReload();
-  setInboxControlsBusy(true);
-  renderInbox(inboxItems);
-  try {
-    const result = await inboxRemovalClient.delete(item.message_id);
-    if (!result) return;
-    expandedInboxMessages.delete(item.message_id);
-    clearMessageOwnedUiState(item.message_id);
-    inboxItems = inboxItems.filter((candidate) => candidate.message_id !== item.message_id);
-    renderInbox(inboxItems);
-    const status = inboxRemovalStatus(result);
-    inboxStatus.textContent = result.outcome === "completed"
-      ? `Deleted "${item.subject}" from local history. The source email was not changed.` : status.text;
-    inboxStatus.dataset.kind = status.kind;
-  } catch (error) {
-    inboxStatus.textContent = errorMessage(error);
-    inboxStatus.dataset.kind = "error";
-  } finally {
-    void threadHistory.endMutation();
-    inboxDeletionsInFlight.delete(item.message_id);
-    setInboxControlsBusy(false);
-    renderInbox(inboxItems);
-    void loadInbox();
-  }
+    threadHistory.beginMutation();
+    inboxDeletionsInFlight.add(messageId);
+    inboxRequestGeneration += 1;
+    wakeInboxReload();
+    setInboxControlsBusy(true);
+    try {
+      const result = await inboxRemovalClient.delete(messageId);
+      if (!result) return;
+      clearMessageOwnedUiState(messageId);
+      const status = inboxRemovalStatus(result);
+      showInboxActionNotice(subject, result.outcome === "completed"
+        ? "Deleted from local history. The source email was not changed." : status.text, status.kind);
+    } catch (error) {
+      showInboxActionNotice(subject, errorMessage(error), "error");
+    } finally {
+      void threadHistory.endMutation();
+      inboxDeletionsInFlight.delete(messageId);
+      setInboxControlsBusy(false);
+      void refreshLoadedInboxSpan();
+    }
+  });
 }
 
 async function clearInboxHistory(): Promise<void> {
@@ -2866,23 +2854,13 @@ async function clearInboxHistory(): Promise<void> {
   try {
     const result = await inboxRemovalClient.clear();
     if (!result) return;
-    const view = inboxClearView(inboxItems, result);
-    const retained = new Set(view.retained.map(item => item.message_id));
-    for (const item of inboxItems) {
-      if (!retained.has(item.message_id)) {
-        expandedInboxMessages.delete(item.message_id);
-        clearMessageOwnedUiState(item.message_id);
-      }
-    }
-    inboxItems = view.retained;
-    if (result.outcome === "completed") {
-      expandedInboxMessages.clear();
-      inboxPageState = "loaded";
-      inboxNextCursor = null;
-      inboxCapabilityUnavailableCount = 0;
-      clearMessageOwnedUiState();
-      inboxLoadMore.hidden = true;
-    }
+    const view = inboxClearStatus(result);
+    inboxItems = [];
+    inboxTotals = null;
+    inboxNextCursor = null;
+    inboxLoadMore.hidden = true;
+    clearMessageOwnedUiState();
+    if (result.outcome === "completed") inboxPageState = "loaded";
     renderInbox(inboxItems);
     inboxStatus.textContent = view.text;
     inboxStatus.dataset.kind = view.kind;
@@ -2899,12 +2877,10 @@ async function clearInboxHistory(): Promise<void> {
 }
 
 function inboxStatusLabel(): string {
-  const count = inboxItems.length;
-  const availability = inboxCapabilityUnavailableCount
-    ? " Some local capability providers are unavailable."
-    : "";
-  const more = inboxNextCursor ? " More matching messages are available." : "";
-  return `Showing ${count} matching message${count === 1 ? "" : "s"}.${more}${availability}`;
+  const count = inboxItems.length, total = inboxTotals?.conversations ?? count;
+  const matching = inboxTotals?.matching_messages ?? 0;
+  return "Showing " + count + " of " + total + " conversation" + (total === 1 ? "" : "s")
+    + " with " + matching + " matching email" + (matching === 1 ? "" : "s") + ".";
 }
 
 async function loadInboxPage(
@@ -2922,11 +2898,9 @@ async function loadInboxPage(
     inboxPageStateGeneration = generation;
     if (inboxItems.length === 0) renderInbox(inboxItems);
   }
-  let page: InboxPage;
+  let page: InboxConversationPage;
   try {
-    page = await invoke<InboxPage>("inbox_query", {
-      query: { ...activeInboxQuery, cursor },
-    });
+    page = await inboxConversationClient.query({ ...activeInboxQuery, cursor });
   } catch (error) {
     if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
       if (!append && inboxPageState === "loading" && inboxPageStateGeneration === generation) {
@@ -2955,44 +2929,23 @@ async function loadInboxPage(
   }
 
   if (!append) {
-    attachmentCapabilities.clear();
-    attachmentCapabilityDiagnostics.clear();
-    inboxCapabilityUnavailableCount = 0;
     inboxItems = page.items;
     inboxItemsEpoch = inboxQueryEpoch;
     inboxPageState = "loaded";
   } else {
-    const known = new Set(inboxItems.map((item) => item.message_id));
-    inboxItems = [...inboxItems, ...page.items.filter((item) => !known.has(item.message_id))];
+    const known = new Set(inboxItems.map(item => inboxConversationKey(item.thread_ref)));
+    inboxItems = [...inboxItems, ...page.items.filter(item => !known.has(inboxConversationKey(item.thread_ref)))];
   }
   inboxNextCursor = page.next_cursor;
+  inboxTotals = page.totals;
   renderInbox(inboxItems);
   inboxLoadMore.hidden = inboxNextCursor === null;
   void refreshInboxRemovalStatuses();
   if (releaseAutomationRefreshFences(automationDecisionRefreshRequired, generation, append)) {
-    renderInbox(inboxItems);
+    inboxThreadEntry.reader.render();
   }
-  inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities are refreshing.`;
-  delete inboxStatus.dataset.kind;
-  try {
-    const discovery = await loadAttachmentCapabilities(page.items);
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return true;
-    for (const [key, capabilities] of discovery.capabilities) {
-      attachmentCapabilities.set(key, capabilities);
-    }
-    for (const [key, diagnostic] of discovery.diagnostics) {
-      attachmentCapabilityDiagnostics.set(key, diagnostic);
-    }
-    inboxCapabilityUnavailableCount += discovery.unavailable;
-    renderInbox(inboxItems);
-    inboxStatus.textContent = inboxStatusLabel();
-    inboxStatus.dataset.kind = "success";
-  } catch (error) {
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return true;
-    renderInbox(inboxItems);
-    inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities could not refresh: ${errorMessage(error)}`;
-    inboxStatus.dataset.kind = "warning";
-  }
+  inboxStatus.textContent = inboxStatusLabel();
+  inboxStatus.dataset.kind = "success";
   if (mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
     setInboxControlsBusy(false);
   }
@@ -3024,7 +2977,7 @@ async function runInboxRefresh(
       inboxThreadEntry.revalidateSource();
       refreshInboxThreadControls();
       committed = true;
-      void threadHistory.commitInboxSpan(readerGeneration === inboxThreadEntry.refreshGeneration);
+      await threadHistory.commitInboxSpan(readerGeneration === inboxThreadEntry.refreshGeneration);
     }
     return true;
   } finally {
@@ -3033,11 +2986,7 @@ async function runInboxRefresh(
 }
 
 function refreshInboxThreadControls(): void {
-  const rows = new Map<string, InboxItem>();
-  for (const item of inboxItems) {
-    const key = inboxThreadOriginKey(item.thread_entry_ref);
-    if (key !== null) rows.set(key, item);
-  }
+  const rows = new Map(inboxItems.map(item => [inboxConversationKey(item.thread_ref), inboxConversationRow(item)]));
   for (const button of inboxList.querySelectorAll<HTMLButtonElement>("[data-inbox-thread-origin]")) {
     const row = rows.get(button.dataset.inboxThreadOrigin!);
     button.disabled = !row || !inboxThreadEntry.canOpen(row);
@@ -3059,7 +3008,7 @@ async function loadInbox(
   return inboxReload.request({ kind: "first" }, effectScope);
 }
 
-async function refreshLoadedInboxSpan(): Promise<void> {
+async function refreshLoadedInboxSpan(): Promise<boolean> {
   if (configurationReady) {
     inboxThreadSpanScope = null;
     refreshInboxThreadControls();
@@ -3069,7 +3018,7 @@ async function refreshLoadedInboxSpan(): Promise<void> {
   const intent: InboxRefreshIntent = inboxItemsEpoch === inboxQueryEpoch
     ? { kind: "span", target: inboxItems.length }
     : { kind: "first" };
-  await inboxReload.request(intent);
+  return inboxReload.request(intent);
 }
 
 function scheduleConnectQueueRefresh(): void {

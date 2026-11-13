@@ -4,7 +4,7 @@ import { stripTypeScriptTypes } from "node:module";
 import test from "node:test";
 import vm from "node:vm";
 import { parseAst } from "vite";
-import { inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
+import { inboxThreadOriginKey, inboxConversationKey } from "../src/inboxThreadEntry.ts";
 import * as availability from "../src/connectAvailability.ts";
 import { activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult } from "../src/connectIdentity.ts";
 import { calendarOutcomeNotice } from "../src/calendarOutcome.ts";
@@ -15,7 +15,8 @@ import { hasInboxAutomationConfirmation, inboxActionState } from "../src/inboxAc
 const source = stripTypeScriptTypes(readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"));
 const ast = parseAst(source);
 const names = ["attachmentKey", "capabilityOutputKey", "clearMessageOwnedUiState", "capabilityGroups",
-  "renderCapabilityResult", "captureInboxScroll", "restoreInboxScroll", "renderInboxMessageDetails", "renderInbox", "loadAttachmentCapabilities", "loadInboxPage",
+  "renderCapabilityResult", "captureInboxScroll", "restoreInboxScroll", "renderInboxMessageDetails", "renderInbox", "inboxConversationRow", "performInboxReaderAction",
+  "beginInboxActionRender", "finishInboxActionRender", "renderInboxReaderAction", "loadReaderAttachmentCapabilities",
   "errorCode", "errorMessage", "errorRetryable"];
 const code = names.map(name => {
   const node = ast.body.find(node => node.type === "FunctionDeclaration" && node.id?.name === name);
@@ -50,6 +51,8 @@ class Element {
   get childNodes() { return this.children; }
   get childElementCount() { return this.children.length; }
   setAttribute(key: string, value: string) { this.attributes.set(key, value); }
+  querySelectorAll() { return nodes(this).filter(node => ["button", "input", "select"].includes(node.tag)); }
+  contains(node: Element) { return nodes(this).includes(node); }
   removeAttribute(key: string) { this.attributes.delete(key); }
   addEventListener(name: string, callback: () => unknown) { this.listeners.set(name, callback); }
   async click() { assert.equal(this.disabled, false); await this.listeners.get("click")?.(); }
@@ -83,15 +86,18 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     attachments: [{ part_id: "part-1", filename: "synthetic.pdf", byte_size: 4, media_type: "application/pdf",
       capability_results: [] as any[], automation_fires: [] }] };
   const context = vm.createContext({
-    inboxThreadOriginKey, inboxThreadEntry: { canOpen: () => true, isSelected: () => false, open: (row: unknown) => opened.push(row) },
+    inboxThreadOriginKey, inboxConversationKey, inboxThreadEntry: { canOpen: () => true, isSelected: () => false, open: (row: unknown) => opened.push(row) },
     ...availability, activeCapabilityResult, capabilityInvocationKey, matchingCapabilityResult,
     hasInboxAutomationConfirmation, inboxActionState, calendarOutcomeNotice, crypto,
-    document: { createElement: (tag: string) => new Element(tag) },
+    document: { activeElement: null, createElement: (tag: string) => new Element(tag) },
     inboxItems: [item], inboxList: new Element("ul"), inboxResults: { scrollTop: 0 }, inboxStatus: new Element(), inboxLoadMore: new Element(),
-    inboxProposalExpiryTimer: null, expandedInboxMessages: new Set([item.message_id]),
+    inboxProposalExpiryTimer: null, inboxRenderProposalExpiry: null,
+    inboxReaderActionsInFlight: new Set(), showInboxActionNotice: (_subject, text, kind) => {
+      context.inboxStatus.textContent = text; context.inboxStatus.dataset.kind = kind;
+    }, readerAttachmentDiscovery: new Map(), readerAttachmentKeys: new Set(), readerAttachmentQueue: [], readerAttachmentRequests: 0,
     attachmentCapabilities: new Map(), attachmentCapabilityDiagnostics: new Map(),
     attachmentSelectionRefusals: new Map(), attachmentInvocationsInFlight: new Set(), attachmentRequestIds: new Map(),
-    capabilityOutputPresentations: new Map(), capabilityOutputPresentationsInFlight: new Set(),
+    capabilityOutputPresentations: new Map(), capabilityOutputPresentationsInFlight: new Map(),
     capabilityOutputPreviews: new Map(), capabilityOutputViewButtons: new Map(),
     inboxDeletionsInFlight: new Set(), inboxMutationInFlight: () => false,
     inboxReloadBlocked: () => false, renderInboxFilterScope: () => {},
@@ -107,7 +113,6 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     collectCapabilityParameters: () => ({}),
     confirmAction: async (message: string) => { confirmations.push(message); return allowConfirmation; },
     invoke: async (operation: string, args: Record<string, any>) => {
-      if (operation === "inbox_query") return { items: [item], next_cursor: null };
       if (operation === "attachment_capabilities") return { items: catalog, diagnostic: null };
       assert.equal(operation, "attachment_capability_invoke");
       invocations.push(structuredClone(args));
@@ -117,9 +122,24 @@ function harness(refusal: { code: string | null; message: string; retryable?: bo
     },
   });
   vm.runInContext(code, context);
-  context.loadInbox = () => context.loadInboxPage(false);
-  const render = () => context.renderInbox(context.inboxItems);
-  const refresh = () => context.loadInboxPage(false);
+  const render = () => {
+    context.beginInboxActionRender();
+    context.inboxList.replaceChildren();
+    for (const email of context.inboxItems) {
+      const row = new Element("li");
+      context.inboxList.append(row);
+      context.renderInboxReaderAction(row, email, { messageId: email.message_id, subject: email.subject,
+        current: () => true, afterApproval: async () => true });
+    }
+    context.finishInboxActionRender();
+  };
+  const refresh = async () => {
+    context.attachmentCapabilities.set(context.attachmentKey("message-1", "part-1"), catalog);
+    render(); return true;
+  };
+  context.refreshLoadedInboxSpan = refresh;
+  context.inboxThreadEntry.reader = { render };
+  context.readerAttachmentDiscovery.set(context.attachmentKey("message-1","part-1"), Symbol());
   const button = (label: string) => {
     const found = nodes(context.inboxList).find(node => node.tag === "button" && node.textContent === label);
     assert.ok(found, `missing button ${label}`);
@@ -255,6 +275,7 @@ test("catalog refresh during an invocation cannot erase its later refusal or sub
   let release!: () => void;
   h.holdInvocation(new Promise<void>(resolve => { release = resolve; }));
   const invoking = h.button("Read invoice 1.0").click();
+  await new Promise(resolve => setImmediate(resolve));
   h.setCatalog([h.current]);
   await h.refresh();
   assert.equal(h.invocations.length, 1);
@@ -312,14 +333,19 @@ test("persisted provider errors consume stored retryability without inventing a 
 });
 
 
-test("Open thread is a separate current-row action and does not invoke saved analysis actions", async () => {
+test("conversation row is a single semantic reader control with no inline actions", async () => {
   const h = harness();
-  const button = h.button("Open thread");
+  const thread_ref = { provider: h.item.provider, account_id: h.item.account_id, mailbox_identity_key: null, thread_key: "fixture-thread" };
+  h.context.renderInbox([{ thread_ref, matching_message_ref: h.item.thread_entry_ref,
+    latest: h.item, senders: [{ address: h.item.sender }], counts: { messages: 2, matching_messages: 1, attachments: 1 } }]);
+  const buttons = nodes(h.context.inboxList).filter(node => node.tag === "button");
+  assert.equal(buttons.length, 1);
+  const [button] = buttons;
   assert.equal(button.attributes.get("aria-controls"), "inbox-thread-view");
-  assert.equal((button.dataset as any).inboxThreadOrigin, inboxThreadOriginKey(h.item.thread_entry_ref));
+  assert.equal((button.dataset as any).inboxThreadOrigin, inboxConversationKey(thread_ref));
   await button.click();
-  assert.deepEqual(h.opened, [h.item]); assert.deepEqual(h.invocations, []); assert.deepEqual(h.confirmations, []);
-  assert.equal(h.context.expandedInboxMessages.has(h.item.message_id), true);
+  assert.equal(h.opened[0].thread_entry_ref, h.item.thread_entry_ref);
+  assert.deepEqual(h.invocations, []); assert.deepEqual(h.confirmations, []);
 });
 
 
@@ -394,12 +420,11 @@ test("row details share one earliest-expiry timer and recompute it after the ear
 });
 
 
-test("the production row renderer never assigns an origin dataset to an incomplete ref", () => {
+test("a stale conversation row remains inert", () => {
   const h = harness();
-  delete (h.item.thread_entry_ref as any).mailbox_identity_key;
   h.context.inboxThreadEntry.canOpen = () => false;
-  h.render();
-  const open = h.button("Open thread");
-  assert.equal(open.disabled, true);
-  assert.equal(Object.hasOwn(open.dataset, "inboxThreadOrigin"), false);
+  const thread_ref = { provider: h.item.provider, account_id: h.item.account_id, mailbox_identity_key: null, thread_key: "fixture-thread" };
+  h.context.renderInbox([{ thread_ref, matching_message_ref: h.item.thread_entry_ref,
+    latest: h.item, senders: [], counts: { messages: 1, matching_messages: 1 } }]);
+  assert.equal(nodes(h.context.inboxList).find(node => node.tag === "button")?.disabled, true);
 });

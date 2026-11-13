@@ -93,7 +93,7 @@ test("decision refresh requires its own committed inbox projection", async () =>
   const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const decisionRefresh = ui.slice(
     ui.indexOf("const refreshDecisionInbox = async"),
-    ui.indexOf("const decide = async (decision: \"confirmed\""),
+    ui.indexOf("const decide = (decision: \"confirmed\""),
   );
   const loadInbox = ui.slice(ui.indexOf("async function loadInboxPage("), ui.indexOf("async function runInboxRefresh("));
   const commitPoint = loadInbox.indexOf("inboxItems = page.items");
@@ -105,7 +105,7 @@ test("decision refresh requires its own committed inbox projection", async () =>
   assert.match(loadInbox, /renderInbox\(inboxItems\);[\s\S]*return true;/);
   assert.doesNotMatch(loadInbox.slice(0, renderPoint), /\breturn(?:;| true;)/);
   assert.doesNotMatch(loadInbox.slice(renderPoint), /\breturn(?:;| false;)/);
-  assert.match(decisionRefresh, /const committed = await loadInbox\(\);[\s\S]*if \(!committed\) \{/);
+  assert.match(decisionRefresh, /const committed = await refresh\(\);[\s\S]*if \(!committed\) \{/);
   assert.doesNotMatch(decisionRefresh, /inboxRequestGeneration/);
 });
 
@@ -130,7 +130,7 @@ test("rerendered decision controls stay blocked until a later query commits", as
   assert.match(ui, /const automationDecisionRefreshRequired = new Map<string, number>\(\)/);
   assert.match(panel, /automationDecisionsInFlight\.has\(fire\.fire_id\)[\s\S]*?confirm\.disabled = true;[\s\S]*?decline\.disabled = true;/);
   assert.match(panel, /automationDecisionRefreshRequired\.has\(fire\.fire_id\)[\s\S]*?showRefreshRetry\(\)/);
-  assert.match(panel, /automationDecisionRefreshRequired\.set\(fire\.fire_id, inboxRequestGeneration\);[\s\S]*?renderInbox\(inboxItems\)/);
+  assert.match(panel, /automationDecisionRefreshRequired\.set\(fire\.fire_id, inboxRequestGeneration\);[\s\S]*?inboxThreadEntry\.reader\.render\(\)/);
   assert.match(loadInbox, /renderInbox\(inboxItems\);[\s\S]*?releaseAutomationRefreshFences\(automationDecisionRefreshRequired, generation, append\)/);
 });
 
@@ -151,7 +151,7 @@ test("a committed decision refresh reconciles the mounted panel after reservatio
 
   const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const panel = ui.slice(ui.indexOf("for (const fire of attachment.automation_fires ?? [])"), ui.indexOf("attachments.append(row);"));
-  assert.match(panel, /if \(!outcome\.refreshed\) \{[\s\S]*?automationDecisionRefreshRequired\.set\(fire\.fire_id, inboxRequestGeneration\);[\s\S]*?\} else \{\s*renderInbox\(inboxItems\);\s*\}/);
+  assert.match(panel, /if \(!outcome\.refreshed\) \{[\s\S]*?automationDecisionRefreshRequired\.set\(fire\.fire_id, inboxRequestGeneration\);[\s\S]*?\}\s*if \(context\.current\(\)\) inboxThreadEntry\.reader\.render\(\);/);
   assert.doesNotMatch(panel, /\} else \{\s*confirm\.disabled = false;\s*decline\.disabled = false;\s*\}/);
 });
 
@@ -189,7 +189,7 @@ test("inbox renders attachment-scoped decisions through the admitted Tauri comma
   assert.match(ui, /runAutomationDecision\(\s*fire,/);
   assert.match(ui, /invoke<AutomationDecisionResult>\("automation_fire_decide", \{ \.\.\.request \}\)/);
   assert.match(ui, /await loadInbox\(\)/);
-  assert.match(ui, /if \(!outcome\.refreshed\) \{[\s\S]*?confirm\.disabled = true;[\s\S]*?decline\.disabled = true;/);
+  assert.match(ui, /if \(!outcome\.refreshed\) \{\s*automationDecisionRefreshRequired\.set/);
   assert.match(ui, /retryRefresh\.textContent = "Refresh inbox"/);
   assert.match(ui, /decisions\.replaceChildren\(retryRefresh\)/);
   assert.match(lib, /async fn automation_fire_decide\([\s\S]*?admission\.require_admitted\(\)\?/);

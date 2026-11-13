@@ -63,7 +63,7 @@ test("destructive action handlers do no work while confirmation is pending or ca
     ["removeVendorAddress", ["vendor", "Vendor", "sender@example.com", true]],
     ["deleteVendor", ["vendor", "Vendor", 1, true]],
   ] as const) {
-    const handler = source.match(new RegExp(`async function ${name}\\([\\s\\S]*?\\n\\}`, "u"))![0];
+    const handler = source.match(new RegExp(`(?:async )?function ${name}\\([\\s\\S]*?\\n\\}`, "u"))![0];
     let release!: (value: boolean) => void;
     let dialogs = 0;
     const pending = new Promise<boolean>((resolve) => { release = resolve; });
@@ -71,7 +71,7 @@ test("destructive action handlers do no work while confirmation is pending or ca
     // boundary before approval makes this actual production handler throw.
     const invokeHandler = runInNewContext(`${stripTypeScriptTypes(handler)}; ${name}`, {
       confirmAction: () => { dialogs++; return pending; },
-      inboxMutationInFlight: () => false, mailOperationInFlight: false,
+      inboxMutationInFlight: () => false, performInboxReaderAction: (_context, _key, run) => run(), mailOperationInFlight: false,
       calendarConsentOperationInFlight: null, vendorsBusy: () => false,
       CALENDAR_CONSENT_PROFILES: [{ profile: "write", actionLabel: "Calendar access" }],
       removeAddressConfirmText: () => "Remove address?", deleteVendorConfirmText: () => "Delete vendor?",

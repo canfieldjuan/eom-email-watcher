@@ -1,6 +1,7 @@
-import type { InboxMessageRef, ThreadReadClient } from "./threadReads.ts";
+import type { InboxMessageRef, ThreadReadClient, ThreadRef } from "./threadReads.ts";
 import { ThreadViewDom, type RetainedThreadAccount, type ThreadReadingPosition } from "./threadViewDom.ts";
-import type { ThreadReadingIdentity } from "./threadView.ts";
+import { sameMailbox, sameThread, type ThreadReadingIdentity, type ReaderMessage } from "./threadView.ts";
+import type { InboxItem } from "./inboxItem.ts";
 
 export interface InboxThreadRow {
   provider: string;
@@ -9,7 +10,8 @@ export interface InboxThreadRow {
   thread_entry_ref: InboxMessageRef;
   subject?: string;
   sender?: string;
-  received_at?: string;
+  received_at?: string | null;
+  thread_ref?: ThreadRef;
 }
 export interface InboxThreadScope { mutation_epoch: number; mailbox_operation_revision: number }
 export interface InboxThreadSnapshot {
@@ -22,6 +24,16 @@ export interface InboxThreadSnapshot {
   scope: InboxThreadScope | null;
   spanScope: InboxThreadScope | null;
 }
+export type InboxActionContext = Readonly<{
+  messageId: string;
+  subject: string;
+  current: () => boolean;
+  afterApproval: () => Promise<boolean>;
+}>;
+
+export const inboxConversationKey = (ref: ThreadRef): string =>
+  JSON.stringify([ref.provider, ref.account_id, ref.mailbox_identity_key, ref.thread_key]);
+
 export function inboxThreadOriginKey(ref: InboxMessageRef | null | undefined): string | null {
   if (!ref || ![ref.provider, ref.account_id, ref.message_id]
     .every(value => typeof value === "string" && value.length > 0)
@@ -31,8 +43,9 @@ export function inboxThreadOriginKey(ref: InboxMessageRef | null | undefined): s
 }
 const sameScope = (a: InboxThreadScope | null, b: InboxThreadScope | null): boolean => !!a && !!b
   && a.mutation_epoch === b.mutation_epoch && a.mailbox_operation_revision === b.mailbox_operation_revision;
-type Entry = { origin: InboxMessageRef; epoch: number; scope: InboxThreadScope;
+type Entry = { origin: InboxMessageRef; thread: ThreadRef | null; epoch: number; scope: InboxThreadScope;
   scroll: { element: Element; top: number; left: number }[] };
+type ActionRefresh = { done: Promise<void>; finish: () => void };
 type ReadingIntent = { origin: string; epoch: number; identity: ThreadReadingIdentity;
   count: number; pages: number; bodies: string[]; position: ThreadReadingPosition; focus: boolean };
 
@@ -45,6 +58,9 @@ export class InboxThreadEntry {
   private sendersExpanded = false;
   private generation = 0;
   private intent: ReadingIntent | null = null;
+  private actionLifetime = 0;
+  private readonly actionMembers = new Map<string, symbol>();
+  private actionRefresh: ActionRefresh | null = null;
   private readonly options: {
     root: HTMLElement;
     columns: HTMLElement;
@@ -55,6 +71,10 @@ export class InboxThreadEntry {
     refreshInbox: () => Promise<void>;
     scrollElements: () => readonly Element[];
     onSelectionChange?: () => void;
+    renderAction?: (row: HTMLElement, record: InboxItem, context: InboxActionContext) => void;
+    actionNotSent?: (subject: string, reason: string) => void;
+    beforeRender?: () => void;
+    afterRender?: () => void;
     layout?: {
       grid: HTMLElement; readerPane: HTMLElement; placeholder: HTMLElement; source: HTMLElement;
       senders: HTMLElement; senderToggle: HTMLButtonElement; senderContent: HTMLElement; footer: HTMLElement;
@@ -67,6 +87,15 @@ export class InboxThreadEntry {
       idPrefix: "inbox-thread", accounts: options.accounts, onExit: () => this.back(),
       scrollRoot: options.layout?.readerPane,
       restoring: () => this.intent !== null,
+      renderAction: options.renderAction ? (row, message) => {
+        const context = this.actionContext(message);
+        if (context && message.inbox_action) options.renderAction?.(row, message.inbox_action, context);
+      } : undefined,
+      beforeRender: () => {
+        if (!this.actionRefresh) this.pruneActionMembers();
+        options.beforeRender?.();
+      },
+      afterRender: options.afterRender,
       onInboxRefresh: () => { this.retryGeneration++; return options.refreshInbox(); },
       onInboxRetry: () => this.retry(), onInboxChoice: () => { this.retryGeneration++; },
       inboxSourceNotice: () => this.entry && !this.current(this.entry)
@@ -98,18 +127,82 @@ export class InboxThreadEntry {
   get selected(): boolean { return this.entry !== null; }
   get refreshGeneration(): number { return this.generation; }
 
+  private actionOrigin(message: ReaderMessage, entry: Entry): string | null {
+    const record = message.inbox_action;
+    if (!record) return null;
+    const origin = record.thread_entry_ref;
+    const key = inboxThreadOriginKey(origin);
+    return key !== null && message.message_id === record.message_id && record.message_id === origin.message_id
+      && record.provider === origin.provider && record.account_id === origin.account_id
+      && sameMailbox(origin, entry.origin) ? key : null;
+  }
+
+  private actionContext(message: ReaderMessage): InboxActionContext | null {
+    const entry = this.entry, record = message.inbox_action;
+    if (!entry || !record || this.actionRefresh) return null;
+    const key = this.actionOrigin(message, entry);
+    if (key === null) return null;
+    const { message_id: messageId, subject } = record;
+    const lifetime = this.actionLifetime;
+    if (!this.actionMembers.has(key)) this.actionMembers.set(key, Symbol());
+    const member = this.actionMembers.get(key);
+    const current = () => this.actionLifetime === lifetime && this.entry === entry
+      && this.actionRefresh === null && this.actionMembers.get(key) === member && this.current(entry)
+      && this.state.messages.value?.items.some(item => item.message_id === messageId
+        && this.actionOrigin(item, entry) === key) === true;
+    if (!current()) return null;
+    return Object.freeze({ messageId, subject, current, afterApproval: async () => {
+      if (this.actionRefresh && this.actionLifetime === lifetime && this.entry === entry) {
+        this.options.actionNotSent?.(subject, "Waiting for the Inbox refresh. Action not sent yet.");
+        while (this.actionRefresh && this.actionLifetime === lifetime && this.entry === entry) {
+          await this.actionRefresh.done;
+        }
+      }
+      if (current()) return true;
+      const reason = this.actionLifetime !== lifetime || this.entry !== entry
+        ? "The reader selection or mailbox scope changed, or the refresh failed."
+        : "The email no longer has current Inbox actions.";
+      this.options.actionNotSent?.(subject, "Action not sent. " + reason);
+      return false;
+    } });
+  }
+
+  private pruneActionMembers(): void {
+    const entry = this.entry;
+    const keys = new Set(entry ? this.state.messages.value?.items.map(item => this.actionOrigin(item, entry)) : []);
+    for (const key of this.actionMembers.keys()) if (!keys.has(key)) this.actionMembers.delete(key);
+  }
+
+  private finishActionRefresh(invalidate: boolean): void {
+    if (invalidate) {
+      this.actionLifetime++;
+      this.actionMembers.clear();
+    } else this.pruneActionMembers();
+    const refresh = this.actionRefresh;
+    this.actionRefresh = null;
+    refresh?.finish();
+  }
+
   /** Preserve identifiers and positions before clearing every retained payload. */
   invalidate(): void {
     const snapshot = this.options.snapshot(), entry = this.entry, identity = this.state.readingIdentity;
-    const origin = entry ? inboxThreadOriginKey(entry.origin) : null;
+    const origin = entry ? this.entryKey(entry) : null;
     if (!entry || origin === null || snapshot.blocked || !snapshot.visible || entry.epoch !== snapshot.queryEpoch
-      || !sameScope(entry.scope, snapshot.scope)) this.intent = null;
-    else if (!this.intent && identity && this.state.messages.value) {
+      || !sameScope(entry.scope, snapshot.scope)) {
+      this.intent = null;
+      this.finishActionRefresh(true);
+    } else if (!this.intent && identity && this.state.messages.value) {
       const position = this.reader.readingPosition();
       this.intent = { origin, epoch: entry.epoch, identity,
         count: this.state.messages.value.items.length, pages: this.state.messages.pages,
         bodies: [...this.state.bodies.keys()], position, focus: position.focus !== null };
+      if (!this.actionRefresh) {
+        let finish!: () => void;
+        const done = new Promise<void>(resolve => { finish = resolve; });
+        this.actionRefresh = { done, finish };
+      }
     }
+    if (this.options.root.ownerDocument.visibilityState === "hidden") this.finishActionRefresh(true);
     this.generation++;
     this.state.invalidate();
   }
@@ -117,24 +210,30 @@ export class InboxThreadEntry {
   failRefresh(generation: number): void {
     if (generation !== this.generation) return;
     this.intent = null; this.generation++;
+    this.finishActionRefresh(true);
     this.state.invalidate();
     if (this.entry) { this.state.resolution.status = "error"; this.reader.render(); }
   }
 
   async refresh(): Promise<void> {
     const entry = this.entry, intent = this.intent, generation = ++this.generation;
-    if (this.options.root.ownerDocument.visibilityState === "hidden") { this.state.invalidate(); return; }
-    if (!entry || !this.current(entry)) { this.intent = null; this.state.invalidate(); return; }
+    if (this.options.root.ownerDocument.visibilityState === "hidden") {
+      this.finishActionRefresh(true); this.state.invalidate(); return;
+    }
+    if (!entry || !this.current(entry)) {
+      this.intent = null; this.finishActionRefresh(true); this.state.invalidate(); return;
+    }
     const current = () => {
       const valid = generation === this.generation && this.entry === entry && this.current(entry);
       if (!valid) this.failRefresh(generation);
       return valid;
     };
-    if (intent && (intent.epoch !== entry.epoch || intent.origin !== inboxThreadOriginKey(entry.origin))) {
+    if (intent && (intent.epoch !== entry.epoch || intent.origin !== this.entryKey(entry))) {
       this.failRefresh(generation); return;
     }
     await this.state.refresh(intent?.identity);
-    if (!current() || !intent) return;
+    if (!current()) return;
+    if (!intent) { this.finishActionRefresh(this.state.messages.status !== "ready"); return; }
     // Replay only the user's old page budget at the unchanged cursor-bound limit.
     // A growing final page stays fresh but closed; missing body IDs never cause a hunt.
     while (this.state.messages.status === "ready" && this.state.messages.value?.next_cursor
@@ -149,21 +248,26 @@ export class InboxThreadEntry {
     if (!current()) return;
     if (bodies.some(id => this.state.bodies.get(id)?.status !== "ready")) { this.failRefresh(generation); return; }
     this.intent = null;
+    this.finishActionRefresh(false);
     this.reader.render();
     this.reader.restoreReadingPosition(intent.position, intent.focus);
   }
 
   resume(): Promise<void> { return this.entry ? this.options.refreshInbox() : this.state.resume(); }
-  close(): void { this.intent = null; this.generation++; this.state.close(); }
-  beginMutation(): void { this.intent = null; this.generation++; this.state.beginMutation(); }
+  close(): void { this.intent = null; this.generation++; this.finishActionRefresh(true); this.state.close(); }
+  beginMutation(): void { this.intent = null; this.generation++; this.finishActionRefresh(true); this.state.beginMutation(); }
   async endMutation(refresh = true): Promise<void> {
     await this.state.endMutation(false);
     if (refresh) await this.refresh();
   }
 
   isSelected(row: InboxThreadRow): boolean {
-    const key = inboxThreadOriginKey(row.thread_entry_ref);
-    return key !== null && this.entry !== null && key === inboxThreadOriginKey(this.entry.origin);
+    const key = row.thread_ref ? inboxConversationKey(row.thread_ref) : inboxThreadOriginKey(row.thread_entry_ref);
+    return key !== null && this.entry !== null && key === this.entryKey(this.entry);
+  }
+
+  private entryKey(entry: Entry): string | null {
+    return entry.thread ? inboxConversationKey(entry.thread) : inboxThreadOriginKey(entry.origin);
   }
 
   private saveListScroll(): Entry["scroll"] {
@@ -212,7 +316,7 @@ export class InboxThreadEntry {
       layout.readerPane.hidden = !this.entry && this.mode === "single";
       layout.placeholder.hidden = this.entry !== null;
       const row = this.entry && this.current(this.entry) && this.state.resolution.status === "ready"
-        ? this.row(this.entry.origin, this.options.snapshot()) : null;
+        ? this.row(this.entry.origin, this.options.snapshot(), this.entry.thread) : null;
       layout.source.textContent = row ? `Opened from Inbox: ${row.subject || "No subject"} · ${row.sender ?? "Sender unavailable"} · ${row.received_at ?? "Date unavailable"} · ${row.provider} / ${row.account_id}` : "";
       layout.source.hidden = !row;
       if (hidFocusedSender) (hideSenders ? this.options.heading : layout.senderToggle).focus({ preventScroll: true });
@@ -230,22 +334,28 @@ export class InboxThreadEntry {
     return this.options.root.ownerDocument.visibilityState !== "hidden" && !snapshot.blocked && this.committed(snapshot);
   }
 
-  private row(origin: InboxMessageRef, snapshot: InboxThreadSnapshot): InboxThreadRow | undefined {
+  private row(origin: InboxMessageRef, snapshot: InboxThreadSnapshot, thread: ThreadRef | null): InboxThreadRow | undefined {
     const key = inboxThreadOriginKey(origin);
     if (key === null) return undefined;
     return snapshot.items.find(row => row.provider === origin.provider && row.account_id === origin.account_id
-      && row.message_id === origin.message_id && inboxThreadOriginKey(row.thread_entry_ref) === key);
+      && row.message_id === row.thread_entry_ref?.message_id && (thread
+        ? row.thread_ref && sameThread(thread, row.thread_ref) && sameMailbox(thread, row.thread_entry_ref)
+          && inboxThreadOriginKey(row.thread_entry_ref) !== null
+        : inboxThreadOriginKey(row.thread_entry_ref) === key));
   }
 
   canOpen(row: InboxThreadRow): boolean {
     const snapshot = this.options.snapshot();
-    return this.ready(snapshot) && !!this.row(row.thread_entry_ref, snapshot);
+    if (!this.ready(snapshot) || inboxThreadOriginKey(row.thread_entry_ref) === null) return false;
+    const fresh = this.row(row.thread_entry_ref, snapshot, row.thread_ref ?? null);
+    return row.message_id === row.thread_entry_ref.message_id && row.provider === row.thread_entry_ref.provider
+      && row.account_id === row.thread_entry_ref.account_id && !!fresh && inboxThreadOriginKey(fresh.thread_entry_ref) === inboxThreadOriginKey(row.thread_entry_ref);
   }
 
   private current(entry: Entry): boolean {
     const snapshot = this.options.snapshot();
     return this.entry === entry && this.ready(snapshot) && entry.epoch === snapshot.queryEpoch
-      && sameScope(entry.scope, snapshot.scope) && !!this.row(entry.origin, snapshot);
+      && sameScope(entry.scope, snapshot.scope) && !!this.row(entry.origin, snapshot, entry.thread);
   }
 
   async open(row: InboxThreadRow): Promise<void> {
@@ -253,13 +363,14 @@ export class InboxThreadEntry {
     this.retryGeneration++;
     if (this.entry && this.isSelected(row) && this.current(this.entry)) { this.reader.focusHeading(); return; }
     this.intent = null; this.generation++;
+    this.finishActionRefresh(true);
     const snapshot = this.options.snapshot();
-    const entry: Entry = { origin: { ...row.thread_entry_ref }, epoch: snapshot.queryEpoch,
+    const entry: Entry = { origin: { ...row.thread_entry_ref }, thread: row.thread_ref ? { ...row.thread_ref } : null, epoch: snapshot.queryEpoch,
       scope: { ...snapshot.scope! }, scroll: this.saveListScroll() };
     this.entry = entry;
     if (this.options.layout) this.options.layout.readerPane.scrollTop = 0;
     this.present();
-    await this.reader.openInbox(entry.origin, () => this.current(entry));
+    await this.reader.openInbox(entry.origin, () => this.current(entry), entry.thread);
   }
 
   /** Called only after the complete requested Inbox span commits, before reader refresh. */
@@ -270,9 +381,19 @@ export class InboxThreadEntry {
     this.state.invalidate();
     const snapshot = this.options.snapshot();
     // A committed span can renew the binding while held; current() still forbids reads until release.
-    if (this.committed(snapshot) && entry.epoch === snapshot.queryEpoch && this.row(entry.origin, snapshot)) {
+    const fresh = this.row(entry.origin, snapshot, entry.thread);
+    if (this.committed(snapshot) && entry.epoch === snapshot.queryEpoch && fresh) {
+      if (!sameScope(entry.scope, snapshot.scope)) this.finishActionRefresh(true);
       entry.scope = { ...snapshot.scope! };
-    } else this.intent = null;
+      entry.origin = { ...fresh.thread_entry_ref };
+      this.state.renewInboxOrigin(entry.origin);
+    } else if (this.committed(snapshot) && entry.thread) {
+      this.back();
+      return;
+    } else {
+      this.intent = null;
+      this.finishActionRefresh(true);
+    }
     this.reader.render();
   }
 
@@ -280,24 +401,26 @@ export class InboxThreadEntry {
     const entry = this.entry;
     if (!entry) return;
     this.intent = null; this.generation++;
+    this.finishActionRefresh(true);
     const generation = ++this.retryGeneration;
     await this.options.refreshInbox();
     if (generation !== this.retryGeneration || !this.current(entry)) return;
     // A disappeared explicit vendor stays an error until this explicit fresh-origin retry.
-    await this.reader.openInbox(entry.origin, () => this.current(entry));
+    await this.reader.openInbox(entry.origin, () => this.current(entry), entry.thread);
   }
 
   back(): void {
     const entry = this.entry;
     this.intent = null; this.generation++;
     this.entry = null;
+    this.finishActionRefresh(true);
     this.state.close();
     this.options.columns.hidden = false;
     if (!entry) return;
     if (this.mode === "single") {
       for (const saved of entry.scroll) { saved.element.scrollTop = saved.top; saved.element.scrollLeft = saved.left; }
     }
-    const key = inboxThreadOriginKey(entry.origin);
+    const key = this.entryKey(entry);
     const trigger = Array.from(this.options.columns.querySelectorAll<HTMLButtonElement>("[data-inbox-thread-origin]"))
       .find(button => key !== null && button.dataset.inboxThreadOrigin === key && !button.disabled);
     (trigger ?? this.options.heading).focus({ preventScroll: true });
