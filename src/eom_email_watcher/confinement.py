@@ -23,11 +23,18 @@ import struct
 import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import DEFAULT_CONFIG, Config, _runtime_state_root, _UnsafeConfigPath, load_config
+from .config import (
+    DEFAULT_CONFIG,
+    Config,
+    _runtime_state_root,
+    _UnsafeConfigPath,
+    admit_every_snapshot,
+    load_config,
+)
 from .deployment import SCHEDULED_COMMANDS
 
 if sys.platform == "linux":
@@ -149,7 +156,10 @@ def scheduled_run(config_path: Path) -> Iterator[None]:
         os.environ["TMPDIR"] = str(private)
         tempfile.tempdir = str(private)
         try:
-            _admit_written_paths(load_config(config_path), roots)
+            # R3 holds for every snapshot this process builds, including the reload a
+            # command makes after taking its lock; this first load refuses before dispatch.
+            admit_every_snapshot(functools.partial(_admit_written_paths, roots=roots))
+            load_config(config_path)
             yield
         finally:
             tempfile.tempdir = previous_tempdir
@@ -284,16 +294,19 @@ def _private_temp(state_root: Path) -> Iterator[Path]:
     try:
         yield private
     finally:
-        shutil.rmtree(private, ignore_errors=True)
         try:
-            os.unlink(parent / f"{name}.lock")
+            with _locked(parent / ".lock"):
+                _remove_run(parent, name)
         except OSError:
-            logger.warning("Private temp lock was not removed; the next run removes it")
-        os.close(run_lock)
+            logger.warning("Private temp directory was not removed; the next run removes it")
+        finally:
+            os.close(run_lock)
 
 
 def _open_lock(path: Path, *, create: bool) -> int:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    # Read-write: NFS emulates flock with byte-range locks, and an exclusive one needs a
+    # descriptor opened for writing (flock(2)).
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
     if create:
         flags |= os.O_CREAT | os.O_EXCL
     return os.open(path, flags, 0o600)
@@ -301,7 +314,7 @@ def _open_lock(path: Path, *, create: bool) -> int:
 
 @contextmanager
 def _locked(path: Path) -> Iterator[None]:
-    descriptor = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
@@ -319,21 +332,26 @@ def _remove_dead_runs(parent: Path, *, keep: str) -> None:
         name = entry.removesuffix(".lock")
         if name == keep or _RUN_NAME.fullmatch(name) is None:
             continue
-        lock_path = parent / f"{name}.lock"
         try:
-            descriptor = _open_lock(lock_path, create=False)
+            descriptor = _open_lock(parent / f"{name}.lock", create=False)
         except FileNotFoundError:
-            shutil.rmtree(parent / name, ignore_errors=True)
+            _remove_run(parent, name)
             continue
         try:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 continue  # a live run holds it
-            shutil.rmtree(parent / name, ignore_errors=True)
-            os.unlink(lock_path)
+            _remove_run(parent, name)
         finally:
             os.close(descriptor)
+
+
+def _remove_run(parent: Path, name: str) -> None:
+    """Remove one run's directory, then its lock file.  Caller holds the parent lock."""
+    shutil.rmtree(parent / name, ignore_errors=True)
+    with suppress(FileNotFoundError):
+        os.unlink(parent / f"{name}.lock")
 
 
 def _admit_written_paths(config: Config, roots: WriteRoots) -> None:

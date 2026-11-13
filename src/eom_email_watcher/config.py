@@ -552,7 +552,7 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
     ):
         raise ConfigError("desktop_initialization_receipt is invalid")
 
-    return Config(
+    config = Config(
         path=config_path,
         timezone=timezone,
         body_char_limit=body_limit,
@@ -600,6 +600,22 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
         senders=tuple(senders),
         desktop_initialization_receipt=raw_initialization_receipt,
     )
+    if _snapshot_admission is not None:
+        _snapshot_admission(config)
+    return config
+
+
+# #363 R3: once a scheduled command has confined itself, every configuration snapshot it
+# builds is admitted against its write roots.  `confinement.py` owns the rule.
+_snapshot_admission: Callable[[Config], None] | None = None
+
+
+def admit_every_snapshot(admission: Callable[[Config], None]) -> None:
+    """Install this process's snapshot admission.  Like confinement, it is permanent."""
+    global _snapshot_admission
+    if _snapshot_admission is not None:
+        raise RuntimeError("Configuration snapshot admission is already installed")
+    _snapshot_admission = admission
 
 
 def load_config(path: Path | None = None) -> Config:

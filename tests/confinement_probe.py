@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from eom_email_watcher import cli, confinement
-from eom_email_watcher.config import DEFAULT_CONFIG
+from eom_email_watcher.config import DEFAULT_CONFIG, load_config
 from eom_email_watcher.db import Store
 
 
@@ -31,6 +31,8 @@ def outcome(action) -> str:
         result = action()
     except OSError as exc:
         return errno.errorcode.get(exc.errno, str(exc.errno))
+    except confinement.ConfinementError as exc:
+        return f"ConfinementError: {exc}"
     except Exception as exc:  # recorded, never hidden
         return type(exc).__name__
     return result if isinstance(result, str) else "ok"
@@ -235,6 +237,18 @@ def sqlite_spill(base: Path, variant: str) -> dict[str, object]:
     return {"temp_store": temp_store, "spill": result}
 
 
+def reload_outside(base: Path) -> dict[str, str]:
+    """R3 on reload: a snapshot loaded after admission is admitted too."""
+    with confinement.scheduled_run(DEFAULT_CONFIG):
+        original = DEFAULT_CONFIG.read_text(encoding="utf-8")
+        moved = original + f'database_file = "{base / "elsewhere" / "db.sqlite3"}"\n'
+        DEFAULT_CONFIG.write_text(moved, encoding="utf-8")
+        return {
+            "reload": outcome(lambda: load_config(DEFAULT_CONFIG) and None),
+            "check_body": outcome(lambda: cli._check(DEFAULT_CONFIG, dry_run=True)),
+        }
+
+
 def main() -> None:
     case, base, *rest = sys.argv[1:]
     base_path = Path(base)
@@ -250,6 +264,8 @@ def main() -> None:
     elif case == "hold":
         hold(base_path)
         return
+    elif case == "reload_outside":
+        report = reload_outside(base_path)
     elif case == "sqlite_spill":
         report = sqlite_spill(base_path, rest[0])
     else:
