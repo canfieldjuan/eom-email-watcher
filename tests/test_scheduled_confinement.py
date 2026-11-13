@@ -24,7 +24,7 @@ from eom_email_watcher.config import Config, load_config
 
 pytestmark = pytest.mark.platform_contract(
     platforms=["linux"],
-    owner="src/eom_email_watcher/confinement.py:127",
+    owner="src/eom_email_watcher/confinement.py:134",
     reason="Landlock write confinement is Linux-only; other platforms are unchanged",
 )
 
@@ -236,6 +236,25 @@ def test_written_key_outside_roots_stops_the_real_entry_before_network(tmp_path)
     assert not (tmp_path / "elsewhere" / "db.sqlite3").exists()
 
 
+def test_a_snapshot_reloaded_inside_a_confined_run_is_admitted_too(tmp_path):
+    # The check body reloads its configuration after taking its lock; that snapshot is
+    # admitted as well, so a change made mid-run cannot skip R3.
+    home = _home(tmp_path)
+    report = _report(_probe(home, tmp_path, "reload_outside"))
+    for key in ("reload", "check_body"):
+        assert report[key].startswith("ConfinementError: database_file is outside"), report
+
+
+def test_snapshot_admission_is_installed_once_and_never_in_the_test_runner():
+    from eom_email_watcher import config as config_module
+
+    assert config_module._snapshot_admission is None
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(config_module, "_snapshot_admission", lambda config: None)
+        with pytest.raises(RuntimeError, match="already installed"):
+            config_module.admit_every_snapshot(lambda config: None)
+
+
 # Item 5: R4.  Each condition: exit 2, one error line, empty stdout, no access.
 REFUSALS = {
     "missing": "error: Landlock is not available on this system",
@@ -335,6 +354,77 @@ def test_private_temp_is_per_run_survives_live_runs_and_is_swept_after_kill(tmp_
         for process in (first, second):
             if process.poll() is None:
                 process.kill()
+
+
+def test_lock_files_open_read_write_for_nfs_exclusive_locks(tmp_path):
+    import fcntl
+
+    descriptor = confinement._open_lock(tmp_path / "run.lock", create=True)
+    try:
+        assert fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDWR
+    finally:
+        os.close(descriptor)
+    opened = []
+    real_open = os.open
+
+    def recording_open(path, flags, *args):
+        opened.append(flags & os.O_ACCMODE)
+        return real_open(path, flags, *args)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(confinement.os, "open", recording_open)
+        with confinement._locked(tmp_path / ".lock"):
+            pass
+    assert opened == [os.O_RDWR]
+
+
+def test_sweep_survives_a_lock_file_that_disappears_under_it(tmp_path, monkeypatch):
+    # The interleaving Codex found on f5d4c89: the sweep opens a run's lock, then that
+    # run's files vanish before the sweep removes them.  The new run must still start.
+    parent = tmp_path / "scheduled-tmp"
+    parent.mkdir(mode=0o700)
+    finished = "run-" + "a" * 16
+    (parent / finished).mkdir()
+    (parent / f"{finished}.lock").write_text("")
+    real_open_lock = confinement._open_lock
+
+    def open_then_vanish(path, *, create):
+        descriptor = real_open_lock(path, create=create)
+        if not create and path.name == f"{finished}.lock":
+            (parent / finished).rmdir()
+            path.unlink()
+        return descriptor
+
+    monkeypatch.setattr(confinement, "_open_lock", open_then_vanish)
+    with confinement._locked(parent / ".lock"):
+        confinement._remove_dead_runs(parent, keep="run-" + "b" * 16)
+    assert sorted(entry.name for entry in parent.iterdir()) == [".lock"]
+
+
+def test_a_finishing_run_cleans_up_only_under_the_parent_lock(tmp_path):
+    import threading
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    entered, leave = threading.Event(), threading.Event()
+    private_dirs = []
+
+    def run() -> None:
+        with confinement._private_temp(state) as private:
+            private_dirs.append(private)
+            entered.set()
+            leave.wait(10)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert entered.wait(10)
+    with confinement._locked(state / "scheduled-tmp" / ".lock"):
+        leave.set()
+        worker.join(0.5)
+        assert worker.is_alive()  # cleanup waits for the parent lock
+        assert private_dirs[0].is_dir()
+    worker.join(10)
+    assert not worker.is_alive() and not private_dirs[0].exists()
 
 
 # Item 7: SQLite temporary storage.
