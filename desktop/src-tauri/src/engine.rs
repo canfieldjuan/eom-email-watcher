@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, TryLockError};
 use std::io::{self, Read, Write};
@@ -1238,6 +1238,15 @@ pub struct InboxItem {
     pub admission: Option<InboxAdmission>,
 }
 
+impl InboxItem {
+    fn has_own_origin(&self) -> bool {
+        !self.message_id.is_empty()
+            && self.thread_entry_ref.message_id == self.message_id
+            && self.thread_entry_ref.provider == self.provider
+            && self.thread_entry_ref.account_id == self.account_id
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct InboxQuery {
     pub limit: u16,
@@ -1590,13 +1599,52 @@ pub enum ThreadMessagesQuery {
         #[serde(default = "thread_page_limit")]
         limit: u16,
         cursor: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "present_nonnull",
+            skip_serializing_if = "Option::is_none"
+        )]
+        include_inbox_actions: Option<bool>,
     },
     Inbox {
         inbox_thread: InboxThreadSelector,
         #[serde(default = "thread_page_limit")]
         limit: u16,
         cursor: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "present_nonnull",
+            skip_serializing_if = "Option::is_none"
+        )]
+        include_inbox_actions: Option<bool>,
     },
+}
+
+impl ThreadMessagesQuery {
+    fn action_selection(&self) -> Result<Option<(&ThreadRef, &InboxMessageRef)>, EngineError> {
+        match self {
+            Self::Inbox {
+                inbox_thread,
+                include_inbox_actions: Some(true),
+                ..
+            } => Ok(Some((&inbox_thread.thread_ref, &inbox_thread.message_ref))),
+            Self::Vendor {
+                thread_ref,
+                inbox_message,
+                include_inbox_actions: Some(true),
+                ..
+            } => inbox_message
+                .as_ref()
+                .map(|origin| Some((thread_ref, origin)))
+                .ok_or_else(|| {
+                    EngineError::host(
+                        "invalid_request",
+                        "Inbox action data requires an Inbox origin",
+                    )
+                }),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1717,6 +1765,12 @@ pub enum ThreadContext {
 }
 
 impl ThreadContext {
+    fn reference(&self) -> &ThreadRef {
+        match self {
+            Self::Vendor { thread_ref, .. } | Self::NonVendor { thread_ref, .. } => thread_ref,
+        }
+    }
+
     fn valid_for(&self, query: &ThreadMessagesQuery) -> bool {
         match (self, query) {
             (
@@ -1748,6 +1802,22 @@ pub struct ThreadMessage {
     pub received_at: Option<String>,
     pub body_state: ThreadBodyState,
     pub copy_count: u64,
+    #[serde(
+        default,
+        deserialize_with = "present_nullable_slot",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inbox_action: Option<Option<InboxItem>>,
+}
+
+// An omitted field is ordinary metadata. An explicit null is a content-only
+// email in a page that requested action data.
+fn present_nullable_slot<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    present_nullable(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1757,6 +1827,38 @@ pub struct ThreadMessagePage {
     pub items: Vec<ThreadMessage>,
     #[serde(deserialize_with = "present_nullable")]
     pub next_cursor: Option<String>,
+}
+
+impl ThreadMessagePage {
+    fn has_valid_action_records(&self, selection: Option<(&ThreadRef, &InboxMessageRef)>) -> bool {
+        let Some((requested, origin)) = selection else {
+            return self.items.iter().all(|item| item.inbox_action.is_none());
+        };
+        let resolved = self.thread.reference();
+        // Python owns same-mailbox IMAP alias resolution. Other providers retain
+        // the requested thread key.
+        if !origin.matches_scope(requested)
+            || !origin.matches_scope(resolved)
+            || resolved.thread_key.is_empty()
+            || (requested.provider != "imap" && resolved.thread_key != requested.thread_key)
+        {
+            return false;
+        }
+        let mut seen = BTreeSet::new();
+        self.items.iter().all(|item| {
+            !item.message_id.is_empty()
+                && seen.insert(&item.message_id)
+                && match &item.inbox_action {
+                    None => false,
+                    Some(None) => true,
+                    Some(Some(record)) => {
+                        record.has_own_origin()
+                            && record.message_id == item.message_id
+                            && record.thread_entry_ref.matches_scope(resolved)
+                    }
+                }
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2400,12 +2502,7 @@ impl Engine {
                 "keyword": query.keyword,
             }),
         )?;
-        if page.items.iter().any(|item| {
-            item.thread_entry_ref.message_id != item.message_id
-                || item.thread_entry_ref.provider != item.provider
-                || item.thread_entry_ref.account_id != item.account_id
-                || item.thread_entry_ref.message_id.is_empty()
-        }) {
+        if page.items.iter().any(|item| !item.has_own_origin()) {
             return Err(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine returned an invalid Inbox origin",
@@ -3506,12 +3603,19 @@ impl Engine {
         &self,
         query: ThreadMessagesQuery,
     ) -> Result<ThreadMessagePage, EngineError> {
+        let action_selection = query.action_selection()?;
         let page: ThreadMessagePage = self.request("threads.messages", json!(query))?;
         if !page.thread.valid_for(&query) || page.items.iter().any(|item| !item.body_state.valid())
         {
             return Err(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine returned invalid body metadata",
+            ));
+        }
+        if !page.has_valid_action_records(action_selection) {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned invalid Inbox action records",
             ));
         }
         Ok(page)
