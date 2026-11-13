@@ -359,6 +359,10 @@ single connection owner | the strongest available at that owner | justified`.
   call site.
 - `src/eom_email_watcher/db.py`: in `Store.connection`, the SQLite clause of R5, on every
   connection, with no dependency on the confinement owner. No other connection site exists.
+- `src/eom_email_watcher/config.py`: a one-time hook in `_load_config_bytes`, the only place a
+  `Config` is built, through which `confinement.py` admits every snapshot a confined process
+  loads (R3). The rule stays in `confinement.py`. Added during implementation; see the
+  revision log.
 - New tests. Four test files call `cli.main` or a scheduled body in-process
   (`tests/test_cli.py`, `tests/test_outbound.py`, `tests/test_engine_api.py`,
   `tests/test_ntfy_disclosure_migration.py`). The implementation must keep those from
@@ -457,3 +461,9 @@ Local folder `codex-evidence/eom-email-watcher/363-scheduled-confinement-contrac
     what R2 refuses.
 - Acceptance: Juan accepted `3a3261a` with D1–D4 as written (2026-11-12). This entry records
   that; no requirement or decision text changed.
+- Implementation note, PR #377 at `d7603c5`: R3 admission runs at config's single snapshot
+  funnel (`_load_config_bytes`), and `config.py` gains the install hook
+  (`admit_every_snapshot`). The check body reloads its configuration after taking the
+  production lock, so admitting only the first snapshot let a mid-run change skip R3 (Codex
+  review of `f5d4c89`). R3's text and owner are unchanged. Oversight review `5884939527`:
+  no new acceptance needed; record it here.
