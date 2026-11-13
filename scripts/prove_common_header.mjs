@@ -1,7 +1,4 @@
-// Source-only browser regression. Build a fixture, serve its output with Vite,
-// then run window.proveHeader() and window.proveFiltersLayout() in Chromium
-// and WebKit (no native IPC). For native focus coverage call
-// prepareHeaderTab(), send its returned key through the browser, then checkHeaderTab().
+// Source-only fixture for desktop/test-browser/common-header.mjs and local WebKit proofs.
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { stripTypeScriptTypes, createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -29,6 +26,9 @@ const headerCall = ast.body.find(n => n.type === "ExpressionStatement"
   && n.expression.type === "CallExpression" && n.expression.callee.name === "observeCommonHeader");
 const filtersCall = ast.body.find(n => n.type === "ExpressionStatement"
   && n.expression.type === "CallExpression" && n.expression.callee.name === "positionInboxFilters");
+if (process.env.HEADER_REQUIRE_MOUNTS === "1" && (!headerCall || !filtersCall)) {
+  throw Error("Missing production header or Filters mount");
+}
 const imports = `
 import {InboxThreadEntry} from '/@fs/${repo}/desktop/src/inboxThreadEntry.ts';
 import {ThreadReadClient} from '/@fs/${repo}/desktop/src/threadReads.ts';
@@ -125,6 +125,8 @@ async function proveHeader() {
   input.scrollIntoView({block:'start'}); input.focus(); await settle();
   const header=document.querySelector('.app-header');
   check(header && header.parentElement === document.querySelector('#app'), 'header still inside content shell');
+  check(header.querySelector('h1')?.textContent === 'Local email watcher', 'application heading missing');
+  check(document.querySelector('#inbox-view').getAttribute('aria-describedby') === 'inbox-help', 'Inbox help is not associated');
   check(document.querySelector('#inbox-help')?.textContent === 'Locally retained messages from watched senders and Gmail labels appear here. Followed threads and Sent replies to vendors also appear when captured with Connect.', 'meaningful Inbox help lost or moved out of content');
   check(input.getBoundingClientRect().top >= header.getBoundingClientRect().bottom, 'focused content covered by header');
   return {pass:true,viewport:[innerWidth,innerHeight],textSize:getComputedStyle(document.documentElement).fontSize,
@@ -159,6 +161,8 @@ async function proveFiltersLayout() {
   panes.forEach(pane => { pane.scrollTop = 40; });
   const before = workspace();
   check(!form.matches(":popover-open"), "Filters should start closed");
+  // The account shortcut opens Filters programmatically from outside the form.
+  select("#inbox-keyword").focus({ preventScroll: true });
   trigger.click();
   await settle();
   check(workspace() === before, "opening Filters moved the workspace or started a read");
@@ -175,8 +179,9 @@ async function proveFiltersLayout() {
   check(workspace() === before && form.getClientRects().length === 0, "closing Filters moved the workspace");
   check(document.activeElement === trigger && sender.value === "unapplied draft", "closing Filters lost focus or draft");
   trigger.click();
+  check(form.matches(":popover-open"), "Filters did not reopen before leaving Inbox");
   fixture.showView("watchlist");
-  check(form.getClientRects().length === 0, "Filters remained visible after leaving Inbox");
+  check(!form.matches(":popover-open") && form.getClientRects().length === 0, "Filters remained open after leaving Inbox");
   return { pass: true, viewport: [viewport.clientWidth, viewport.clientHeight], scrollY };
 }
 
