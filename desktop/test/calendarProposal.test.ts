@@ -18,7 +18,7 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /window\.clearTimeout\(inboxProposalExpiryTimer\)/);
   assert.match(source, /const renderStartedAt = Date\.now\(\)/);
   assert.match(source, /proposalExpiresAt > renderStartedAt/);
-  assert.match(source, /Math\.max\(nextProposalExpiry - Date\.now\(\) \+ 1, 0\)/);
+  assert.match(source, /Math\.max\(inboxRenderProposalExpiry - Date\.now\(\) \+ 1, 0\)/);
   assert.match(source, /inboxProposalExpiryTimer = window\.setTimeout/);
   assert.match(source, /renderInbox\(inboxItems\)/);
   assert.match(
@@ -58,8 +58,8 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /stateVersion: proposal\.state_version/);
   assert.equal(calendarOutcomeNotice(null, "decision", "failed").text,
     "Microsoft rejected the calendar event creation.");
-  assert.match(source, /await loadInbox\(\);[\s\S]*?latestCalendarOutcome\(result\.calendar_write_outcome, refreshed\?\.calendar_write_outcome\)/);
-  assert.match(source, /inboxStatus\.dataset\.kind = "warning"/);
+  assert.match(source, /await refresh\(\);[\s\S]*?latestCalendarOutcome\(result\.calendar_write_outcome, refreshed\?\.calendar_write_outcome\)/);
+  assert.match(source, /report\(notice\.text, notice\.kind\)/);
   assert.match(styles, /\.calendar-proposal\s*\{/);
   assert.match(styles, /\.calendar-proposal-invitation-warning\s*\{/);
   assert.match(styles, /\.calendar-proposal-actions\s*\{/);
@@ -131,11 +131,13 @@ test("calendar decision refresh cannot overwrite a newer durable outcome", async
   const status = { textContent: "", dataset: {} as Record<string, string> };
   let refreshed = false;
   await runInNewContext(segment, {
-    item: { message_id: "m" }, proposal: {}, decision: "confirm",
+    messageId: "m", target: {messageId:"m"}, decision: "confirm",
     invoke: async () => ({ state: "unresolved", calendar_write_outcome: reply }),
-    loadInbox: async () => { refreshed = true; },
-    inboxItems: [{ message_id: "m", calendar_write_outcome: completed }],
-    inboxStatus: status, calendarOutcomeNotice, latestCalendarOutcome,
+    refresh: async () => { refreshed = true; },
+    context: { current: () => true },
+    inboxThreadEntry: { state: { messages: { value: { items: [{ message_id: "m", inbox_action: { calendar_write_outcome: completed } }] } } } },
+    report: (text, kind) => { status.textContent = text; status.dataset.kind = kind; },
+    calendarOutcomeNotice, latestCalendarOutcome,
   });
   assert.equal(refreshed, true);
   assert.equal(status.textContent, "Calendar event created.");

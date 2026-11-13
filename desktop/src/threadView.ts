@@ -1,7 +1,8 @@
+import type { InboxItem } from "./inboxItem.ts";
 import type {
   ThreadReadClient, ThreadVendor, ThreadRef, ThreadItem, ThreadPage, ThreadMessagePage,
   ThreadBodyResponse, ThreadCopy, ThreadInventory, ThreadCopyPage, ThreadListQuery,
-  InboxMessageRef, NonVendorThreadItem, ThreadResolveResult, ThreadResolveQuery, ThreadSelector,
+  InboxMessageRef, InboxActionMessagesQuery, ThreadMessage, NonVendorThreadItem, ThreadResolveResult, ThreadResolveQuery, ThreadSelector,
 } from "./threadReads.ts";
 
 const BODY_LABELS = {
@@ -111,26 +112,42 @@ const contextKey = (thread: Pick<ThreadItem | NonVendorThreadItem, "thread_ref" 
     vendor, thread.relation, thread.owner_vendor?.vendor_id ?? null]);
 };
 
+export type ReaderMessage = ThreadMessage & { inbox_action?: InboxItem | null };
+type ReaderPage = Omit<ThreadMessagePage, "items"> & { items: ReaderMessage[] };
+
+export function sameMailbox(a: Pick<ThreadRef, "provider" | "account_id" | "mailbox_identity_key">,
+  b: Pick<ThreadRef, "provider" | "account_id" | "mailbox_identity_key">): boolean {
+  return a.provider === b.provider && a.account_id === b.account_id
+    && a.mailbox_identity_key === b.mailbox_identity_key;
+}
+
+export function sameThread(a: ThreadRef, b: ThreadRef): boolean {
+  return sameMailbox(a, b) && a.thread_key === b.thread_key;
+}
+
 export class ThreadViewState {
   vendor: ThreadVendor | null = null;
   account: Account = null;
   selectedThread: ThreadItem | NonVendorThreadItem | null = null;
   readonly resolution = new ThreadReadState<ThreadResolveResult>();
   readonly threads = new ThreadReadState<ThreadPage>();
-  readonly messages = new ThreadReadState<ThreadMessagePage>();
+  readonly messages = new ThreadReadState<ReaderPage>();
   readonly bodies = new Map<string, ThreadReadState<ThreadBodyResponse>>();
   readonly copies = new Map<string, ThreadReadState<ThreadCopyPage<ThreadCopy>>>();
   readonly inventory = new Map<string, ThreadReadState<ThreadCopyPage<ThreadInventory>>>();
   private visible = true;
   private mutations = 0;
   private selectionGeneration = 0;
-  private inbox: { origin: InboxMessageRef; current: () => boolean } | null = null;
+  private inbox: { origin: InboxMessageRef; current: () => boolean; thread: ThreadRef | null } | null = null;
   // Only a user choice persists; automatic resolution must reconsider the vendor set.
   private inboxVendor: string | undefined;
   private readonly client: ThreadReadClient;
   private readonly notify: () => void;
 
-  constructor(client: ThreadReadClient, notify: () => void) {
+  private readonly inboxActions: boolean;
+
+  constructor(client: ThreadReadClient, notify: () => void, inboxActions = false) {
+    this.inboxActions = inboxActions;
     this.client = client;
     this.notify = notify;
   }
@@ -163,14 +180,18 @@ export class ThreadViewState {
     return { resolution: contextKey(resolved.context.thread, vendor), messages: contextKey(messages.thread, vendor) };
   }
 
-  openInbox(origin: InboxMessageRef, current: () => boolean): Promise<void> {
-    this.inbox = { origin: structuredClone(origin), current };
+  openInbox(origin: InboxMessageRef, current: () => boolean, thread: ThreadRef | null = null): Promise<void> {
+    this.inbox = { origin: structuredClone(origin), current, thread };
     this.inboxVendor = undefined;
     this.vendor = null;
     this.account = { provider: origin.provider, account_id: origin.account_id };
     this.selectedThread = null;
     this.visible = true;
     return this.refresh();
+  }
+
+  renewInboxOrigin(origin: InboxMessageRef): void {
+    if (this.inbox) this.inbox.origin = { ...origin };
   }
 
   async resolveInbox(more = false, expected?: ThreadReadingIdentity): Promise<void> {
@@ -193,7 +214,11 @@ export class ThreadViewState {
       const query: ThreadResolveQuery = vendor === undefined
         ? { message_ref: entry.origin, cursor }
         : { message_ref: entry.origin, vendor_id: vendor };
-      return this.client.resolve(query);
+      return this.client.resolve(query).then(result => {
+        if (entry.thread && !sameThread(entry.thread, result.state === "resolved"
+          ? result.context.thread.thread_ref : result.thread_ref)) throw new Error("Inbox conversation changed");
+        return result;
+      });
     };
     await this.resolution.read(() => load(cursor), this.notify,
       more ? (old, fresh) => old.state === "choose_vendor" && fresh.state === "choose_vendor"
@@ -322,7 +347,16 @@ export class ThreadViewState {
     const query = this.threadSelector(this.selectedThread.thread_ref);
     if (!query) return Promise.resolve();
     return this.page(this.messages, more, async cursor => {
-      const result = await this.client.messages({ ...query, cursor });
+      const origin = this.inbox?.origin;
+      const inboxQuery: InboxActionMessagesQuery | null = this.inboxActions && origin
+        ? query.inbox_thread ? { inbox_thread: query.inbox_thread, cursor, include_inbox_actions: true }
+          : { vendor_id: query.vendor_id, thread_ref: query.thread_ref, inbox_message: origin, cursor, include_inbox_actions: true }
+        : null;
+      const result: ReaderPage = inboxQuery
+        ? await this.client.messages(inboxQuery) : await this.client.messages({ ...query, cursor });
+      if (this.inbox?.thread && !sameThread(result.thread.thread_ref, this.inbox.thread)) {
+        throw new Error("Inbox conversation changed");
+      }
       if (expected && contextKey(result.thread, this.vendor?.vendor_id ?? null) !== expected.messages) {
         throw new Error("Retained thread context changed");
       }

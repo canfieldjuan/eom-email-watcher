@@ -8,7 +8,7 @@ const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
 const names = ['currentMailboxEffectScope', 'observeMailboxOperationRevision', 'observeMailboxOperationRevisionFromError',
   'mailboxEffectScopeIsCurrent', 'mailboxEffectRequestIsCurrent', 'runMailAccountMutation',
   'selectInboxSender', 'queryFromInboxControls', 'commitInboxQueryFromControls', 'clearInboxPageForAccountChange', 'reconcileInboxAccountScope', 'inboxMutationInFlight',
-  'deleteInboxItem', 'clearInboxHistory', 'inboxReloadBlocked', 'wakeInboxReload', 'runInboxRefresh', 'loadInboxPage', 'loadInbox', 'refreshLoadedInboxSpan', 'scheduleConnectQueueRefresh', 'renderHealth', 'startConfiguredDesktop', 'renderConfigAdmissionState'];
+  'performInboxReaderAction', 'deleteInboxItem', 'clearInboxHistory', 'inboxReloadBlocked', 'wakeInboxReload', 'runInboxRefresh', 'loadInboxPage', 'loadInbox', 'refreshLoadedInboxSpan', 'scheduleConnectQueueRefresh', 'renderHealth', 'startConfiguredDesktop', 'renderConfigAdmissionState'];
 const code = names.map(name => {
   const match = source.match(new RegExp('^(?:async )?function '+name+'(?:<[^\\n]+>)?\\([\\s\\S]*?^\\}', 'm'));
   assert.ok(match, name);
@@ -29,7 +29,7 @@ function harness() {
     activeInboxQuery: {provider:'imap',account_id:'old',sender:null,limit:25},
     inboxItemsEpoch:0, connectQueueRefresh:null, connectQueueRefreshAgain:false,
     activeInboxAccountSelection: 'active', inboxQueryEpoch: 0, inboxRequestGeneration: 0,
-    inboxPageState:'loaded', inboxPageStateGeneration:0, inboxCapabilityUnavailableCount:0,
+    inboxPageState:'loaded', inboxPageStateGeneration:0, inboxTotals:null, inboxReaderActionsInFlight:new Set(), showInboxActionNotice:noop,
     expandedInboxMessages:new Set(), inboxDeletionsInFlight:new Set(), inboxClearInFlight:false,
     configurationReady:true, mailOperationInFlight:false,
     mailAccountMutationsInFlight:0, mailAccountMutationEpoch:0, mailboxOperationRevision:1,
@@ -52,13 +52,14 @@ function harness() {
     loadAutostart:async()=>{},loadSenders:async()=>false,finishOperation:noop,
     renderInbox:noop,clearMessageOwnedUiState:noop,setInboxControlsBusy:noop,
     refreshInboxRemovalStatuses:async()=>{},releaseAutomationRefreshFences:()=>false,
-    inboxStatusLabel:()=>'',errorMessage:e=>e.message,
+    inboxStatusLabel:()=>'',errorMessage:e=>e.message, inboxClearStatus:()=>({kind:'success',text:'Cleared'}),
+    inboxConversationKey:ref=>ref.thread_key,
     loadAttachmentCapabilities:async()=>({capabilities:new Map(),diagnostics:new Map(),unavailable:0}),
     gmailLabelSenderCountAfterHealth:(_old,count)=>({count}),renderGmailLabelPollingState:noop,
     setHealthValue:noop,receivedLabel:x=>x,intervalLabel:String,watcherPrerequisitesReady:()=>true,
     mailAccounts:[{provider:'imap',account_id:'old',active:true}],
     invoke:async(operation,args)=>{
-      assert.equal(operation,'inbox_query'); calls.push({...args.query});
+      assert.equal(operation,'inbox_conversations_query'); calls.push({...args.query});
       return {items:Array.from({length:25},(_,i)=>({message_id:args.query.cursor?'later-'+i:'first-'+i})),
         next_cursor:args.query.cursor?null:'page-two'};
     },
@@ -74,7 +75,13 @@ function harness() {
     context.mailAccounts=data.accounts;
     return context.reconcileInboxAccountScope();
   };
+  context.inboxConversationClient={query:async query=>{
+    const page=await context.invoke('inbox_conversations_query',{query});
+    return {...page,items:page.items.map(item=>({...item,thread_ref:{thread_key:item.message_id}}))};
+  }};
   vm.runInContext(executable,context);
+  const remove=context.deleteInboxItem;
+  context.deleteInboxItem=item=>remove({messageId:item.message_id,subject:item.subject,current:()=>true,afterApproval:async()=>true});
   context.inboxReload=new InboxReload({
     epoch:()=>context.inboxQueryEpoch, blocked:context.inboxReloadBlocked,
     currentScope:context.mailboxEffectScopeIsCurrent,run:context.runInboxRefresh,
@@ -87,8 +94,8 @@ const health={mail:{accounts:[{provider:'imap',account_id:'new',active:true,conn
  local_model:{ok:true}, database:{ok:true,initialized:true},notifications:{enabled:false},
  polling:{enabled:false},gmail:{label_watch_configured:false},production_check_supported:true};
 
-test('thread entry span commits only after every requested page and capabilities settle', async()=>{
-  const {c}=harness(), pageTwo=deferred(), capabilities=deferred();
+test('thread entry span commits only after every requested conversation page settles', async()=>{
+  const {c}=harness(), pageTwo=deferred();
   c.inboxItems=Array.from({length:50},(_,i)=>({message_id:'retained-'+i}));
   c.inboxThreadSpanScope={mutation_epoch:0,mailbox_operation_revision:1};
   const events=[];
@@ -96,14 +103,10 @@ test('thread entry span commits only after every requested page and capabilities
   c.threadHistory.commitInboxSpan=async()=>events.push(['reader',c.inboxItems.length]);
   c.invoke=async(_command,{query})=>query.cursor ? pageTwo.promise
     : {items:Array.from({length:25},(_,i)=>({message_id:'first-'+i})),next_cursor:'second'};
-  let page=0;
-  c.loadAttachmentCapabilities=async()=>++page===2 ? capabilities.promise
-    : {capabilities:new Map(),diagnostics:new Map(),unavailable:0};
   const loading=c.refreshLoadedInboxSpan(); await tick();
   assert.equal(c.inboxThreadSpanScope,null); assert.equal(c.inboxItems.length,25); assert.deepEqual(events,[]);
-  pageTwo.resolve({items:Array.from({length:25},(_,i)=>({message_id:'second-'+i})),next_cursor:null}); await tick();
-  assert.equal(c.inboxItems.length,50); assert.equal(c.inboxThreadSpanScope,null); assert.deepEqual(events,[]);
-  capabilities.resolve({capabilities:new Map(),diagnostics:new Map(),unavailable:0}); await loading;
+  pageTwo.resolve({items:Array.from({length:25},(_,i)=>({message_id:'second-'+i})),next_cursor:null}); await loading;
+  assert.equal(c.inboxItems.length,50);
   assert.equal(JSON.stringify(c.inboxThreadSpanScope),JSON.stringify({mutation_epoch:0,mailbox_operation_revision:1}));
   assert.deepEqual(events.map(e=>e.slice(0,2)),[['source',50],['reader',50]]);
 });
@@ -269,19 +272,20 @@ test('R2: pending largest span survives first-page invalidations and repeated wa
 
 test('R2/R3: span interrupted between pages restarts without duplicates or old continuation',async()=>{
   const {c,calls}=harness();c.inboxItems=Array(50).fill({message_id:'retained'});
-  const discovery=deferred();let discoveries=0;
-  c.loadAttachmentCapabilities=async()=>{
-    if(++discoveries===1)await discovery.promise;
-    return {capabilities:new Map(),diagnostics:new Map(),unavailable:0};
+  const page=deferred();
+  const query=c.invoke;
+  c.invoke=async (...args)=>{
+    const response=await query(...args);
+    return calls.length===2 ? page.promise : response;
   };
-  const refresh=c.refreshLoadedInboxSpan();await tick();assert.equal(calls.length,1);
+  const refresh=c.refreshLoadedInboxSpan();await tick();assert.equal(calls.length,2);
   const removalHold=deferred();c.inboxRemovalClient.delete=()=>removalHold.promise;
   const removal=c.deleteInboxItem({message_id:'removed',subject:'fixture'});await tick();
-  assert.equal(calls.length,1);
+  assert.equal(calls.length,2);
   removalHold.resolve(null);await removal;await tick();
-  assert.equal(c.inboxItems.length,50);assert.equal(calls.length,3);
-  discovery.resolve();await refresh;await tick();
-  assert.equal(calls.length,3,'superseded active span cannot append again');
+  assert.equal(c.inboxItems.length,50);assert.equal(calls.length,4);
+  page.resolve({items:[],next_cursor:null});await refresh;await tick();
+  assert.equal(calls.length,4,'superseded active span cannot append again');
   assert.equal(new Set(c.inboxItems.map(x=>x.message_id)).size,50);
 });
 

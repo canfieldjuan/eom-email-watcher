@@ -65,7 +65,7 @@ test("exact selection and All use the existing scope-clear owner and preserve ev
   h.button("jimbob@acme.com").click();
   assert.deepEqual({ ...c.activeInboxQuery }, { ...before, sender: "jimbob@acme.com" });
   assert.equal(c.calls.length, 1); assert.equal(c.threadCloses, 1);
-  assert.equal(c.calls[0].ids.length, 0); assert.equal(c.calls[0].expanded.length, 0); assert.equal(c.calls[0].cursor, null);
+  assert.equal(c.calls[0].ids.length, 0); assert.equal(c.calls[0].cursor, null);
   assert.equal(c.calls[0].epoch, 9); assert.equal(h.doc.activeElement, h.button("jimbob@acme.com"));
   assert.equal(h.button("jimbob@acme.com").attributes.get("aria-pressed"), "true");
   c.inboxSenderAll.click();

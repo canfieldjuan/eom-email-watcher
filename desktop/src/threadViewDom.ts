@@ -1,5 +1,5 @@
-import type { ThreadReadClient, ThreadVendor, ThreadRef, ThreadMessage, ThreadCopy, InboxMessageRef } from "./threadReads.ts";
-import { ThreadViewState, ThreadReadState, threadBodyDisplay, threadBodyStateLabel } from "./threadView.ts";
+import type { ThreadReadClient, ThreadVendor, ThreadRef, ThreadCopy, InboxMessageRef } from "./threadReads.ts";
+import { ThreadViewState, ThreadReadState, threadBodyDisplay, threadBodyStateLabel, type ReaderMessage } from "./threadView.ts";
 
 export interface RetainedThreadAccount {
   provider: string;
@@ -36,6 +36,9 @@ export class ThreadViewDom {
     onStateChange?: () => void;
     scrollRoot?: HTMLElement;
     restoring?: () => boolean;
+    renderAction?: (row: HTMLElement, message: ReaderMessage) => void;
+    beforeRender?: () => void;
+    afterRender?: () => void;
   };
   private pendingFocus: string | null = null;
 
@@ -43,10 +46,10 @@ export class ThreadViewDom {
     this.root = root;
     this.doc = root.ownerDocument;
     this.options = options;
-    this.state = new ThreadViewState(client, () => { this.render(); this.options.onStateChange?.(); });
+    this.state = new ThreadViewState(client, () => { this.render(); this.options.onStateChange?.(); }, !!options.renderAction);
     root.className = "thread-view";
     root.setAttribute("aria-labelledby", this.id("view-heading"));
-    this.render();
+    this.render(false);
   }
 
   open(vendor: ThreadVendor): Promise<void> {
@@ -54,9 +57,9 @@ export class ThreadViewDom {
     return this.state.selectVendor(vendor);
   }
 
-  openInbox(origin: InboxMessageRef, current: () => boolean): Promise<void> {
+  openInbox(origin: InboxMessageRef, current: () => boolean, thread: ThreadRef | null = null): Promise<void> {
     this.pendingFocus = "heading";
-    return this.state.openInbox(origin, current);
+    return this.state.openInbox(origin, current, thread);
   }
 
   focusHeading(): void {
@@ -82,9 +85,16 @@ export class ThreadViewDom {
     }
     if (this.options.scrollRoot) this.options.scrollRoot.scrollTop = position.top;
     if (focus) {
-      const target = targets.find(element => element.dataset.threadFocus === position.focus);
+      const target = targets.find(element => element.dataset.threadFocus === position.focus
+        && !(element as HTMLButtonElement).disabled) ?? this.actionHeading(targets, position.focus);
       if (target) target.focus({ preventScroll: true }); else this.focusHeading();
     }
+  }
+
+  private actionHeading(targets: HTMLElement[], key: string | null | undefined): HTMLElement | undefined {
+    if (!key?.startsWith("inbox-action:")) return undefined;
+    const [messageId] = JSON.parse(key.slice("inbox-action:".length)) as [string];
+    return targets.find(element => element.dataset.threadFocus === this.focusKey("message:" + messageId));
   }
 
   private id(suffix: string): string { return `${this.options.idPrefix ?? "thread"}-${suffix}`; }
@@ -160,7 +170,8 @@ export class ThreadViewDom {
     return label;
   }
 
-  render(): void {
+  render(notify = true): void {
+    if (notify) this.options.beforeRender?.();
     const outerScroll = this.options.scrollRoot?.scrollTop ?? 0;
     this.root.setAttribute("aria-busy", String(!!this.options.restoring?.()));
     const active = this.doc.activeElement as HTMLElement | null;
@@ -170,7 +181,7 @@ export class ThreadViewDom {
     const origin = this.state.inboxOrigin;
     this.root.hidden = this.state.vendor === null && origin === null;
     this.root.replaceChildren();
-    if (this.root.hidden) { this.pendingFocus = null; return; }
+    if (this.root.hidden) { this.pendingFocus = null; if (notify) this.options.afterRender?.(); return; }
     const header = this.node("div", "", "thread-toolbar");
     header.append(this.button(origin ? "Back to Inbox" : "Back to vendors", origin ? "back-inbox" : "back-vendors", () => {
       if (!origin) this.state.close();
@@ -196,9 +207,13 @@ export class ThreadViewDom {
     if (this.state.selectedThread) this.renderMessages();
     else if (origin) this.renderResolution();
     else this.renderThreads();
+    if (notify) this.options.afterRender?.();
     const targets = Array.from(this.root.querySelectorAll<HTMLElement>("[data-thread-focus]"));
     for (const element of targets) element.scrollTop = scroll.get(element.dataset.threadFocus) ?? 0;
-    const target = targets.find(element => element.dataset.threadFocus === (this.pendingFocus === null ? focus : this.focusKey(this.pendingFocus)));
+    const target = targets.find(element => !(element as HTMLButtonElement).disabled && element.dataset.threadFocus
+      === (this.pendingFocus === null ? focus : this.focusKey(this.pendingFocus)))
+      ?? this.actionHeading(targets, focus)
+      ?? (focus?.startsWith("inbox-action:") ? heading : undefined);
     if (this.options.scrollRoot) this.options.scrollRoot.scrollTop = outerScroll;
     if (target) { target.focus(this.options.scrollRoot ? { preventScroll: true } : undefined); this.pendingFocus = null; }
     else if (this.pendingFocus && ["ready", "error"].includes(
@@ -296,13 +311,16 @@ export class ThreadViewDom {
     this.root.append(section);
   }
 
-  private messageCard(message: ThreadMessage): HTMLElement {
+  private messageCard(message: ReaderMessage): HTMLElement {
     const row = this.node("li", "", "thread-card");
     if (this.state.inboxOrigin?.message_id === message.message_id) {
       row.dataset.threadOrigin = "true";
       row.append(this.node("p", "Opened from Inbox", "thread-origin"));
     }
-    row.append(this.node("h4", message.subject.trim() ? message.subject : "No subject"),
+    const heading = this.node("h4", message.subject.trim() ? message.subject : "No subject");
+    heading.tabIndex = -1;
+    heading.dataset.threadFocus = this.focusKey("message:" + message.message_id);
+    row.append(heading,
       this.node("p", `${message.direction === "outbound" ? "Outbound" : "Inbound"} · ${dateLabel(message.received_at)}`, "thread-meta"),
       this.node("p", message.sender_name ? `${message.sender_name} (${message.sender})` : message.sender),
       this.node("p", message.attributed_vendor?.display_name ?? "No attributed vendor", "thread-meta"));
@@ -336,6 +354,7 @@ export class ThreadViewDom {
       }
     }
     row.append(copyContainer);
+    if (this.state.inboxOrigin) this.options.renderAction?.(row, message);
     return row;
   }
 

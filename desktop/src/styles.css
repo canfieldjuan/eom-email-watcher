@@ -272,7 +272,7 @@ select:focus {
 #inbox-reading-pane { border: 1px solid #d7ded8; border-radius: 12px; background: #fff; padding: 16px; }
 #inbox-reader-empty { color: #536158; }
 #inbox-senders-toggle { margin-bottom: 8px; padding: 8px 12px; }
-.inbox-open-thread[aria-pressed="true"] { outline: 2px solid #2e6b4c; background: #e8ede8; }
+.inbox-row-toggle[aria-pressed="true"] { outline: 2px solid #2e6b4c; background: #e8ede8; }
 
 #inbox-sender-results {
   display: grid;
@@ -361,9 +361,22 @@ select:focus {
   font-weight: 800;
 }
 
-.inbox-message-content {
+.inbox-message-extras {
   margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #d7ded8;
+  overflow-wrap: anywhere;
 }
+
+.inbox-message-extras .attachment-list li {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.inbox-message-extras .attachment-actions {
+  justify-content: flex-start;
+}
+
+#inbox-action-notices:empty { display: none; }
 
 @media (max-width: 760px) {
   .inbox-columns {
@@ -1680,6 +1693,5 @@ select:focus {
 .thread-copy-summary { white-space: pre-wrap; }
 .thread-view :focus-visible { outline: 3px solid #2e6b4c; outline-offset: 3px; }
 
-.inbox-open-thread { margin-top: 10px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .thread-origin { color: #245c40; font-weight: 800; }
 .thread-card[data-thread-origin="true"] { border-inline-start: 4px solid #2e6b4c; }

@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { InboxThreadEntry, inboxThreadOriginKey, type InboxThreadSnapshot } from "../src/inboxThreadEntry.ts";
+import type { InboxItem } from "../src/inboxItem.ts";
+import type { InboxActionContext } from "../src/inboxThreadEntry.ts";
 import { ThreadReadClient } from "../src/threadReads.ts";
 import { Element, nodes } from "./threadDomFixture.ts";
 
-export function paneHarness() {
+export function paneHarness(renderAction?: (row: HTMLElement, record: InboxItem, context: InboxActionContext) => void,
+  actionNotSent?: (subject: string, reason: string) => void) {
   const events = new Map<string, Function[]>();
   const doc: any = { activeElement: null, addEventListener: (type: string, fn: Function) => {
     events.set(type, [...(events.get(type) ?? []), fn]);
@@ -49,7 +52,7 @@ export function paneHarness() {
   let respond = defaultResponse, refreshes = 0;
   const ui = new InboxThreadEntry({ root: root as any, columns: columns as any, heading: heading as any,
     layout: layout as any, accounts: () => [], snapshot: () => snapshot, scrollElements: () => [listScroll as any],
-    client: new ThreadReadClient(async <T>(command: string, args: any) => {
+    renderAction, actionNotSent, client: new ThreadReadClient(async <T>(command: string, args: any) => {
       calls.push({ command, query: structuredClone(args.query) }); return await respond(command, args.query) as T;
     }), refreshInbox: async () => { refreshes++; } });
   const button = (label: string) => { const value = nodes(root).find(n => n.tagName === "BUTTON" && n.textContent === label); assert.ok(value, label); return value; };

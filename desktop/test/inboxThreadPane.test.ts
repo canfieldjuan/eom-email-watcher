@@ -158,12 +158,14 @@ test("the actual Inbox span owner cannot restore an earlier refresh after a newe
   assert.equal(h.calls.slice(before).filter(c => c.command === "threads_body").length, 1);
 });
 
-test("Back during a current span reload enables Open thread without restoring the cancelled reader", async () => {
+test("Back during a current span reload enables conversation rows without restoring the cancelled reader", async () => {
   for (const back of [false, true]) {
     const h = paneHarness(), page = deferred(); await h.ui.open(h.rows[0]); await h.ui.state.openBody("a");
     const history = new ThreadHistory({} as any, h.ui); let restored = Promise.resolve();
     const c = createContext({ inboxThreadEntry: h.ui, inboxQueryEpoch: h.snapshot.queryEpoch, inboxItemsEpoch: h.snapshot.itemsEpoch,
-      inboxItems: h.rows, inboxList: h.columns, inboxThreadOriginKey, inboxNextCursor: null,
+      inboxItems: h.rows.map(row => ({ ...row, thread_ref: { thread_key: inboxThreadOriginKey(row.thread_entry_ref) } })),
+      inboxList: h.columns, inboxThreadOriginKey, inboxConversationKey: ref => ref.thread_key, inboxConversationRow: ({thread_ref,...row}) => row,
+      inboxNextCursor: null,
       currentMailboxEffectScope: () => h.snapshot.scope, mailboxEffectScopeIsCurrent: () => true,
       captureInboxScroll: () => ({ top: 0, revision: 0 }), restoreInboxScroll() {}, loadInboxPage: () => page.promise,
       threadHistory: { commitInboxSpan: (restore = true) => { restored = history.commitInboxSpan(restore); return restored; } } });

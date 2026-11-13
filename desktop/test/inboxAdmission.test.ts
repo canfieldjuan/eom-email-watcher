@@ -16,7 +16,7 @@ test("all immutable admission kinds display their actual reason", () => {
 test("production inbox admission segment renders every kind safely as text", () => {
   const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
   const start = source.indexOf("if (item.admission !== null) {");
-  const segment = source.slice(start, source.indexOf("const received =", start));
+  const segment = source.slice(start, source.indexOf("meta.append(senderIdentity)", start));
   assert.ok(start >= 0);
   for (const kind of ["exact_sender", "vendor_address", "vendor_domain", "sent_to_vendor", "thread_follow", "gmail_user_label"] as const) {
     const rendered: unknown[] = [];

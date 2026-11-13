@@ -6,7 +6,7 @@ import test from "node:test";
 import { parseAst } from "vite";
 import { ThreadHistory } from "../src/threadHistory.ts";
 import type { ThreadViewState } from "../src/threadView.ts";
-import { InboxThreadEntry, inboxThreadOriginKey } from "../src/inboxThreadEntry.ts";
+import { InboxThreadEntry, inboxThreadOriginKey, inboxConversationKey } from "../src/inboxThreadEntry.ts";
 import { ThreadReadClient } from "../src/threadReads.ts";
 import { Element } from "./threadDomFixture.ts";
 
@@ -48,8 +48,9 @@ function harness(names: string[]) {
     clearMessageOwnedUiState: noop, inboxRemovalStatus: () => ({ text: "Removed", kind: "success" }),
     inboxClearView: () => ({ retained: [], text: "Cleared", kind: "success" }),
     inboxStatus: node(), inboxLoadMore: node(), inboxPageState: "ready", inboxNextCursor: null,
-    inboxCapabilityUnavailableCount: 0, errorMessage: () => "Failed",
-    loadInbox: async () => { events.push("inbox"); },
+    inboxTotals: null, inboxReaderActionsInFlight: new Set(), showInboxActionNotice: noop, inboxConversationKey,
+    inboxClearStatus: () => ({text:"Cleared",kind:"success"}), errorMessage: () => "Failed",
+    loadInbox: async () => { events.push("inbox"); }, refreshLoadedInboxSpan: async () => { events.push("inbox"); },
     inboxRemovalClient: { delete: async () => { events.push("write"); return { outcome: "completed" }; },
       clear: async () => { events.push("write"); return { outcome: "completed" }; } },
     mailAccountMutationsInFlight: 0, mailAccountMutationEpoch: 0, healthRequestGeneration: 0,
@@ -74,7 +75,7 @@ function harness(names: string[]) {
   context.threadHistory = new ThreadHistory(context.threadReader.state as ThreadViewState, inbox as unknown as ThreadViewState);
   for (const name of ["inboxView", "watchlistView", "vendorsSection", "expiryLedgerView", "healthView", "settingsView",
     "inboxTab", "watchlistTab", "vendorsTab", "expiryLedgerTab", "healthTab", "settingsTab"]) context[name] = node();
-  vm.runInContext(names.map(owner).join("\n"), context);
+  vm.runInContext([...new Set(["performInboxReaderAction", "inboxConversationRow", ...names])].map(owner).join("\n"), context);
   return { events, inboxEvents, context };
 }
 
@@ -86,7 +87,7 @@ test("actual delete/clear and check owners clear thread reads before writes and 
         const failure = async () => { h.events.push("write"); throw new Error("synthetic failure"); };
         h.context.inboxRemovalClient = { delete: failure, clear: failure }; h.context.invoke = failure;
       }
-      await h.context[name]({ message_id: "m", subject: "Subject" });
+      await h.context[name]({ messageId: "m", subject: "Subject", current: () => true, afterApproval: async () => true });
       assert.equal(h.events[0], "begin", `${name}: ${h.events}`);
       assert.deepEqual(h.inboxEvents, ["begin", "end"], name);
       assert.equal(h.events.filter(x => x === "begin").length, 1);
@@ -156,10 +157,10 @@ test("actual span refresh revalidates threads and respects configuration readine
 test("actual row controls track nested mutation release and current-source eligibility", async () => {
   const h = harness(["refreshInboxThreadControls"]);
   const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: "identity", message_id: "m" };
-  const button = { disabled: true, setAttribute: noop, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
-  const other = { disabled: false, setAttribute: noop, dataset: { inboxThreadOrigin: inboxThreadOriginKey({ ...origin, account_id: "other" }) } };
-  h.context.inboxThreadOriginKey = inboxThreadOriginKey;
-  h.context.inboxItems = [{ ...origin, thread_entry_ref: origin }];
+  const row = conversation(origin);
+  const button = { disabled: true, setAttribute: noop, dataset: { inboxThreadOrigin: inboxConversationKey(row.thread_ref) } };
+  const other = { disabled: false, setAttribute: noop, dataset: { inboxThreadOrigin: inboxConversationKey({ ...row.thread_ref, account_id: "other" }) } };
+  h.context.inboxItems = [row];
   h.context.inboxList = { querySelectorAll: () => [button, other] };
   let sourceCurrent = true;
   const history = new ThreadHistory(h.context.threadReader.state, h.context.inboxThreadState, h.context.refreshInboxThreadControls);
@@ -175,9 +176,9 @@ test("returning to Inbox enables current rows refreshed while hidden, without by
   for (const mode of ["current", "old-query", "mailbox-changed", "unconfigured", "held"]) {
     const h = harness(["showView", "runInboxRefresh", "refreshInboxThreadControls"]), c = h.context;
     const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: "identity", message_id: "m" };
-    const button = { disabled: false, setAttribute: noop, dataset: { inboxThreadOrigin: inboxThreadOriginKey(origin) } };
-    c.inboxThreadOriginKey = inboxThreadOriginKey;
-    c.inboxItems = [{ ...origin, thread_entry_ref: origin }];
+    const row = conversation(origin);
+    const button = { disabled: false, setAttribute: noop, dataset: { inboxThreadOrigin: inboxConversationKey(row.thread_ref) } };
+    c.inboxItems = [row];
     c.inboxList = { querySelectorAll: () => [button] };
     const doc: any = { activeElement: null, createElement: (tag: string) => new Element(tag, doc) };
     const reads: string[] = [];
@@ -187,7 +188,7 @@ test("returning to Inbox enables current rows refreshed while hidden, without by
       accounts: () => [], refreshInbox: async () => {}, scrollElements: () => [],
       snapshot: () => ({ configured: c.configurationReady, visible: !c.inboxView.hidden,
         blocked: c.threadHistory.mutationHeld, queryEpoch: c.inboxQueryEpoch, itemsEpoch: c.inboxItemsEpoch,
-        items: c.inboxItems, scope: c.currentMailboxEffectScope(), spanScope: c.inboxThreadSpanScope }),
+        items: c.inboxItems.map(c.inboxConversationRow), scope: c.currentMailboxEffectScope(), spanScope: c.inboxThreadSpanScope }),
     });
     c.inboxThreadEntry = ui;
     c.threadHistory = new ThreadHistory(c.threadReader.state, ui.state, c.refreshInboxThreadControls);
@@ -260,38 +261,34 @@ test("entry is read class, lifecycle/settings hooks exist, and approved copy pre
   assert.match(settings, /finally \{\s*void threadHistory\.endMutation\(\)/);
   assert.ok(source.includes("Locally retained messages from watched senders and Gmail labels appear here. Followed threads and Sent replies to vendors also appear when captured with Connect."));
   assert.ok(source.includes("Watching an address keeps messages from that sender in the Inbox. Vendor records can also capture followed threads and Sent replies while Connect is active."));
-  assert.match(source, /aria-label="Recent retained messages"/);
+  assert.match(source, /aria-label="Recent retained conversations"/);
   assert.match(source, /inboxSenderEmptyText\(activeInboxQuery, activeInboxAccountSelection\)/);
   assert.doesNotMatch(source, /No watched messages/);
 });
 
 
-test("partial look-alike cannot overwrite the valid null-mailbox row in the production controls map", async () => {
-  for (const reversed of [false, true]) {
-    const h = harness(["refreshInboxThreadControls"]), c = h.context;
-    const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: null, message_id: "m" };
-    const valid = { ...origin, thread_entry_ref: origin };
-    const partial: any = { ...valid, thread_entry_ref: { ...origin } };
-    delete partial.thread_entry_ref.mailbox_identity_key;
-    c.inboxItems = reversed ? [partial, valid] : [valid, partial];
-    const button = (key: string | null) => ({ disabled: key === null, dataset: key === null ? {} : { inboxThreadOrigin: key },
-      attributes: new Map([["aria-pressed", "false"]]), setAttribute(key: string, value: string) { this.attributes.set(key, value); } });
-    const good = button(inboxThreadOriginKey(origin)), bad = button(inboxThreadOriginKey(partial.thread_entry_ref));
-    c.inboxList = { querySelectorAll: () => [good, bad].filter(b => b.dataset.inboxThreadOrigin !== undefined) };
-    c.inboxThreadOriginKey = inboxThreadOriginKey;
-    const doc: any = { activeElement: null, createElement: (tag: string) => new Element(tag, doc) };
-    const ui = new InboxThreadEntry({ root: new Element("section", doc) as any,
-      columns: new Element("div", doc) as any, heading: new Element("h2", doc) as any,
-      client: new ThreadReadClient(async () => { throw new Error("Synthetic unavailable thread"); }),
-      accounts: () => [], refreshInbox: async () => {}, scrollElements: () => [],
-      snapshot: () => ({ configured: true, visible: true, blocked: false, queryEpoch: 1, itemsEpoch: 1,
-        items: c.inboxItems, scope: { mutation_epoch: 0, mailbox_operation_revision: 1 },
-        spanScope: { mutation_epoch: 0, mailbox_operation_revision: 1 } }),
-    });
-    c.inboxThreadEntry = ui; await ui.open(valid);
-    c.refreshInboxThreadControls();
-    assert.equal(good.disabled, false, "valid row remains enabled regardless of partial-row order");
-    assert.equal(good.attributes.get("aria-pressed"), "true");
-    assert.equal(bad.disabled, true); assert.equal(bad.attributes.get("aria-pressed"), "false");
-  }
+function conversation(origin: { provider: string; account_id: string; mailbox_identity_key: string | null; message_id: string }) {
+  const {message_id, ...scope} = origin;
+  return { thread_ref: {...scope,thread_key:"thread-" + message_id}, matching_message_ref: origin,
+    latest:{subject:"Subject",sender:"sender@example.test",received_at:null} };
+}
+
+test("a stale same-key conversation with a changed anchor cannot be opened", async () => {
+  const h = harness(["refreshInboxThreadControls"]), c = h.context;
+  const origin = { provider: "imap", account_id: "retained", mailbox_identity_key: null, message_id: "m" };
+  const row = conversation(origin);
+  const fresh = {...row,matching_message_ref:{...origin,message_id:"fresh"}};
+  c.inboxItems = [fresh];
+  const doc: any = { activeElement: null, createElement: (tag: string) => new Element(tag, doc) };
+  let reads = 0;
+  const ui = new InboxThreadEntry({ root: new Element("section", doc) as any,
+    columns: new Element("div", doc) as any, heading: new Element("h2", doc) as any,
+    client: new ThreadReadClient(async () => { reads++; throw new Error("Synthetic unavailable thread"); }),
+    accounts: () => [], refreshInbox: async () => {}, scrollElements: () => [],
+    snapshot: () => ({ configured:true,visible:true,blocked:false,queryEpoch:1,itemsEpoch:1,
+      items:c.inboxItems.map(c.inboxConversationRow),scope:{mutation_epoch:0,mailbox_operation_revision:1},
+      spanScope:{mutation_epoch:0,mailbox_operation_revision:1} }),
+  });
+  await ui.open(c.inboxConversationRow(row)); assert.equal(reads,0);
+  await ui.open(c.inboxConversationRow(fresh)); assert.equal(reads,1);
 });
