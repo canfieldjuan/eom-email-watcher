@@ -1,5 +1,6 @@
 import { InboxReload, type InboxRefreshIntent } from "./inboxReload";
 import { observeCommonHeader } from "./commonHeader";
+import { positionInboxFilters } from "./inboxFilters";
 import { ThreadReadClient } from "./threadReads";
 import { ThreadViewDom } from "./threadViewDom";
 import { InboxThreadEntry, inboxConversationKey, type InboxActionContext, type InboxThreadRow } from "./inboxThreadEntry";
@@ -414,9 +415,14 @@ app.innerHTML = `
           <input id="inbox-keyword" name="keyword" maxlength="200" form="inbox-filter-form" />
         </label>
         <button class="inbox-search-submit" type="submit" form="inbox-filter-form">Search</button>
-        <details id="inbox-filter-panel" class="inbox-filter-panel">
-          <summary id="inbox-filters-toggle">Filters</summary>
-          <form id="inbox-filter-form" class="inbox-filter-form">
+        <button id="inbox-filters-toggle" class="inbox-filters-toggle" type="button"
+          popovertarget="inbox-filter-form" aria-controls="inbox-filter-form">Filters</button>
+        <form id="inbox-filter-form" class="inbox-filter-form" popover aria-labelledby="inbox-filters-heading">
+          <div class="inbox-filter-heading">
+            <h3 id="inbox-filters-heading">Inbox filters</h3>
+            <button id="inbox-filters-close" class="secondary-action" type="button" popovertarget="inbox-filter-form"
+              popovertargetaction="hide">Close</button>
+          </div>
           <label>
             <span>Sender contains</span>
             <input id="inbox-sender" name="sender" maxlength="320" />
@@ -476,7 +482,6 @@ app.innerHTML = `
             <button id="inbox-reset" class="secondary-action" type="button">Reset</button>
           </div>
         </form>
-        </details>
       </div>
       <div id="inbox-filter-scope" class="inbox-filter-scope" role="group" aria-label="Applied filters"></div>
       <p id="inbox-previous-results" class="status" role="status" hidden>Previous results</p>
@@ -884,8 +889,8 @@ const inboxSenderEmpty = requiredElement<HTMLElement>("#inbox-sender-empty");
 const inboxSenderError = requiredElement<HTMLParagraphElement>("#inbox-sender-error");
 const inboxHeading = requiredElement<HTMLElement>("#inbox-heading");
 const inboxFilterForm = requiredElement<HTMLFormElement>("#inbox-filter-form");
-const inboxFilterPanel = requiredElement<HTMLDetailsElement>("#inbox-filter-panel");
-const inboxFiltersToggle = requiredElement<HTMLElement>("#inbox-filters-toggle");
+const inboxFiltersToggle = requiredElement<HTMLButtonElement>("#inbox-filters-toggle");
+positionInboxFilters(inboxFilterForm, inboxFiltersToggle, requiredElement<HTMLElement>(".app-header"), inboxView);
 const inboxFilterScope = requiredElement<HTMLElement>("#inbox-filter-scope");
 const inboxPreviousResults = requiredElement<HTMLElement>("#inbox-previous-results");
 const inboxKeywordInput = requiredElement<HTMLInputElement>("#inbox-keyword");
@@ -1273,6 +1278,7 @@ function showView(
   const expiryLedgerSelected = view === "expiry-ledger";
   const healthSelected = view === "health";
   const settingsSelected = view === "settings";
+  if (!inboxSelected) inboxFilterForm.hidePopover();
   inboxView.hidden = !inboxSelected;
   watchlistView.hidden = !watchlistSelected;
   vendorsSection.hidden = !vendorsSelected;
@@ -2721,7 +2727,10 @@ function renderInboxFilterScope(): void {
     inboxFilterScope.append(element);
     return element;
   };
-  button("account", accountLabel, () => { inboxFilterPanel.open = true; inboxAccountSelect.focus(); });
+  button("account", accountLabel, () => {
+    if (!inboxFilterForm.matches(":popover-open")) inboxFiltersToggle.click();
+    inboxAccountSelect.focus();
+  });
   if (removableAccount) button("remove-account", "Remove account filter", () => removeInboxFilter("account"));
   for (const predicate of predicates) {
     button(predicate.key, `${predicate.text} ×`, () => removeInboxFilter(predicate.key))

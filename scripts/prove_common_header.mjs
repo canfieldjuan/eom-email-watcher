@@ -1,5 +1,6 @@
 // Source-only browser regression. Build a fixture, serve its output with Vite,
-// then run window.proveHeader() in Chromium and WebKit (no native IPC).
+// then run window.proveHeader() and window.proveFiltersLayout() in Chromium
+// and WebKit (no native IPC).
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { stripTypeScriptTypes, createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -25,16 +26,21 @@ const handlers = ast.body.filter(n => n.type === "ExpressionStatement"
 if (handlers.length !== tabs.length) throw Error("Missing production navigation listeners");
 const headerCall = ast.body.find(n => n.type === "ExpressionStatement"
   && n.expression.type === "CallExpression" && n.expression.callee.name === "observeCommonHeader");
+const filtersCall = ast.body.find(n => n.type === "ExpressionStatement"
+  && n.expression.type === "CallExpression" && n.expression.callee.name === "positionInboxFilters");
 const imports = `
 import {InboxThreadEntry} from '/@fs/${repo}/desktop/src/inboxThreadEntry.ts';
 import {ThreadReadClient} from '/@fs/${repo}/desktop/src/threadReads.ts';
 import {ThreadHistory} from '/@fs/${repo}/desktop/src/threadHistory.ts';
 ${headerCall ? `import {observeCommonHeader} from '/@fs/${repo}/desktop/src/commonHeader.ts';` : ""}
+${filtersCall ? `import {positionInboxFilters} from '/@fs/${repo}/desktop/src/inboxFilters.ts';` : ""}
 `;
 const fixture = `
 const requiredElement = selector => {const e=document.querySelector(selector);if(!e)throw Error(selector);return e;};
 const [inboxTab,watchlistTab,vendorsTab,expiryLedgerTab,healthTab,settingsTab]=${JSON.stringify(tabs)}.map(v=>requiredElement('#'+v+'-tab'));
 const [inboxView,watchlistView,vendorsSection,expiryLedgerView,healthView,settingsView]=${JSON.stringify(tabs)}.map(v=>requiredElement('#'+v+'-view'));
+const inboxFilterForm=requiredElement('#inbox-filter-form');
+const inboxFiltersToggle=requiredElement('#inbox-filters-toggle');
 const calls=[],configurationReady=true,refreshInboxThreadControls=()=>{};
 const loadVendors=async()=>calls.push('vendors'),refreshConnectStatus=async()=>calls.push('connect'),
 loadExpiryLedger=async()=>calls.push('expiry'),coiSetup={refresh:async()=>calls.push('coi')},
@@ -56,10 +62,12 @@ for(const selector of ['#inbox-list','#inbox-sender-results'])for(let i=0;i<80;i
  requiredElement(selector).append(row);
 }
 ${headerCall ? source.slice(headerCall.start, headerCall.end) : ""}
+${filtersCall ? source.slice(filtersCall.start, filtersCall.end) : ""}
 ${source.slice(showView.start, showView.end)}
 ${handlers.map(n => source.slice(n.start, n.end)).join("\n")}
 window.fixture={calls,entry,tabs:${JSON.stringify(tabs)},showView};
 window.proveHeader=${proveHeader.toString()};
+window.proveFiltersLayout=${proveFiltersLayout.toString()};
 window.fixtureReady=true;
 `;
 mkdirSync(output, { recursive: true, mode: 0o700 });
@@ -118,4 +126,53 @@ async function proveHeader() {
   check(input.getBoundingClientRect().top >= header.getBoundingClientRect().bottom, 'focused content covered by header');
   return {pass:true,viewport:[innerWidth,innerHeight],textSize:getComputedStyle(document.documentElement).fontSize,
     rows,layout:grid.dataset.layout,fit:grid.dataset.fit,paneHeight:pane.clientHeight,headerHeight:header.getBoundingClientRect().height,layoutReads:fixture.calls.length-before};
+}
+
+async function proveFiltersLayout() {
+  const select = selector => document.querySelector(selector);
+  const form = select("#inbox-filter-form");
+  const trigger = select("#inbox-filters-toggle");
+  const close = select("#inbox-filters-close");
+  const sender = select("#inbox-sender");
+  const account = select("#inbox-account");
+  const header = select(".app-header");
+  const viewport = document.documentElement;
+  const panes = ["#inbox-columns", "#inbox-sender-results", "#inbox-results", "#inbox-reading-pane"].map(select);
+  const settle = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const check = (condition, message) => { if (!condition) throw Error(message); };
+  const workspace = () => JSON.stringify({
+    document: [viewport.scrollHeight, viewport.scrollWidth, scrollY, scrollX],
+    panes: panes.map(pane => {
+      const { x, y, width, height } = pane.getBoundingClientRect();
+      return [x, y, width, height, pane.scrollTop, pane.scrollLeft];
+    }),
+    calls: fixture.calls.length,
+  });
+  fixture.showView("inbox");
+  account.add(new Option("Example Bookkeeping Account — owner@example.test", "account-fixture", true, true));
+  sender.value = "unapplied draft";
+  trigger.focus();
+  await settle();
+  panes.forEach(pane => { pane.scrollTop = 40; });
+  const before = workspace();
+  check(!form.matches(":popover-open"), "Filters should start closed");
+  trigger.click();
+  await settle();
+  check(workspace() === before, "opening Filters moved the workspace or started a read");
+  const bounds = form.getBoundingClientRect();
+  check(bounds.height > 0 && bounds.top >= header.getBoundingClientRect().bottom
+    && bounds.bottom <= viewport.clientHeight + 1 && bounds.left >= 0
+    && bounds.right <= viewport.clientWidth + 1, "Filters is outside the visible space below the header");
+  check(form.scrollWidth <= form.clientWidth + 1, "Filters has horizontal overflow");
+  form.scrollTop = form.scrollHeight;
+  await settle();
+  check(workspace() === before, "scrolling Filters moved the workspace");
+  close.click();
+  await settle();
+  check(workspace() === before && form.getClientRects().length === 0, "closing Filters moved the workspace");
+  check(document.activeElement === trigger && sender.value === "unapplied draft", "closing Filters lost focus or draft");
+  trigger.click();
+  fixture.showView("watchlist");
+  check(form.getClientRects().length === 0, "Filters remained visible after leaving Inbox");
+  return { pass: true, viewport: [viewport.clientWidth, viewport.clientHeight], scrollY };
 }
