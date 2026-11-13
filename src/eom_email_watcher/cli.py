@@ -13,7 +13,7 @@ from pathlib import Path
 
 from connect_automate.locking import operation_lock
 
-from . import __version__, private_storage, removal
+from . import __version__, confinement, private_storage, removal
 from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .db import Store
 from .mailbox import MailboxError
@@ -357,6 +357,33 @@ def _requeue_analysis(config_path: Path, message_id: str) -> int:
     return 0
 
 
+def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "doctor":
+        return _doctor(args.config)
+    if args.command == "setup":
+        return _setup(args.config)
+    if args.command == "setup-send":
+        return _setup_send(args.config)
+    if args.command == "check":
+        return _check(args.config, args.dry_run)
+    if args.command == "send-hours":
+        return _send_hours(args.config, test_to=args.test_to, dry_run=args.dry_run)
+    if args.command == "outbound-status":
+        return _outbound_status(args.config, args.dedupe_key)
+    if args.command == "outbound-resolve":
+        return _outbound_resolve(
+            args.config,
+            args.dedupe_key,
+            confirm_sent=args.confirm_sent,
+            confirm_unsent=args.confirm_unsent,
+        )
+    if args.command == "requeue-analysis":
+        return _requeue_analysis(args.config, args.message_id)
+    if args.command == "rule-delete":
+        return _rule_delete(args.config, args.rule_id, args.expected_version)
+    return _recent(args.config, args.limit)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     logging.basicConfig(
@@ -366,33 +393,21 @@ def main(argv: list[str] | None = None) -> None:
     previous_umask = os.umask(0o077)
     try:
         try:
-            if args.command == "doctor":
-                code = _doctor(args.config)
-            elif args.command == "setup":
-                code = _setup(args.config)
-            elif args.command == "setup-send":
-                code = _setup_send(args.config)
-            elif args.command == "check":
-                code = _check(args.config, args.dry_run)
-            elif args.command == "send-hours":
-                code = _send_hours(args.config, test_to=args.test_to, dry_run=args.dry_run)
-            elif args.command == "outbound-status":
-                code = _outbound_status(args.config, args.dedupe_key)
-            elif args.command == "outbound-resolve":
-                code = _outbound_resolve(
-                    args.config,
-                    args.dedupe_key,
-                    confirm_sent=args.confirm_sent,
-                    confirm_unsent=args.confirm_unsent,
-                )
-            elif args.command == "requeue-analysis":
-                code = _requeue_analysis(args.config, args.message_id)
-            elif args.command == "rule-delete":
-                code = _rule_delete(args.config, args.rule_id, args.expected_version)
-            else:
-                code = _recent(args.config, args.limit)
+            # #363: scheduled commands confine their own writes before loading anything.
+            scope = (
+                confinement.scheduled_run(args.config)
+                if args.command in confinement.SCHEDULED
+                else nullcontext()
+            )
+            with scope:
+                code = _dispatch(args)
         except (
-            ConfigError, MailboxError, SendError, RuntimeError, private_storage.PrivateStorageError
+            ConfigError,
+            MailboxError,
+            SendError,
+            RuntimeError,
+            private_storage.PrivateStorageError,
+            confinement.ConfinementError,
         ) as exc:
             print(f"error: {exc}", file=sys.stderr)
             code = 2

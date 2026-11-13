@@ -406,11 +406,55 @@ desktop safety. A desktop bundle embeds its authority at build time; do not pass
 keyring to its installer. Both modes consume the same shipped unit payload owner.
 Source installation refuses to replace an existing native scheduled alias; use
 the concrete desktop `--engine` installer to update that paired deployment.
-Service cadence, sandbox, ntfy delivery and attachment confirmation remain as before.
+Service cadence, ntfy delivery and attachment confirmation remain as before.
 Logs contain message IDs and sanitized failure classes, not bodies or credentials.
 Post-send reservation recovery after a deployment refusal is tracked in
 [#219](https://github.com/canfieldjuan/eom-email-watcher/issues/219); do not resend an
 uncertain delivery before manual reconciliation.
+
+### What scheduled runs may write
+
+On Linux, `check` and `send-hours` confine their own writes before they load the
+configuration, whether a timer or a person starts them. From then on, the run and every
+program it starts can create, change, rename or delete files only inside:
+
+- `~/.config/eom-email-watcher`;
+- the state folder: `$STATE_DIRECTORY` under systemd, otherwise
+  `$XDG_STATE_HOME/eom-email-watcher` or `~/.local/state/eom-email-watcher`, plus
+  `~/.local/state/eom-email-watcher` when it exists and is a different folder;
+- a private temporary folder inside the state folder, removed when the run ends;
+- `/dev/null`.
+
+Reading files, running programs and network access are not restricted. The folders are
+fixed. A configuration that puts `database_file`, `gmail_token_file` or
+`gmail_send_token_file` somewhere else stops the run before it contacts anything, with an
+`error:` line naming the setting, until the file is moved. A `--config` file elsewhere is
+still read, but its folder is not writable.
+
+A Linux system that cannot enforce this does not run scheduled commands at all: Landlock
+missing or disabled, a kernel older than 6.2, or a missing folder. The run exits with
+status 2 and an `error:` line saying why. There is no switch to skip it. The run also
+refuses to start with more than one thread, because threads that exist before
+confinement are not confined.
+
+Not covered:
+
+- permission, ownership, timestamp and extended-attribute changes to files outside those
+  folders;
+- writes through a file opened before confinement, or through a hard link inside the
+  folders that already pointed at an outside file;
+- requests to other services in your session. The run still talks to the systemd user
+  manager (for the deployment checks) and the desktop message bus (for notifications),
+  and a program one of them starts on the run's behalf is outside the boundary.
+
+So the boundary stops a bug that writes in the wrong place. It does not contain code that
+has taken over the run. The units' `PrivateTmp=`, `ProtectSystem=`, `ProtectHome=` and
+`ReadWritePaths=` lines do not take effect on Ubuntu 24.04 and later, where AppArmor
+denies the user manager the namespace they need
+([#363](https://github.com/canfieldjuan/eom-email-watcher/issues/363)). They stay until
+the unit payload can change
+([#341](https://github.com/canfieldjuan/eom-email-watcher/issues/341)); the confinement
+above is what enforces the boundary.
 
 ## Model output and safety
 

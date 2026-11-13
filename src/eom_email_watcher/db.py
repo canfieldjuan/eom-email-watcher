@@ -6485,6 +6485,9 @@ class Store:
                 connection.execute("PRAGMA recursive_triggers = ON")
                 connection.execute("PRAGMA secure_delete = ON")
                 connection.execute("PRAGMA foreign_keys = ON")
+                # #363 R5: SQLite fixes its temp directory at import, before a scheduled
+                # command confines itself, so temporary tables and sorts stay in memory.
+                connection.execute("PRAGMA temp_store = MEMORY")
                 connection.row_factory = sqlite3.Row
                 connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
                 connection.create_function(
