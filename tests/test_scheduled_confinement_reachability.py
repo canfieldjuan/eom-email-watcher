@@ -39,7 +39,7 @@ from eom_email_watcher import engine_api
 
 pytestmark = pytest.mark.platform_contract(
     platforms=["linux"],
-    owner="src/eom_email_watcher/confinement.py:127",
+    owner="src/eom_email_watcher/confinement.py:134",
     reason="Landlock write confinement is Linux-only; other platforms are unchanged",
 )
 
