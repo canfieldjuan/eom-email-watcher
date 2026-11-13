@@ -52,9 +52,11 @@ def _home(tmp_path: Path, *, state: bool = True, extra: str = "") -> Path:
 
 
 def _env(home: Path) -> dict[str, str]:
+    # Coverage hooks in a confined child would write their data outside the roots.
     env = {
         key: value for key, value in os.environ.items()
         if key not in {"STATE_DIRECTORY", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "TMPDIR"}
+        and not key.startswith(("COV_CORE_", "COVERAGE_"))
     }
     env["HOME"] = str(home)
     return env
