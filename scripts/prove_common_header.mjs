@@ -1,6 +1,7 @@
 // Source-only browser regression. Build a fixture, serve its output with Vite,
 // then run window.proveHeader() and window.proveFiltersLayout() in Chromium
-// and WebKit (no native IPC).
+// and WebKit (no native IPC). For native focus coverage call
+// prepareHeaderTab(), send its returned key through the browser, then checkHeaderTab().
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { stripTypeScriptTypes, createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -68,6 +69,8 @@ ${handlers.map(n => source.slice(n.start, n.end)).join("\n")}
 window.fixture={calls,entry,tabs:${JSON.stringify(tabs)},showView};
 window.proveHeader=${proveHeader.toString()};
 window.proveFiltersLayout=${proveFiltersLayout.toString()};
+window.prepareHeaderTab=${prepareHeaderTab.toString()};
+window.checkHeaderTab=${checkHeaderTab.toString()};
 window.fixtureReady=true;
 `;
 mkdirSync(output, { recursive: true, mode: 0o700 });
@@ -175,4 +178,64 @@ async function proveFiltersLayout() {
   fixture.showView("watchlist");
   check(form.getClientRects().length === 0, "Filters remained visible after leaving Inbox");
   return { pass: true, viewport: [viewport.clientWidth, viewport.clientHeight], scrollY };
+}
+
+async function prepareHeaderTab(id, from, backwards = false, overlap = 16) {
+  const pane = document.getElementById(id);
+  const start = document.getElementById(from);
+  const header = document.querySelector(".app-header");
+  const settle = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  fixture.showView("inbox");
+  await settle();
+  if (id === "inbox-sender-results" && document.getElementById("inbox-senders-content").hidden) {
+    document.getElementById("inbox-senders-toggle").click();
+    await settle();
+  }
+  if (!pane.getClientRects().length || !start.getClientRects().length) throw Error("Tab fixture target is hidden");
+  const spacer = document.createElement("div");
+  spacer.style.height = "520px";
+  document.getElementById("inbox-view").append(spacer);
+  const sample = () => ({
+    target: pane.id, active: document.activeElement.id,
+    paneTop: pane.getBoundingClientRect().top, headerBottom: header.getBoundingClientRect().bottom,
+    paneScroll: pane.scrollTop, y: scrollY, calls: fixture.calls.length,
+  });
+  start.focus({ preventScroll: true });
+  await settle();
+  pane.scrollTop = 80;
+  scrollBy(0, pane.getBoundingClientRect().top - header.getBoundingClientRect().bottom + overlap);
+  await settle();
+  const before = sample();
+  if (before.active !== from || (overlap > 0 && before.paneTop >= before.headerBottom)) {
+    throw Error("Tab fixture did not reach its starting position");
+  }
+  let native;
+  pane.addEventListener("focus", () => { native = sample(); }, { once: true });
+  const corrections = [];
+  const scroll = window.scrollBy;
+  window.scrollBy = function (...args) {
+    corrections.push(sample());
+    return scroll.apply(this, args);
+  };
+  fixture.focusProbe = { sample, before, settle, spacer, native: () => native, corrections, scroll };
+  return { before, key: backwards ? "Shift+Tab" : "Tab" };
+}
+
+async function checkHeaderTab() {
+  const { sample, before, settle, spacer, native, corrections, scroll } = fixture.focusProbe;
+  await settle();
+  const after = sample();
+  window.scrollBy = scroll;
+  spacer.remove();
+  const nativeFocus = native();
+  const evidence = JSON.stringify({ before, nativeFocus, after });
+  if (after.active !== after.target) throw Error("Native Tab reached the wrong target: " + evidence);
+  if (after.paneTop < after.headerBottom + 4) throw Error("Native Tab leaves the focus outline under the sticky header: " + evidence);
+  if (after.calls !== before.calls || after.paneScroll !== before.paneScroll) {
+    throw Error("Focus clearance changed calls or pane scroll: " + evidence);
+  }
+  if (corrections.some(position => position.paneTop >= position.headerBottom + 12)) {
+    throw Error("Already-clear native focus caused an extra document scroll: " + evidence);
+  }
+  return { before, nativeFocus, after, corrections, pass: true };
 }

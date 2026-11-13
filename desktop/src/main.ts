@@ -498,21 +498,21 @@ app.innerHTML = `
           <button id="inbox-sender-all" type="button" aria-pressed="true" aria-describedby="inbox-sender-help">All senders</button>
           <p id="inbox-sender-help">All retained messages in the selected account scope.</p>
           <div id="inbox-sender-pinned" hidden></div>
-          <div id="inbox-sender-results" role="region" aria-label="Watched sender results" tabindex="0"></div>
+          <div id="inbox-sender-results" role="region" aria-label="Watched sender results" tabindex="0" data-header-focus-clearance></div>
           <p id="inbox-sender-empty" class="status" role="status" hidden></p>
         </nav>
         <p id="inbox-sender-error" class="status" role="status" hidden></p>
         </div>
       </aside>
       <div id="inbox-message-pane" class="inbox-messages">
-      <div id="inbox-results" role="region" aria-label="Conversation results" tabindex="0">
+      <div id="inbox-results" role="region" aria-label="Conversation results" tabindex="0" data-header-focus-clearance>
         <ul id="inbox-list" class="inbox-list" aria-label="Recent retained conversations"></ul>
         <div class="inbox-page-actions">
           <button id="inbox-load-more" type="button" hidden>Load more</button>
         </div>
       </div>
       </div>
-      <section id="inbox-reading-pane" role="region" aria-label="Retained thread reading pane" tabindex="0">
+      <section id="inbox-reading-pane" role="region" aria-label="Retained thread reading pane" tabindex="0" data-header-focus-clearance>
         <p id="inbox-reader-empty">Select a conversation to read its retained messages.</p>
         <p id="inbox-reader-source" class="thread-history-notice" hidden></p>
         <section id="inbox-thread-view" hidden></section>
