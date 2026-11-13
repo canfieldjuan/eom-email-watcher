@@ -25,6 +25,7 @@ function harness(names: string[]) {
     focus: () => events.push("focus") });
   const shell = node();
   const context = vm.createContext({
+    inboxFilterForm: { hidePopover() {} },
     threadReader: { state: { beginMutation: () => events.push("begin"), endMutation: async () => { events.push("end"); },
       refresh: async () => { events.push("refresh"); }, suspend: () => events.push("suspend"), resume: async () => { events.push("resume"); },
       close: () => events.push("close"), vendor: { vendor_id: "v", display_name: "Before" } } },

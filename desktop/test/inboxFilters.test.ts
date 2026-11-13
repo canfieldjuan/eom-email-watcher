@@ -8,19 +8,15 @@ import { inboxClearStatus, inboxRemovalStatus } from "../src/inboxRemoval.ts";
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 
-test("compact filters start collapsed while keyword and Search stay visible and share the same form", () => {
-  const panel = source.match(
-    /<details id="inbox-filter-panel" class="inbox-filter-panel">([\s\S]*?)<\/details>/,
-  );
-
-  assert.ok(panel, "expected the inbox filter disclosure without open");
-  assert.match(panel[1], /<summary id="inbox-filters-toggle">Filters<\/summary>/);
+test("Filters, Close and external Search controls use the single native form", () => {
+  const panel = source.match(/<form id="inbox-filter-form" class="inbox-filter-form" popover aria-labelledby="inbox-filters-heading">([\s\S]*?)<\/form>/);
+  assert.ok(panel, "expected a closed, labelled modeless popover");
+  assert.match(source, /id="inbox-filters-toggle"[\s\S]*?type="button"\s+popovertarget="inbox-filter-form"/);
+  assert.match(panel[1], /id="inbox-filters-close"[^>]*type="button" popovertarget="inbox-filter-form"\s+popovertargetaction="hide"/);
   assert.doesNotMatch(panel[1], /id="inbox-keyword"/);
   assert.match(source, /<input id="inbox-keyword"[^>]*maxlength="200"[^>]*form="inbox-filter-form"/);
   assert.match(source, /<button class="inbox-search-submit" type="submit" form="inbox-filter-form">Search<\/button>/);
   assert.match(panel[1], /Sender contains[\s\S]*id="inbox-sender"[^>]*maxlength="320"/);
-  assert.match(panel[1], /<form id="inbox-filter-form" class="inbox-filter-form">/);
-  assert.ok(panel[1].indexOf("<summary ") < panel[1].indexOf("<form"));
 });
 
 test("shell view marker starts at inbox and follows only showView", () => {

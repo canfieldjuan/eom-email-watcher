@@ -11,7 +11,7 @@ function harness() {
   const code = names.map(name => { const m = source.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`)); assert.ok(m, `required owner ${name}`); return m[0]; }).join("\n");
   const doc: any = { activeElement: null, createElement: (tag: string) => new Element(tag, doc) };
   const el = () => new Element("div", doc), control = (value: string) => Object.assign(new Element("input", doc), { value, options: [] });
-  const c = createContext({ document: doc, inboxFilterScope: el(), inboxFilterPanel: { open: false }, inboxFiltersToggle: el(),
+  const c = createContext({ document: doc, inboxFilterScope: el(), inboxFilterForm: { matches: () => false }, inboxFiltersToggle: el(),
     inboxPreviousResults: el(), inboxKeywordInput: control("draft keyword"), inboxSenderInput: control("draft sender"),
     inboxPrioritySelect: control("low"), inboxCategorySelect: control("other"), inboxStateSelect: control("pending"),
     inboxAccountSelect: control("all"), inboxPageSizeSelect: control("100"), inboxMutationInFlight: () => false,
@@ -23,6 +23,7 @@ function harness() {
     inboxItems: [{ message_id: "retained" }], inboxQueryEpoch: 3, inboxItemsEpoch: 3, inboxRequestGeneration: 4,
     inboxNextCursor: "next", inboxPageState: "loaded", inboxCapabilityUnavailableCount: 0, expandedInboxMessages: new Set(["retained"]),
     inboxLoadMore: el(), inboxStatus: el(), calls: [], closes: 0, clearMessageOwnedUiState: () => {} });
+  c.inboxFiltersToggle.addEventListener("click", () => { c.inboxFilterForm.matches = () => true; });
   c.inboxPredicateControls = { keyword: c.inboxKeywordInput, sender_query: c.inboxSenderInput, priority: c.inboxPrioritySelect,
     category: c.inboxCategorySelect, status: c.inboxStateSelect };
   c.inboxPrioritySelect.options = [{ value: "high", textContent: "High" }, { value: "low", textContent: "Low" }];
@@ -42,7 +43,7 @@ test("visible scope describes committed predicates, account and page size, not c
   assert.doesNotMatch(content, /draft keyword|draft sender|100 per page/);
   assert.equal(nodes(c.inboxFilterScope).some(n => n.tagName === "IMG"), false);
   assert.equal(nodes(c.inboxFilterScope).some(n => n.dataset.inboxFilterFocus === "remove-account"), false);
-  button("account").click(); assert.equal(c.inboxFilterPanel.open, true); assert.equal(c.document.activeElement, c.inboxAccountSelect);
+  button("account").click(); assert.equal(c.inboxFilterForm.matches(":popover-open"), true); assert.equal(c.document.activeElement, c.inboxAccountSelect);
   assert.equal(c.calls.length, 0);
 });
 

@@ -403,11 +403,7 @@ select:focus {
   grid-row: 1;
 }
 
-.inbox-filter-panel {
-  display: contents;
-}
-
-.inbox-filter-panel > summary {
+.inbox-filters-toggle {
   grid-column: 3;
   grid-row: 1;
   padding: 11px 14px;
@@ -419,20 +415,70 @@ select:focus {
   font-weight: 700;
 }
 
-.inbox-filter-panel > summary:focus-visible,
+.inbox-filters-toggle:focus-visible,
 .inbox-filter-label:focus-visible {
   outline: 3px solid rgb(46 107 76 / 40%);
   outline-offset: 2px;
 }
 
 .inbox-filter-form {
-  grid-column: 1 / -1;
-  grid-row: 2;
+  position: fixed;
+  inset: var(--filter-top) var(--filter-right) var(--filter-bottom) auto;
+  width: min(32rem, calc(100% - var(--filter-right) - 12px));
+  max-height: var(--filter-height);
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #9fb2a5;
+  border-radius: 12px;
+  color: #17211b;
+  background: #fff;
+  box-shadow: 0 10px 28px rgb(23 33 27 / 15%);
+}
+
+.inbox-filter-form:popover-open {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-  padding: 14px 0;
-  border-bottom: 1px solid #d7ded8;
+}
+
+.inbox-filter-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  grid-column: 1 / -1;
+}
+
+.inbox-filter-heading h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.inbox-filter-form label,
+.inbox-filter-form button {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.inbox-filter-form input,
+.inbox-filter-form select {
+  min-width: 0;
+}
+
+/* WebKit's native select can paint a long account name beyond its border. */
+#inbox-account {
+  appearance: none;
+  padding-inline-end: 2rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: right calc(0.75rem + 5px) center, right 0.75rem center;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
 }
 
 .inbox-filter-scope {
@@ -469,12 +515,8 @@ select:focus {
   gap: 9px;
 }
 
-.inbox-filter-actions button {
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
 .inbox-search-submit,
+.inbox-filter-heading button,
 .inbox-filter-actions button,
 .inbox-page-actions button {
   padding: 10px 15px;
@@ -485,6 +527,7 @@ select:focus {
   font-weight: 800;
 }
 
+.inbox-filter-heading .secondary-action,
 .inbox-filter-actions .secondary-action {
   border: 1px solid #9fb2a5;
   color: #245c40;
@@ -1589,15 +1632,14 @@ select:focus {
     grid-template-columns: 1fr;
   }
 
-  .inbox-filter-form {
-    grid-template-columns: 1fr;
+  .inbox-filter-form:popover-open {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .inbox-search-toolbar { grid-template-columns: minmax(0, 1fr) auto; }
   .inbox-keyword-label { grid-column: 1 / -1; }
   .inbox-search-submit { grid-column: 1; grid-row: 2; justify-self: start; }
-  .inbox-filter-panel > summary { grid-column: 2; grid-row: 2; }
-  .inbox-filter-form { grid-row: 3; }
+  .inbox-filters-toggle { grid-column: 2; grid-row: 2; }
 
   .settings-form {
     grid-template-columns: 1fr;
