@@ -39,6 +39,216 @@ fn inbox_row() -> Value {
         "received_at":"2026-11-05T00:00:00Z", "sender":"sender@example.test", "subject":"Subject", "status":"pending", "attempts":0})
 }
 
+fn inbox_action_fixture() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../../tests/data/inbox_thread_action_page.json"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn action_opt_in_is_a_strict_message_query_boolean() {
+    let fixture = inbox_action_fixture();
+    let mut query = fixture["query"].clone();
+    query["cursor"] = Value::Null;
+    for flag in [json!(true), json!(false)] {
+        query["include_inbox_actions"] = flag;
+        let decoded: ThreadMessagesQuery = serde_json::from_value(query.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), query);
+    }
+    for flag in [Value::Null, json!(0), json!("true"), json!([]), json!({})] {
+        query["include_inbox_actions"] = flag;
+        assert!(serde_json::from_value::<ThreadMessagesQuery>(query.clone()).is_err());
+    }
+    query["include_inbox_actions"] = json!(true);
+    query["message_id"] = json!("not a message-page selector");
+    assert!(serde_json::from_value::<ThreadMessagesQuery>(query).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn action_page_round_trips_own_records_and_explicit_content_only_slots() {
+    let fixture = inbox_action_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let mut query = fixture["query"].clone();
+    query["cursor"] = Value::Null;
+    let page = fixture["action_page"].clone();
+    let engine = |data| {
+        process_fixture(
+            dir.path(),
+            json!({
+                "protocol":1, "ok":true, "operation":"threads.messages", "data":data,
+            }),
+        )
+    };
+    let decoded = engine(page.clone())
+        .thread_messages(serde_json::from_value(query.clone()).unwrap())
+        .unwrap();
+    let result = serde_json::to_value(decoded).unwrap();
+    assert_eq!(captured_payload(dir.path(), "threads.messages"), query);
+    for (index, (message, part)) in [("newer", "second-part"), ("m", "first-part")]
+        .into_iter()
+        .enumerate()
+    {
+        let item = &result["items"][index];
+        assert_eq!(item["message_id"], message);
+        assert_eq!(
+            item["inbox_action"]["thread_entry_ref"]["message_id"],
+            message
+        );
+        assert_eq!(item["inbox_action"]["attachments"][0]["part_id"], part);
+    }
+    assert_eq!(result["items"][0]["direction"], "outbound");
+    assert_eq!(
+        result["items"][0]["inbox_action"]["admission"]["kind"],
+        "sent_to_vendor"
+    );
+    assert_eq!(result["items"][1]["inbox_action"]["action_required"], 0);
+    assert_eq!(
+        fixture["copies"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["copy_ref"] == "sent-copy" && item.get("inbox_action").is_none())
+            .count(),
+        1
+    );
+
+    let mut legacy = message_page(false);
+    legacy["thread"]["thread_ref"]["thread_key"] = json!("survivor");
+    legacy["items"] = page["items"].clone();
+    let record = &mut legacy["items"][0]["inbox_action"];
+    record["provider"] = json!("imap");
+    record["account_id"] = json!("retained");
+    record["thread_entry_ref"] = json!({
+        "provider":"imap", "account_id":"retained", "mailbox_identity_key":null, "message_id":"newer",
+    });
+    legacy["items"][1]["inbox_action"] = Value::Null;
+    let mut query = selector(false);
+    query["include_inbox_actions"] = json!(true);
+    let result = serde_json::to_value(
+        engine(legacy)
+            .thread_messages(serde_json::from_value(query).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        result["items"][0]["inbox_action"]["thread_entry_ref"].get("mailbox_identity_key"),
+        Some(&Value::Null)
+    );
+    assert_eq!(result["items"][1].get("inbox_action"), Some(&Value::Null));
+    assert_eq!(result["thread"]["thread_ref"]["thread_key"], "survivor");
+}
+
+#[cfg(unix)]
+#[test]
+fn action_page_rejects_unrequested_missing_duplicate_and_foreign_records() {
+    let fixture = inbox_action_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let mut query = fixture["query"].clone();
+    query["cursor"] = Value::Null;
+    let page = fixture["action_page"].clone();
+    let engine = |data| {
+        process_fixture(
+            dir.path(),
+            json!({
+                "protocol":1, "ok":true, "operation":"threads.messages", "data":data,
+            }),
+        )
+    };
+    let mut plain_query = query.clone();
+    plain_query
+        .as_object_mut()
+        .unwrap()
+        .remove("include_inbox_actions");
+    let plain = fixture["plain_page"].clone();
+    assert_eq!(
+        serde_json::to_value(
+            engine(plain.clone())
+                .thread_messages(serde_json::from_value(plain_query.clone()).unwrap())
+                .unwrap()
+        )
+        .unwrap(),
+        plain,
+    );
+    for flag in [None, Some(json!(false))] {
+        if let Some(value) = flag {
+            plain_query["include_inbox_actions"] = value;
+        }
+        assert_eq!(
+            engine(page.clone())
+                .thread_messages(serde_json::from_value(plain_query.clone()).unwrap())
+                .unwrap_err()
+                .code,
+            "engine_protocol_error"
+        );
+    }
+    let mut vendor_only = query.clone();
+    vendor_only.as_object_mut().unwrap().remove("inbox_message");
+    assert_eq!(
+        engine(plain.clone())
+            .thread_messages(serde_json::from_value(vendor_only).unwrap())
+            .unwrap_err()
+            .code,
+        "invalid_request"
+    );
+
+    let mut missing = page.clone();
+    missing["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("inbox_action");
+    let mut duplicate = page.clone();
+    duplicate["items"][1] = duplicate["items"][0].clone();
+    let mut borrowed = page.clone();
+    borrowed["items"][0]["inbox_action"] = page["items"][1]["inbox_action"].clone();
+    let mut missing_identity = page.clone();
+    missing_identity["items"][0]["inbox_action"]["thread_entry_ref"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mailbox_identity_key");
+    let mut wrong_local_origin = page.clone();
+    wrong_local_origin["items"][0]["inbox_action"]["thread_entry_ref"]["message_id"] =
+        json!("foreign");
+    let mut wrong_type = page.clone();
+    wrong_type["items"][0]["inbox_action"]["attachments"] = json!({"part_id":"first-part"});
+    let mut invalid_pages = vec![
+        missing,
+        duplicate,
+        borrowed,
+        missing_identity,
+        wrong_local_origin,
+        wrong_type,
+    ];
+    for field in ["provider", "account_id", "mailbox_identity_key"] {
+        let mut invalid = page.clone();
+        invalid["items"][0]["inbox_action"]["thread_entry_ref"][field] = json!("foreign");
+        if field != "mailbox_identity_key" {
+            invalid["items"][0]["inbox_action"][field] = json!("foreign");
+        }
+        invalid_pages.push(invalid);
+    }
+    let mut foreign_thread = page.clone();
+    foreign_thread["thread"]["thread_ref"]["thread_key"] = json!("foreign");
+    invalid_pages.push(foreign_thread);
+    let mut foreign_mailbox = page.clone();
+    foreign_mailbox["thread"]["thread_ref"]["mailbox_identity_key"] = Value::Null;
+    for item in foreign_mailbox["items"].as_array_mut().unwrap() {
+        item["inbox_action"]["thread_entry_ref"]["mailbox_identity_key"] = Value::Null;
+    }
+    invalid_pages.push(foreign_mailbox);
+    for (index, invalid) in invalid_pages.into_iter().enumerate() {
+        assert_eq!(
+            engine(invalid)
+                .thread_messages(serde_json::from_value(query.clone()).unwrap())
+                .unwrap_err()
+                .code,
+            "engine_protocol_error",
+            "invalid page {index}"
+        );
+    }
+}
+
 #[test]
 fn inbox_reference_requires_all_fields_and_never_defaults_an_origin() {
     for identity in [Value::Null, json!("a".repeat(64))] {
