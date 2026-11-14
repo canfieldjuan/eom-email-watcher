@@ -13,10 +13,17 @@ export function positionInboxFilters(
     const above = Math.max(0, aboveBottom - top);
     const belowTop = Math.max(top, Math.min(bottom, anchor.bottom + gap));
     const below = bottom - belowTop;
-    const openBelow = below >= above;
-    form.style.setProperty("--filter-top", openBelow ? belowTop + "px" : "auto");
+    const style = win.getComputedStyle(form);
+    const minimum = [style.paddingTop, style.paddingBottom, style.borderTopWidth, style.borderBottomWidth]
+      .reduce((height, inset) => height + Number.parseFloat(inset), 0);
+    // A border box cannot shrink below its padding and borders. Use the full
+    // band when neither adjoining gap can contain it.
+    const useFullBand = Math.max(above, below) < minimum;
+    const openBelow = useFullBand || below >= above;
+    const panelTop = useFullBand ? top : belowTop;
+    form.style.setProperty("--filter-top", openBelow ? panelTop + "px" : "auto");
     form.style.setProperty("--filter-bottom", openBelow ? "auto" : viewport.clientHeight - aboveBottom + "px");
-    form.style.setProperty("--filter-height", Math.max(0, openBelow ? below : above) + "px");
+    form.style.setProperty("--filter-height", Math.max(0, openBelow ? bottom - panelTop : above) + "px");
     form.style.setProperty("--filter-right", Math.max(gap, viewport.clientWidth - anchor.right) + "px");
   };
 
