@@ -234,6 +234,7 @@ jobs:
             build-essential \
             curl \
             file \
+            fonts-dejavu-core \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
@@ -263,6 +264,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm build
+      - name: Install headless Chromium
+        run: pnpm exec playwright-core install --with-deps --only-shell chromium
+      - name: Verify common header, native Tab and Inbox Filters
+        run: node test-browser/common-header.mjs
+        timeout-minutes: 2
       - run: ../scripts/build-desktop-sidecar.sh
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
