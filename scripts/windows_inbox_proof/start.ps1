@@ -43,7 +43,38 @@ try {
     Remove-Item Env:EOM_EMAIL_ENGINE_BIN -ErrorAction SilentlyContinue
     $app = Start-Process -FilePath $desktop -WorkingDirectory $installation -PassThru
     "Installed desktop PID $($app.Id) in session $($app.SessionId)"
-    & (Join-Path $PSScriptRoot 'measure-webview.ps1') -Output (Join-Path $Evidence 'inbox.json')
+    try {
+        & (Join-Path $PSScriptRoot 'measure-webview.ps1') -Output (Join-Path $Evidence 'inbox.json')
+    } catch {
+        $app.Refresh()
+        "Desktop exited: $($app.HasExited)"
+        if ($app.HasExited) {
+            "Desktop exit code: $($app.ExitCode)"
+        } else {
+            "Desktop window: $($app.MainWindowTitle) ($($app.MainWindowHandle))"
+        }
+        Get-CimInstance Win32_Process -Filter "Name = 'msedgewebview2.exe' OR Name = 'eom-email-watcher-desktop.exe' OR Name = 'eom-mail-engine.exe'" |
+            Select-Object Name, ProcessId, ParentProcessId, SessionId, CommandLine |
+            ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $Evidence 'processes.json')
+        Get-NetTCPConnection -LocalPort 9222 -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, State, OwningProcess |
+            ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $Evidence 'listener.json')
+        try {
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $bounds = [Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bitmap = [Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
+            try {
+                $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                try {
+                    $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.Size)
+                    $bitmap.Save((Join-Path $Evidence 'desktop.png'), [Drawing.Imaging.ImageFormat]::Png)
+                } finally { $graphics.Dispose() }
+            } finally { $bitmap.Dispose() }
+        } catch {
+            "Could not capture the hosted test desktop: $_"
+        }
+        throw
+    }
 } finally {
     Stop-Transcript | Out-Null
 }

@@ -49,4 +49,7 @@ jobs:
             ${{ runner.temp }}/ew-inbox-proof/seed.json
             ${{ runner.temp }}/ew-inbox-proof/launch.txt
             ${{ runner.temp }}/ew-inbox-proof/inbox.json
+            ${{ runner.temp }}/ew-inbox-proof/processes.json
+            ${{ runner.temp }}/ew-inbox-proof/listener.json
+            ${{ runner.temp }}/ew-inbox-proof/desktop.png
             ${{ runner.temp }}/ew-inbox-proof/installer/**/*.log
