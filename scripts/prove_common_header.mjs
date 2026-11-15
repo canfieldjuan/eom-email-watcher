@@ -60,6 +60,7 @@ const threadHistory=new ThreadHistory({resume:async()=>{},suspend(){},refresh:as
 // Synthetic retained rows create real overflow for the production pane owner.
 for(const selector of ['#inbox-list','#inbox-sender-results'])for(let i=0;i<80;i++){
  const row=document.createElement(selector==='#inbox-list'?'li':'button');row.textContent='Synthetic retained message '+i+' sender@example.test';
+ if(selector==='#inbox-sender-results' && i===0)row.id='fixture-sender-control';
  requiredElement(selector).append(row);
 }
 ${headerCall ? source.slice(headerCall.start, headerCall.end) : ""}
@@ -185,7 +186,7 @@ async function proveFiltersLayout() {
   return { pass: true, viewport: [viewport.clientWidth, viewport.clientHeight], scrollY };
 }
 
-async function prepareHeaderTab(id, from, backwards = false, overlap = 16) {
+async function prepareHeaderTab(id, from, backwards = false, overlap = 16, controlSelector) {
   const pane = document.getElementById(id);
   const start = document.getElementById(from);
   const header = document.querySelector(".app-header");
@@ -196,26 +197,44 @@ async function prepareHeaderTab(id, from, backwards = false, overlap = 16) {
     document.getElementById("inbox-senders-toggle").click();
     await settle();
   }
+  if (controlSelector === "#inbox-load-more") {
+    document.querySelector(controlSelector).hidden = false;
+  }
+  if (controlSelector === "#fixture-reader-control") {
+    const button = document.createElement("button");
+    button.id = "fixture-reader-control";
+    button.textContent = "Show body";
+    pane.append(button);
+  }
+  const target = controlSelector ? pane.querySelector(controlSelector) : pane;
+  if (!target) throw Error("Tab fixture control missing: " + controlSelector);
   if (!pane.getClientRects().length || !start.getClientRects().length) throw Error("Tab fixture target is hidden");
   const spacer = document.createElement("div");
   spacer.style.height = "520px";
   document.getElementById("inbox-view").append(spacer);
-  const sample = () => ({
-    target: pane.id, active: document.activeElement.id,
-    paneTop: pane.getBoundingClientRect().top, headerBottom: header.getBoundingClientRect().bottom,
-    paneScroll: pane.scrollTop, y: scrollY, calls: fixture.calls.length,
-  });
+  const sample = () => {
+    const bounds = target.getBoundingClientRect();
+    const paneBounds = pane.getBoundingClientRect();
+    return {
+      target: target.id, active: document.activeElement.id,
+      targetTop: bounds.top, headerBottom: header.getBoundingClientRect().bottom,
+      controlVisible: target === pane || (
+        bounds.top >= paneBounds.top && bounds.bottom <= Math.min(paneBounds.bottom, innerHeight)
+      ),
+      paneScroll: pane.scrollTop, y: scrollY, calls: fixture.calls.length,
+    };
+  };
   start.focus({ preventScroll: true });
   await settle();
-  pane.scrollTop = 80;
-  scrollBy(0, pane.getBoundingClientRect().top - header.getBoundingClientRect().bottom + overlap);
+  pane.scrollTop = controlSelector === "#inbox-load-more" ? pane.scrollHeight : controlSelector ? 0 : 80;
+  scrollBy(0, target.getBoundingClientRect().top - header.getBoundingClientRect().bottom + overlap);
   await settle();
   const before = sample();
-  if (before.active !== from || (overlap > 0 && before.paneTop >= before.headerBottom)) {
+  if (before.active !== from || (overlap > 0 && before.targetTop >= before.headerBottom)) {
     throw Error("Tab fixture did not reach its starting position");
   }
   let native;
-  pane.addEventListener("focus", () => { native = sample(); }, { once: true });
+  target.addEventListener("focus", () => { native = sample(); }, { once: true });
   const corrections = [];
   const scroll = window.scrollBy;
   window.scrollBy = function (...args) {
@@ -235,11 +254,12 @@ async function checkHeaderTab() {
   const nativeFocus = native();
   const evidence = JSON.stringify({ before, nativeFocus, after });
   if (after.active !== after.target) throw Error("Native Tab reached the wrong target: " + evidence);
-  if (after.paneTop < after.headerBottom + 4) throw Error("Native Tab leaves the focus outline under the sticky header: " + evidence);
+  if (after.targetTop < after.headerBottom + 4) throw Error("Native Tab leaves the focus outline under the sticky header: " + evidence);
+  if (!after.controlVisible) throw Error("Native Tab left a focused control clipped: " + evidence);
   if (after.calls !== before.calls || after.paneScroll !== before.paneScroll) {
     throw Error("Focus clearance changed calls or pane scroll: " + evidence);
   }
-  if (corrections.some(position => position.paneTop >= position.headerBottom + 12)) {
+  if (corrections.some(position => position.targetTop >= position.headerBottom + 12)) {
     throw Error("Already-clear native focus caused an extra document scroll: " + evidence);
   }
   return { before, nativeFocus, after, corrections, pass: true };

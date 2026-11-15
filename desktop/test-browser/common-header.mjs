@@ -20,9 +20,65 @@ const cases = [
   { width: 640, height: 520, scale: 2, focus: ["inbox-sender-results", "inbox-sender-all"] },
   { width: 320, height: 520, scale: 2, focus: ["inbox-results", "inbox-senders-toggle"] },
   { width: 1024, height: 300, scale: 1, focus: ["inbox-reading-pane", "inbox-clear", true] },
+  { width: 640, height: 520, scale: 2, focus: ["inbox-sender-results", "inbox-sender-results", false, 8, "#fixture-sender-control"] },
+  { width: 640, height: 520, scale: 2, focus: ["inbox-results", "inbox-results", false, 8, "#inbox-load-more"] },
+  { width: 1024, height: 300, scale: 1, focus: ["inbox-reading-pane", "inbox-reading-pane", false, 8, "#fixture-reader-control"] },
 ];
 const namedFont = "DejaVu Sans";
 const fonts = [null, namedFont];
+
+async function proveOpenFiltersPlacement(page) {
+  await page.evaluate(() => {
+    window.fixture.showView("inbox");
+    // Keep the observed Inbox and header heights stable while the viewport resizes.
+    document.querySelector("#inbox-list").replaceChildren();
+    const spacer = document.createElement("div");
+    spacer.style.height = "800px";
+    document.querySelector("#app").append(spacer);
+    scrollTo(0, 0);
+    document.querySelector("#inbox-sender").value = "unapplied draft";
+  });
+  const form = page.locator("#inbox-filter-form");
+  const snapshot = () => form.evaluate(async panel => {
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const { top, bottom, left, right } = panel.getBoundingClientRect();
+    return {
+      top, bottom, left, right, width: document.documentElement.clientWidth, height: innerHeight,
+      header: document.querySelector(".app-header").getBoundingClientRect().bottom,
+      inboxHeight: document.querySelector("#inbox-view").getBoundingClientRect().height,
+      y: scrollY, draft: document.querySelector("#inbox-sender").value,
+      open: panel.matches(":popover-open"), calls: window.fixture.calls.length,
+    };
+  });
+  await page.locator("#inbox-filters-toggle").focus();
+  await page.keyboard.press("Space");
+  const opened = await snapshot();
+  await page.mouse.move(8, 8);
+  await page.mouse.wheel(0, 160);
+  await page.waitForFunction(y => scrollY > y, opened.y);
+  const scrolled = await snapshot();
+  assert.notDeepEqual([scrolled.top, scrolled.bottom], [opened.top, opened.bottom], "Filters placement did not update on window scroll");
+  await page.setViewportSize({ width: 640, height: 380 });
+  const resized = await snapshot();
+  assert.notEqual(resized.height, scrolled.height, "The browser viewport did not resize");
+  assert.equal(resized.inboxHeight, scrolled.inboxHeight, "The Inbox observer could mask the resize listener");
+  assert.equal(resized.header, scrolled.header, "The header observer could mask the resize listener");
+  assert.notDeepEqual([resized.top, resized.bottom], [scrolled.top, scrolled.bottom], "Filters placement did not update on window resize");
+  for (const [phase, result] of Object.entries({ opened, scrolled, resized })) {
+    assert.ok(result.open, `Filters closed during ${phase}`);
+    assert.ok(result.top >= result.header && result.bottom <= result.height
+      && result.left >= 0 && result.right <= result.width && result.bottom > result.top,
+    `Filters escaped the viewport or covered the header during ${phase}: ${JSON.stringify(result)}`);
+    assert.equal(result.draft, "unapplied draft");
+    assert.equal(result.calls, opened.calls);
+  }
+  await page.keyboard.press("Escape");
+  await form.waitFor({ state: "hidden" });
+  console.log(`Open Filters stayed in bounds after window scroll and resize: ${JSON.stringify({
+    font: await page.evaluate(() => getComputedStyle(document.documentElement).fontFamily),
+    scroll: [opened.y, scrolled.y], height: [scrolled.height, resized.height],
+  })}`);
+}
 
 let server, browser;
 try {
@@ -47,7 +103,7 @@ try {
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
     await page.route("**/*", route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
-    const name = `${font ?? "default font stack"} | ${width}×${height} at ${scale * 100}% text${focus ? `, ${focus[0]}` : ""}`;
+    const name = `${font ?? "default font stack"} | ${width}×${height} at ${scale * 100}% text${focus ? `, ${focus[4] ?? focus[0]}` : ""}`;
     try {
       await page.goto(`${origin}/candidate.html`);
       await page.waitForFunction(() => window.fixtureReady);
@@ -66,6 +122,7 @@ try {
         await window.proveHeader();
         await window.proveFiltersLayout();
       });
+      if (width === 640 && scale === 1) await proveOpenFiltersPlacement(page);
       if (font === namedFont && width === 320 && scale === 2) {
         await page.evaluate(() => window.fixture.showView("inbox"));
         const trigger = page.locator("#inbox-filters-toggle");
