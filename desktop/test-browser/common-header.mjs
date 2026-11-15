@@ -27,6 +27,103 @@ const cases = [
 const namedFont = "DejaVu Sans";
 const fonts = [null, namedFont];
 
+async function fixturePage(browser, origin, viewport) {
+  const page = await browser.newPage({ viewport });
+  page.setDefaultTimeout(10_000);
+  const errors = [];
+  page.on("pageerror", error => errors.push(error.message));
+  await page.route("**/*", route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+  return { page, errors };
+}
+
+async function proveHeaderPaint(page) {
+  const { x, y, hitHeader, overlapsContent } = await page.evaluate(async () => {
+    window.fixture.showView("inbox");
+    const app = document.querySelector("#app");
+    const spacer = document.createElement("div");
+    spacer.style.height = "1400px";
+    app.append(spacer);
+    scrollTo(0, 400);
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const header = document.querySelector(".app-header");
+    const bounds = header.getBoundingClientRect();
+    const x = Math.floor(bounds.right) - 20;
+    const y = Math.floor(bounds.top + bounds.height / 2);
+    // Later positioned content overlaps an unoccupied patch of the header.
+    const marker = document.createElement("div");
+    marker.id = "fixture-header-backdrop";
+    Object.assign(marker.style, {
+      position: "absolute", left: `${x - 8}px`, top: `${scrollY + y - 8}px`,
+      width: "16px", height: "16px", background: "#f0f",
+    });
+    app.append(marker);
+    return {
+      x, y, hitHeader: header.contains(document.elementFromPoint(x, y)),
+      overlapsContent: document.elementsFromPoint(x, y).includes(marker),
+    };
+  });
+  assert.ok(overlapsContent, "The fixture content did not overlap the header");
+  assert.ok(hitHeader, "Scrolled content received a hit above the sticky header");
+  const pixel = async () => {
+    const png = (await page.screenshot({ scale: "css" })).toString("base64");
+    return page.evaluate(async ({ png, x, y }) => {
+      const bitmap = await createImageBitmap(new Blob([Uint8Array.from(atob(png), char => char.charCodeAt(0))]));
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 1;
+      const context = canvas.getContext("2d");
+      context.drawImage(bitmap, x, y, 1, 1, 0, 0, 1, 1);
+      bitmap.close();
+      return Array.from(context.getImageData(0, 0, 1, 1).data);
+    }, { png, x, y });
+  };
+  const first = await pixel();
+  await page.locator("#fixture-header-backdrop").evaluate(marker => { marker.style.background = "#0f0"; });
+  assert.deepEqual(await pixel(), first, "Changing content under the sticky header changed its painted pixel");
+  console.log("PASS header stacking and opaque paint over scrolled content");
+}
+
+async function proveClassicScrollbar(browser, origin) {
+  const { page, errors } = await fixturePage(browser, origin, { width: 1024, height: 1000 });
+  try {
+    await page.goto(`${origin}/candidate.html`);
+    await page.waitForFunction(() => window.fixtureReady);
+    const { before, during, after } = await page.evaluate(async () => {
+      window.fixture.showView("inbox");
+      document.querySelector("#inbox-list").replaceChildren();
+      const root = document.documentElement;
+      const sample = async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const bounds = selector => {
+          const { x, width } = document.querySelector(selector).getBoundingClientRect();
+          return [x, width];
+        };
+        return {
+          overflow: root.scrollHeight > root.clientHeight,
+          scrollbar: innerWidth - root.clientWidth,
+          header: bounds(".app-header"), nav: bounds(".view-tabs"),
+        };
+      };
+      const before = await sample();
+      const spacer = document.createElement("div");
+      spacer.style.height = "1400px";
+      document.querySelector("#app").append(spacer);
+      const during = await sample();
+      spacer.remove();
+      return { before, during, after: await sample() };
+    });
+    assert.ok(!before.overflow && during.overflow && !after.overflow && during.scrollbar > 0,
+      `The fixture did not add and remove a classic scrollbar: ${JSON.stringify({ before, during, after })}`);
+    for (const result of [during, after]) {
+      assert.deepEqual(result.header, before.header, "A classic scrollbar shifted the common header");
+      assert.deepEqual(result.nav, before.nav, "A classic scrollbar shifted common navigation");
+    }
+    assert.deepEqual(errors, []);
+    console.log(`PASS header and navigation gutters with a ${during.scrollbar}px classic scrollbar`);
+  } finally {
+    await page.close();
+  }
+}
+
 async function proveOpenFiltersPlacement(page) {
   await page.evaluate(() => {
     window.fixture.showView("inbox");
@@ -98,11 +195,7 @@ try {
   browser = await chromium.launch();
   console.log(`Common-header and Filters browser proof on Chromium ${browser.version()}`);
   for (const { width, height, scale, focus, font } of fonts.flatMap(font => cases.map(test => ({ ...test, font })))) {
-    const page = await browser.newPage({ viewport: { width, height } });
-    page.setDefaultTimeout(10_000);
-    const errors = [];
-    page.on("pageerror", error => errors.push(error.message));
-    await page.route("**/*", route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+    const { page, errors } = await fixturePage(browser, origin, { width, height });
     const name = `${font ?? "default font stack"} | ${width}×${height} at ${scale * 100}% text${focus ? `, ${focus[4] ?? focus[0]}` : ""}`;
     try {
       await page.goto(`${origin}/candidate.html`);
@@ -123,6 +216,7 @@ try {
         await window.proveFiltersLayout();
       });
       if (width === 640 && scale === 1) await proveOpenFiltersPlacement(page);
+      if (!font && width === 1024 && height === 768) await proveHeaderPaint(page);
       if (font === namedFont && width === 320 && scale === 2) {
         await page.evaluate(() => window.fixture.showView("inbox"));
         const trigger = page.locator("#inbox-filters-toggle");
@@ -145,6 +239,9 @@ try {
       await page.close();
     }
   }
+  await browser.close();
+  browser = await chromium.launch({ ignoreDefaultArgs: ["--hide-scrollbars"] });
+  await proveClassicScrollbar(browser, origin);
 } finally {
   try {
     await browser?.close();
