@@ -37,9 +37,20 @@ try {
     Assert-Hash $desktop '12090df2582faa592033783734fdaf5794246a99ab010a39d1eca488e9a6b0b8'
     Assert-Hash $engine 'aedcd11df8ded8a220c5d55373ee64d1c60a9d522b806e158c8be239034412d3'
 
+    foreach ($name in 'ordinary-write-config.toml','config.toml') {
+        $configPath = Join-Path $Fixture $name
+        $request = @{protocol=1; operation='config.admission.snapshot'; config_path=$configPath; payload=@{}}
+        $reply = ($request | ConvertTo-Json -Compress) | & $engine | Out-String | ConvertFrom-Json
+        $status = @{name=$name; ok=$reply.ok; error=$reply.error}
+        $status | ConvertTo-Json -Compress | Tee-Object -FilePath (Join-Path $Evidence 'admission.jsonl') -Append
+        if ($name -eq 'config.toml' -and -not $reply.ok) { throw 'Packaged engine refused the private fixture config' }
+    }
+
     $env:EOM_EMAIL_WATCHER_CONFIG = Join-Path $Fixture 'config.toml'
     $env:WEBVIEW2_USER_DATA_FOLDER = Join-Path $Evidence 'webview'
-    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9222'
+    $browserArguments = 'HKCU:\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments'
+    New-Item -Path $browserArguments -Force | Out-Null
+    New-ItemProperty -Path $browserArguments -Name 'eom-email-watcher-desktop.exe' -PropertyType String -Value '--remote-debugging-port=9222' | Out-Null
     Remove-Item Env:EOM_EMAIL_ENGINE_BIN -ErrorAction SilentlyContinue
     $app = Start-Process -FilePath $desktop -WorkingDirectory $installation -PassThru
     "Installed desktop PID $($app.Id) in session $($app.SessionId)"

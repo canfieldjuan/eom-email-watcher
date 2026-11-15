@@ -7,7 +7,7 @@ import sqlite3
 
 from eom_email_watcher.config import exact_sender_selector_id
 from eom_email_watcher.db import AdmissionProvenance, Store
-from eom_email_watcher import engine_api
+from eom_email_watcher import engine_api, private_storage
 from eom_email_watcher.mime import AttachmentDescriptor
 
 
@@ -53,14 +53,17 @@ for index, (message_id, thread, author, recipient, subject, folder, attachment) 
             db.execute("UPDATE messages SET summary=? WHERE message_id=?", (f"Analysis for {message_id}", message_id))
 
 config = profile / "config.toml"
-config.write_text(
+config_text = (
     'timezone = "UTC"\nmodel_name = "synthetic-inbox-proof"\n'
     'model_base_url = "http://127.0.0.1:9/v1"\nmodel_require_auth = false\n'
     'notifications_enabled = false\npoll_interval_minutes = 1440\n'
     f'database_file = {json.dumps(str(store.path))}\n'
     f'\n[[senders]]\nemail = "{sender}"\n\n[[senders]]\nemail = "{owner}"\n'
 )
-config.chmod(0o600)
+control = profile / "ordinary-write-config.toml"
+control.write_text(config_text, encoding="utf-8")
+control.chmod(0o600)
+private_storage.write_text(config, config_text)
 
 
 def request(operation, **payload):
