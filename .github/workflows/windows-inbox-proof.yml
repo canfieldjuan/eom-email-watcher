@@ -1,0 +1,52 @@
+name: Packaged Windows Inbox proof
+
+on:
+  push:
+    branches:
+      - proof/windows-inbox-20261115
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  packaged-inbox:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.13"
+      - name: Download the merged main installer
+        uses: actions/download-artifact@v8
+        with:
+          name: email-watcher-windows-nsis
+          run-id: 43688624140
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/ew-main-installer
+      - name: Seed and verify the synthetic Inbox
+        shell: pwsh
+        run: |
+          $proof = Join-Path $env:RUNNER_TEMP 'ew-inbox-proof'
+          New-Item -ItemType Directory -Path $proof | Out-Null
+          uv run --locked python scripts/windows_inbox_proof/seed.py (Join-Path $proof 'fixture') |
+            Tee-Object -FilePath (Join-Path $proof 'seed.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise installed desktop and bundled engine
+        shell: pwsh
+        run: |
+          $proof = Join-Path $env:RUNNER_TEMP 'ew-inbox-proof'
+          $installer = Join-Path $env:RUNNER_TEMP 'ew-main-installer/release-installer.exe'
+          & ./scripts/windows_inbox_proof/start.ps1 -Installer $installer -Fixture (Join-Path $proof 'fixture') -Evidence $proof
+      - name: Save the qualification results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: packaged-inbox-proof
+          path: |
+            ${{ runner.temp }}/ew-inbox-proof/seed.json
+            ${{ runner.temp }}/ew-inbox-proof/launch.txt
+            ${{ runner.temp }}/ew-inbox-proof/inbox.json
+            ${{ runner.temp }}/ew-inbox-proof/installer/**/*.log
