@@ -63,3 +63,23 @@ test("an exact border-box fit retains the anchor and a larger CSS inset uses the
   assert.equal(place(400, 458, 505)["--filter-height"], "34px");
   assert.equal(place(400, 458, 505, 17)["--filter-height"], "96px");
 });
+
+test("Filters falls back when the largest gap is one pixel short of the border box", () => {
+  // The 33px gap fits the padding and top border, but not the bottom border.
+  assert.deepEqual(place(400, 457, 505), {
+    "--filter-top": "412px",
+    "--filter-bottom": "auto",
+    "--filter-height": "96px",
+    "--filter-right": "16px",
+  });
+});
+
+test("Filters falls back when only the sum of the adjoining gaps fits the border box", () => {
+  // Each adjoining gap is 21px, below the 34px minimum.
+  assert.deepEqual(place(400, 445, 475), {
+    "--filter-top": "412px",
+    "--filter-bottom": "auto",
+    "--filter-height": "96px",
+    "--filter-right": "16px",
+  });
+});
