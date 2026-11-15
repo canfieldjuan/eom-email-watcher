@@ -60,9 +60,6 @@ config_text = (
     f'database_file = {json.dumps(str(store.path))}\n'
     f'\n[[senders]]\nemail = "{sender}"\n\n[[senders]]\nemail = "{owner}"\n'
 )
-control = profile / "ordinary-write-config.toml"
-control.write_text(config_text, encoding="utf-8")
-control.chmod(0o600)
 private_storage.write_text(config, config_text)
 
 
