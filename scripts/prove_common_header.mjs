@@ -87,6 +87,7 @@ async function proveHeader() {
   const settle = async () => { await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); };
   const rect = e => { const b = e.getBoundingClientRect(); return [b.x, b.y, b.width, b.height]; };
   const nav = document.querySelector('.view-tabs');
+  const shell = document.querySelector('.shell');
   const tabs = [...nav.querySelectorAll('button')];
   const rows = [];
   let expected;
@@ -103,6 +104,12 @@ async function proveHeader() {
       check(b.height >= 40, 'tiny destination: ' + tab.id);
     }
     const content = document.querySelector('#' + view + '-view');
+    if (view === 'inbox') {
+      const shellBounds = shell.getBoundingClientRect();
+      const contentBounds = content.getBoundingClientRect();
+      check(contentBounds.top - shellBounds.top === 24 && shellBounds.bottom - contentBounds.bottom === 24,
+        'Inbox shell vertical spacing changed');
+    }
     const spacer = document.createElement('div'); spacer.style.height = '1800px'; content.append(spacer);
     scrollTo(0, 400); await settle();
     const scrolled = rect(nav);
