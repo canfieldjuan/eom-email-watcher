@@ -15,6 +15,7 @@ from eom_email_watcher.model import (
     GatewayModelError,
     GatewayOutputRejected,
     ModelError,
+    analysis_response_schema,
 )
 from eom_email_watcher.runtime import load_runtime
 from eom_email_watcher.scheduling import (
@@ -232,6 +233,31 @@ def test_gateway_health_and_analysis_use_scoped_model_free_contract(
         "test trust root",
         "test trust root",
     ]
+
+
+def test_gateway_analysis_sends_the_analysis_response_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    analyze(model)
+
+    assert payloads[0]["generation"]["response_schema"] == analysis_response_schema()
 
 
 def test_gateway_retry_reuses_request_identity_and_immutable_expiry(

@@ -11,6 +11,7 @@ from eom_email_watcher.model import (
     ModelError,
     _email_prompt,
     _split_quoted_history,
+    analysis_response_schema,
     validate_analysis,
 )
 from eom_email_watcher.scheduling import SchedulingSource, SchedulingViolation
@@ -130,6 +131,132 @@ def test_no_action_with_empty_suggestion_is_normalized(
 
     assert result.action_required is False
     assert result.suggested_action is None
+
+
+NULLABLE_ANALYSIS_KEYS = ("suggested_action", "deadline_text", "deadline_iso")
+# Keywords local-inference-gateway admits in a response_schema
+# (contracts.py SUPPORTED_SCHEMA_KEYWORDS at f105bfd). Anything else, such as
+# "pattern" or "format", makes the gateway reject the whole request.
+GATEWAY_SCHEMA_KEYWORDS = {
+    "additionalProperties", "anyOf", "default", "enum", "items", "maxLength", "maxItems",
+    "maximum", "minLength", "minItems", "minimum", "properties", "required", "title", "type",
+}
+
+
+def _prompt_required_keys() -> list[str]:
+    tail = SYSTEM_PROMPT.split("Required keys:", 1)[1].split(".", 1)[0]
+    return [key.strip() for key in tail.replace("\n", " ").split(",")]
+
+
+def _schema_nodes(schema: dict[str, object]):
+    yield schema
+    for value in schema.get("properties", {}).values():
+        yield from _schema_nodes(value)
+    for branch in schema.get("anyOf", []):
+        yield from _schema_nodes(branch)
+
+
+def test_analysis_response_schema_requires_every_prompt_key() -> None:
+    schema = analysis_response_schema()
+
+    assert schema["required"] == list(schema["properties"])
+    assert schema["required"] == _prompt_required_keys()
+    assert schema["additionalProperties"] is False
+    for key in NULLABLE_ANALYSIS_KEYS:
+        assert {"type": "null"} in schema["properties"][key]["anyOf"]
+
+
+def test_analysis_response_schema_bounds_deadline_with_gateway_keywords() -> None:
+    schema = analysis_response_schema()
+    deadline = schema["properties"]["deadline_iso"]["anyOf"]
+    string_branch = next(branch for branch in deadline if branch.get("type") == "string")
+
+    assert string_branch["minLength"] == 10
+    assert string_branch["maxLength"] == 10
+    for node in _schema_nodes(schema):
+        assert set(node) <= GATEWAY_SCHEMA_KEYWORDS
+    assert analysis_response_schema() == schema
+    schema["required"].clear()
+    assert analysis_response_schema()["required"] == _prompt_required_keys()
+
+
+@pytest.mark.parametrize("missing", NULLABLE_ANALYSIS_KEYS)
+def test_missing_nullable_key_is_rejected(missing: str) -> None:
+    raw = valid_result()
+    raw["action_required"] = False
+    raw["suggested_action"] = None
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+    del raw[missing]
+
+    with pytest.raises(ModelError, match="did not match the required schema"):
+        validate_analysis(raw, "2026-07-18T12:00:00+00:00")
+
+
+def test_explicit_nulls_remain_a_valid_no_action_result() -> None:
+    raw = valid_result()
+    raw.update(action_required=False, suggested_action=None, deadline_text=None, deadline_iso=None)
+
+    result = validate_analysis(raw, "2026-07-18T12:00:00+00:00")
+
+    assert result.action_required is False
+    assert result.suggested_action is None
+    assert result.deadline_text is None
+    assert result.deadline_iso is None
+
+
+@pytest.mark.parametrize(
+    ("deadline_iso", "kept"),
+    [
+        ("2026-07-20", True),
+        ("2026-07-17", False),
+        ("September 5", False),
+        ("2026-07-20T00:00:00-05:00Z", False),
+    ],
+)
+def test_validator_still_owns_deadline_clearing(deadline_iso: str, kept: bool) -> None:
+    raw = valid_result()
+    raw["deadline_iso"] = deadline_iso
+
+    result = validate_analysis(raw, "2026-07-18T12:00:00+00:00")
+
+    assert result.deadline_iso == (deadline_iso if kept else None)
+    assert result.deadline_text == "by July 20"
+
+
+def test_local_model_sends_the_analysis_response_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_file = tmp_path / "token"
+    token_file.write_text("k", encoding="utf-8")
+    model = LocalModel("http://127.0.0.1:1234/v1", "model", 60, token_file, True)
+    requests: list[dict[str, object]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": json.dumps(valid_result())}}]}
+
+    def post(*_args, **kwargs):
+        requests.append(kwargs["json"])
+        return FakeResponse()
+
+    monkeypatch.setattr("eom_email_watcher.model.httpx.post", post)
+
+    model.analyze(
+        sender="trusted@example.com",
+        subject="Schedule",
+        received_at="2026-07-18T12:00:00+00:00",
+        body="Please confirm the new time by July 20.",
+        attachment_names=(),
+        current_local_time=datetime(2026, 7, 18, tzinfo=UTC),
+    )
+
+    response_format = requests[0]["response_format"]
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"] == analysis_response_schema()
 
 
 def test_prompt_treats_email_as_untrusted() -> None:
