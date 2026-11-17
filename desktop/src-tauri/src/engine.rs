@@ -3770,6 +3770,23 @@ impl Engine {
         timeout: Option<Duration>,
         commit_risk: EngineRequestCommitRisk,
     ) -> Result<T, EngineError> {
+        let trace_started = (matches!(
+            operation,
+            "config.ntfy_disclosure.status"
+                | "config.admission.snapshot"
+                | "config.admission.compare"
+        ) && std::env::var_os("EOM_EMAIL_WATCHER_PROOF_ADMISSION_TRACE")
+            .is_some())
+        .then(Instant::now);
+        let trace = |phase: &'static str| {
+            if let Some(start) = trace_started {
+                eprintln!(
+                    "admission proof: {operation} {phase} elapsed_ms={}",
+                    start.elapsed().as_millis()
+                );
+            }
+        };
+        trace("entry");
         self.check_cancellation()?;
         Self::remaining_request_time(self.operation_deadline)?;
         let admission_binding = if operation_requires_admission_token(operation) {
@@ -3809,12 +3826,14 @@ impl Engine {
         #[cfg(unix)]
         command.process_group(0);
         let child = EngineChild::spawn(&mut command, &self.cancellations).map_err(|_| {
+            trace("spawn_error");
             EngineError::host(
                 "engine_unavailable",
                 "Watcher engine is unavailable; reinstall it or inspect desktop logs",
             )
         })?;
 
+        trace("spawned");
         let write_result = child
             .take_stdin()
             .map_err(|_| EngineError::host("host_error", "Engine stdin was unavailable"))?
@@ -3834,6 +3853,7 @@ impl Engine {
 
         let started = Instant::now();
         let deadline = self.request_deadline(timeout, started);
+        trace("stdin_dispatched");
         let status = loop {
             if cancellation_requested(&self.cancellations) {
                 child.terminate();
@@ -3843,6 +3863,7 @@ impl Engine {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        trace("child_wait_timeout");
                         child.terminate();
                         return Err(commit_risk.map_post_dispatch(EngineError::host(
                             "engine_timeout",
@@ -3861,15 +3882,19 @@ impl Engine {
             }
         };
 
+        trace("primary_exited");
         let output = child
             .collect_output(status, &self.cancellations, deadline)
             .map_err(|error| {
                 let error = match error {
                     EngineOutputError::Cancelled => engine_cancelled(),
-                    EngineOutputError::TimedOut => EngineError::host(
-                        "engine_timeout",
-                        "Watcher engine did not respond before its timeout",
-                    ),
+                    EngineOutputError::TimedOut => {
+                        trace("collection_timeout");
+                        EngineError::host(
+                            "engine_timeout",
+                            "Watcher engine did not respond before its timeout",
+                        )
+                    }
                     EngineOutputError::StdoutTooLarge | EngineOutputError::StderrTooLarge => {
                         EngineError::host(
                             "engine_protocol_error",
@@ -3883,6 +3908,7 @@ impl Engine {
                 };
                 commit_risk.map_post_dispatch(error)
             })?;
+        trace("output_collected");
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.trim().is_empty() {
             eprintln!("watcher engine {operation} stderr: {}", stderr.trim());

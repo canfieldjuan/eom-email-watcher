@@ -26,6 +26,18 @@ jobs:
           run-id: 43688624140
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/ew-main-installer
+      - uses: pnpm/action-setup@v6.0.10
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "26"
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
       - name: Seed and verify the synthetic Inbox
         shell: pwsh
         run: |
@@ -34,23 +46,48 @@ jobs:
           uv run --locked python scripts/windows_inbox_proof/seed.py (Join-Path $proof 'fixture') |
             Tee-Object -FilePath (Join-Path $proof 'seed.json')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Exercise installed desktop and bundled engine
+      - name: Stage the exact shipped engine and build the diagnostic desktop
         shell: pwsh
         run: |
           $proof = Join-Path $env:RUNNER_TEMP 'ew-inbox-proof'
           $installer = Join-Path $env:RUNNER_TEMP 'ew-main-installer/release-installer.exe'
-          & ./scripts/windows_inbox_proof/start.ps1 -Installer $installer -Fixture (Join-Path $proof 'fixture') -Evidence $proof
-      - name: Save the qualification results
+          $engineHash = 'aedcd11df8ded8a220c5d55373ee64d1c60a9d522b806e158c8be239034412d3'
+          if ((Get-FileHash -LiteralPath $installer).Hash -ne '62f916e639eae293506edabf816d966ea013231483ab9d912961daf0f99da86a') {
+            throw 'Main installer identity mismatch'
+          }
+          & 7z x $installer '-y' ('-o' + $proof) '$8/eom-mail-engine.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $engine = Join-Path $proof '$8/eom-mail-engine.exe'
+          if ((Get-FileHash -LiteralPath $engine).Hash -ne $engineHash) { throw 'Extracted engine identity mismatch' }
+          $triple = (rustc --print host-tuple).Trim()
+          New-Item -ItemType Directory -Path desktop/src-tauri/binaries -Force | Out-Null
+          Copy-Item -LiteralPath $engine -Destination "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe"
+          @{build=@{beforeBuildCommand='pnpm build'}} | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath (Join-Path $proof 'diagnostic-tauri.json') -Encoding utf8NoBOM
+          pnpm --dir desktop install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --dir desktop tauri build --bundles nsis --config (Join-Path $proof 'diagnostic-tauri.json') *> (Join-Path $proof 'build.log')
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content -LiteralPath (Join-Path $proof 'build.log') -Tail 60
+            exit $LASTEXITCODE
+          }
+          cargo test --lib --manifest-path desktop/src-tauri/Cargo.toml --release admission_refusals_report_the_deciding_stage_and_code
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install the diagnostic build and capture the real desktop decision
+        shell: pwsh
+        run: |
+          $proof = Join-Path $env:RUNNER_TEMP 'ew-inbox-proof'
+          $installer = @(Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if ($installer.Count -ne 1) { throw 'Expected one diagnostic installer' }
+          & ./scripts/windows_inbox_proof/diagnose.ps1 -Installer $installer[0].FullName -Evidence $proof
+      - name: Save the diagnostic evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: packaged-inbox-proof
+          name: packaged-inbox-admission-diagnostic
           path: |
             ${{ runner.temp }}/ew-inbox-proof/seed.json
-            ${{ runner.temp }}/ew-inbox-proof/launch.txt
-            ${{ runner.temp }}/ew-inbox-proof/inbox.json
-            ${{ runner.temp }}/ew-inbox-proof/admission.jsonl
-            ${{ runner.temp }}/ew-inbox-proof/processes.json
-            ${{ runner.temp }}/ew-inbox-proof/listener.json
-            ${{ runner.temp }}/ew-inbox-proof/desktop.png
-            ${{ runner.temp }}/ew-inbox-proof/installer/**/*.log
+            ${{ runner.temp }}/ew-inbox-proof/build.log
+            ${{ runner.temp }}/ew-inbox-proof/diagnostic.json
+            ${{ runner.temp }}/ew-inbox-proof/desktop-admission-trace.txt
