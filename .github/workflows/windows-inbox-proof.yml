@@ -66,6 +66,8 @@ jobs:
             Set-Content -LiteralPath (Join-Path $proof 'diagnostic-tauri.json') -Encoding utf8NoBOM
           pnpm --dir desktop install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --locked python -c "import sys; sys.path.insert(0, 'scripts'); from build_desktop_sidecar import PROJECT_DIRECTORY, BUILD_DIRECTORY; from windows_installer_template import prepare; print(prepare(PROJECT_DIRECTORY, BUILD_DIRECTORY))"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm --dir desktop tauri build --bundles nsis --config (Join-Path $proof 'diagnostic-tauri.json') *> (Join-Path $proof 'build.log')
           if ($LASTEXITCODE -ne 0) {
             Get-Content -LiteralPath (Join-Path $proof 'build.log') -Tail 60
