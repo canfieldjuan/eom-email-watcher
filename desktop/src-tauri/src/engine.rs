@@ -3834,6 +3834,13 @@ impl Engine {
         })?;
 
         trace("spawned");
+        if trace_started.is_some()
+            && let Ok(pid) = child
+                .control
+                .with_process(|process| Ok(process.process.id()))
+        {
+            eprintln!("admission proof: {operation} child_pid={pid}");
+        }
         let write_result = child
             .take_stdin()
             .map_err(|_| EngineError::host("host_error", "Engine stdin was unavailable"))?

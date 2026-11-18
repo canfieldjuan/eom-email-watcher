@@ -46,6 +46,8 @@ jobs:
           uv run --locked python scripts/windows_inbox_proof/seed.py (Join-Path $proof 'fixture') |
             Tee-Object -FilePath (Join-Path $proof 'seed.json')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build the Windows trace decoder
+        run: dotnet build scripts/windows_inbox_proof/trace/EngineTrace.csproj --configuration Release
       - name: Stage the exact shipped engine and build the diagnostic desktop
         shell: pwsh
         run: |
@@ -93,3 +95,4 @@ jobs:
             ${{ runner.temp }}/ew-inbox-proof/build.log
             ${{ runner.temp }}/ew-inbox-proof/diagnostic.json
             ${{ runner.temp }}/ew-inbox-proof/desktop-admission-trace.txt
+            ${{ runner.temp }}/ew-inbox-proof/engine-delay.json

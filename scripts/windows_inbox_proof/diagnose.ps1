@@ -20,19 +20,27 @@ $env:WEBVIEW2_USER_DATA_FOLDER = Join-Path $Evidence 'diagnostic-webview'
 Remove-Item Env:EOM_EMAIL_ENGINE_BIN -ErrorAction SilentlyContinue
 $stderr = Join-Path $Evidence 'desktop-stderr.raw'
 $stdout = Join-Path $Evidence 'desktop-stdout.raw'
-$app = Start-Process -FilePath $desktop -WorkingDirectory $installation -RedirectStandardError $stderr -RedirectStandardOutput $stdout -PassThru
-# Return evidence to the hosted job if the GUI stalls without a decision.
-# This collection window does not change the app's request deadlines.
-$until = (Get-Date).AddSeconds(55)
-do {
-    Start-Sleep -Milliseconds 250
-    $app.Refresh()
-    $trace = @(Get-Content -LiteralPath $stderr | Where-Object {
-        $_.StartsWith('admission proof: ') -or $_.StartsWith('configuration admission failed at ')
-    })
-    $decision = @($trace | Where-Object { $_.StartsWith('configuration admission failed at ') })
-    $comparison = @($trace | Where-Object { $_.StartsWith('admission proof: config.admission.compare output_collected ') })
-} until ($app.HasExited -or $decision.Count -or $comparison.Count -gt 1 -or (Get-Date) -ge $until)
+$etl = Join-Path $Evidence 'windows-processes.etl'
+& wpr.exe -start CPU -start FileIO -filemode
+if ($LASTEXITCODE -ne 0) { throw "Could not start Windows CPU and file trace: $LASTEXITCODE" }
+try {
+    $app = Start-Process -FilePath $desktop -WorkingDirectory $installation -RedirectStandardError $stderr -RedirectStandardOutput $stdout -PassThru
+    # Return evidence to the hosted job if the GUI stalls without a decision.
+    # This collection window does not change the app's request deadlines.
+    $until = (Get-Date).AddSeconds(55)
+    do {
+        Start-Sleep -Milliseconds 250
+        $app.Refresh()
+        $trace = @(Get-Content -LiteralPath $stderr | Where-Object {
+            $_.StartsWith('admission proof: ') -or $_.StartsWith('configuration admission failed at ')
+        })
+        $decision = @($trace | Where-Object { $_.StartsWith('configuration admission failed at ') })
+        $comparison = @($trace | Where-Object { $_.StartsWith('admission proof: config.admission.compare output_collected ') })
+    } until ($app.HasExited -or $decision.Count -or $comparison.Count -gt 1 -or (Get-Date) -ge $until)
+} finally {
+    & wpr.exe -stop $etl
+    if ($LASTEXITCODE -ne 0) { throw "Could not save Windows process trace: $LASTEXITCODE" }
+}
 
 $trace | Set-Content -LiteralPath (Join-Path $Evidence 'desktop-admission-trace.txt') -Encoding utf8NoBOM
 [ordered]@{
@@ -46,3 +54,6 @@ $trace | Set-Content -LiteralPath (Join-Path $Evidence 'desktop-admission-trace.
 } | ConvertTo-Json -Depth 4 | Tee-Object -FilePath (Join-Path $Evidence 'diagnostic.json')
 $trace
 if (-not $trace.Count) { throw 'The installed diagnostic desktop emitted no admission trace' }
+$parser = Join-Path $PSScriptRoot 'trace/EngineTrace.csproj'
+dotnet run --project $parser --configuration Release --no-build -- $etl $app.Id (Join-Path $Evidence 'engine-delay.json')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
