@@ -21,8 +21,9 @@ Remove-Item Env:EOM_EMAIL_ENGINE_BIN -ErrorAction SilentlyContinue
 $stderr = Join-Path $Evidence 'desktop-stderr.raw'
 $stdout = Join-Path $Evidence 'desktop-stdout.raw'
 $etl = Join-Path $Evidence 'windows-processes.etl'
-& wpr.exe -start CPU -start FileIO -filemode
-if ($LASTEXITCODE -ne 0) { throw "Could not start Windows CPU and file trace: $LASTEXITCODE" }
+$profile = Join-Path $PSScriptRoot 'trace/EngineLifecycle.wprp'
+& wpr.exe -start "$profile!EngineLifecycle.Light"
+if ($LASTEXITCODE -ne 0) { throw "Could not start Windows process and image trace: $LASTEXITCODE" }
 try {
     $app = Start-Process -FilePath $desktop -WorkingDirectory $installation -RedirectStandardError $stderr -RedirectStandardOutput $stdout -PassThru
     # Return evidence to the hosted job if the GUI stalls without a decision.

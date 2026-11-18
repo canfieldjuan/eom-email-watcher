@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0">
+  <Profiles>
+    <SystemCollector Id="LifecycleCollector" Name="NT Kernel Logger">
+      <BufferSize Value="128" />
+      <Buffers Value="64" />
+    </SystemCollector>
+    <SystemProvider Id="LifecycleProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread" />
+        <Keyword Value="Loader" />
+      </Keywords>
+    </SystemProvider>
+    <Profile Id="EngineLifecycle.Light.Memory" Name="EngineLifecycle" Description="Engine process and image lifetimes" DetailLevel="Light" LoggingMode="Memory">
+      <Collectors>
+        <SystemCollectorId Value="LifecycleCollector">
+          <SystemProviderId Value="LifecycleProvider" />
+        </SystemCollectorId>
+      </Collectors>
+    </Profile>
+    <Profile Id="EngineLifecycle.Light.File" Name="EngineLifecycle" Description="Engine process and image lifetimes" DetailLevel="Light" LoggingMode="File">
+      <Collectors>
+        <SystemCollectorId Value="LifecycleCollector">
+          <SystemProviderId Value="LifecycleProvider" />
+        </SystemCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

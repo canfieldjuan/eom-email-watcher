@@ -12,6 +12,10 @@ permissions:
 jobs:
   packaged-inbox:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        launch: [a, b]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -89,7 +93,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: packaged-inbox-admission-diagnostic
+          name: packaged-inbox-admission-diagnostic-${{ matrix.launch }}
           path: |
             ${{ runner.temp }}/ew-inbox-proof/seed.json
             ${{ runner.temp }}/ew-inbox-proof/build.log
