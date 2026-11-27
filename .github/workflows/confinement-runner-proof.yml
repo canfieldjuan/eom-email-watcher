@@ -1,0 +1,33 @@
+name: Hosted confinement proof
+
+on:
+  push:
+    branches: [proof/ew-confinement-runner]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.13.18"
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - name: Run the existing write-boundary test
+        run: uv run pytest tests/test_scheduled_confinement.py::test_boundary_refuses_outside_and_allows_inside
+      - name: Compare SQLite spill controls
+        if: always()
+        shell: bash
+        run: |
+          uv run python .github/confinement-runner-proof.py | tee "${RUNNER_TEMP}/confinement-runner.jsonl"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: confinement-runner
+          path: ${{ runner.temp }}/confinement-runner.jsonl
+          if-no-files-found: error
